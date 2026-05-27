@@ -15,10 +15,11 @@
 #ifndef XBOX_KERNEL_H
 #define XBOX_KERNEL_H
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+/*
+ * NT type vocabulary. On Windows this resolves to <windows.h>; on Linux it
+ * provides the same types natively (see src/platform/xbox_winnt.h).
+ */
+#include "platform/xbox_winnt.h"
 #include <stdint.h>
 #include <stdbool.h>
 

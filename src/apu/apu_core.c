@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include "apu.h"
+#include "apu_xaudio2.h"
 #include "fpconv.h"
 
 /* ============================================================
@@ -44,7 +45,7 @@ int g_dbg_voice_monitor = -1;
 uint64_t g_dbg_muted_voices[4] = { 0 };
 
 /* Global audio mute — disables all AWD/mixer sound playback */
-volatile int g_audio_muted = 1;  /* Start muted; set to 0 to enable */
+volatile int g_audio_muted = 0;  /* 0 = audio enabled */
 
 /* ============================================================
  * Debug frame markers (minimal stubs)
@@ -150,11 +151,15 @@ static struct {
 } g_test_tone = { false, 0.0, 0.0, 0 };
 
 /* ============================================================
- * Monitor - waveOut audio output (replaces SDL stubs)
+ * Monitor - Audio output (XAudio2 primary, waveOut fallback)
  * ============================================================ */
 
+#if defined(_WIN32)
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
+#endif
+/* On Linux, waveOut* are inert stubs from win32_compat.h: the APU's
+ * waveOut fallback path stays inactive and never produces audio. */
 
 /* Ring of waveOut buffers for double-buffering */
 #define WAVEOUT_NUM_BUFS 4
@@ -178,6 +183,13 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.stream = NULL;
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
+
+    /* Try XAudio2 first (lower latency) */
+    if (xa2_init()) {
+        fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+        return;
+    }
+    fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
 
     WAVEFORMATEX wfx = { 0 };
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -214,6 +226,10 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 {
     (void)d;
+    if (xa2_is_active()) {
+        xa2_shutdown();
+        return;
+    }
     if (!g_waveout.initialized) return;
 
     waveOutReset(g_waveout.hwo);
@@ -229,6 +245,40 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
+        return;
+    }
+
+    /* XAudio2 path: render and submit a buffer */
+    if (xa2_is_active()) {
+        int buf_size = xa2_get_buffer_size();
+        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
+        int remaining = buf_size;
+        int out_offset = 0;
+
+        while (remaining > 0) {
+            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+
+            if (g_test_tone.active && !g_audio_muted) {
+                for (int i = 0; i < chunk; i++) {
+                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                    d->monitor.frame_buf[i][0] = s;
+                    d->monitor.frame_buf[i][1] = s;
+                    g_test_tone.phase += g_test_tone.phase_inc;
+                    if (g_test_tone.phase >= 2.0 * M_PI)
+                        g_test_tone.phase -= 2.0 * M_PI;
+                }
+            }
+
+            if (!g_audio_muted)
+                mixer_render(d->monitor.frame_buf, chunk);
+
+            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
+            out_offset += chunk;
+            remaining -= chunk;
+        }
+
+        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
         return;
     }
 

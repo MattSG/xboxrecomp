@@ -32,4 +32,10 @@ if(MSVC)
     )
 endif()
 
-target_link_libraries(xbox_apu PRIVATE kernel32 winmm)
+if(WIN32)
+    target_link_libraries(xbox_apu PRIVATE kernel32 winmm)
+else()
+    # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
+    find_package(SDL2 REQUIRED)
+    target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
+endif()

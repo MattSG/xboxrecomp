@@ -28,19 +28,6 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include <stdio.h>
-
-/* Runtime-configurable thunk table address and size.
- * Set by xbox_kernel_set_thunk_address() before bridge init.
- * Defaults to Burnout 3's address for backward compatibility. */
-static uint32_t g_thunk_table_va = XBOX_KERNEL_THUNK_TABLE_BASE;
-static uint32_t g_thunk_table_count = 147;
-
-void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
-{
-    g_thunk_table_va = xbox_va;
-    g_thunk_table_count = count;
-    fprintf(stderr, "  Kernel thunk address set to 0x%08X (%u entries)\n", xbox_va, count);
-}
 #include <float.h>
 
 /* Access to recompiled code globals */
@@ -247,18 +234,14 @@ static void bridge_PsCreateSystemThreadEx(void)
      * because on real Xbox each thread has its own register set. Without this,
      * the worker clobbers the caller's g_esi, g_ebx, etc. */
     if (start_routine) {
-        recomp_func_t fn = recomp_lookup_manual(start_routine);
-        if (!fn) fn = recomp_lookup(start_routine);
+        recomp_func_t fn = recomp_lookup(start_routine);
+        if (!fn) fn = recomp_lookup_manual(start_routine);
         if (fn) {
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                /* Set g_seh_ebp so fpo_leaf functions that inherit the
-                 * caller's frame can access the simulated stack. The SEH
-                 * prolog (__SEH_prolog) will overwrite this properly. */
-                g_seh_ebp = g_esp;
                 fn();
                 g_esp += 12;
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
@@ -285,10 +268,15 @@ static void bridge_PsCreateSystemThreadEx(void)
  * NTSTATUS NtClose(HANDLE Handle)
  * Handle is a value (not a pointer), so safe for generic call.
  */
+/* Handle-table helpers; defined further below. Xbox memory slots are 32-bit
+ * but native HANDLEs are 64-bit pointers, so handles are kept in a table and
+ * referenced by tagged 32-bit tokens. */
+static void   bridge_write_handle(uint32_t handle_va, HANDLE h);
+static HANDLE bridge_take_handle(uint32_t token);
+
 static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
-    HANDLE h = (HANDLE)(uintptr_t)raw_handle;
 
     if (g_kernel_call_count <= 200) {
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
@@ -296,9 +284,10 @@ static void bridge_NtClose(void)
     }
 
     /* Close real handles but skip fake/synthetic ones */
-    if (raw_handle && raw_handle != 0xDEAD0001u &&
-        raw_handle != 0xBEEF0010u && h != INVALID_HANDLE_VALUE) {
-        CloseHandle(h);
+    if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
+        HANDLE h = bridge_take_handle(raw_handle);
+        if (h && h != INVALID_HANDLE_VALUE)
+            CloseHandle(h);
     }
     g_eax = 0; /* STATUS_SUCCESS */
 }
@@ -514,24 +503,6 @@ static void bridge_RtlLeaveCriticalSection(void)
     g_eax = 0;
 }
 
-/* ── RtlInitAnsiString (ordinal 289) ────────────────────────── */
-static void bridge_RtlInitAnsiString(void)
-{
-    uint32_t dest_va = STACK_ARG(0);  /* PANSI_STRING */
-    uint32_t src_va  = STACK_ARG(1);  /* const char* */
-
-    /* Xbox ANSI_STRING: { USHORT Length, USHORT MaxLength, PCHAR Buffer } */
-    if (src_va) {
-        const char *src = (const char *)XBOX_TO_NATIVE(src_va);
-        USHORT len = (USHORT)strlen(src);
-        BRIDGE_MEM32(dest_va + 0) = len | ((UINT32)(len + 1) << 16); /* Length | MaxLength */
-        BRIDGE_MEM32(dest_va + 4) = src_va;  /* Buffer = original Xbox VA */
-    } else {
-        BRIDGE_MEM32(dest_va + 0) = 0;
-        BRIDGE_MEM32(dest_va + 4) = 0;
-    }
-}
-
 /* ── KeQueryPerformanceCounter / Frequency (ordinals 126, 127) ─ */
 static void bridge_KeQueryPerformanceCounter(void)
 {
@@ -579,7 +550,7 @@ static void bridge_NtCreateEvent(void)
         event_type, initial_state);
 
     if (handle_ptr) {
-        BRIDGE_MEM32(handle_ptr) = (uint32_t)(uintptr_t)local_handle;
+        bridge_write_handle(handle_ptr, local_handle);
     }
 
     fprintf(stderr, "  [BRIDGE] NtCreateEvent: handle_ptr=0x%08X type=%u init=%u → status=0x%08X handle=0x%08X\n",
@@ -728,90 +699,16 @@ static void bridge_KeInitializeTimerEx(void)
     g_eax = 0;
 }
 
-/* ── DPC queue for HalRequestSoftwareInterrupt ───────────
- * When KeSetTimer is called with a DPC, we record it.
- * When HalRequestSoftwareInterrupt is called at DISPATCH_LEVEL,
- * we immediately drain any pending DPCs.
- */
-#define MAX_PENDING_DPCS 16
-static uint32_t g_pending_dpc_vas[MAX_PENDING_DPCS]; /* Xbox VA of KDPC objects */
-static int g_pending_dpc_count = 0;
-
-extern recomp_func_t recomp_lookup(uint32_t xbox_va);
-extern recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
-
 /* ── KeSetTimer / KeSetTimerEx (ordinal 149/150) ──────────
  * BOOLEAN KeSetTimer(PKTIMER Timer, LARGE_INTEGER DueTime, PKDPC Dpc)
  *
- * Sets a timer with an optional DPC. We record the DPC for immediate
- * dispatch when HalRequestSoftwareInterrupt fires.
+ * Sets a timer. We don't actually start timers - just record the state.
  * Returns FALSE (timer was not already set).
  */
 static void bridge_KeSetTimer(void)
 {
-    uint32_t timer_va = STACK_ARG(0);
-    /* DueTime is a LARGE_INTEGER (8 bytes) at STACK_ARG(1) and STACK_ARG(2) */
-    uint32_t dpc_va = STACK_ARG(3);
-
-    if (dpc_va && g_pending_dpc_count < MAX_PENDING_DPCS) {
-        g_pending_dpc_vas[g_pending_dpc_count++] = dpc_va;
-        fprintf(stderr, "  [KERNEL] KeSetTimer: timer=0x%08X dpc=0x%08X (queued #%d)\n",
-                timer_va, dpc_va, g_pending_dpc_count);
-    }
-    g_eax = 0; /* Timer was not previously set */
-}
-
-/* ── HalRequestSoftwareInterrupt (ordinal 49) ────────────
- * VOID HalRequestSoftwareInterrupt(KIRQL Irql)
- *
- * When called with DISPATCH_LEVEL (2), drain any pending DPCs.
- * The DPC routine signature is:
- *   VOID DeferredRoutine(PKDPC Dpc, PVOID DeferredContext,
- *                        PVOID SystemArgument1, PVOID SystemArgument2)
- */
-static void bridge_HalRequestSoftwareInterrupt(void)
-{
-    uint32_t irql = STACK_ARG(0);
-
-    fprintf(stderr, "  [KERNEL] HalRequestSoftwareInterrupt: irql=%u, pending_dpcs=%d\n",
-            irql, g_pending_dpc_count);
-    fflush(stderr);
-
-    if (irql >= 2 && g_pending_dpc_count > 0) {
-        fprintf(stderr, "  [KERNEL] HalRequestSoftwareInterrupt: dispatching %d DPCs\n",
-                g_pending_dpc_count);
-        fflush(stderr);
-
-        for (int i = 0; i < g_pending_dpc_count; i++) {
-            uint32_t dpc_va = g_pending_dpc_vas[i];
-            uint32_t routine_va = BRIDGE_MEM32(dpc_va + 12); /* DeferredRoutine */
-            uint32_t context_va = BRIDGE_MEM32(dpc_va + 16); /* DeferredContext */
-
-            fprintf(stderr, "  [KERNEL]   DPC #%d: routine=0x%08X ctx=0x%08X\n",
-                    i, routine_va, context_va);
-            fflush(stderr);
-
-            recomp_func_t fn = recomp_lookup_manual(routine_va);
-            if (!fn) fn = recomp_lookup(routine_va);
-            if (fn) {
-                /* Push DPC arguments (stdcall, 4 args) */
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;          /* SystemArgument2 */
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;          /* SystemArgument1 */
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = context_va; /* DeferredContext */
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;     /* Dpc */
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;          /* dummy return */
-                fn();
-                g_esp += 20; /* clean up 4 args + return addr */
-                fprintf(stderr, "  [KERNEL]   DPC #%d completed\n", i);
-                fflush(stderr);
-            } else {
-                fprintf(stderr, "  [KERNEL]   DPC #%d: routine 0x%08X not found!\n",
-                        i, routine_va);
-                fflush(stderr);
-            }
-        }
-        g_pending_dpc_count = 0;
-    }
+    /* Timer functionality is not needed for basic execution.
+     * Return FALSE = timer was not previously set. */
     g_eax = 0;
 }
 
@@ -896,112 +793,110 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
     }
 }
 
-/* Write a Win32 HANDLE into a 32-bit Xbox memory slot.
- * Win32 handles fit in 32 bits even on Win64. */
+/*
+ * Handle table.
+ *
+ * Xbox memory only has 32-bit handle slots, but native HANDLEs are 64-bit
+ * pointers (win32_compat objects, or real Win32 handles on Windows). Map
+ * 32-bit tokens <-> native HANDLEs so a handle survives a round-trip through
+ * Xbox memory. Tokens carry a tag in the high byte so they never collide
+ * with the synthetic handles (0xDEAD0001 / 0xBEEF0010) used elsewhere.
+ */
+#define BRIDGE_HANDLE_TAG  0x48000000u
+#define BRIDGE_HANDLE_MASK 0x00FFFFFFu
+#define BRIDGE_HANDLE_MAX  16384
+static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
+
+static uint32_t bridge_handle_token(HANDLE h)
+{
+    int i;
+    if (!h || h == INVALID_HANDLE_VALUE) return 0;
+    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
+    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+        if (s_handle_table[i] == NULL) {
+            s_handle_table[i] = h;
+            return BRIDGE_HANDLE_TAG | (uint32_t)i;
+        }
+    fprintf(stderr, "  [BRIDGE] handle table full\n");
+    return 0;
+}
+
+/* Store a native HANDLE into a 32-bit Xbox memory slot (as a token). */
 static void bridge_write_handle(uint32_t handle_va, HANDLE h)
 {
     if (handle_va)
-        BRIDGE_MEM32(handle_va) = (uint32_t)(uintptr_t)h;
+        BRIDGE_MEM32(handle_va) = bridge_handle_token(h);
 }
 
-/* Read a Win32 HANDLE from a 32-bit Xbox memory slot */
+/* Resolve a 32-bit Xbox handle slot back to a native HANDLE. */
 static HANDLE bridge_read_handle(uint32_t va)
 {
-    return (HANDLE)(uintptr_t)BRIDGE_MEM32(va);
+    uint32_t token = BRIDGE_MEM32(va);
+    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
+        uint32_t i = token & BRIDGE_HANDLE_MASK;
+        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
+    }
+    /* Untagged value: synthetic/dummy handle -- pass through unchanged. */
+    return (HANDLE)(uintptr_t)token;
 }
 
-/* Translate Xbox path and open file via Win32 CreateFileW */
+/* Resolve a token to a HANDLE and release its table slot (for NtClose). */
+static HANDLE bridge_take_handle(uint32_t token)
+{
+    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
+        uint32_t i = token & BRIDGE_HANDLE_MASK;
+        if (i > 0 && i < BRIDGE_HANDLE_MAX) {
+            HANDLE h = s_handle_table[i];
+            s_handle_table[i] = NULL;
+            return h;
+        }
+    }
+    return NULL;   /* untagged -> not a table handle, do not close */
+}
+
+/* Build a native OBJECT_ATTRIBUTES wrapping the translated Xbox path. */
+static void bridge_build_oa(uint32_t obj_attrs_va,
+                            XBOX_OBJECT_ATTRIBUTES* oa, XBOX_ANSI_STRING* name)
+{
+    const char* path = bridge_get_xbox_path(obj_attrs_va);
+    name->Buffer        = (PCHAR)path;
+    name->Length        = path ? (USHORT)strlen(path) : 0;
+    name->MaximumLength = (USHORT)(name->Length + 1);
+    oa->RootDirectory = NULL;
+    oa->ObjectName    = name;
+    oa->Attributes    = 0;
+}
+
+/* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
     uint32_t iostatus_va, ULONG file_attrs, ULONG share,
     ULONG disposition, ULONG options)
 {
-    WCHAR win_path[MAX_PATH];
-    HANDLE h;
-    DWORD win_access = 0, win_share = 0, win_disp, flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
-    const char* xbox_path;
-    DWORD err;
+    XBOX_OBJECT_ATTRIBUTES oa;
+    XBOX_ANSI_STRING       name;
+    XBOX_IO_STATUS_BLOCK   ios;
+    HANDLE   h  = NULL;
+    NTSTATUS st;
 
-    xbox_path = bridge_get_xbox_path(obj_attrs_va);
-    if (!xbox_path) {
-        if (g_kernel_call_count <= 200) {
-            fprintf(stderr, "  [FILE] NtCreateFile: obj_attrs=0x%08X -> NULL path\n", obj_attrs_va);
-            fflush(stderr);
-        }
+    bridge_build_oa(obj_attrs_va, &oa, &name);
+    if (!name.Buffer) {
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+    memset(&ios, 0, sizeof(ios));
 
-    if (!xbox_translate_path(xbox_path, win_path, MAX_PATH)) {
-        bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
-        return STATUS_OBJECT_PATH_NOT_FOUND;
-    }
+    st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
+                           file_attrs, share, disposition, options);
 
-    /* Access mask translation */
-    if (access & 0x80000000) win_access |= GENERIC_ALL;
-    if (access & 0x80000000 || access & 0x00120089) win_access |= GENERIC_READ;
-    if (access & 0x80000000 || access & 0x00120116) win_access |= GENERIC_WRITE;
-    if (access & 0x00000001) win_access |= FILE_READ_DATA;
-    if (access & 0x00000002) win_access |= FILE_WRITE_DATA;
-    if (access & 0x00000004) win_access |= FILE_APPEND_DATA;
-    if (access & 0x00000080) win_access |= FILE_READ_ATTRIBUTES;
-    if (access & 0x00000100) win_access |= FILE_WRITE_ATTRIBUTES;
-    if (access & 0x00100000) win_access |= SYNCHRONIZE;
-    if (win_access == 0 || win_access == SYNCHRONIZE)
-        win_access |= GENERIC_READ;
-
-    /* Share mode */
-    if (share & 0x01) win_share |= FILE_SHARE_READ;
-    if (share & 0x02) win_share |= FILE_SHARE_WRITE;
-    if (share & 0x04) win_share |= FILE_SHARE_DELETE;
-
-    /* Disposition */
-    switch (disposition) {
-    case 0: win_disp = CREATE_ALWAYS; break;     /* FILE_SUPERSEDE */
-    case 1: win_disp = OPEN_EXISTING; break;     /* FILE_OPEN */
-    case 2: win_disp = CREATE_NEW; break;        /* FILE_CREATE */
-    case 3: win_disp = OPEN_ALWAYS; break;       /* FILE_OPEN_IF */
-    case 4: win_disp = TRUNCATE_EXISTING; break; /* FILE_OVERWRITE */
-    case 5: win_disp = CREATE_ALWAYS; break;     /* FILE_OVERWRITE_IF */
-    default: win_disp = OPEN_EXISTING; break;
-    }
-
-    /* Handle directory requests */
-    if (options & 0x00000001) { /* FILE_DIRECTORY_FILE */
-        if (disposition == 2 || disposition == 3)
-            CreateDirectoryW(win_path, NULL);
-        h = CreateFileW(win_path, win_access, win_share, NULL,
-                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (NT_SUCCESS(st)) {
+        bridge_write_handle(handle_va, h);
+        bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
     } else {
-        if (options & 0x00000008) /* FILE_NO_INTERMEDIATE_BUFFERING */
-            flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
-        if (file_attrs & 0x00000001) /* FILE_ATTRIBUTE_READONLY */
-            flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
-        h = CreateFileW(win_path, win_access, win_share, NULL,
-                        win_disp, flags_and_attrs, NULL);
+        bridge_write_iostatus(iostatus_va, st, 0);
     }
-
-    if (h == INVALID_HANDLE_VALUE) {
-        err = GetLastError();
-        fprintf(stderr, "  [FILE] NtCreateFile FAILED: %s -> %S (err=%u)\n", xbox_path, win_path, err);
-        fflush(stderr);
-        bridge_write_iostatus(iostatus_va, STATUS_OBJECT_NAME_NOT_FOUND, 0);
-        switch (err) {
-        case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
-        case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
-        case ERROR_ACCESS_DENIED:  return 0xC0000022u; /* STATUS_ACCESS_DENIED */
-        case ERROR_ALREADY_EXISTS: return 0xC0000035u; /* STATUS_OBJECT_NAME_COLLISION */
-        default:                   return 0xC0000001u; /* STATUS_UNSUCCESSFUL */
-        }
-    }
-
-    bridge_write_handle(handle_va, h);
-    bridge_write_iostatus(iostatus_va, STATUS_SUCCESS,
-                          (disposition == 2) ? 2 /* FILE_CREATED */ : 1 /* FILE_OPENED */);
-
-    fprintf(stderr, "  [FILE] open: %s -> handle=0x%08X\n", xbox_path, (uint32_t)(uintptr_t)h);
-    fflush(stderr);
-    return STATUS_SUCCESS;
+    return st;
 }
 
 /* ── NtCreateFile (ordinal 190, 9 args = 36 bytes) ─────── */
@@ -1041,175 +936,64 @@ static void bridge_NtOpenFile(void)
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
-    HANDLE   handle     = bridge_read_handle(STACK_ARG(0));
-    /* arg1: Event handle - ignored for sync I/O */
-    /* arg2: ApcRoutine - ignored */
-    /* arg3: ApcContext - ignored */
-    uint32_t iostatus   = STACK_ARG(4);  /* PIO_STATUS_BLOCK */
-    uint32_t buffer_va  = STACK_ARG(5);  /* PVOID Buffer */
-    uint32_t length     = STACK_ARG(6);  /* ULONG Length */
-    uint32_t offset_va  = STACK_ARG(7);  /* PLARGE_INTEGER ByteOffset */
-    void*    buffer     = XBOX_TO_NATIVE(buffer_va);
-    DWORD    bytes_read = 0;
-    BOOL     result;
-    OVERLAPPED ov;
+    HANDLE   handle    = bridge_read_handle(STACK_ARG(0));
+    uint32_t iostatus  = STACK_ARG(4);
+    uint32_t buffer_va = STACK_ARG(5);
+    uint32_t length    = STACK_ARG(6);
+    uint32_t offset_va = STACK_ARG(7);
+    XBOX_IO_STATUS_BLOCK ios;
+    LARGE_INTEGER  off;
+    PLARGE_INTEGER poff = NULL;
 
-    if (!iostatus || !buffer) {
-        g_eax = 0xC000000Du; /* STATUS_INVALID_PARAMETER */
-        return;
-    }
-
+    memset(&ios, 0, sizeof(ios));
     if (offset_va) {
-        uint32_t lo = BRIDGE_MEM32(offset_va);
-        uint32_t hi = BRIDGE_MEM32(offset_va + 4);
-        if ((int32_t)hi >= 0) { /* positive offset = explicit seek */
-            memset(&ov, 0, sizeof(ov));
-            ov.Offset = lo;
-            ov.OffsetHigh = hi;
-            result = ReadFile(handle, buffer, length, &bytes_read, &ov);
-        } else {
-            result = ReadFile(handle, buffer, length, &bytes_read, NULL);
-        }
-    } else {
-        result = ReadFile(handle, buffer, length, &bytes_read, NULL);
+        off.LowPart  = BRIDGE_MEM32(offset_va);
+        off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
+        poff = &off;
     }
-
-    if (result || GetLastError() == ERROR_HANDLE_EOF) {
-        bridge_write_iostatus(iostatus, STATUS_SUCCESS, bytes_read);
-        if (bytes_read == 0 && length > 0) {
-            bridge_write_iostatus(iostatus, 0xC0000011u, 0); /* STATUS_END_OF_FILE */
-            g_eax = 0xC0000011u;
-            return;
-        }
-        g_eax = STATUS_SUCCESS;
-        return;
-    }
-
-    bridge_write_iostatus(iostatus, 0xC0000001u, 0); /* STATUS_UNSUCCESSFUL */
-    g_eax = 0xC0000001u;
+    g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                XBOX_TO_NATIVE(buffer_va), length, poff);
+    bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
 }
 
 /* ── NtWriteFile (ordinal 236, 8 args = 32 bytes) ─────── */
 static void bridge_NtWriteFile(void)
 {
-    HANDLE   handle     = bridge_read_handle(STACK_ARG(0));
-    uint32_t iostatus   = STACK_ARG(4);
-    uint32_t buffer_va  = STACK_ARG(5);
-    uint32_t length     = STACK_ARG(6);
-    uint32_t offset_va  = STACK_ARG(7);
-    void*    buffer     = XBOX_TO_NATIVE(buffer_va);
-    DWORD    bytes_written = 0;
-    BOOL     result;
-    OVERLAPPED ov;
+    HANDLE   handle    = bridge_read_handle(STACK_ARG(0));
+    uint32_t iostatus  = STACK_ARG(4);
+    uint32_t buffer_va = STACK_ARG(5);
+    uint32_t length    = STACK_ARG(6);
+    uint32_t offset_va = STACK_ARG(7);
+    XBOX_IO_STATUS_BLOCK ios;
+    LARGE_INTEGER  off;
+    PLARGE_INTEGER poff = NULL;
 
-    if (!iostatus || !buffer) {
-        g_eax = 0xC000000Du;
-        return;
-    }
-
+    memset(&ios, 0, sizeof(ios));
     if (offset_va) {
-        uint32_t lo = BRIDGE_MEM32(offset_va);
-        uint32_t hi = BRIDGE_MEM32(offset_va + 4);
-        if ((int32_t)hi >= 0) {
-            memset(&ov, 0, sizeof(ov));
-            ov.Offset = lo;
-            ov.OffsetHigh = hi;
-            result = WriteFile(handle, buffer, length, &bytes_written, &ov);
-        } else {
-            result = WriteFile(handle, buffer, length, &bytes_written, NULL);
-        }
-    } else {
-        result = WriteFile(handle, buffer, length, &bytes_written, NULL);
+        off.LowPart  = BRIDGE_MEM32(offset_va);
+        off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
+        poff = &off;
     }
-
-    if (result) {
-        bridge_write_iostatus(iostatus, STATUS_SUCCESS, bytes_written);
-        g_eax = STATUS_SUCCESS;
-    } else {
-        bridge_write_iostatus(iostatus, 0xC0000001u, 0);
-        g_eax = 0xC0000001u;
-    }
+    g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
+                XBOX_TO_NATIVE(buffer_va), length, poff);
+    bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
 }
 
 /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
 static void bridge_NtQueryInformationFile(void)
 {
-    HANDLE   handle  = bridge_read_handle(STACK_ARG(0));
-    uint32_t ios_va  = STACK_ARG(1);
-    uint32_t info_va = STACK_ARG(2);
-    uint32_t length  = STACK_ARG(3);
+    HANDLE   handle    = bridge_read_handle(STACK_ARG(0));
+    uint32_t ios_va    = STACK_ARG(1);
+    uint32_t info_va   = STACK_ARG(2);
+    uint32_t length    = STACK_ARG(3);
     uint32_t infoclass = STACK_ARG(4);
-    BY_HANDLE_FILE_INFORMATION fi;
-    void* info = XBOX_TO_NATIVE(info_va);
+    XBOX_IO_STATUS_BLOCK ios;
 
-    if (!ios_va || !info) { g_eax = 0xC000000Du; return; }
-
-    switch (infoclass) {
-    case 4: { /* FileBasicInformation (36 bytes) */
-        if (!GetFileInformationByHandle(handle, &fi)) { g_eax = 0xC0000001u; return; }
-        BRIDGE_MEM32(info_va +  0) = fi.ftCreationTime.dwLowDateTime;
-        BRIDGE_MEM32(info_va +  4) = fi.ftCreationTime.dwHighDateTime;
-        BRIDGE_MEM32(info_va +  8) = fi.ftLastAccessTime.dwLowDateTime;
-        BRIDGE_MEM32(info_va + 12) = fi.ftLastAccessTime.dwHighDateTime;
-        BRIDGE_MEM32(info_va + 16) = fi.ftLastWriteTime.dwLowDateTime;
-        BRIDGE_MEM32(info_va + 20) = fi.ftLastWriteTime.dwHighDateTime;
-        BRIDGE_MEM32(info_va + 24) = fi.ftLastWriteTime.dwLowDateTime; /* ChangeTime */
-        BRIDGE_MEM32(info_va + 28) = fi.ftLastWriteTime.dwHighDateTime;
-        BRIDGE_MEM32(info_va + 32) = fi.dwFileAttributes;
-        bridge_write_iostatus(ios_va, STATUS_SUCCESS, 36);
-        g_eax = STATUS_SUCCESS;
-        break;
-    }
-    case 5: { /* FileStandardInformation (24 bytes) */
-        LONGLONG size;
-        if (!GetFileInformationByHandle(handle, &fi)) { g_eax = 0xC0000001u; return; }
-        size = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
-        BRIDGE_MEM32(info_va +  0) = (uint32_t)((size + 4095) & ~4095LL);       /* AllocationSize.Lo */
-        BRIDGE_MEM32(info_va +  4) = (uint32_t)(((size + 4095) & ~4095LL) >> 32);
-        BRIDGE_MEM32(info_va +  8) = fi.nFileSizeLow;                            /* EndOfFile.Lo */
-        BRIDGE_MEM32(info_va + 12) = fi.nFileSizeHigh;                           /* EndOfFile.Hi */
-        BRIDGE_MEM32(info_va + 16) = fi.nNumberOfLinks;                          /* NumberOfLinks */
-        BRIDGE_MEM32(info_va + 20) = (fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 0x00010000 : 0;
-        bridge_write_iostatus(ios_va, STATUS_SUCCESS, 24);
-        g_eax = STATUS_SUCCESS;
-        break;
-    }
-    case 14: { /* FilePositionInformation (8 bytes) */
-        LARGE_INTEGER pos, zero;
-        zero.QuadPart = 0;
-        if (!SetFilePointerEx(handle, zero, &pos, FILE_CURRENT)) { g_eax = 0xC0000001u; return; }
-        BRIDGE_MEM32(info_va + 0) = pos.LowPart;
-        BRIDGE_MEM32(info_va + 4) = pos.HighPart;
-        bridge_write_iostatus(ios_va, STATUS_SUCCESS, 8);
-        g_eax = STATUS_SUCCESS;
-        break;
-    }
-    case 34: { /* FileNetworkOpenInformation (56 bytes) */
-        LONGLONG size;
-        if (!GetFileInformationByHandle(handle, &fi)) { g_eax = 0xC0000001u; return; }
-        size = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
-        BRIDGE_MEM32(info_va +  0) = fi.ftCreationTime.dwLowDateTime;
-        BRIDGE_MEM32(info_va +  4) = fi.ftCreationTime.dwHighDateTime;
-        BRIDGE_MEM32(info_va +  8) = fi.ftLastAccessTime.dwLowDateTime;
-        BRIDGE_MEM32(info_va + 12) = fi.ftLastAccessTime.dwHighDateTime;
-        BRIDGE_MEM32(info_va + 16) = fi.ftLastWriteTime.dwLowDateTime;
-        BRIDGE_MEM32(info_va + 20) = fi.ftLastWriteTime.dwHighDateTime;
-        BRIDGE_MEM32(info_va + 24) = fi.ftLastWriteTime.dwLowDateTime;
-        BRIDGE_MEM32(info_va + 28) = fi.ftLastWriteTime.dwHighDateTime;
-        BRIDGE_MEM32(info_va + 32) = fi.nFileSizeLow;
-        BRIDGE_MEM32(info_va + 36) = fi.nFileSizeHigh;
-        BRIDGE_MEM32(info_va + 40) = (uint32_t)((size + 4095) & ~4095LL);
-        BRIDGE_MEM32(info_va + 44) = (uint32_t)(((size + 4095) & ~4095LL) >> 32);
-        BRIDGE_MEM32(info_va + 48) = fi.dwFileAttributes;
-        bridge_write_iostatus(ios_va, STATUS_SUCCESS, 56);
-        g_eax = STATUS_SUCCESS;
-        break;
-    }
-    default:
-        fprintf(stderr, "  [FILE] NtQueryInformationFile: unhandled class %u\n", infoclass);
-        g_eax = 0xC00000BBu; /* STATUS_NOT_SUPPORTED */
-        break;
-    }
+    memset(&ios, 0, sizeof(ios));
+    g_eax = (uint32_t)xbox_NtQueryInformationFile(handle, &ios,
+                XBOX_TO_NATIVE(info_va), length,
+                (XBOX_FILE_INFORMATION_CLASS)infoclass);
+    bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
 /* ── NtSetInformationFile (ordinal 226, 5 args = 20 bytes) ─ */
@@ -1218,72 +1002,32 @@ static void bridge_NtSetInformationFile(void)
     HANDLE   handle    = bridge_read_handle(STACK_ARG(0));
     uint32_t ios_va    = STACK_ARG(1);
     uint32_t info_va   = STACK_ARG(2);
-    /* uint32_t length = STACK_ARG(3); */
+    uint32_t length    = STACK_ARG(3);
     uint32_t infoclass = STACK_ARG(4);
+    XBOX_IO_STATUS_BLOCK ios;
 
-    switch (infoclass) {
-    case 14: { /* FilePositionInformation */
-        LARGE_INTEGER pos;
-        pos.LowPart  = BRIDGE_MEM32(info_va);
-        pos.HighPart = BRIDGE_MEM32(info_va + 4);
-        SetFilePointerEx(handle, pos, NULL, FILE_BEGIN);
-        bridge_write_iostatus(ios_va, STATUS_SUCCESS, 0);
-        g_eax = STATUS_SUCCESS;
-        break;
-    }
-    case 20: { /* FileEndOfFileInformation */
-        LARGE_INTEGER eof;
-        eof.LowPart  = BRIDGE_MEM32(info_va);
-        eof.HighPart = BRIDGE_MEM32(info_va + 4);
-        SetFilePointerEx(handle, eof, NULL, FILE_BEGIN);
-        SetEndOfFile(handle);
-        bridge_write_iostatus(ios_va, STATUS_SUCCESS, 0);
-        g_eax = STATUS_SUCCESS;
-        break;
-    }
-    case 13: { /* FileDispositionInformation */
-        FILE_DISPOSITION_INFO fdi;
-        fdi.DeleteFile = BRIDGE_MEM32(info_va) ? TRUE : FALSE;
-        SetFileInformationByHandle(handle, FileDispositionInfo, &fdi, sizeof(fdi));
-        bridge_write_iostatus(ios_va, STATUS_SUCCESS, 0);
-        g_eax = STATUS_SUCCESS;
-        break;
-    }
-    default:
-        fprintf(stderr, "  [FILE] NtSetInformationFile: unhandled class %u\n", infoclass);
-        bridge_write_iostatus(ios_va, STATUS_SUCCESS, 0);
-        g_eax = STATUS_SUCCESS;
-        break;
-    }
+    memset(&ios, 0, sizeof(ios));
+    g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
+                XBOX_TO_NATIVE(info_va), length,
+                (XBOX_FILE_INFORMATION_CLASS)infoclass);
+    bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
 /* ── NtQueryVolumeInformationFile (ordinal 218, 5 args = 20 bytes) */
 static void bridge_NtQueryVolumeInformationFile(void)
 {
-    /* HANDLE handle = bridge_read_handle(STACK_ARG(0)); */
+    HANDLE   handle    = bridge_read_handle(STACK_ARG(0));
     uint32_t ios_va    = STACK_ARG(1);
     uint32_t info_va   = STACK_ARG(2);
-    /* uint32_t length = STACK_ARG(3); */
+    uint32_t length    = STACK_ARG(3);
     uint32_t infoclass = STACK_ARG(4);
+    XBOX_IO_STATUS_BLOCK ios;
 
-    switch (infoclass) {
-    case 3: { /* FileFsSizeInformation (24 bytes) */
-        /* Report Xbox-like: ~4GB partition, 4KB clusters */
-        BRIDGE_MEM32(info_va +  0) = 1048576;  /* TotalAllocationUnits.Lo */
-        BRIDGE_MEM32(info_va +  4) = 0;
-        BRIDGE_MEM32(info_va +  8) = 524288;   /* AvailableAllocationUnits.Lo */
-        BRIDGE_MEM32(info_va + 12) = 0;
-        BRIDGE_MEM32(info_va + 16) = 8;        /* SectorsPerAllocationUnit */
-        BRIDGE_MEM32(info_va + 20) = 512;      /* BytesPerSector */
-        bridge_write_iostatus(ios_va, STATUS_SUCCESS, 24);
-        g_eax = STATUS_SUCCESS;
-        break;
-    }
-    default:
-        fprintf(stderr, "  [FILE] NtQueryVolumeInformationFile: unhandled class %u\n", infoclass);
-        g_eax = 0xC00000BBu;
-        break;
-    }
+    memset(&ios, 0, sizeof(ios));
+    g_eax = (uint32_t)xbox_NtQueryVolumeInformationFile(handle, &ios,
+                XBOX_TO_NATIVE(info_va), length,
+                (XBOX_FS_INFORMATION_CLASS)infoclass);
+    bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
 /* ── NtQueryFullAttributesFile (ordinal 210, 2 args = 8 bytes) */
@@ -1291,174 +1035,72 @@ static void bridge_NtQueryFullAttributesFile(void)
 {
     uint32_t obj_attrs = STACK_ARG(0);
     uint32_t info_va   = STACK_ARG(1);
-    WCHAR win_path[MAX_PATH];
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    LONGLONG size;
-    const char* xbox_path;
+    XBOX_OBJECT_ATTRIBUTES oa;
+    XBOX_ANSI_STRING       name;
 
-    xbox_path = bridge_get_xbox_path(obj_attrs);
-    if (!xbox_path || !xbox_translate_path(xbox_path, win_path, MAX_PATH)) {
-        g_eax = STATUS_OBJECT_PATH_NOT_FOUND;
-        return;
-    }
-
-    if (!GetFileAttributesExW(win_path, GetFileExInfoStandard, &fad)) {
-        DWORD err = GetLastError();
-        g_eax = (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
-                ? STATUS_OBJECT_NAME_NOT_FOUND : 0xC0000001u;
-        return;
-    }
-
-    size = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-    BRIDGE_MEM32(info_va +  0) = fad.ftCreationTime.dwLowDateTime;
-    BRIDGE_MEM32(info_va +  4) = fad.ftCreationTime.dwHighDateTime;
-    BRIDGE_MEM32(info_va +  8) = fad.ftLastAccessTime.dwLowDateTime;
-    BRIDGE_MEM32(info_va + 12) = fad.ftLastAccessTime.dwHighDateTime;
-    BRIDGE_MEM32(info_va + 16) = fad.ftLastWriteTime.dwLowDateTime;
-    BRIDGE_MEM32(info_va + 20) = fad.ftLastWriteTime.dwHighDateTime;
-    BRIDGE_MEM32(info_va + 24) = fad.ftLastWriteTime.dwLowDateTime;
-    BRIDGE_MEM32(info_va + 28) = fad.ftLastWriteTime.dwHighDateTime;
-    BRIDGE_MEM32(info_va + 32) = fad.nFileSizeLow;
-    BRIDGE_MEM32(info_va + 36) = fad.nFileSizeHigh;
-    BRIDGE_MEM32(info_va + 40) = (uint32_t)((size + 4095) & ~4095LL);
-    BRIDGE_MEM32(info_va + 44) = (uint32_t)(((size + 4095) & ~4095LL) >> 32);
-    BRIDGE_MEM32(info_va + 48) = fad.dwFileAttributes;
-    g_eax = STATUS_SUCCESS;
+    bridge_build_oa(obj_attrs, &oa, &name);
+    if (!name.Buffer) { g_eax = STATUS_OBJECT_PATH_NOT_FOUND; return; }
+    g_eax = (uint32_t)xbox_NtQueryFullAttributesFile(&oa,
+                (PXBOX_FILE_NETWORK_OPEN_INFORMATION)XBOX_TO_NATIVE(info_va));
 }
 
 /* ── NtFlushBuffersFile (ordinal 198, 2 args = 8 bytes) ─── */
 static void bridge_NtFlushBuffersFile(void)
 {
-    HANDLE handle = bridge_read_handle(STACK_ARG(0));
+    HANDLE   handle = bridge_read_handle(STACK_ARG(0));
     uint32_t ios_va = STACK_ARG(1);
-    FlushFileBuffers(handle);
-    bridge_write_iostatus(ios_va, STATUS_SUCCESS, 0);
-    g_eax = STATUS_SUCCESS;
+    XBOX_IO_STATUS_BLOCK ios;
+
+    memset(&ios, 0, sizeof(ios));
+    g_eax = (uint32_t)xbox_NtFlushBuffersFile(handle, &ios);
+    bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
 /* ── NtDeleteFile (ordinal 195, 1 arg = 4 bytes) ─────── */
 static void bridge_NtDeleteFile(void)
 {
-    uint32_t obj_attrs = STACK_ARG(0);
-    WCHAR win_path[MAX_PATH];
-    const char* xbox_path = bridge_get_xbox_path(obj_attrs);
+    XBOX_OBJECT_ATTRIBUTES oa;
+    XBOX_ANSI_STRING       name;
 
-    if (!xbox_path || !xbox_translate_path(xbox_path, win_path, MAX_PATH)) {
-        g_eax = STATUS_OBJECT_PATH_NOT_FOUND;
-        return;
-    }
-
-    if (DeleteFileW(win_path) || RemoveDirectoryW(win_path))
-        g_eax = STATUS_SUCCESS;
-    else
-        g_eax = STATUS_OBJECT_NAME_NOT_FOUND;
+    bridge_build_oa(STACK_ARG(0), &oa, &name);
+    if (!name.Buffer) { g_eax = STATUS_OBJECT_PATH_NOT_FOUND; return; }
+    g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
 }
 
 /* ── NtQueryDirectoryFile (ordinal 207, 9 args = 36 bytes) ─ */
 static void bridge_NtQueryDirectoryFile(void)
 {
     HANDLE   handle      = bridge_read_handle(STACK_ARG(0));
-    /* arg1: Event, arg2: ApcRoutine, arg3: ApcContext - ignored */
     uint32_t ios_va      = STACK_ARG(4);
     uint32_t info_va     = STACK_ARG(5);
     uint32_t length      = STACK_ARG(6);
     uint32_t filename_va = STACK_ARG(7);  /* PXBOX_ANSI_STRING */
     uint32_t restart     = STACK_ARG(8);  /* BOOLEAN */
+    XBOX_IO_STATUS_BLOCK ios;
+    XBOX_ANSI_STRING     fn;
+    PXBOX_ANSI_STRING    pfn = NULL;
 
-    /* Get directory path */
-    WCHAR dir_path[MAX_PATH];
-    WCHAR search_path[MAX_PATH];
-    DWORD path_len;
-    WCHAR* clean_path;
-    WIN32_FIND_DATAW fd;
-    HANDLE find_handle;
-    char filename_ansi[MAX_PATH];
-    int name_len;
-
-    path_len = GetFinalPathNameByHandleW(handle, dir_path, MAX_PATH, FILE_NAME_NORMALIZED);
-    if (path_len == 0 || path_len >= MAX_PATH) {
-        bridge_write_iostatus(ios_va, 0xC0000001u, 0);
-        g_eax = 0xC0000001u;
-        return;
-    }
-
-    clean_path = dir_path;
-    if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
-        clean_path += 4;
-
+    memset(&ios, 0, sizeof(ios));
     if (filename_va) {
-        /* Xbox ANSI_STRING: offset 0=Length(u16), offset 4=Buffer(u32) */
-        uint16_t fn_len = BRIDGE_MEM16(filename_va);
-        uint32_t fn_buf = BRIDGE_MEM32(filename_va + 4);
-        if (fn_buf && fn_len > 0) {
-            WCHAR pattern[MAX_PATH];
-            const char* fn_str = (const char*)XBOX_TO_NATIVE(fn_buf);
-            MultiByteToWideChar(CP_ACP, 0, fn_str, fn_len, pattern, MAX_PATH);
-            pattern[fn_len] = L'\0';
-            swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, pattern);
-        } else {
-            swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
-        }
-    } else {
-        swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
+        /* Xbox ANSI_STRING: 0=Length(u16), 2=MaximumLength(u16), 4=Buffer(u32) */
+        uint32_t fn_buf  = BRIDGE_MEM32(filename_va + 4);
+        fn.Length        = BRIDGE_MEM16(filename_va);
+        fn.MaximumLength = BRIDGE_MEM16(filename_va + 2);
+        fn.Buffer        = fn_buf ? (PCHAR)XBOX_TO_NATIVE(fn_buf) : NULL;
+        if (fn.Buffer) pfn = &fn;
     }
-
-    find_handle = FindFirstFileW(search_path, &fd);
-    if (find_handle == INVALID_HANDLE_VALUE) {
-        bridge_write_iostatus(ios_va, 0x80000006u, 0); /* STATUS_NO_MORE_FILES */
-        g_eax = 0x80000006u;
-        return;
-    }
-
-    /* Fill Xbox FILE_DIRECTORY_INFORMATION (variable length struct):
-     * offset  0: NextEntryOffset (4)
-     * offset  4: FileIndex (4)
-     * offset  8: CreationTime (8)
-     * offset 16: LastAccessTime (8)
-     * offset 24: LastWriteTime (8)
-     * offset 32: ChangeTime (8)
-     * offset 40: EndOfFile (8)
-     * offset 48: AllocationSize (8)
-     * offset 56: FileAttributes (4)
-     * offset 60: FileNameLength (4)
-     * offset 64: FileName[] (variable)
-     */
-    memset(XBOX_TO_NATIVE(info_va), 0, length);
-    name_len = WideCharToMultiByte(CP_ACP, 0, fd.cFileName, -1,
-                                    filename_ansi, MAX_PATH, NULL, NULL);
-    if (name_len > 0) name_len--;
-
-    BRIDGE_MEM32(info_va +  0) = 0; /* NextEntryOffset */
-    BRIDGE_MEM32(info_va +  4) = 0; /* FileIndex */
-    BRIDGE_MEM32(info_va +  8) = fd.ftCreationTime.dwLowDateTime;
-    BRIDGE_MEM32(info_va + 12) = fd.ftCreationTime.dwHighDateTime;
-    BRIDGE_MEM32(info_va + 16) = fd.ftLastAccessTime.dwLowDateTime;
-    BRIDGE_MEM32(info_va + 20) = fd.ftLastAccessTime.dwHighDateTime;
-    BRIDGE_MEM32(info_va + 24) = fd.ftLastWriteTime.dwLowDateTime;
-    BRIDGE_MEM32(info_va + 28) = fd.ftLastWriteTime.dwHighDateTime;
-    BRIDGE_MEM32(info_va + 32) = fd.ftLastWriteTime.dwLowDateTime;
-    BRIDGE_MEM32(info_va + 36) = fd.ftLastWriteTime.dwHighDateTime;
-    BRIDGE_MEM32(info_va + 40) = fd.nFileSizeLow;
-    BRIDGE_MEM32(info_va + 44) = fd.nFileSizeHigh;
-    { LONGLONG sz = ((LONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-      BRIDGE_MEM32(info_va + 48) = (uint32_t)((sz + 4095) & ~4095LL);
-      BRIDGE_MEM32(info_va + 52) = (uint32_t)(((sz + 4095) & ~4095LL) >> 32); }
-    BRIDGE_MEM32(info_va + 56) = fd.dwFileAttributes;
-    BRIDGE_MEM32(info_va + 60) = name_len;
-    if (name_len > 0 && (64 + name_len) <= length)
-        memcpy(XBOX_TO_NATIVE(info_va + 64), filename_ansi, name_len);
-
-    bridge_write_iostatus(ios_va, STATUS_SUCCESS, 64 + name_len);
-    FindClose(find_handle);
-    g_eax = STATUS_SUCCESS;
+    g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
+                XBOX_TO_NATIVE(info_va), length, pfn, (BOOLEAN)restart);
+    bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
 /* ── NtOpenSymbolicLinkObject (ordinal 203, 2 args = 8 bytes) */
 static void bridge_NtOpenSymbolicLinkObject(void)
 {
     uint32_t handle_va = STACK_ARG(0);
-    /* arg1: POBJECT_ATTRIBUTES - ignored, we return a dummy */
-    bridge_write_handle(handle_va, (HANDLE)(uintptr_t)0xDEAD0001u);
+    /* arg1: POBJECT_ATTRIBUTES - ignored, we return a synthetic handle.
+     * Written raw (untagged) so NtClose recognises it and skips it. */
+    if (handle_va) BRIDGE_MEM32(handle_va) = 0xDEAD0001u;
     g_eax = STATUS_SUCCESS;
 }
 
@@ -1483,7 +1125,24 @@ static void bridge_NtQuerySymbolicLinkObject(void)
     g_eax = STATUS_SUCCESS;
 }
 
-/* ── IoCreateSymbolicLink (ordinal 67, 2 args = 8 bytes) ────── */
+/* ── IoCreateFile (ordinal 67, 10 args = 40 bytes) ────── */
+static void bridge_IoCreateFile(void)
+{
+    /* Same as NtCreateFile with an extra Options arg at the end */
+    uint32_t handle_va   = STACK_ARG(0);
+    uint32_t access      = STACK_ARG(1);
+    uint32_t obj_attrs   = STACK_ARG(2);
+    uint32_t iostatus    = STACK_ARG(3);
+    uint32_t file_attrs  = STACK_ARG(5);
+    uint32_t share       = STACK_ARG(6);
+    uint32_t disposition = STACK_ARG(7);
+    uint32_t options     = STACK_ARG(8);
+
+    g_eax = (uint32_t)bridge_create_file_impl(
+        handle_va, access, obj_attrs, iostatus,
+        file_attrs, share, disposition, options);
+}
+
 /* ── NtDeviceIoControlFile (ordinal 196, 10 args = 40 bytes) */
 static void bridge_NtDeviceIoControlFile(void)
 {
@@ -1652,7 +1311,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     /* ── I/O Manager ── */
     case  62: return 36;  /* IoBuildDeviceIoControlRequest(9) */
     /* case  65: DATA export - IoCompletionObjectType */
-    case  67: return  8;  /* IoCreateSymbolicLink(2) */
+    case  67: return 40;  /* IoCreateFile(10) */
     case  69: return  4;  /* IoDeleteDevice(1) */
     /* case  71: DATA export - IoDeviceObjectType */
     case  74: return 12;  /* IoInitializeIrp(3) */
@@ -1851,9 +1510,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 277: return bridge_RtlEnterCriticalSection;
     case 294: return bridge_RtlLeaveCriticalSection;
 
-    /* String functions */
-    case 289: return bridge_RtlInitAnsiString;
-
     /* Timing */
     case 126: return bridge_KeQueryPerformanceCounter;
     case 127: return bridge_KeQueryPerformanceFrequency;
@@ -1873,14 +1529,13 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* Hardware */
     case  47: return bridge_HalReadSMCTrayState;
-    case  49: return bridge_HalRequestSoftwareInterrupt;
 
     /* Display */
     case   3: return bridge_AvSetDisplayMode;
 
     /* I/O */
     case  63: return bridge_IoCreateSymbolicLink;
-    case  67: return bridge_IoCreateSymbolicLink;
+    case  67: return bridge_IoCreateFile;
     case 188: return bridge_NtCreateDirectoryObject;
     case 246: return bridge_ObReferenceObjectByHandle;
 
@@ -2006,14 +1661,14 @@ void xbox_kernel_bridge_init(void)
     int unbridged = 0;
     DWORD old_protect;
 
-    fprintf(stderr, "  Kernel thunk bridge: resolving %u entries at 0x%08X\n",
-            g_thunk_table_count, g_thunk_table_va);
+    fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
+            XBOX_KERNEL_THUNK_TABLE_SIZE, XBOX_KERNEL_THUNK_TABLE_BASE);
 
-    /* The thunk table lives in .rdata which may be marked PAGE_READONLY.
+    /* The thunk table lives in .rdata which is marked PAGE_READONLY.
      * Temporarily make it writable so we can patch the ordinals. */
     VirtualProtect(
-        (LPVOID)((uintptr_t)g_thunk_table_va + g_xbox_mem_offset),
-        g_thunk_table_count * 4,
+        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
+        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
         PAGE_READWRITE,
         &old_protect
     );
@@ -2021,8 +1676,8 @@ void xbox_kernel_bridge_init(void)
     /* Initialize kernel data export values first */
     kernel_data_init();
 
-    for (i = 0; (uint32_t)i < g_thunk_table_count; i++) {
-        uint32_t va = g_thunk_table_va + i * 4;
+    for (i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
+        uint32_t va = XBOX_KERNEL_THUNK_TABLE_BASE + i * 4;
         uint32_t current = BRIDGE_MEM32(va);
 
         if (current & 0x80000000) {
@@ -2059,14 +1714,14 @@ void xbox_kernel_bridge_init(void)
 
     /* Restore original protection */
     VirtualProtect(
-        (LPVOID)((uintptr_t)g_thunk_table_va + g_xbox_mem_offset),
-        g_thunk_table_count * 4,
+        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
+        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
         old_protect,
         &old_protect
     );
 
-    fprintf(stderr, "  Kernel thunk bridge: %d/%u resolved (%d bridged, %d stub)\n",
-            resolved, g_thunk_table_count, bridged, unbridged);
+    fprintf(stderr, "  Kernel thunk bridge: %d/%d resolved (%d bridged, %d stub)\n",
+            resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, bridged, unbridged);
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 

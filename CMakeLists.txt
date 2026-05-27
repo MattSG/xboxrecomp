@@ -27,6 +27,11 @@ option(XBOXRECOMP_BUILD_EXAMPLES "Build example programs" OFF)
 
 # ── Runtime Libraries ─────────────────────────────────────────
 
+# Platform: Win32/NT type vocabulary + POSIX implementation of generic
+# Win32 host primitives. Carries no Xbox semantics; provides the foundation
+# the kernel HLE and the graphics/audio/input layers build on.
+add_subdirectory(src/platform)
+
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 
