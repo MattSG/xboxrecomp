@@ -15,6 +15,9 @@
 
 ### Recent Changes
 
+- **Cross-Platform / Linux Port** — Platform abstraction layer with an **OpenGL D3D8 backend** alongside the Windows D3D11 path, POSIX path handling, and Linux build deps (`tools/linux/install_deps.sh`). Builds with GCC/Clang.
+- **`ghidra_naming` Tool (optional)** — Headless Ghidra FidDb pass recovers real CRT/XDK symbol names from a stripped XBE and merges them into `functions.json`, so generated C uses meaningful names instead of `sub_XXXXXXXX`. The core pipeline still needs no disassembler. See `tools/ghidra_naming/`.
+- **`--seed-functions`** — Iterative disasm mode: seed the function database from known/recovered entry points for fuller coverage on stripped binaries.
 - **Full Multi-Texture Fixed-Function Pipeline** — 4-stage texture blending with all D3D8 operations (MODULATE, ADD, SUBTRACT, BLEND*, DOTPRODUCT3, etc.), full D3DTA argument resolution (DIFFUSE, CURRENT, TEXTURE, TFACTOR, SPECULAR + COMPLEMENT/ALPHAREPLICATE), and 4 samplers bound per draw.
 - **Hardware T&L Lighting** — Up to 8 lights (directional, point, spot) with material properties, global ambient, specular highlights, and world-space normal transform. Full Blinn-Phong with attenuation and spotlight cones.
 - **Vertex Fog** — Linear/exp/exp2 fog computed in vertex shader, blended with fog color in pixel shader. Fog parameters sourced from D3D8 render states.
@@ -24,7 +27,7 @@
 - **Texture Unswizzling** — Xbox Z-order (Morton code) swizzled textures converted to linear D3D11 layout. Optimized masked-increment algorithm from xemu.
 - **NV2A PGRAPH→D3D11 Translator** — Push buffer method interception and D3D11 rendering (upstreamed from Burnout 3).
 - **EEPROM / AV Pack / SMBus** — Games can query region, language, video standard, AV pack type, and hardware info.
-- **Three games in progress** — Burnout 3 (rendering), Wreckless (debugging), Blood Wake (analysis complete, scaffolded).
+- **Games in progress** — Burnout 3 (**playable**: menus, tracks, physics, audio), Xbox Dashboard (VRML+JS scene-engine bring-up), Wreckless (debugging), Blood Wake (scaffolded).
 
 ---
 
@@ -158,7 +161,7 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 
 ### Prerequisites
 
-- **Windows 11** (or 10 with recent updates)
+- **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
 - **Python 3.10+** with `capstone` (`pip install capstone`)
 - **Visual Studio 2022** (MSVC compiler)
 - **CMake 3.20+**
@@ -385,7 +388,8 @@ See [docs/technical/candidate-games.md](docs/technical/candidate-games.md) for a
 
 ## Projects Using This Toolkit
 
-- **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The reference implementation. 22,097 functions lifted, full main menu rendering at 60fps, 37 playable tracks with textures, 67 vehicle models, AWD audio playback.
+- **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The reference implementation and most mature target: **playable**. 22,097 functions lifted, main menu at 60fps, 37 tracks with textures, 67 vehicle models, physics, AWD audio.
+- **[Xbox Dashboard](https://github.com/sp00nznet/xboxdashboard)** — The original Xbox system shell (build 3944). Boots and renders the green orb at 60fps (D3D8→D3D11). Its UI is driven by a **VRML97 + JavaScript scene engine** (text→bytecode compiler + stack-machine VM + node-class reflection registry) — currently being brought online; demonstrates the toolkit on system software, not just games.
 - **[Wreckless: The Yakuza Missions](https://github.com/sp00nznet/wreckless)** — Xbox launch title (2002). Custom engine, 3,407 functions, boots through CRT init into game main. Debugging early gameplay crash.
 - **[Blood Wake](https://github.com/sp00nznet/bloodwake)** — First-party Microsoft naval combat (2001). Stormfront Studios custom engine. 4,608 functions, 367K lines of C generated (99.1% success). Project scaffolded, working toward first build.
 
@@ -408,7 +412,7 @@ Python 3.10+
 capstone        # x86 disassembly (pip install capstone)
 ```
 
-That's it. No IDA, no Ghidra, no proprietary tools. Standard library + Capstone.
+That's it for the core pipeline — no IDA, no Ghidra, no proprietary tools. Just the standard library + Capstone. (An *optional* `tools/ghidra_naming` helper can use headless Ghidra purely to recover symbol names; it is never required to produce a working build.)
 
 The runtime libraries (C) use:
 - MSVC (Visual Studio 2022) or MinGW-w64
