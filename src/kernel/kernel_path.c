@@ -46,10 +46,16 @@ static const path_rule s_rules[] = {
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     { "D:\\",                                 0, NULL,         NULL          },
     { "d:\\",                                 0, NULL,         NULL          },
+    /* Y: is the Xbox dashboard partition; the dashboard opens its assets
+     * (e.g. "Y:\default.xip") from there. Map it to the game dir. */
+    { "Y:\\",                                 0, NULL,         NULL          },
+    { "y:\\",                                 0, NULL,         NULL          },
     { "T:\\",                                 1, "\\TitleData","/TitleData"  },
     { "U:\\",                                 1, "\\UserData", "/UserData"   },
     { "Z:\\",                                 1, "\\Cache",    "/Cache"      },
     { "\\??\\D:\\",                           0, NULL,         NULL          },
+    { "\\??\\Y:\\",                           0, NULL,         NULL          },
+    { "\\??\\y:\\",                           0, NULL,         NULL          },
     { "\\??\\T:\\",                           1, "\\TitleData","/TitleData"  },
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
