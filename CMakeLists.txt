@@ -23,7 +23,6 @@ add_compile_definitions(
 )
 
 # Option to build examples
-option(XBOXRECOMP_BUILD_EXAMPLES "Build example programs" OFF)
 
 # ── Runtime Libraries ─────────────────────────────────────────
 
@@ -63,8 +62,3 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_nv2a
 )
 
-# ── Examples ──────────────────────────────────────────────────
-
-if(XBOXRECOMP_BUILD_EXAMPLES)
-    add_subdirectory(examples)
-endif()

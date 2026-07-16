@@ -98,7 +98,7 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 
 | Library | Source | What It Does |
 |---------|--------|-------------|
-| **xbox_kernel** | Custom | Xbox kernel → Win32 (147+ imports: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
+| **xbox_kernel** | Custom | Xbox kernel → Win32 (115 of the kernel's 366 ordinals resolved, 55 with dedicated bridges: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
 | **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
 | **xbox_apu** | xemu | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
@@ -196,7 +196,7 @@ py -3 -m tools.recomp game_files/default.xbe --all --split 1000
 #    Output: src/game/recomp/gen/ (millions of lines of C)
 
 # 7. Set up runtime shims (see docs/runtime/ for templates)
-#    - Xbox kernel replacement (147 imports)
+#    - Xbox kernel replacement (115 ordinals resolved)
 #    - D3D8 -> D3D11 translation layer
 #    - Memory layout reproduction
 #    - Input system
@@ -249,7 +249,7 @@ xboxrecomp/
 │   ├── technical/               # Deep technical documentation
 │   ├── formats/                 # Xbox file format references
 │   └── runtime/                 # Runtime implementation guides
-└── examples/                    # Example configurations
+└── templates/                   # new-game scaffold + runtime headers
 ```
 
 ## Documentation
@@ -281,7 +281,7 @@ xboxrecomp/
 - [Indirect Call Dispatch](docs/technical/indirect-calls.md) — The RECOMP_ICALL problem and how to solve it
 - [D3D8 to D3D11 Translation](docs/technical/d3d-translation.md) — Bridging Xbox's graphics API to modern DirectX
 - [D3D8LTCG Device Context](docs/technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions **(NEW)**
-- [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping 147 kernel imports to Win32
+- [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping Xbox kernel ordinals to Win32
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
 - [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
 - [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
@@ -359,7 +359,7 @@ SetPixelShader(0x00000103);  // 3 stages, tex0=2D, tex1=2D
 //   Final:   output = r0
 ```
 
-The 128-entry shader cache means each unique combiner configuration is compiled once and reused. This handles multi-texturing, bump mapping, environment mapping, water effects, and every other Xbox rendering technique.
+The 128-entry shader cache means each unique combiner configuration is compiled once and reused. This covers multi-texturing outright. Bump and environment mapping are partial — the combiner side is there, but texture coordinate generation (`TEXCOORDINDEX` with the camera-space modes) is not, so effects that depend on generated coords won't look right yet. See [gap-analysis](docs/technical/gap-analysis.md) for the current per-feature state.
 
 ### NV2A Vertex Shader Microcode → HLSL
 
