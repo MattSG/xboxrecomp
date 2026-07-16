@@ -29,4 +29,7 @@ else()
     target_compile_options(xbox_nv2a PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
 
-target_link_libraries(xbox_nv2a PRIVATE kernel32)
+target_link_libraries(xbox_nv2a PRIVATE platform)
+if(WIN32)
+    target_link_libraries(xbox_nv2a PRIVATE kernel32)
+endif()

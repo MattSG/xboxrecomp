@@ -10,10 +10,9 @@ target_include_directories(xbox_dsound PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # Links to APU emulation for mixer voices
 target_link_libraries(xbox_dsound PUBLIC xbox_apu)
 
-if(NOT WIN32)
-    # Linux: needs the platform layer for NT types / win32_compat
-    target_link_libraries(xbox_dsound PUBLIC platform)
-endif()
+# platform carries the src/ include path (and on Linux the POSIX Win32
+# primitives), so both hosts need it for "platform/xbox_winnt.h".
+target_link_libraries(xbox_dsound PUBLIC platform)
 
 if(MSVC)
     target_compile_options(xbox_dsound PRIVATE /W4 /O2)

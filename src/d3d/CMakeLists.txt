@@ -11,7 +11,7 @@ if(WIN32)
         d3d8_combiners.c
         d3d8_vsh.c
     )
-    target_link_libraries(xbox_d3d8 PUBLIC d3d11 dxgi dxguid d3dcompiler)
+    target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c

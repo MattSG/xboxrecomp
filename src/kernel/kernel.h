@@ -467,11 +467,22 @@ void xbox_kernel_bridge_init(void);
 void xbox_path_init(const char* game_dir, const char* save_dir);
 
 /*
- * Translate an Xbox path to a Windows path.
- * Returns TRUE on success, FALSE if the path couldn't be translated.
- * win_path_buf must be at least MAX_PATH characters.
+ * Character type of a translated host path. The Win32 file APIs take wide
+ * chars; POSIX takes bytes. kernel_path.c and kernel_file.c are split on
+ * _WIN32 and each side uses the matching type.
  */
-BOOL xbox_translate_path(const char* xbox_path, WCHAR* win_path_buf, DWORD buf_size);
+#if defined(_WIN32)
+typedef WCHAR xbox_host_char;
+#else
+typedef char  xbox_host_char;
+#endif
+
+/*
+ * Translate an Xbox path to a host path.
+ * Returns TRUE on success, FALSE if the path couldn't be translated.
+ * host_path_buf must be at least MAX_PATH characters (not bytes).
+ */
+BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
