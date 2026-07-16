@@ -63,7 +63,7 @@ def list_categories(translator):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Burnout 3: x86 → C Static Recompiler")
+        description="Xbox x86 -> C Static Recompiler")
     parser.add_argument("xbe_path", help="Path to default.xbe")
     parser.add_argument("-o", "--output-dir",
                         help="Output directory")

@@ -129,17 +129,22 @@ def _parse_hex(s: str) -> int:
 
 
 def _find_analysis_json(xbe_path: Path) -> Optional[Path]:
-    """Auto-detect the analysis JSON file location."""
-    candidates = [
+    """Auto-detect the analysis JSON file location.
+
+    Matches any ``*_analysis.json`` written by ``tools.xbe_parser --json``,
+    so the name is per-game rather than hardcoded to one title.
+    """
+    search_dirs = [
         # Same directory as XBE
-        xbe_path.parent / "burnout3_analysis.json",
+        xbe_path.parent,
         # In the xbe_parser tool directory
-        Path("tools/xbe_parser/burnout3_analysis.json"),
+        Path("tools/xbe_parser"),
         # Relative to repo root
-        xbe_path.parent.parent / "tools" / "xbe_parser" / "burnout3_analysis.json",
+        xbe_path.parent.parent / "tools" / "xbe_parser",
     ]
-    for p in candidates:
-        if p.exists():
+    for d in search_dirs:
+        # sorted() so the pick is deterministic when a dir holds several
+        for p in sorted(d.glob("*_analysis.json")):
             return p
     return None
 

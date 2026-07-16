@@ -58,8 +58,12 @@ game_files/
 ## Step 2: Parse the XBE
 
 ```bash
-py -3 -m tools.xbe_parser game_files/default.xbe
+py -3 -m tools.xbe_parser game_files/default.xbe --json game_files/mygame_analysis.json
 ```
+
+The `--json` file is **required by Step 3** — the disassembler reads the section
+layout from it. Name it `<anything>_analysis.json` and keep it next to the XBE;
+Step 3 finds it automatically.
 
 This outputs:
 - **Entry point** — where execution starts (e.g., `0x001D2807`)

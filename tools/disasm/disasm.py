@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import config
-from .loader import load_image, BinaryImage, SectionInfo
+from .loader import load_image, BinaryImage, SectionInfo, _find_analysis_json
 from .engine import DisasmEngine
 from .functions import FunctionDetector
 from .xrefs import build_xrefs, XRefTracker
@@ -245,14 +245,8 @@ class Disassembler:
         if self.analysis_json:
             return self.analysis_json
 
-        candidates = [
-            Path(self.xbe_path).parent / "burnout3_analysis.json",
-            Path("tools/xbe_parser/burnout3_analysis.json"),
-        ]
-        for p in candidates:
-            if p.exists():
-                return str(p)
-        return None
+        found = _find_analysis_json(Path(self.xbe_path))
+        return str(found) if found else None
 
     def _load_and_print_cached_stats(self) -> None:
         """Load and print stats from cached summary.json."""

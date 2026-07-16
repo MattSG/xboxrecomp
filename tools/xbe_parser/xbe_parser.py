@@ -1100,7 +1100,7 @@ def main():
         print(f"\nExtracting sections to: {args.extract_sections}")
         for sec in xbe.sections:
             filepath = xbe_parser.extract_section(sec, args.extract_sections)
-            print(f"  {sec.name:<12} → {filepath} ({sec.raw_size} bytes)")
+            print(f"  {sec.name:<12} -> {filepath} ({sec.raw_size} bytes)")
 
 
 if __name__ == "__main__":
