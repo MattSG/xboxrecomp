@@ -247,13 +247,29 @@ static void bridge_PsCreateSystemThreadEx(void)
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
                 fflush(stderr);
             } else {
-                /* Worker thread: do NOT call synchronously.
-                 * Running the worker here destroys resource slots that the
-                 * init code just populated. Instead, let the main thread's
-                 * rendering tick (sub_000110E0) handle completion. */
-                fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: deferring worker 0x%08X\n",
-                        start_routine);
+                /* Worker thread: run synchronously but save/restore all
+                 * global registers (each Xbox thread has its own register set).
+                 * The XIP file loader runs as a worker and must complete
+                 * before the scene graph can be built. */
+                uint32_t save_eax = g_eax, save_ecx = g_ecx, save_edx = g_edx;
+                uint32_t save_ebx = g_ebx, save_esi = g_esi, save_edi = g_edi;
+                uint32_t save_esp = g_esp, save_ebp = g_seh_ebp;
+                fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: running worker 0x%08X (ctx=0x%08X)\n",
+                        start_routine, start_context1);
                 fflush(stderr);
+
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+                g_seh_ebp = g_esp;
+                fn();
+                fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: worker returned\n");
+                fflush(stderr);
+
+                /* Restore all registers */
+                g_eax = save_eax; g_ecx = save_ecx; g_edx = save_edx;
+                g_ebx = save_ebx; g_esi = save_esi; g_edi = save_edi;
+                g_esp = save_esp; g_seh_ebp = save_ebp;
             }
         } else {
             fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: start routine 0x%08X not found in dispatch!\n",
@@ -1262,7 +1278,9 @@ static void bridge_MmPersistContiguousMemory(void)
 /* ── Generic fallback for simple value-only functions ────── */
 static void bridge_generic_stub(void)
 {
-    /* For functions we haven't specifically bridged yet, log and return 0 */
+    /* Success-returning stub for functions whose callers only check for 0.
+     * Deliberately silent: the caller (kernel_thunk_dispatch) warns for
+     * ordinals with no bridge at all, which is the case worth hearing about. */
     g_eax = 0;
 }
 
@@ -1604,9 +1622,15 @@ static void kernel_thunk_dispatch(void)
     if (bridge) {
         bridge();
     } else {
-        /* No specific bridge - log warning and return 0 */
-        if (g_kernel_call_count <= 200) {
-            fprintf(stderr, "  [KERNEL] WARNING: no bridge for ordinal %u, returning 0\n", ordinal);
+        /* No specific bridge - return 0. Warn once per ordinal rather than
+         * gating on g_kernel_call_count: a missing bridge is rare and is
+         * usually the reason a game misbehaves, so it must not be swallowed
+         * by the general call-trace throttle. Bounded to one line per slot. */
+        static uint8_t warned[XBOX_KERNEL_THUNK_TABLE_SIZE];
+        if (!warned[slot]) {
+            warned[slot] = 1;
+            fprintf(stderr, "  [KERNEL] WARNING: no bridge for ordinal %u (slot %d), returning 0\n",
+                    ordinal, slot);
             fflush(stderr);
         }
         g_eax = 0;
