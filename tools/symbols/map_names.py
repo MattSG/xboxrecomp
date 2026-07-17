@@ -6,10 +6,15 @@ Two modes:
   resolve   MAP + analysis.json -> {va: name} for the title the MAP belongs to.
 
   port      Carry XDK *library* names from a title that has a MAP onto a title
-            that does not, by matching library code byte-for-byte. Only valid
-            when both titles linked the same XDK build (compare `xdk_version`
-            from tools.xbe_parser --json); library code differs between XDK
-            versions and the match will silently rot if they disagree.
+            that does not, by matching library code byte-for-byte.
+
+            Donors do NOT have to share the target's XDK version. Measured:
+            ATV3 (XDK 5849) named 504 functions in Burnout 3 (also 5849), and
+            Starcraft Ghost (XDK 5659) named 657 in the same binary at the same
+            precision. Where both named the same address they agreed 99.1% of
+            the time (422/426), so XDK library code is stable enough across
+            versions to port names between them. Prefer several donors over one
+            and merge the results; the union beat either alone (735 vs 504).
 
 Why section:offset and not Rva+Base
 -----------------------------------
@@ -88,6 +93,30 @@ def parse_map(map_path, sections):
                 entry = sec_va[idx] + off
             break
     return syms, entry
+
+
+def check_entry(entry, xbe):
+    """Does the MAP describe the build this XBE actually is?
+
+    A MAP and an XBE sitting in the same drop are not necessarily the same
+    build. Resolving the MAP's entry point and comparing it to the one in the
+    XBE header is a cheap identity check: it agrees for a matched pair and
+    diverges immediately for a mismatched one. Xyanide (2003-05-07) ships a MAP
+    from 17:42 next to an XBE built 14 hours later, and without this it
+    silently yields 20,642 wrong names at 10% recall.
+    """
+    if entry is None:
+        print("note: no entry point in MAP; cannot verify it matches the XBE.")
+        return True
+    actual = int(xbe["entry_point"], 16)
+    if entry == actual:
+        print(f"entry point check: MATCH ({entry:#010x}) -- MAP describes this XBE")
+        return True
+    print(f"ERROR: entry point mismatch. MAP resolves to {entry:#010x}, "
+          f"XBE header says {actual:#010x}.\n"
+          f"       The MAP and XBE are different builds; the names would be "
+          f"wrong. Find the XBE built alongside this MAP.", file=sys.stderr)
+    return False
 
 
 def va_to_off(sections, va):
@@ -184,11 +213,11 @@ def main():
     a = p.parse_args()
 
     if a.mode == "resolve":
-        secs, _ = load_sections(a.analysis_json)
+        secs, xbe = load_sections(a.analysis_json)
         syms, entry = parse_map(a.map_file, secs)
         print(f"resolved {len(syms)} symbols")
-        if entry is not None:
-            print(f"MAP entry point -> {entry:#010x}")
+        if not check_entry(entry, xbe):
+            sys.exit(2)
         json.dump({f"{v:#010x}": n for v, n in sorted(syms.items())},
                   open(a.output, "w"), indent=1)
         print(f"wrote {a.output}")
@@ -199,13 +228,19 @@ def main():
 
     dv, tv = donor_a.get("xdk_version"), tgt_a.get("xdk_version")
     if dv != tv:
-        print(f"WARNING: XDK versions differ (donor {dv}, target {tv}). "
-              f"Library code will not match; results are unreliable.",
-              file=sys.stderr)
+        # Not a problem in practice: a 5659 donor named MORE of Burnout 3
+        # (5849) than a 5849 donor did, at the same precision. Worth printing
+        # only so a wildly mismatched pairing is visible.
+        print(f"note: donor is XDK {dv}, target is XDK {tv}. Library code is "
+              f"largely stable across versions; mismatched donors still work.")
     else:
         print(f"both titles are XDK {dv}")
 
-    donor_syms, _ = parse_map(a.donor_map, donor_secs)
+    donor_syms, donor_entry = parse_map(a.donor_map, donor_secs)
+    # The donor's MAP must describe the donor's XBE, or every signature is
+    # taken from the wrong bytes.
+    if not check_entry(donor_entry, donor_a):
+        sys.exit(2)
     names, stats = port_names(
         Path(a.donor_xbe).read_bytes(), donor_secs, donor_syms,
         Path(a.target_xbe).read_bytes(), tgt_secs, _load_starts(a.target_functions),

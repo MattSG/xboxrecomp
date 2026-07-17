@@ -6,7 +6,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from map_names import parse_map, port_names, va_to_off
+from map_names import check_entry, parse_map, port_names, va_to_off
 
 # A title with .text at 0x11000 and an XDK section at 0x50000, mirroring the
 # real layout: MAP section 0001 -> XBE section 0.
@@ -91,8 +91,19 @@ def test_port():
     print("ok  port_names: rejects zero-filled signatures")
 
 
+def test_check_entry():
+    # Matched pair: MAP's entry resolves to the XBE header's entry.
+    assert check_entry(0x11100, {"entry_point": "0x00011100"}) is True
+    # Mismatched build -- the Xyanide case, which otherwise yields 20k wrong names.
+    assert check_entry(0x21CDA2, {"entry_point": "0x00280724"}) is False
+    # A MAP with no entry point line can't be checked, but isn't fatal.
+    assert check_entry(None, {"entry_point": "0x00011100"}) is True
+    print("ok  check_entry: accepts matched builds, rejects mismatched")
+
+
 if __name__ == "__main__":
     test_parse()
     test_va_to_off()
     test_port()
+    test_check_entry()
     print("\nall passed")
