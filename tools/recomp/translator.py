@@ -349,7 +349,12 @@ class FunctionTranslator:
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
-                lines.append(f"loc_{bb.start:08X}:")
+                # The trailing ';' is load-bearing: C requires a statement after
+                # a label, and a block whose instructions all emit comments only
+                # (a lone `cmp`, which just sets flags for the next jcc) would
+                # otherwise produce `loc_X:` immediately before `}` and fail to
+                # compile. The null statement costs nothing and is always valid.
+                lines.append(f"loc_{bb.start:08X}: ;")
 
             # Propagate flag state from previous block (fallthrough path).
             # This handles patterns like: test eax,eax / ja X / jb Y
