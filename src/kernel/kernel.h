@@ -437,7 +437,17 @@ typedef VOID (*PIO_APC_ROUTINE)(
  * New code should use xbox_kernel_set_thunk_address() instead.
  */
 #define XBOX_KERNEL_THUNK_TABLE_BASE  0x0036B7C0  /* default; overridden at runtime */
-#define XBOX_KERNEL_THUNK_TABLE_SIZE  366  /* max possible Xbox kernel ordinals */
+/* The real kernel's export directory has 378 slots, of which 371 are exported
+ * (ordinals 367-373 are null). Verified identical in xboxkrnl.exe from builds
+ * 3944, 4039 and 5455, so this is stable across the console's life. The old
+ * value of 366 was short by 12 and bounds the per-slot arrays, so a title
+ * importing more than 366 kernel functions would have overrun them.
+ *
+ * Note the kernel exports by ordinal only -- its export directory carries no
+ * name table -- which is why ordinal->name mappings are reverse-engineered
+ * (see KERNEL_EXPORTS in tools/xbe_parser). We have no names for 374-378.
+ */
+#define XBOX_KERNEL_THUNK_TABLE_SIZE  378  /* export slots in xboxkrnl.exe */
 
 /**
  * Set the kernel thunk table address for the current game.
