@@ -11,6 +11,17 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+# Sections that hold data even when the XBE marks them executable. Excluded
+# from disassembly by name; --extra-sections overrides this per title.
+#
+# Only the conventional PE data sections are listed. XDK library sections are
+# NOT excluded even when their name suggests data (DSOUND_RD, D3D_RD, XON_RD):
+# the linker maps class those as CODE, and they are exactly the sections we
+# want disassembled.
+DATA_SECTION_NAMES = frozenset({
+    ".data", ".data1", ".rdata", ".idata", ".edata", ".reloc", ".tls",
+})
+
 
 @dataclass
 class SectionInfo:
@@ -119,8 +130,21 @@ class BinaryImage:
         return [s for s in self.sections if s.executable]
 
     def get_code_sections(self) -> List[SectionInfo]:
-        """Return sections suitable for disassembly (executable, have raw data)."""
-        return [s for s in self.sections if s.executable and s.raw_size > 0]
+        """Return sections suitable for disassembly.
+
+        The executable flag alone is not a usable signal: Xbox linkers mark
+        nearly every section executable, including .data. Disassembling those
+        yields phantom functions built out of zero-fill -- runs of 00 00 decode
+        as `add [eax], al`, and the lifter happily emits C for them (one such
+        phantom referenced a nonexistent `cr7` and broke the build).
+
+        So data sections are excluded by name regardless of their flags. A
+        title that genuinely hides code in one of them can put it back with
+        --extra-sections, which is exactly what that flag is for.
+        """
+        return [s for s in self.sections
+                if s.executable and s.raw_size > 0
+                and s.name not in DATA_SECTION_NAMES]
 
 
 def _parse_hex(s: str) -> int:
