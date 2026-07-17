@@ -331,42 +331,38 @@ class FunctionDetector:
         """
         Determine where a function ends.
 
-        Walks forward from start, tracking the furthest reachable point
-        through fall-through and internal jumps.
+        Traverse reachable basic blocks, including forward unconditional
+        jumps, while respecting the next candidate and section boundaries.
         """
-        max_addr = start
-        addr = start
-
-        # Upper bound
         upper = sec_end if sec_end else start + 0x100000
         if next_func and next_func < upper:
             upper = next_func
 
-        while addr < upper:
-            insn = self.engine.get_instruction(addr)
-            if insn is None:
-                break
+        max_addr = start
+        pending = [start]
+        visited: Set[int] = set()
 
-            end = insn.end_address
-            if end > max_addr:
-                max_addr = end
-
-            # Track internal forward jumps to extend function bounds
-            if insn.is_cond_jump and insn.jump_target is not None:
-                target = insn.jump_target
-                if start <= target < upper and target > max_addr:
-                    # This jump goes forward within bounds, extend
-                    max_addr = target
-
-            if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
-                # Check if we've covered all internal jump targets
-                if addr + insn.size >= max_addr:
+        while pending:
+            addr = pending.pop()
+            while start <= addr < upper and addr not in visited:
+                insn = self.engine.get_instruction(addr)
+                if insn is None:
                     break
-                # There might be more code after (jumped over)
-                addr = insn.end_address
-                continue
 
-            addr = insn.end_address
+                visited.add(addr)
+                max_addr = max(max_addr, insn.end_address)
+
+                if insn.is_branch and insn.jump_target is not None:
+                    target = insn.jump_target
+                    if start <= target < upper and target not in visited:
+                        pending.append(target)
+                    if not insn.is_cond_jump:
+                        break
+
+                if insn.is_ret:
+                    break
+
+                addr = insn.end_address
 
         return max_addr
 
