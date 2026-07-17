@@ -296,9 +296,32 @@ def main():
                     help="Recompiler functions.json (for --apply)")
     ap.add_argument("--apply", action="store_true",
                     help="Apply names into functions.json in place (.bak first)")
+    ap.add_argument("--names-json",
+                    help="Skip the Ghidra export and take names from an existing "
+                         "{addr: name} file, e.g. the output of "
+                         "tools/symbols/map_names.py. Names are still sanitized "
+                         "and de-duplicated the same way.")
     args = ap.parse_args()
 
-    final, buckets, chosen = build_map(args.export_dir)
+    if args.names_json:
+        raw = load_json(args.names_json) or {}
+        final, buckets = {}, {}
+        seen = {}
+        for addr, name in raw.items():
+            a = norm_addr(addr)
+            clean = sanitize(name)
+            if not clean or is_placeholder(name):
+                continue
+            # Same de-dup rule as build_map: distinct addresses must not
+            # collapse onto one C identifier.
+            if clean in seen:
+                clean = "%s_%s" % (clean, a[2:])
+            seen[clean] = a
+            final[a] = clean
+            buckets["symbol"] = buckets.get("symbol", 0) + 1
+        print("loaded %d names from %s" % (len(final), args.names_json))
+    else:
+        final, buckets, _chosen = build_map(args.export_dir)
     n = write_map(final, args.out)
 
     # How many of these addresses actually exist in the recompiler's functions.json?
