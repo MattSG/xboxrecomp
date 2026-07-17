@@ -123,6 +123,10 @@ class FunctionDetector:
 
     def add_forced_function(self, start: int, end: int) -> None:
         """Seed a known split function whose interior resembles function starts."""
+        if end <= start:
+            raise ValueError(
+                f"forced function end 0x{end:08X} must follow start "
+                f"0x{start:08X}")
         self._add_candidate(start, 1.0, "seed_forced_range")
         self._forced_ends[start] = end
 

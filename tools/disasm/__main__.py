@@ -110,7 +110,12 @@ def main():
 
 
 def _load_seed_functions(path):
-    """Load seed function addresses from a JSON file."""
+    """Load function starts and explicit forced ranges from a JSON file.
+
+    A start-only entry is a candidate function address.  Only entries with an
+    explicit end are forced ranges; treating a missing end as ``start`` leaves
+    a zero-length forced function that still truncates its preceding function.
+    """
     import json
     with open(path) as f:
         data = json.load(f)
@@ -118,8 +123,10 @@ def _load_seed_functions(path):
     for entry in data:
         if isinstance(entry, dict) and "start" in entry:
             start = int(entry["start"], 16)
-            addrs.append((start, int(entry["end"], 16))
-                         if "end" in entry else start)
+            if "end" in entry:
+                addrs.append((start, int(entry["end"], 16)))
+            else:
+                addrs.append(start)
         elif isinstance(entry, int):
             addrs.append(entry)
     return addrs

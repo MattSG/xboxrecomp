@@ -26,6 +26,7 @@ Thumbs.db
 
 # Build
 build/
+build-*/
 bin/
 *.obj
 *.exe
