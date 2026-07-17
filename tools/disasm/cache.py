@@ -58,12 +58,30 @@ class AnalysisCache:
                 sha256.update(chunk)
         return sha256.hexdigest()
 
+    @staticmethod
+    def _opts_key(text_only, extra_sections=None, seed_functions=None):
+        """Fingerprint every input that changes the result.
+
+        Not just the files: --seed-functions and --extra-sections change what
+        gets disassembled, so a cache keyed only on the XBE would hand back
+        results from a different seed set and look like the seeds did nothing.
+        That is a silent wrong answer, which is worse than a slow one.
+        """
+        import hashlib
+        h = hashlib.sha256()
+        h.update(repr(bool(text_only)).encode())
+        h.update(repr(sorted(extra_sections or [])).encode())
+        h.update(repr(sorted(seed_functions or [])).encode())
+        return h.hexdigest()
+
     def is_valid(self, xbe_path: str, analysis_json_path: str,
-                 text_only: bool = False) -> bool:
+                 text_only: bool = False, extra_sections=None,
+                 seed_functions=None) -> bool:
         """
         Check if cached results are still valid.
 
-        Returns True if the cache exists and the input files haven't changed.
+        Returns True if the cache exists and neither the input files nor the
+        options that affect the output have changed.
         """
         cache = self._load_cache()
         if cache is None:
@@ -79,8 +97,9 @@ class AnalysisCache:
         if cache.get("json_hash") != json_hash:
             return False
 
-        # Check text_only flag matches
-        if cache.get("text_only") != text_only:
+        # Check every option that affects the output, not just text_only
+        if cache.get("opts_key") != self._opts_key(text_only, extra_sections,
+                                                   seed_functions):
             return False
 
         # Verify output files exist
@@ -95,7 +114,8 @@ class AnalysisCache:
         return True
 
     def save(self, xbe_path: str, analysis_json_path: str,
-             text_only: bool, elapsed_seconds: float) -> None:
+             text_only: bool, elapsed_seconds: float,
+             extra_sections=None, seed_functions=None) -> None:
         """
         Save cache metadata after a successful analysis run.
         """
@@ -106,6 +126,8 @@ class AnalysisCache:
             "xbe_hash": self._hash_file(xbe_path),
             "json_hash": self._hash_file(analysis_json_path),
             "text_only": text_only,
+            "opts_key": self._opts_key(text_only, extra_sections,
+                                       seed_functions),
             "timestamp": time.time(),
             "elapsed_seconds": elapsed_seconds,
         }

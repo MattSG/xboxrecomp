@@ -70,7 +70,9 @@ class Disassembler:
         if not self.force:
             json_path = self._find_analysis_json()
             if json_path and cache.is_valid(self.xbe_path, json_path,
-                                             self.text_only):
+                                             self.text_only,
+                                             self.extra_sections,
+                                             self.seed_functions):
                 last_time = cache.get_last_run_time()
                 print(f"Cache hit - results unchanged (last run: "
                       f"{last_time:.1f}s)")
@@ -202,7 +204,8 @@ class Disassembler:
             # Save cache
             json_path = self._find_analysis_json()
             if json_path:
-                cache.save(self.xbe_path, json_path, self.text_only, elapsed)
+                cache.save(self.xbe_path, json_path, self.text_only, elapsed,
+                           self.extra_sections, self.seed_functions)
 
             if self.verbose:
                 print(f"\n  Output written to {self.output_dir}/")
