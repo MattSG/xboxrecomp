@@ -36,6 +36,7 @@ class Instruction:
     call_target: Optional[int] = None     # For direct calls
     jump_target: Optional[int] = None     # For direct jumps
     memory_ref: Optional[int] = None      # For [addr] references
+    immediate_refs: List[int] = field(default_factory=list)
 
     @property
     def is_branch(self) -> bool:
@@ -111,6 +112,14 @@ class DisasmEngine:
 
         if operands:
             op = operands[0]
+
+            # A code address written directly into memory is a strong callback
+            # signal (for example `mov [callback], offset handler`). Do not
+            # treat every numeric immediate in code as a function pointer.
+            if (mnemonic == "mov" and len(operands) >= 2 and
+                    operands[0].type == CS_OP_MEM and
+                    operands[1].type == CS_OP_IMM):
+                insn.immediate_refs = [operands[1].imm & 0xFFFFFFFF]
 
             if insn.is_call:
                 if op.type == CS_OP_IMM:

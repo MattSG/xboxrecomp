@@ -534,7 +534,6 @@ static void bridge_RtlInitAnsiString(void)
 
 static void bridge_RtlEqualString(void)
 {
-    static unsigned comparisons;
     uint32_t first = STACK_ARG(0), second = STACK_ARG(1);
     uint16_t length = BRIDGE_MEM16(first);
     if (length != BRIDGE_MEM16(second)) {
@@ -543,9 +542,6 @@ static void bridge_RtlEqualString(void)
     }
     const char *a = (const char*)XBOX_TO_NATIVE(BRIDGE_MEM32(first + 4));
     const char *b = (const char*)XBOX_TO_NATIVE(BRIDGE_MEM32(second + 4));
-    if (comparisons++ < 8)
-        fprintf(stderr, "  [RTL] EqualString '%.*s' vs '%.*s' insensitive=%u\n",
-                length, a, length, b, STACK_ARG(2));
     g_eax = STACK_ARG(2) ? (_strnicmp(a, b, length) == 0) : (strncmp(a, b, length) == 0);
 }
 
@@ -1171,6 +1167,13 @@ static void bridge_NtQuerySymbolicLinkObject(void)
     g_eax = STATUS_SUCCESS;
 }
 
+/* ── HalRequestSoftwareInterrupt (ordinal 49, 1 arg = 4 bytes) */
+static void bridge_HalRequestSoftwareInterrupt(void)
+{
+    xbox_HalRequestSoftwareInterrupt((KIRQL)STACK_ARG(0));
+    g_eax = 0;
+}
+
 /* ── IoCreateFile (ordinal 67, 10 args = 40 bytes) ────── */
 static void bridge_IoCreateFile(void)
 {
@@ -1594,6 +1597,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 207: return bridge_NtQueryDirectoryFile;
     case 210: return bridge_NtQueryFullAttributesFile;
     case 211: return bridge_NtQueryInformationFile;
+    case 215: return bridge_NtQuerySymbolicLinkObject;
     case 218: return bridge_NtQueryVolumeInformationFile;
     case 219: return bridge_NtReadFile;
     case 226: return bridge_NtSetInformationFile;
@@ -1647,6 +1651,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* Hardware */
     case  47: return bridge_HalReadSMCTrayState;
+    case  49: return bridge_HalRequestSoftwareInterrupt;
 
     /* Display */
     case   3: return bridge_AvSetDisplayMode;

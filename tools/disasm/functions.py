@@ -107,7 +107,14 @@ class FunctionDetector:
         # Pass 4: Call targets
         self._pass_call_targets(sections)
 
-        # Pass 5: Build functions from candidates
+        # Pass 5: Function pointers stored in data (vtables, CRT initializer
+        # arrays, callbacks, and thread entry points).
+        self._pass_data_function_pointers()
+
+        # Pass 6: Code addresses assigned as immediate callback values.
+        self._pass_immediate_function_pointers()
+
+        # Pass 7: Build functions from candidates
         self._build_functions(sections)
 
         # Populate call graph
@@ -248,6 +255,46 @@ class FunctionDetector:
                         "call_target"
                     )
 
+    def _pass_data_function_pointers(self) -> None:
+        """Add aligned code pointers stored in non-executable sections.
+
+        Direct-call and prologue scans cannot discover functions invoked only
+        through vtables, CRT initializer arrays, callbacks, or thread start
+        records. An aligned dword in data that resolves to an actual decoded
+        instruction in an executable section is a strong indirect-entry signal.
+        """
+        code_sections = self.image.get_code_sections()
+        code_section_names = {section.name for section in code_sections}
+        for section in self.image.sections:
+            if section.name in code_section_names:
+                continue
+            data = self.image.get_section_data(section)
+            if not data:
+                continue
+            for offset in range(0, len(data) - 3, 4):
+                target = int.from_bytes(data[offset:offset + 4], "little")
+                if target not in self.engine.instructions:
+                    continue
+                target_section = self.image.get_section_at_va(target)
+                if (target_section and
+                        target_section.name in code_section_names):
+                    self._add_candidate(target, 0.85, "data_function_pointer")
+
+    def _pass_immediate_function_pointers(self) -> None:
+        """Add code addresses used as immediate callback assignments."""
+        code_section_names = {
+            section.name for section in self.image.get_code_sections()
+        }
+        for insn in self.engine.instructions.values():
+            for target in insn.immediate_refs:
+                if target not in self.engine.instructions:
+                    continue
+                target_section = self.image.get_section_at_va(target)
+                if (target_section and
+                        target_section.name in code_section_names):
+                    self._add_candidate(
+                        target, 0.85, "immediate_function_pointer")
+
     def _build_functions(self, sections: List[SectionInfo]) -> None:
         """
         Pass 5: Build Function objects from candidates.
@@ -334,9 +381,9 @@ class FunctionDetector:
         Traverse reachable basic blocks, including forward unconditional
         jumps, while respecting the next candidate and section boundaries.
         """
+        # Candidate starts are callable entry points, but an explicit branch
+        # may cross one to reach a shared epilogue or exception block.
         upper = sec_end if sec_end else start + 0x100000
-        if next_func and next_func < upper:
-            upper = next_func
 
         max_addr = start
         pending = [start]
@@ -354,7 +401,8 @@ class FunctionDetector:
 
                 if insn.is_branch and insn.jump_target is not None:
                     target = insn.jump_target
-                    if start <= target < upper and target not in visited:
+                    if (start <= target < upper and target not in visited and
+                            (target == start or target not in self._candidates)):
                         pending.append(target)
                     if not insn.is_cond_jump:
                         break
@@ -362,7 +410,10 @@ class FunctionDetector:
                 if insn.is_ret:
                     break
 
-                addr = insn.end_address
+                next_addr = insn.end_address
+                if next_addr != start and next_addr in self._candidates:
+                    break
+                addr = next_addr
 
         return max_addr
 
