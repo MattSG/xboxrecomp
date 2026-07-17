@@ -105,6 +105,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    DWORD existing_attrs;
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
@@ -115,11 +116,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
-    if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+    existing_attrs = GetFileAttributesW(win_path);
+    if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) ||
+        (existing_attrs != INVALID_FILE_ATTRIBUTES &&
+         (existing_attrs & FILE_ATTRIBUTE_DIRECTORY))) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
-        h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
+        h = CreateFileW(win_path, 0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
         if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
@@ -405,13 +409,13 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = 512;
-                info->SectorsPerAllocationUnit = 8;
+                info->SectorsPerAllocationUnit = 32;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
             } else {
                 info->BytesPerSector = 512;
-                info->SectorsPerAllocationUnit = 8;
+                info->SectorsPerAllocationUnit = 32;
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
@@ -922,7 +926,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
             info->BytesPerSector = 512;
-            info->SectorsPerAllocationUnit = 8;
+            info->SectorsPerAllocationUnit = 32;
             if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;

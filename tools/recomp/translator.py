@@ -223,9 +223,21 @@ class FunctionTranslator:
         if has_tail_jump:
             used_regs.add("ebp")
 
+        # Conditional jumps can also leave a detector-split function and must
+        # publish the inherited frame before entering the continuation.
+        if any(insn.is_cond_jump and insn.jump_target and
+               not (start <= insn.jump_target < end)
+               for insn in instructions):
+            used_regs.add("ebp")
+
+        # Direct calls may enter an fpo_leaf callee that inherits EBP through
+        # g_seh_ebp, so every direct caller must retain and publish its frame.
+        if any(insn.call_target for insn in instructions):
+            used_regs.add("ebp")
+
         # Ensure ebp tracked if function calls __SEH_prolog or __SEH_epilog
         # (lifter emits ebp = g_seh_ebp readback after these calls).
-        SEH_FUNCS = {0x00244784, 0x002447BF}
+        SEH_FUNCS = {0x00244784, 0x002447BF, 0x00094FC0, 0x00094FFB}
         if any(insn.call_target in SEH_FUNCS for insn in instructions):
             used_regs.add("ebp")
 
@@ -270,7 +282,7 @@ class FunctionTranslator:
         # Volatile registers (eax, ecx, edx, esp) are also global via macros.
         reg_decls = []
         if "ebp" in used_regs:
-            reg_decls.append("ebp")
+            reg_decls.append("ebp = g_seh_ebp")
         if reg_decls:
             lines.append(f"    uint32_t {', '.join(reg_decls)};")
 
@@ -282,8 +294,8 @@ class FunctionTranslator:
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
 
-        # Add _cf for carry-dependent instructions (sbb, adc)
-        has_carry = any(insn.mnemonic in ("sbb", "adc")
+        # Add _cf for instructions which consume or produce carry.
+        has_carry = any(insn.mnemonic in ("sbb", "adc", "neg")
                         for insn in instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
@@ -317,16 +329,8 @@ class FunctionTranslator:
             lines.append(f"    #define fp_top() _fp_stack[_fp_top & 7]")
             lines.append(f"    #define fp_st1() _fp_stack[(_fp_top + 1) & 7]")
 
-        # For fpo_leaf functions that use ebp: initialize from g_seh_ebp.
-        # In x86, these functions inherit EBP from their caller (typically
-        # via a tail jump that shares the caller's frame). In our C translation,
-        # ebp is a local variable that would start uninitialized, causing
-        # crashes when the function reads MEM32(ebp + offset). The g_seh_ebp
-        # global bridges ebp across function boundaries.
-        if frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue:
-            lines.append(f"    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */")
-
         lines.append(f"")
+        lines.append(f"    recomp_trace_enter(0x{start:08X}u);")
 
         # Generate code for each basic block
         # Create a set of addresses that need labels
@@ -409,6 +413,11 @@ class FunctionTranslator:
         if _last_label_idx is not None and not _has_stmt_after:
             lines.insert(_last_label_idx + 1, "    (void)0;")
 
+        # Every translated return must balance the trace entry. This also
+        # handles inline conditional returns emitted by the lifter.
+        lines = [line.replace("return;", "recomp_trace_leave(); return;")
+                 for line in lines]
+
         # Undefine FPU macros
         if has_fpu:
             lines.append(f"    #undef fp_push")
@@ -417,6 +426,7 @@ class FunctionTranslator:
             lines.append(f"    #undef fp_top")
             lines.append(f"    #undef fp_st1")
 
+        lines.append(f"    recomp_trace_leave();")
         lines.append(f"}}")
         lines.append(f"")
 

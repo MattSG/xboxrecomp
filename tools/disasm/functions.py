@@ -75,6 +75,7 @@ class FunctionDetector:
 
         # Candidate function starts: address -> (confidence, method)
         self._candidates: Dict[int, Tuple[float, str]] = {}
+        self._forced_ends: Dict[int, int] = {}
 
         # Final function list
         self.functions: Dict[int, Function] = {}
@@ -119,6 +120,11 @@ class FunctionDetector:
         existing = self._candidates.get(addr)
         if existing is None or confidence > existing[0]:
             self._candidates[addr] = (confidence, method)
+
+    def add_forced_function(self, start: int, end: int) -> None:
+        """Seed a known split function whose interior resembles function starts."""
+        self._add_candidate(start, 1.0, "seed_forced_range")
+        self._forced_ends[start] = end
 
     def _pass_known_addresses(self) -> None:
         """Pass 1: Add known function addresses."""
@@ -278,7 +284,9 @@ class FunctionDetector:
             if section:
                 sec_end = section.virtual_addr + section.virtual_size
 
-            end_addr = self._find_function_end(start_addr, next_func, sec_end)
+            end_addr = self._forced_ends.get(start_addr)
+            if end_addr is None:
+                end_addr = self._find_function_end(start_addr, next_func, sec_end)
 
             # Count instructions
             insns = self.engine.get_instructions_in_range(start_addr, end_addr)

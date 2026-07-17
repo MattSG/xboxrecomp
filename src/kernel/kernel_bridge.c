@@ -40,6 +40,7 @@ extern ptrdiff_t g_xbox_mem_offset;
 typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
+void recomp_trace_dump(void);
 
 /* Memory access - same as recomp_types.h MEM32 but without the #define guard */
 #define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
@@ -51,6 +52,8 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
 #define KERNEL_VA_BASE  0xFE000000u
 #define KERNEL_VA_END   (KERNEL_VA_BASE + XBOX_KERNEL_THUNK_TABLE_SIZE * 4)
+static uint32_t g_kernel_thunk_table_base = XBOX_KERNEL_THUNK_TABLE_BASE;
+static uint32_t g_kernel_thunk_table_count = XBOX_KERNEL_THUNK_TABLE_SIZE;
 
 /* ── Kernel data exports ──────────────────────────────────
  *
@@ -84,8 +87,6 @@ static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
     case 324: return XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION;
     case 325: return XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY;
     case 326: return XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY;
-    case 327: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS;
-    case 328: return XBOX_KERNEL_DATA_BASE + KDATA_XE_IMAGE_FILENAME;
     case 355: return XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY;         /* alias */
     case 356: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS; /* alias */
     case 357: return XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY;
@@ -519,6 +520,35 @@ static void bridge_RtlLeaveCriticalSection(void)
     g_eax = 0;
 }
 
+static void bridge_RtlInitAnsiString(void)
+{
+    uint32_t destination = STACK_ARG(0);
+    uint32_t source = STACK_ARG(1);
+    size_t length = source ? strlen((const char*)XBOX_TO_NATIVE(source)) : 0;
+    if (length > 0xFFFE) length = 0xFFFE;
+    BRIDGE_MEM16(destination) = (uint16_t)length;
+    BRIDGE_MEM16(destination + 2) = (uint16_t)(source ? length + 1 : 0);
+    BRIDGE_MEM32(destination + 4) = source;
+    g_eax = 0;
+}
+
+static void bridge_RtlEqualString(void)
+{
+    static unsigned comparisons;
+    uint32_t first = STACK_ARG(0), second = STACK_ARG(1);
+    uint16_t length = BRIDGE_MEM16(first);
+    if (length != BRIDGE_MEM16(second)) {
+        g_eax = 0;
+        return;
+    }
+    const char *a = (const char*)XBOX_TO_NATIVE(BRIDGE_MEM32(first + 4));
+    const char *b = (const char*)XBOX_TO_NATIVE(BRIDGE_MEM32(second + 4));
+    if (comparisons++ < 8)
+        fprintf(stderr, "  [RTL] EqualString '%.*s' vs '%.*s' insensitive=%u\n",
+                length, a, length, b, STACK_ARG(2));
+    g_eax = STACK_ARG(2) ? (_strnicmp(a, b, length) == 0) : (strncmp(a, b, length) == 0);
+}
+
 /* ── KeQueryPerformanceCounter / Frequency (ordinals 126, 127) ─ */
 static void bridge_KeQueryPerformanceCounter(void)
 {
@@ -845,10 +875,9 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h)
         BRIDGE_MEM32(handle_va) = bridge_handle_token(h);
 }
 
-/* Resolve a 32-bit Xbox handle slot back to a native HANDLE. */
-static HANDLE bridge_read_handle(uint32_t va)
+/* Resolve a 32-bit Xbox handle token back to a native HANDLE. */
+static HANDLE bridge_read_handle(uint32_t token)
 {
-    uint32_t token = BRIDGE_MEM32(va);
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
@@ -910,6 +939,7 @@ static NTSTATUS bridge_create_file_impl(
         bridge_write_handle(handle_va, h);
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
     } else {
+        fprintf(stderr, "  [FILE] create '%s' failed: 0x%08X\n", name.Buffer, (uint32_t)st);
         bridge_write_iostatus(iostatus_va, st, 0);
     }
     return st;
@@ -1164,9 +1194,78 @@ static void bridge_NtDeviceIoControlFile(void)
 {
     uint32_t ioctl = STACK_ARG(5);
     uint32_t ios_va = STACK_ARG(4);
+    uint32_t input_va = STACK_ARG(6);
+    uint32_t input_len = STACK_ARG(7);
+
+    /* Xbox IDE/ATAPI pass-through used during DVD capability probing. */
+    if (ioctl == 0x4D014 && input_va && input_len >= 0x2C) {
+        uint32_t data_len = BRIDGE_MEM32(input_va + 12);
+        uint32_t data_va = BRIDGE_MEM32(input_va + 20);
+        uint8_t command = BRIDGE_MEM8(input_va + 28);
+        if (data_va && data_len) {
+            memset(XBOX_TO_NATIVE(data_va), 0, data_len);
+            if (command == 0x5A && data_len >= 13) {
+                BRIDGE_MEM8(data_va + 10) = 1;
+                BRIDGE_MEM8(data_va + 11) = 1;
+                BRIDGE_MEM8(data_va + 12) = 1;
+            } else if (command == 0xAD && data_len > 0x4AE) {
+                /* The XBE validates the returned DVD descriptor's media ID
+                 * against the one recorded in its launch-data structure. */
+                uint32_t launch_data = BRIDGE_MEM32(0x00010118);
+                if (launch_data)
+                    BRIDGE_MEM32(data_va + 0x4AB) = BRIDGE_MEM32(launch_data + 4);
+            }
+        }
+        fprintf(stderr, "  [FILE] NtDeviceIoControlFile(0x%X): ATAPI 0x%02X, %u bytes\n",
+                ioctl, command, data_len);
+        bridge_write_iostatus(ios_va, 0, data_len);
+        g_eax = 0;
+        return;
+    }
     fprintf(stderr, "  [FILE] NtDeviceIoControlFile(0x%X) - stub\n", ioctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
     g_eax = 0xC00000BBu; /* STATUS_NOT_IMPLEMENTED */
+}
+
+static void bridge_XcSHAInit(void)
+{
+    xbox_XcSHAInit((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)));
+    g_eax = 0;
+}
+
+static void bridge_XcSHAUpdate(void)
+{
+    xbox_XcSHAUpdate((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
+                     (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)), STACK_ARG(2));
+    g_eax = 0;
+}
+
+static void bridge_XcSHAFinal(void)
+{
+    xbox_XcSHAFinal((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
+                    (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)));
+    g_eax = 0;
+}
+
+static void bridge_XcVerifyPKCS1Signature(void)
+{
+    g_eax = xbox_XcVerifyPKCS1Signature(XBOX_TO_NATIVE(STACK_ARG(0)),
+                                        XBOX_TO_NATIVE(STACK_ARG(1)),
+                                        XBOX_TO_NATIVE(STACK_ARG(2)));
+}
+
+static void bridge_XeLoadSection(void)
+{
+    uint32_t section = STACK_ARG(0);
+    if (section) BRIDGE_MEM32(section + 0x18)++;
+    g_eax = section ? 0 : STATUS_INVALID_PARAMETER;
+}
+
+static void bridge_XeUnloadSection(void)
+{
+    uint32_t section = STACK_ARG(0);
+    if (section && BRIDGE_MEM32(section + 0x18)) BRIDGE_MEM32(section + 0x18)--;
+    g_eax = section ? 0 : STATUS_INVALID_PARAMETER;
 }
 
 /* ── NtFsControlFile (ordinal 200, 10 args = 40 bytes) ──── */
@@ -1329,7 +1428,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     /* ── I/O Manager ── */
     case  62: return 36;  /* IoBuildDeviceIoControlRequest(9) */
     /* case  65: DATA export - IoCompletionObjectType */
-    case  67: return 40;  /* IoCreateFile(10) */
+    case  67: return  8;  /* IoCreateSymbolicLink(2) in this kernel revision */
     case  69: return  4;  /* IoDeleteDevice(1) */
     /* case  71: DATA export - IoDeviceObjectType */
     case  74: return 12;  /* IoInitializeIrp(3) */
@@ -1457,21 +1556,20 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     /* ── Xbox Identity (data exports) ── */
     /* cases 322-328, 355-357: DATA exports */
 
-    /* ── Port I/O ── */
-    case 335: return 12;  /* WRITE_PORT_BUFFER_USHORT(3) */
-    case 336: return 12;  /* WRITE_PORT_BUFFER_ULONG(3) */
-
     /* ── Crypto ── */
-    case 337: return  4;  /* XcSHAInit(1) */
-    case 338: return 12;  /* XcSHAUpdate(3) */
-    case 339: return  8;  /* XcSHAFinal(2) */
+    case 335: return  4;  /* XcSHAInit(1) */
+    case 336: return 12;  /* XcSHAUpdate(3) */
+    case 337: return  8;  /* XcSHAFinal(2) */
     case 340: return 12;  /* XcRC4Key(3) */
-    case 344: return 12;  /* XcPKDecPrivate(3) */
+    case 344: return 12;  /* XcVerifyPKCS1Signature(3) */
     case 345: return  4;  /* XcPKGetKeyLen(1) */
     case 346: return 12;  /* XcVerifyPKCS1Signature(3) */
     case 347: return 20;  /* XcModExp(5) */
     case 349: return 12;  /* XcKeyTable(3) */
     case 353: return  8;  /* XcUpdateCrypto(2) */
+
+    case 327: return 4;   /* XeLoadSection(1) */
+    case 328: return 4;   /* XeUnloadSection(1) */
 
     default:  return  0;  /* DATA exports or truly unknown */
     }
@@ -1527,6 +1625,8 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 291: return bridge_RtlInitializeCriticalSection;
     case 277: return bridge_RtlEnterCriticalSection;
     case 294: return bridge_RtlLeaveCriticalSection;
+    case 289: return bridge_RtlInitAnsiString;
+    case 279: return bridge_RtlEqualString;
 
     /* Timing */
     case 126: return bridge_KeQueryPerformanceCounter;
@@ -1553,7 +1653,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* I/O */
     case  63: return bridge_IoCreateSymbolicLink;
-    case  67: return bridge_IoCreateFile;
+    case  67: return bridge_IoCreateSymbolicLink;
     case 188: return bridge_NtCreateDirectoryObject;
     case 246: return bridge_ObReferenceObjectByHandle;
 
@@ -1564,6 +1664,14 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* RTL */
     case 301: return bridge_RtlNtStatusToDosError;
     case 302: return bridge_RtlRaiseException;
+
+    /* Crypto */
+    case 335: return bridge_XcSHAInit;
+    case 336: return bridge_XcSHAUpdate;
+    case 337: return bridge_XcSHAFinal;
+    case 344: return bridge_XcVerifyPKCS1Signature;
+    case 327: return bridge_XeLoadSection;
+    case 328: return bridge_XeUnloadSection;
 
     default:  return NULL;
     }
@@ -1631,6 +1739,7 @@ static void kernel_thunk_dispatch(void)
             warned[slot] = 1;
             fprintf(stderr, "  [KERNEL] WARNING: no bridge for ordinal %u (slot %d), returning 0\n",
                     ordinal, slot);
+            recomp_trace_dump();
             fflush(stderr);
         }
         g_eax = 0;
@@ -1656,7 +1765,8 @@ static void kernel_thunk_dispatch(void)
  */
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va)
 {
-    if (xbox_va >= KERNEL_VA_BASE && xbox_va < KERNEL_VA_END) {
+    if (xbox_va >= KERNEL_VA_BASE &&
+        xbox_va < KERNEL_VA_BASE + g_kernel_thunk_table_count * 4) {
         int slot = (xbox_va - KERNEL_VA_BASE) / 4;
         if (slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE) {
             g_kernel_dispatch_slot = slot;
@@ -1667,6 +1777,14 @@ recomp_func_t recomp_lookup_kernel(uint32_t xbox_va)
 }
 
 /* ── Initialization ─────────────────────────────────────── */
+
+void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
+{
+    if (xbox_va && count && count <= XBOX_KERNEL_THUNK_TABLE_SIZE) {
+        g_kernel_thunk_table_base = xbox_va;
+        g_kernel_thunk_table_count = count;
+    }
+}
 
 /**
  * Resolve the kernel thunk table in Xbox memory.
@@ -1686,13 +1804,13 @@ void xbox_kernel_bridge_init(void)
     DWORD old_protect;
 
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
-            XBOX_KERNEL_THUNK_TABLE_SIZE, XBOX_KERNEL_THUNK_TABLE_BASE);
+            g_kernel_thunk_table_count, g_kernel_thunk_table_base);
 
     /* The thunk table lives in .rdata which is marked PAGE_READONLY.
      * Temporarily make it writable so we can patch the ordinals. */
     VirtualProtect(
-        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
-        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
+        (LPVOID)((uintptr_t)g_kernel_thunk_table_base + g_xbox_mem_offset),
+        g_kernel_thunk_table_count * 4,
         PAGE_READWRITE,
         &old_protect
     );
@@ -1700,8 +1818,8 @@ void xbox_kernel_bridge_init(void)
     /* Initialize kernel data export values first */
     kernel_data_init();
 
-    for (i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        uint32_t va = XBOX_KERNEL_THUNK_TABLE_BASE + i * 4;
+    for (i = 0; i < (int)g_kernel_thunk_table_count; i++) {
+        uint32_t va = g_kernel_thunk_table_base + i * 4;
         uint32_t current = BRIDGE_MEM32(va);
 
         if (current & 0x80000000) {
@@ -1738,8 +1856,8 @@ void xbox_kernel_bridge_init(void)
 
     /* Restore original protection */
     VirtualProtect(
-        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
-        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
+        (LPVOID)((uintptr_t)g_kernel_thunk_table_base + g_xbox_mem_offset),
+        g_kernel_thunk_table_count * 4,
         old_protect,
         &old_protect
     );

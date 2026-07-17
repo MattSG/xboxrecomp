@@ -124,6 +124,11 @@ extern volatile uint64_t g_icall_count;
  */
 void recomp_icall_fail_log(uint32_t va);
 
+/** Generated-function call stack used by runtime failure diagnostics. */
+void recomp_trace_enter(uint32_t va);
+void recomp_trace_leave(void);
+void recomp_trace_dump(void);
+
 /* ================================================================
  * Memory access helpers
  * ================================================================ */

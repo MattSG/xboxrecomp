@@ -117,7 +117,9 @@ def _load_seed_functions(path):
     addrs = []
     for entry in data:
         if isinstance(entry, dict) and "start" in entry:
-            addrs.append(int(entry["start"], 16))
+            start = int(entry["start"], 16)
+            addrs.append((start, int(entry["end"], 16))
+                         if "end" in entry else start)
         elif isinstance(entry, int):
             addrs.append(entry)
     return addrs

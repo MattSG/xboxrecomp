@@ -22,10 +22,6 @@ import os
 import sys
 import time
 
-from .translator import BatchTranslator
-from .output import write_summary, print_stats, generate_header
-
-
 def find_data_files():
     """Locate the disasm/func_id output files."""
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -65,6 +61,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Xbox x86 -> C Static Recompiler")
     parser.add_argument("xbe_path", help="Path to default.xbe")
+    parser.add_argument("--analysis-json", required=True,
+                        help="xbe_parser analysis JSON for the target XBE")
     parser.add_argument("-o", "--output-dir",
                         help="Output directory")
     parser.add_argument("-f", "--function",
@@ -89,6 +87,12 @@ def main():
                              "(default: src/game/recomp/gen)")
 
     args = parser.parse_args()
+
+    # Configuration must be loaded before translator/lifter import constants.
+    from . import config
+    config.configure(args.analysis_json)
+    from .translator import BatchTranslator
+    from .output import write_summary, print_stats, generate_header
 
     # Find data files
     data_files = find_data_files()

@@ -606,7 +606,7 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
         return f"if ({cond_expr}) {{ /* {jcc}: {desc} - indirect */ }}"
     if lifter and lifter._is_external_target(target):
         name = lifter._call_target_name(target)
-        return (f"if ({cond_expr}) {{ {name}(); return; }}"
+        return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
                 f" /* {jcc}: {desc} */")
     return f"if ({cond_expr}) goto loc_{target:08X}; /* {jcc}: {desc} */"
 
@@ -660,6 +660,8 @@ class Lifter:
 
     def _call_target_name(self, addr):
         """Get the name for a call target address."""
+        if addr == 0x0008029B:
+            return "recomp_set_last_error"
         if addr in self.label_db:
             return self.label_db[addr]
         if addr in self.func_db:
@@ -925,7 +927,8 @@ class Lifter:
         if len(ops) < 1:
             return ["/* neg: no operand */"]
         val = _fmt_operand_read(ops[0])
-        return [_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})")]
+        return [f"_cf = ({val} != 0);",
+                _fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})")]
 
     def _lift_not(self, insn, ops):
         if len(ops) < 1:
@@ -1072,8 +1075,8 @@ class Lifter:
     # SEH prolog/epilog addresses - these functions modify ebp for their
     # caller.  After calling __SEH_prolog, the caller must read back ebp
     # from g_seh_ebp.  Before returning, __SEH_prolog writes g_seh_ebp.
-    SEH_PROLOG = 0x00244784  # __SEH_prolog
-    SEH_EPILOG = 0x002447BF  # __SEH_epilog
+    SEH_PROLOGS = {0x00244784, 0x00094FC0}
+    SEH_EPILOGS = {0x002447BF, 0x00094FFB}
 
     def _lift_call(self, insn, ops):
         # x86 'call' pushes return address then jumps.
@@ -1081,9 +1084,9 @@ class Lifter:
         # The callee's 'ret' will pop it back off.
         if insn.call_target:
             name = self._call_target_name(insn.call_target)
-            lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
+            lines = [f"g_seh_ebp = ebp; PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
             # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
-            if insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG):
+            if insn.call_target in self.SEH_PROLOGS | self.SEH_EPILOGS:
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
             return lines
         elif len(ops) >= 1:
@@ -1098,7 +1101,7 @@ class Lifter:
         # If this function IS __SEH_prolog or __SEH_epilog, bridge ebp
         # so the caller can read back the frame pointer.
         prefix = ""
-        if self.func_start in (self.SEH_PROLOG, self.SEH_EPILOG):
+        if self.func_start in self.SEH_PROLOGS | self.SEH_EPILOGS:
             prefix = "g_seh_ebp = ebp; "
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
@@ -1183,7 +1186,7 @@ class Lifter:
             if target:
                 if self._is_external_target(target):
                     name = self._call_target_name(target)
-                    return [f"if ({cond}) {{ {name}(); return; }} /* {jcc} */"]
+                    return [f"if ({cond}) {{ g_seh_ebp = ebp; {name}(); return; }} /* {jcc} */"]
                 return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
             return [f"/* {jcc} - no target */"]
 
@@ -1192,7 +1195,7 @@ class Lifter:
         if target:
             if self._is_external_target(target):
                 name = self._call_target_name(target)
-                return [f"if (_flags /* {jcc}: {desc} */) {{ {name}(); return; }}"]
+                return [f"if (_flags /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
             return [f"if (_flags /* {jcc}: {desc} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 

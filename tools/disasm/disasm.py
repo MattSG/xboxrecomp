@@ -156,8 +156,12 @@ class Disassembler:
 
         # Add seed functions from vtable scanner or other sources
         if self.seed_functions:
-            for addr in self.seed_functions:
-                self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
+            for seed in self.seed_functions:
+                if isinstance(seed, tuple):
+                    addr, end = seed
+                    self.func_detector.add_forced_function(addr, end)
+                else:
+                    self.func_detector._add_candidate(seed, 0.95, "seed_vtable_thunk")
             if self.verbose:
                 print(f"  Seeded {len(self.seed_functions)} function addresses")
 
