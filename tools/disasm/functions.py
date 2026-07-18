@@ -412,7 +412,14 @@ class FunctionDetector:
 
                 next_addr = insn.end_address
                 if next_addr != start and next_addr in self._candidates:
-                    break
+                    # A pointer found in a data section can name an alternate
+                    # entry (notably an SEH continuation) inside the current
+                    # function.  Do not truncate a proven fallthrough path at
+                    # that weaker kind of candidate.  Stronger call/prologue/
+                    # seed candidates remain hard boundaries.
+                    _, next_method = self._candidates[next_addr]
+                    if next_method != "data_function_pointer":
+                        break
                 addr = next_addr
 
         return max_addr
