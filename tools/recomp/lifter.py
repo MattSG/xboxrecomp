@@ -806,6 +806,7 @@ class Lifter:
                  "shufps", "unpcklps", "unpckhps",
                  "addps", "subps", "mulps", "divps",
                  "minps", "maxps", "rsqrtss", "rcpss",
+                 "sqrtps", "rsqrtps", "rcpps",
                  "cmpneqps", "cmpeqps", "cmpltps", "cmpleps",
                  "movmskps",
                  "pand", "pandn", "por", "pxor", "pcmpgtd"):
@@ -1430,6 +1431,28 @@ class Lifter:
         if m == "rcpss":
             if nops >= 2:
                 return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}") + " /* rcpss */"]
+
+        # ── Packed sqrt / reciprocal / rsqrt ──
+        # The SSE model here tracks only the low lane as a single float, so
+        # these compute the low lane like their scalar ...ss forms rather than
+        # all four. That is the same low-lane approximation the packed
+        # arithmetic ops (addps/mulps) already use -- but computing the low lane
+        # is strictly better than the TODO no-op these used to hit, which left
+        # the destination stale and fed garbage into vector normalisation.
+        # rsqrtps/sqrtps are the workhorse of 3D vector normalize; Wreckless
+        # uses them heavily, Burnout 3 did not, which is why this surfaced now.
+        if m == "sqrtps":
+            if nops >= 2:
+                return [_sse_write(ops[0], f"sqrtf({_sse_read(ops[1])})")
+                        + " /* sqrtps (low lane; 4-lane model TODO) */"]
+        if m == "rsqrtps":
+            if nops >= 2:
+                return [_sse_write(ops[0], f"1.0f / sqrtf({_sse_read(ops[1])})")
+                        + " /* rsqrtps (low lane; 4-lane model TODO) */"]
+        if m == "rcpps":
+            if nops >= 2:
+                return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}")
+                        + " /* rcpps (low lane; 4-lane model TODO) */"]
 
         # ── Packed comparison ──
         if m in ("cmpneqps", "cmpeqps", "cmpltps", "cmpleps"):
