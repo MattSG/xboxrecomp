@@ -42,7 +42,11 @@ add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 # Collect generated recompiled code.
 # The recomp pipeline outputs files into src/recomp/gen/.
 # With --split 1000, you get gen_0000.c, gen_0001.c, etc.
-file(GLOB RECOMP_GEN_SOURCES "src/recomp/gen/*.c")
+# CONFIGURE_DEPENDS so re-running the recompiler picks up added/removed files
+# without a manual re-configure. A plain GLOB is evaluated once at configure
+# time, so a newly generated file (an extra chunk, recomp_stubs_unresolved.c)
+# is silently left out of the build and shows up as unresolved externals.
+file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 
 # Core game sources
 set(GAME_SOURCES
