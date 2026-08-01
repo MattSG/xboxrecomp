@@ -361,8 +361,11 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  */
 #define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
-    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
-    g_icall_trace_idx++; \
+    /* Trace only valid Xbox VAs (filter native-address leaks) */ \
+    if (_va < 0x00400000 || _va >= 0xFE000000) { \
+        g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+        g_icall_trace_idx++; \
+    } \
     g_icall_count++; \
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
         g_esp = (saved_esp); eax = 0; break; \
