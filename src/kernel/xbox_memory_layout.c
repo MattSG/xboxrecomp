@@ -51,9 +51,6 @@ static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
  * Some RenderWare code reads the kernel PE header to detect features. */
 static void *g_kernel_memory = NULL;
 
-/* GPU MMIO region (0xF0000000+) for NV2A register emulation. */
-static void *g_gpu_mmio = NULL;
-
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
 
@@ -428,30 +425,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #undef KERNEL_PAGE_SIZE
     }
 
-    /* GPU MMIO region (NV2A registers: 0xF0000000-0xFFFFFFFF).
-     * Map 64 MB to catch GPU register reads/writes without crashing. */
-    {
-        #define GPU_MMIO_BASE    0xF0000000u
-        #define GPU_MMIO_SIZE    (64 * 1024 * 1024)  /* 64 MB */
-        uintptr_t mmio_native = GPU_MMIO_BASE + g_memory_offset;
-        g_gpu_mmio = VirtualAlloc(
-            (LPVOID)mmio_native,
-            GPU_MMIO_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
-        if (g_gpu_mmio) {
-            memset(g_gpu_mmio, 0, GPU_MMIO_SIZE);
-            fprintf(stderr, "  GPU MMIO: 64 MB at Xbox VA 0x%08X (native %p)\n",
-                    GPU_MMIO_BASE, g_gpu_mmio);
-        } else {
-            fprintf(stderr, "  WARNING: could not map GPU MMIO at 0x%08X (err=%lu)\n",
-                    GPU_MMIO_BASE, GetLastError());
-        }
-        #undef GPU_MMIO_BASE
-        #undef GPU_MMIO_SIZE
-    }
-
     /* Initialize the dynamic heap. */
     fprintf(stderr, "  Heap: %u MB at Xbox VA 0x%08X-0x%08X\n",
             XBOX_HEAP_SIZE / (1024 * 1024), XBOX_HEAP_BASE,
@@ -504,10 +477,6 @@ void xbox_MemoryLayoutShutdown(void)
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
-    }
-    if (g_gpu_mmio) {
-        VirtualFree(g_gpu_mmio, 0, MEM_RELEASE);
-        g_gpu_mmio = NULL;
     }
     /* Unmap mirror views first */
     for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
