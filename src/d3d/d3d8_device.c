@@ -1210,6 +1210,41 @@ static ULONG __stdcall d3d8_Release(IDirect3D8 *self)
     return (ULONG)InterlockedDecrement(&g_d3d8_ref);
 }
 
+void d3d8_PresentFrame(void);
+
+/* ── Auto window creation (when game provides no HWND) ────── */
+
+static HWND d3d8_create_default_window(int width, int height)
+{
+    static const wchar_t CLASS_NAME[] = L"MM3RecompWindow";
+    WNDCLASSW wc = {0};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = CLASS_NAME;
+    RegisterClassW(&wc);
+
+    RECT r = {0, 0, width, height};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+
+    return CreateWindowExW(0, CLASS_NAME,
+        L"Midtown Madness 3 (Recomp)", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+        NULL, NULL, wc.hInstance, NULL);
+}
+
+/* ── Message pump thread ───────────────────────────────────── */
+
+static DWORD WINAPI d3d8_msg_thread(LPVOID param)
+{
+    (void)param;
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return 0;
+}
+
 static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD DeviceType, HWND hFocusWindow, DWORD BehaviorFlags, D3DPRESENT_PARAMETERS *pPP, IDirect3DDevice8 **ppDevice)
 {
     (void)self; (void)Adapter; (void)DeviceType; (void)BehaviorFlags;
@@ -1220,7 +1255,17 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     memset(&g_device_state, 0, sizeof(g_device_state));
     g_device_state.ref_count = 1;
 
-    if (!pPP->hDeviceWindow) pPP->hDeviceWindow = hFocusWindow;
+    if (!pPP->hDeviceWindow) {
+        pPP->hDeviceWindow = hFocusWindow;
+        if (!pPP->hDeviceWindow) {
+            int w = pPP->BackBufferWidth ? pPP->BackBufferWidth : 640;
+            int h = pPP->BackBufferHeight ? pPP->BackBufferHeight : 480;
+            pPP->hDeviceWindow = d3d8_create_default_window(w, h);
+            fprintf(stderr, "[D3D8] Auto-created window %dx%d (HWND=%p)\n", w, h, pPP->hDeviceWindow);
+            /* Start message pump on background thread */
+            CreateThread(NULL, 0, d3d8_msg_thread, NULL, 0, NULL);
+        }
+    }
 
     hr = d3d11_create_device_and_swap_chain(&g_device_state, pPP);
     if (FAILED(hr)) return hr;
@@ -1229,6 +1274,9 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     if (FAILED(hr)) return hr;
 
     d3d8_init_default_states(&g_device_state);
+
+    /* Show the window */
+    ShowWindow(g_device_state.hwnd, SW_SHOW);
 
     /* Set initial viewport (D3D11 requires explicit viewport) */
     {
@@ -1285,6 +1333,11 @@ static const IDirect3D8Vtbl g_d3d8_vtbl = {
 IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion)
 {
     (void)SDKVersion;
+    static int s_called = 0;
+    if (!s_called) {
+        fprintf(stderr, "[D3D8] Direct3DCreate8 called (SDKVersion=%u)\n", SDKVersion);
+        s_called = 1;
+    }
     g_d3d8.lpVtbl = &g_d3d8_vtbl;
     g_d3d8_ref = 1;
     return &g_d3d8;
