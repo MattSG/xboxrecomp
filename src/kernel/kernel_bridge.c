@@ -645,18 +645,17 @@ static void bridge_AvSetDisplayMode(void)
  * VOID PsTerminateSystemThread(NTSTATUS ExitStatus)
  *
  * On real Xbox, this terminates the calling thread (never returns).
- * In our recompiled version, threads run synchronously, so we just
- * return. The caller (sub_001D1818) handles this gracefully.
+ * In our recompiled version, we call ExitThread to match the behavior.
  */
 static void bridge_PsTerminateSystemThread(void)
 {
     uint32_t exit_status = STACK_ARG(0);
 
-    fprintf(stderr, "  [KERNEL] PsTerminateSystemThread: status=0x%08X\n", exit_status);
+    fprintf(stderr, "  [KERNEL] PsTerminateSystemThread: status=0x%08X - calling ExitThread\n", exit_status);
     fflush(stderr);
 
-    g_eax = exit_status;
-    /* Simply return - caller will clean up */
+    ExitThread(exit_status);
+    /* Never returns */
 }
 
 /* ── HalReadSMCTrayState (ordinal 47) ─────────────────────
@@ -943,10 +942,20 @@ static void bridge_NtOpenFile(void)
     uint32_t share     = STACK_ARG(4);  /* ShareAccess */
     uint32_t options   = STACK_ARG(5);  /* OpenOptions */
 
+    /* Log the path being opened */
+    {
+        const char* path = bridge_get_xbox_path(obj_attrs);
+        fprintf(stderr, "  [KERNEL] NtOpenFile: path='%s' access=0x%X\n",
+            path ? path : "(null)", access);
+    }
+
     /* NtOpenFile = NtCreateFile with FILE_OPEN disposition */
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         0, share, 1 /* FILE_OPEN */, options);
+
+    fprintf(stderr, "  [KERNEL] NtOpenFile: result=0x%08X handle_va=0x%08X\n",
+        g_eax, handle_va);
 }
 
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
@@ -1582,6 +1591,7 @@ static void kernel_thunk_dispatch(void)
     int slot = g_kernel_dispatch_slot;
     bridge_func_t bridge;
     ULONG ordinal;
+    uint32_t esp_before = g_esp;
 
     if (slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
         fprintf(stderr, "  [KERNEL] bad slot %d\n", slot);
@@ -1595,7 +1605,7 @@ static void kernel_thunk_dispatch(void)
 
     g_kernel_call_count++;
 
-    if (g_kernel_call_count <= 200) {
+    if (g_kernel_call_count <= 500) {
         fprintf(stderr, "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X\n",
                 g_kernel_call_count, ordinal, slot, g_esp);
         fflush(stderr);
@@ -1642,9 +1652,31 @@ static void kernel_thunk_dispatch(void)
      * above; now pop the args. */
     g_esp += g_slot_arg_bytes[slot];
 
+    if (g_kernel_call_count == 20) {
+        __debugbreak();  /* first call after GPU init */
+    }
+
+    /* Detect ESP corruption: after the thunk, ESP should be near esp_before
+     * (the dummy return + args were popped). Large deviations indicate a bug. */
+    if (g_esp < 0x00780000 || g_esp > 0x03000000) {
+        fprintf(stderr, "  [KERNEL] ESP CORRUPTION after ordinal %u (slot %d): "
+            "before=0x%08X after=0x%08X delta=%d\n",
+            ordinal, slot, esp_before, g_esp, (int)(g_esp - esp_before));
+        fflush(stderr);
+    }
+
     if (g_kernel_call_count <= 200) {
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
         fflush(stderr);
+    }
+
+    /* ESP-guard: catch corruption immediately */
+    if (g_esp < 0x00780000 || g_esp > 0x0277FFF0) {
+        fprintf(stderr, "  [FATAL] ESP corrupt after kernel call #%d: esp=0x%08X\n",
+            g_kernel_call_count, g_esp);
+        fflush(stderr);
+        __debugbreak();
+        ExitProcess(1);
     }
 }
 
