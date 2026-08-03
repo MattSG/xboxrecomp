@@ -36,6 +36,13 @@ extern uint32_t g_ebx, g_esi, g_edi;
 extern uint32_t g_seh_ebp;
 extern ptrdiff_t g_xbox_mem_offset;
 
+/* Xbox file I/O bridge (src/xbox_file_bridge.c) */
+extern int xbox_file_register(FILE *fp);
+extern FILE *xbox_file_lookup(int handle);
+extern void xbox_file_close(int handle);
+extern size_t xbox_file_read(int handle, void *buf, size_t size);
+extern FILE *xbox_file_open(const char *path, const char *mode);
+
 /* Dispatch table lookup (for function pointer args) */
 typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t xbox_va);
@@ -902,6 +909,41 @@ static NTSTATUS bridge_create_file_impl(
     }
     memset(&ios, 0, sizeof(ios));
 
+    /* ── Xbox file I/O bridge: also open a real Windows file ── */
+    {
+        static int s_file_log = 0;
+        const char *xbox_path = name.Buffer ? name.Buffer : "(null)";
+        if (s_file_log < 10) {
+            fprintf(stderr, "[FILE] NtCreateFile: path='%s' access=0x%X disp=%d\n",
+                xbox_path, access, disposition);
+            s_file_log++;
+        }
+        /* Try to map Xbox path to game_files/Data/ */
+        /* Xbox paths look like \\Device\\Harddisk0\\Partition1\\... */
+        /* Strip the device prefix to get the game-relative path */
+        const char *rel = xbox_path;
+        /* Skip common Xbox device prefixes */
+        if (strncmp(rel, "\\Device\\", 8) == 0) {
+            rel = strchr(rel + 8, '\\');
+            if (rel) rel++; /* skip partition prefix */
+            if (rel && strncmp(rel, "Harddisk", 8) == 0) {
+                rel = strchr(rel, '\\');
+                if (rel) rel++;
+            }
+        }
+        if (rel && *rel) {
+            char win_path[1024];
+            snprintf(win_path, sizeof(win_path), "game_files\\Data\\%s", rel);
+            FILE *fp = xbox_file_open(win_path, "rb");
+            if (fp) {
+                int slot = xbox_file_register(fp);
+                fprintf(stderr, "[FILE] opened '%s' -> slot %d\n", win_path, slot);
+            } else if (s_file_log < 10) {
+                fprintf(stderr, "[FILE] not found: '%s'\n", win_path);
+            }
+        }
+    }
+
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
                            file_attrs, share, disposition, options);
 
@@ -1671,7 +1713,7 @@ static void kernel_thunk_dispatch(void)
     }
 
     /* ESP-guard: catch corruption immediately */
-    if (g_esp < 0x00780000 || g_esp > 0x0277FFF0) {
+    if (g_esp < 0x00780000 || g_esp > 0x02780FFF) {
         fprintf(stderr, "  [FATAL] ESP corrupt after kernel call #%d: esp=0x%08X\n",
             g_kernel_call_count, g_esp);
         fflush(stderr);
