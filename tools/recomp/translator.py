@@ -230,7 +230,17 @@ class FunctionTranslator:
 
         # Ensure ebp tracked if function calls __SEH_prolog or __SEH_epilog
         # (lifter emits ebp = g_seh_ebp readback after these calls).
-        SEH_FUNCS = {0x00244784, 0x002447BF}
+        # Use the per-title detected helpers (self.SEH_PROLOG/SEH_EPILOG),
+        # NOT the hardcoded fallback set — those addresses are stale for
+        # MM3 (real helpers: 0x00094FC0 prolog / 0x00094FFB epilog) and
+        # intra-function entry points that start at an SEH-epilog call
+        # would miss the ebp declaration and fail to compile.
+        SEH_FUNCS = {
+            self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG,
+            # keep the legacy constants as a fallback for titles where the
+            # detector does not run (single-function translation)
+            0x00244784, 0x002447BF,
+        }
         if any(insn.call_target in SEH_FUNCS for insn in instructions):
             used_regs.add("ebp")
 
@@ -597,6 +607,8 @@ class BatchTranslator:
         c_chunks.append('#define RECOMP_GENERATED_CODE')
         c_chunks.append('#include "recomp_types.h"')
         c_chunks.append('#include <math.h>')
+        c_chunks.append('#include <intrin.h>')
+        c_chunks.append('#include <windows.h>')
         c_chunks.append("")
         c_chunks.append("/* Forward declarations */")
 
@@ -777,6 +789,8 @@ class BatchTranslator:
                 "#define RECOMP_GENERATED_CODE",
                 f'#include "{header_name}"',
                 '#include <math.h>',
+                '#include <intrin.h>',
+                '#include <windows.h>',
                 "",
             ]
             for addr, name, code in chunk:

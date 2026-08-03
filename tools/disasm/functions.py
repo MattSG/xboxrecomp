@@ -5,16 +5,18 @@ Implements multi-pass function detection with confidence scoring:
 1. Known addresses (entry point)
 2. Standard prologues (push ebp; mov ebp, esp)
 3. CC padding boundaries (CC run after ret)
+3b. Packed glue-thunk tables (E8+A3+C3, no inter-function padding)
 4. Call targets (destinations of call instructions)
 5. Cross-validation and overlap resolution
 """
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
+import struct
 
 from . import config
 from .engine import DisasmEngine, Instruction
-from .loader import BinaryImage, SectionInfo
+from .loader import BinaryImage, SectionInfo, DATA_SECTION_NAMES
 from .xrefs import XRefTracker
 from .labels import LabelManager, Label, LabelType
 
@@ -106,8 +108,42 @@ class FunctionDetector:
         # Pass 4: Call targets
         self._pass_call_targets(sections)
 
+        # Pass 4b: Packed glue-thunk tables (no padding between leaf functions)
+        # Runs after call_target so the CALL destinations are in _candidates.
+        for sec in sections:
+            self._pass_thunk_tables(sec)
+
+        # Pass 4c: Jump targets (tail calls / intra-function entry points)
+        # The lifter treats any jump/cond_jump target outside the current
+        # function as an external call and emits a named call to it. If that
+        # target is not a registered function start, the recomp generates an
+        # empty stub, and the missing body returns garbage eax (MM3: 0x950EC
+        # shared body inside sub_000950E2). This pass needs function extents,
+        # so it runs iteratively AFTER _build_functions (Pass 5) below.
+        # (Implementation in _pass_external_jump_targets.)
+
+        # Pass 4d: Data-table function pointers (.data/.rdata)
+        # Functions referenced only through data tables (vtables, callback
+        # tables) have zero direct call/jump xrefs and are invisible to every
+        # code-scan pass. MM3: 0x00257E12 is stored in the .data callback
+        # table at 0x391F30 and never referenced from code. Scan writable
+        # data for dwords that point at decoded instruction boundaries in
+        # executable sections and register them as function starts.
+        self._pass_data_pointer_targets(sections)
+
         # Pass 5: Build functions from candidates
         self._build_functions(sections)
+
+        # Pass 5b: External jump targets (iterative).
+        # Loop back-edges land INSIDE their own function and must not become
+        # function starts; external tail-call targets must. Extents are only
+        # known after _build_functions, so scan, rebuild, repeat until the
+        # candidate set stabilizes (usually 1-2 rounds).
+        for _round in range(4):
+            added = self._pass_external_jump_targets(sections)
+            if not added:
+                break
+            self._build_functions(sections)
 
         # Populate call graph
         self._build_call_graph()
@@ -133,7 +169,9 @@ class FunctionDetector:
         """
         Pass 2: Scan for standard function prologues.
 
-        Looks for: push ebp (0x55); mov ebp, esp (0x8BEC or 0x89E5)
+        Detects:
+        - Standard: push ebp (0x55); mov ebp, esp (0x8BEC or 0x89E5)
+        - SEH:      push imm8 (0x6A); push imm32 (0x68); call rel32 (0xE8)
         """
         data = self.image.get_section_data(section)
         if not data:
@@ -147,7 +185,6 @@ class FunctionDetector:
                 if (i + 2 < len(data) and
                         data[i + 1] == 0x8B and data[i + 2] == 0xEC):
                     addr = va_start + i
-                    # Verify this address has a decoded instruction
                     if addr in self.engine.instructions:
                         self._add_candidate(
                             addr,
@@ -166,6 +203,19 @@ class FunctionDetector:
                             "prologue_alt"
                         )
                     i += 3
+                    continue
+            # Check for SEH prologue: push imm8; push imm32; call rel32
+            # Pattern: 6A XX 68 XX XX XX XX E8 XX XX XX XX
+            if data[i] == 0x6A and i + 10 < len(data):
+                if (data[i + 2] == 0x68 and data[i + 7] == 0xE8):
+                    addr = va_start + i
+                    if addr in self.engine.instructions:
+                        self._add_candidate(
+                            addr,
+                            config.CONFIDENCE_PROLOGUE * 0.9,
+                            "seh_prologue"
+                        )
+                    i += 10
                     continue
             i += 1
 
@@ -195,9 +245,8 @@ class FunctionDetector:
                 if cc_run_length >= config.MIN_CC_RUN and i < len(data):
                     # Check if instruction before CC run was a ret
                     before_addr = va_start + cc_start
-                    # Look for a ret instruction ending right at the CC run
                     found_ret = False
-                    for check_offset in range(1, 4):  # ret can be 1-3 bytes
+                    for check_offset in range(1, 4):
                         check_addr = before_addr - check_offset
                         insn = self.engine.get_instruction(check_addr)
                         if insn and insn.is_ret and insn.end_address == before_addr:
@@ -215,20 +264,113 @@ class FunctionDetector:
             else:
                 i += 1
 
+    def _pass_thunk_tables(self, section: SectionInfo) -> None:
+        """
+        Pass 3b: Detect packed glue-thunk tables.
+
+        Pattern: consecutive 11-byte leaf functions with zero padding:
+            E8 rel32        CALL  <real_function>
+            A3 abs32        MOV   [abs32], EAX
+            C3              RET
+
+        These are common in D3DX/XGRPH glue thunks. They lack prologues
+        and have no CC padding between entries, so the standard prologue
+        and CC-boundary passes miss them.
+
+        Only accepts candidates where:
+        - Section is executable
+        - Exact 3-instruction sequence: E8 rel32 + A3 abs32 + C3
+        - Bytes decode as valid instructions at exact boundaries
+        - CALL target is in an executable section with a decoded instruction
+        - A3 destination is a writable address in the XBE image
+        - Candidate doesn't overlap an existing function
+        """
+        if not section.executable:
+            return
+
+        data = self.image.get_section_data(section)
+        if not data or len(data) < 11:
+            return
+
+        va_start = section.virtual_addr
+        existing_funcs = set(self._candidates.keys())
+
+        i = 0
+        while i <= len(data) - 11:
+            # Check exact 11-byte thunk pattern
+            if (data[i] == 0xE8 and          # CALL rel32
+                data[i + 5] == 0xA3 and      # MOV [abs32], EAX
+                data[i + 10] == 0xC3):       # RET
+
+                addr = va_start + i
+
+                # (a) Must be at a decoded instruction boundary
+                if addr not in self.engine.instructions:
+                    i += 1
+                    continue
+
+                # (b) All 3 instructions must decode to exact boundaries
+                insn0 = self.engine.get_instruction(addr)
+                insn1 = self.engine.get_instruction(addr + 5)
+                insn2 = self.engine.get_instruction(addr + 10)
+                if not (insn0 and insn1 and insn2):
+                    i += 1
+                    continue
+                if not (insn0.end_address == addr + 5 and
+                        insn1.end_address == addr + 10 and
+                        insn2.end_address == addr + 11):
+                    i += 1
+                    continue
+
+                # (c) CALL target must be in executable section with
+                #     a decoded instruction AND already a known function
+                #     candidate from earlier passes (prologue/cc_boundary/
+                #     entry_point). This prevents matching thunks whose
+                #     CALL targets happen to decode but aren't real functions.
+                call_target = insn0.call_target
+                if call_target is None:
+                    i += 1
+                    continue
+                target_sec = self.image.get_section_at_va(call_target)
+                if not target_sec or not target_sec.executable:
+                    i += 1
+                    continue
+                if call_target not in self.engine.instructions:
+                    i += 1
+                    continue
+                if call_target not in existing_funcs:
+                    i += 1
+                    continue
+
+                # (d) A3 destination must be writable (in .data or .rdata)
+                store_dest = struct.unpack_from('<I', data, i + 6)[0]
+                dest_sec = self.image.get_section_at_va(store_dest)
+                if not dest_sec or not dest_sec.writable:
+                    i += 1
+                    continue
+
+                # (e) Must not overlap an existing function
+                #     Check that no existing function contains addr
+                if addr in existing_funcs:
+                    i += 1
+                    continue
+
+                self._add_candidate(
+                    addr,
+                    config.CONFIDENCE_CALL_TARGET * 0.9,
+                    "thunk_table"
+                )
+                i += 11
+                continue
+
+            i += 1
+
     def _pass_call_targets(self, sections: List[SectionInfo]) -> None:
         """
         Pass 4: Add destinations of direct call instructions as function starts.
         """
-        # Build set of valid code ranges
-        code_ranges = set()
-        for sec in sections:
-            for addr in range(sec.virtual_addr,
-                              sec.virtual_addr + sec.virtual_size):
-                code_ranges.add(addr)
-
         call_targets = self.engine.get_call_targets()
         for target in call_targets:
-            # Verify target is in a code section and has a decoded instruction
             if target in self.engine.instructions:
                 section = self.image.get_section_at_va(target)
                 if section and section.executable:
@@ -238,62 +380,152 @@ class FunctionDetector:
                         "call_target"
                     )
 
+    def _pass_external_jump_targets(self, sections: List[SectionInfo]) -> int:
+        """
+        Pass 5b: Register jump targets that leave their containing function.
+
+        Mirrors the lifter's _is_external_target logic: any unconditional
+        jump or conditional-jump target OUTSIDE [func.start, func.end) is
+        treated as an external call (tail call / conditional tail call) and
+        emitted as a named call. Targets INSIDE the same function (loop
+        back-edges, branch targets) become `goto` and are NOT entry points.
+
+        Returns the number of new candidates added (0 = stable).
+        """
+        funcs = list(self.functions.values())
+        added = 0
+        for func in funcs:
+            insns = self.engine.get_instructions_in_range(func.start, func.end)
+            for insn in insns:
+                target = insn.jump_target
+                if target is None:
+                    continue
+                if func.start <= target < func.end:
+                    continue  # internal branch (loop back-edge, if/else)
+                if target in self._candidates:
+                    continue
+                if target not in self.engine.instructions:
+                    continue
+                section = self.image.get_section_at_va(target)
+                if section is None or not section.executable:
+                    continue
+                self._add_candidate(
+                    target,
+                    config.CONFIDENCE_CALL_TARGET * 0.85,
+                    "jump_target"
+                )
+                added += 1
+        return added
+
+    def _pass_data_pointer_targets(self, sections: List[SectionInfo]) -> None:
+        """
+        Pass 4d: Register data-table function pointers as function starts.
+
+        Functions reachable only through data tables (vtables, callback
+        tables, class registries) have zero direct call/jump xrefs, so no
+        code-scan pass can see them. MM3: the init callback table at
+        0x391F30 stores 0x00257E12 (a D3DX thunk) which is only ever called
+        via ICALL from the table walker — never from code. Without a
+        dispatch entry it falls to the D3DX safe stub and returns a fake
+        pointer.
+
+        Scan writable data sections for 32-bit values that point at decoded
+        instruction boundaries inside executable sections. Each hit becomes
+        a function-start candidate. Only data sections with raw bytes are
+        scanned (BSS has no table content).
+        """
+        text_secs = [s for s in sections if s.executable]
+        if not text_secs:
+            return
+        # Valid instruction boundaries in executable sections
+        code_addrs = set(self.engine.instructions.keys())
+        # Candidate data sections: conventional PE data sections by name.
+        # XBE linkers mark .data/.rdata executable, so the executable flag
+        # is NOT a reliable discriminator — name is (loader.DATA_SECTION_NAMES
+        # is the same list get_code_sections uses to exclude them).
+        data_secs = [s for s in self.image.sections
+                     if s.name in DATA_SECTION_NAMES and s.raw_size >= 4]
+        for sec in data_secs:
+            data = self.image.get_section_data(sec)
+            if not data:
+                continue
+            # Only scan the raw portion (BSS tail has no initialized data)
+            n = min(len(data), sec.raw_size) - 3
+            for i in range(0, n, 4):
+                val = struct.unpack_from('<I', data, i)[0]
+                if val not in code_addrs:
+                    continue
+                target_sec = self.image.get_section_at_va(val)
+                if target_sec is None or not target_sec.executable:
+                    continue
+                if val in self._candidates:
+                    continue
+                self._add_candidate(
+                    val,
+                    config.CONFIDENCE_CALL_TARGET * 0.8,
+                    "data_pointer"
+                )
+
     def _build_functions(self, sections: List[SectionInfo]) -> None:
         """
         Pass 5: Build Function objects from candidates.
 
         Determines function boundaries by finding the extent of each
         function (up to the next function start or unreachable point).
+
+        Intra-entry candidates (jump_target / data_pointer) do NOT bound
+        the parent function: a tail-jump or data-table pointer can land in
+        the middle of another function's body (shared code body), and the
+        parent must keep its full terminator-based extent. Each intra
+        candidate still gets its own Function entry with its own extent
+        (overlapping ranges are intentional — trap #38: each entry point
+        produces its own translation starting at the right offset).
         """
-        # Sort candidates by address
+        INTRA_METHODS = {"jump_target", "data_pointer"}
+
         sorted_starts = sorted(self._candidates.keys())
         if not sorted_starts:
             return
 
-        # Build section boundary lookup
         sec_ranges = {}
         for sec in sections:
             sec_ranges[sec.name] = (sec.virtual_addr,
                                     sec.virtual_addr + sec.virtual_size)
 
-        # Create functions
         for idx, start_addr in enumerate(sorted_starts):
             confidence, method = self._candidates[start_addr]
 
-            # Determine section
             section = self.image.get_section_at_va(start_addr)
             sec_name = section.name if section else ""
 
-            # Determine end address:
-            # Walk instructions until we hit the next function start,
-            # leave the section, or reach an unconditional terminator
-            # with no fall-through.
-            if idx + 1 < len(sorted_starts):
-                next_func = sorted_starts[idx + 1]
-            else:
-                next_func = None
+            # Next REAL function boundary: skip intra-entry candidates that
+            # live inside this function's body (shared entry points).
+            next_func = None
+            for j in range(idx + 1, len(sorted_starts)):
+                cand = sorted_starts[j]
+                cand_method = self._candidates[cand][1]
+                if cand_method in INTRA_METHODS:
+                    continue
+                next_func = cand
+                break
 
-            # Section end boundary
             sec_end = None
             if section:
                 sec_end = section.virtual_addr + section.virtual_size
 
             end_addr = self._find_function_end(start_addr, next_func, sec_end)
 
-            # Count instructions
             insns = self.engine.get_instructions_in_range(start_addr, end_addr)
             num_insns = len(insns)
 
             if num_insns == 0:
                 continue
 
-            # Check for prologue
             first_insn = self.engine.get_instruction(start_addr)
             has_prologue = (first_insn is not None and
                             first_insn.mnemonic == "push" and
                             first_insn.op_str == "ebp")
 
-            # Get or create name
             label = self.labels.get(start_addr)
             if label:
                 name = label.name
@@ -316,16 +548,10 @@ class FunctionDetector:
 
     def _find_function_end(self, start: int, next_func: Optional[int],
                            sec_end: Optional[int]) -> int:
-        """
-        Determine where a function ends.
-
-        Walks forward from start, tracking the furthest reachable point
-        through fall-through and internal jumps.
-        """
+        """Determine where a function ends."""
         max_addr = start
         addr = start
 
-        # Upper bound
         upper = sec_end if sec_end else start + 0x100000
         if next_func and next_func < upper:
             upper = next_func
@@ -339,18 +565,14 @@ class FunctionDetector:
             if end > max_addr:
                 max_addr = end
 
-            # Track internal forward jumps to extend function bounds
             if insn.is_cond_jump and insn.jump_target is not None:
                 target = insn.jump_target
                 if start <= target < upper and target > max_addr:
-                    # This jump goes forward within bounds, extend
                     max_addr = target
 
             if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
-                # Check if we've covered all internal jump targets
                 if addr + insn.size >= max_addr:
                     break
-                # There might be more code after (jumped over)
                 addr = insn.end_address
                 continue
 
@@ -376,16 +598,13 @@ class FunctionDetector:
                 if callee is not None:
                     callee.called_by.append(func.start)
 
-        # Sort called_by lists
         for func in self.functions.values():
             func.called_by = sorted(set(func.called_by))
 
     def get_function_at(self, addr: int) -> Optional[Function]:
         """Get the function containing an address."""
-        # First check direct match
         if addr in self.functions:
             return self.functions[addr]
-        # Search for containing function
         for func in self.functions.values():
             if func.start <= addr < func.end:
                 return func
