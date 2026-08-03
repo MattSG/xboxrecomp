@@ -135,7 +135,10 @@ void recomp_icall_fail_log(uint32_t va);
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
  * our mapping and causing access violations.
  */
-#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+#define XBOX_PTR(addr) \
+    (((uintptr_t)(uint32_t)(addr) >= 0xFE000000u) \
+        ? ((uintptr_t)((uint32_t)(addr) & 0x0000FFFFu) + g_xbox_mem_offset) \
+        : ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset))
 
 /** Read/write N bytes at a flat Xbox memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
@@ -342,13 +345,13 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_count++; \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
-        g_esp += 4; eax = 0; break; \
+        recomp_icall_fail_log(_va); g_esp += 4; eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) _fn(); \
-    else { g_esp += 4; eax = 0; } \
+    else { recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
 
 /**
@@ -368,13 +371,13 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     } \
     g_icall_count++; \
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
-        g_esp = (saved_esp); eax = 0; break; \
+        recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) _fn(); \
-    else { g_esp = (saved_esp); eax = 0; } \
+    else { recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
 
 /**
@@ -389,6 +392,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     if (!_fn) _fn = recomp_lookup((uint32_t)(xbox_va)); \
     if (!_fn) _fn = recomp_lookup_kernel((uint32_t)(xbox_va)); \
     if (_fn) _fn(); \
+    else recomp_icall_fail_log((uint32_t)(xbox_va)); \
 } while(0)
 
 /* ================================================================
@@ -422,5 +426,30 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * The recomp_funcs.h header (generated) declares all translated
  * function prototypes.
  * ================================================================ */
+
+/* Debug registers (x86 dr0-dr7) — referenced by generated code */
+extern uint32_t dr0, dr1, dr2, dr3, dr6, dr7;
+
+/* ── Xbox file I/O bridge (generated code only) ────────
+ * Only active when RECOMP_CRT_BRIDGE is defined.
+ * This prevents macros from breaking hand-written code
+ * (main.c, recomp_manual.c, xbox_file_bridge.c). */
+#ifdef RECOMP_CRT_BRIDGE
+
+extern size_t xbox_fread_s(void *buf, size_t bufsz, size_t elsz,
+                           size_t cnt, FILE *stream);
+#define fread_s(buf, bufsz, elsz, cnt, stream) \
+    xbox_fread_s(buf, bufsz, elsz, cnt, stream)
+extern size_t xbox_fread(void *buf, size_t sz, size_t cnt, FILE *stream);
+#define fread(buf, sz, cnt, stream) xbox_fread(buf, sz, cnt, stream)
+
+/* Blanket output macros: prevent fprintf/fputs/fwrite crashes */
+#define fprintf(stream, ...) 0
+#define fputs(str, stream) 0
+#define fputc(c, stream) (-1)
+#define fwrite(buf, sz, cnt, stream) ((size_t)0)
+#define fflush(stream) 0
+
+#endif /* RECOMP_CRT_BRIDGE */
 
 #endif /* RECOMP_TYPES_H */
