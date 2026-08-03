@@ -932,7 +932,17 @@ static NTSTATUS bridge_create_file_impl(
             }
         }
         if (rel && *rel) {
+            /* Skip trailing partition name if it's just "partition1\\" */
+            if (strncmp(rel, "partition", 9) == 0 || strncmp(rel, "Partition", 9) == 0) {
+                rel = strchr(rel, '\\');
+                if (rel) rel++;
+            }
+        }
+        {
             char win_path[1024];
+            if (!rel || !*rel) {
+                /* Root directory */snprintf(win_path, sizeof(win_path), "game_files\\Data");
+            } else {
             snprintf(win_path, sizeof(win_path), "game_files\\Data\\%s", rel);
             FILE *fp = xbox_file_open(win_path, "rb");
             if (fp) {
@@ -940,6 +950,7 @@ static NTSTATUS bridge_create_file_impl(
                 fprintf(stderr, "[FILE] opened '%s' -> slot %d\n", win_path, slot);
             } else if (s_file_log < 10) {
                 fprintf(stderr, "[FILE] not found: '%s'\n", win_path);
+            }
             }
         }
     }
