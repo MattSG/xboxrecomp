@@ -855,10 +855,12 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h)
         BRIDGE_MEM32(handle_va) = bridge_handle_token(h);
 }
 
-/* Resolve a 32-bit Xbox handle slot back to a native HANDLE. */
-static HANDLE bridge_read_handle(uint32_t va)
+/* Resolve a 32-bit handle token to a native HANDLE.
+ * Tokens are tagged with BRIDGE_HANDLE_TAG in the high byte;
+ * untagged values pass through as synthetic/dummy handles.
+ * This treats the argument as a TOKEN VALUE, not a VA pointer. */
+static HANDLE bridge_read_handle(uint32_t token)
 {
-    uint32_t token = BRIDGE_MEM32(va);
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
@@ -967,42 +969,39 @@ static NTSTATUS bridge_create_file_impl(
                            file_attrs, share, disposition, options);
 
     if (NT_SUCCESS(st)) {
-        /* Convert Windows HANDLE → CRT FILE* via _open_osfhandle + _fdopen.
-         * Store the slot index as the Xbox handle (32-bit safe).
-         * This ensures the game never receives a raw HANDLE as FILE*. */
-        FILE *fp = NULL;
-        int slot = 0;
+        /* Always store the native Windows HANDLE for kernel I/O
+         * (NtReadFile, NtClose, etc.). The handle-table token
+         * is tagged and stored in Xbox memory. */
+        bridge_write_handle(handle_va, h);
 
+        /* Also register a CRT FILE* for fread/fread_s interception.
+         * Uses a duplicated handle so CRT owns the dup while the
+         * kernel keeps the original for ReadFile-based NtReadFile. */
         if (h && h != INVALID_HANDLE_VALUE) {
-            int fd = _open_osfhandle((intptr_t)h, _O_RDONLY);
-            if (fd != -1) {
-                fp = _fdopen(fd, "rb");
-                if (fp) {
-                    /* Register in the shared FILE* table → get slot index */
-                    slot = xbox_file_register(fp);
-                    if (!slot) {
-                        fclose(fp); /* slot table full */
-                        fp = NULL;
+            HANDLE dup_h = NULL;
+            if (DuplicateHandle(GetCurrentProcess(), h,
+                    GetCurrentProcess(), &dup_h,
+                    0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                int fd = _open_osfhandle((intptr_t)dup_h, _O_RDONLY);
+                if (fd != -1) {
+                    FILE *fp = _fdopen(fd, "rb");
+                    if (fp) {
+                        int slot = xbox_file_register(fp);
+                        if (slot) {
+                            xbox_handle_register_file(slot, fp);
+                        } else {
+                            fclose(fp);
+                        }
+                    } else {
+                        _close(fd);
                     }
                 } else {
-                    _close(fd);
+                    CloseHandle(dup_h);
                 }
             }
         }
 
-        /* Write slot index as handle (or original HANDLE if conversion failed) */
-        bridge_write_handle(handle_va, (HANDLE)(uintptr_t)(slot ? (uintptr_t)slot : (uintptr_t)h));
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
-
-        /* Register slot → FILE* mapping for CRT interception */
-        if (slot && fp) {
-            xbox_handle_register_file(slot, fp);
-        }
-
-        /* Also keep win_fp mapping if we had a separate Windows file open */
-        if (win_fp) {
-            xbox_handle_register_file(win_slot ? win_slot : slot, win_fp);
-        }
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
     }
