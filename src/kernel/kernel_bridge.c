@@ -1828,10 +1828,6 @@ static void kernel_thunk_dispatch(void)
      * above; now pop the args. */
     g_esp += g_slot_arg_bytes[slot];
 
-    if (g_kernel_call_count == 20) {
-        __debugbreak();  /* first call after GPU init */
-    }
-
     /* Detect ESP corruption: after the thunk, ESP should be near esp_before
      * (the dummy return + args were popped). Large deviations indicate a bug. */
     if (g_esp < 0x00780000 || g_esp > 0x03000000) {
