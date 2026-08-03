@@ -779,6 +779,11 @@ class Lifter:
         ops = insn.operands
         nops = len(ops)
 
+        # LOCK prefix is meaningless in recompiled code (not atomic context).
+        # Underlying instruction is lifted normally.
+        if hasattr(insn, 'prefix') and 0xF0 in insn.prefix:
+            pass  # strip LOCK, continue to normal lift
+
         # ── NOP ──
         if m == "nop" or (m == "lea" and nops == 2 and
                           ops[0].type == "reg" and ops[1].type == "mem" and
@@ -867,6 +872,9 @@ class Lifter:
             return [f"{r} = BSWAP32({r}); /* bswap */"]
         if m == "int3":
             return ["__debugbreak(); /* int3 */"]
+        if m == "int" and insn.op_str == "0x2d":
+            return ["/* int 0x2d — Xbox kernel service dispatch */",
+                    "eax = xbox_int_0x2d(eax, ecx, edx);"]
         if m in ("leave",):
             return ["esp = ebp;", "POP32(esp, ebp); /* leave */"]
         if m in ("cld", "std"):
@@ -915,6 +923,30 @@ class Lifter:
         # ── FPU ──
         if m.startswith("f"):
             return self._lift_fpu(insn, m, ops)
+
+        # ── Privileged / special ──
+        if m == "rdtsc":
+            return ["/* rdtsc → edx:eax */",
+                    "edx = (uint32_t)(__rdtsc() >> 32);",
+                    "eax = (uint32_t)__rdtsc();"]
+        if m == "cpuid":
+            return ["/* cpuid */",
+                    "{ int _cpu_info[4];",
+                    "  __cpuidex(_cpu_info, (int)eax, (int)ecx);",
+                    "  eax = _cpu_info[0]; ebx = _cpu_info[1];",
+                    "  ecx = _cpu_info[2]; edx = _cpu_info[3]; }"]
+        if m == "hlt":
+            return ["/* hlt — yield CPU */",
+                    "SwitchToThread();"]
+        if m == "cli":
+            return ["/* cli — no-op in user mode */"]
+        if m == "sti":
+            return ["/* sti — no-op in user mode */"]
+        if m in ("in", "insb", "insd", "insw"):
+            return ["/* in — zero in user mode */",
+                    "eax = 0;"]
+        if m in ("out", "outsb", "outsd", "outsw"):
+            return ["/* out — no-op in user mode */"]
 
         # ── Unhandled ──
         return [f"/* TODO: {m} {insn.op_str} */"]

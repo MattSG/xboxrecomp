@@ -451,6 +451,46 @@ static void bridge_NtFreeVirtualMemory(void)
         XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
 }
 
+/* ── NtQueryVirtualMemory (ordinal 217) ────────────────────
+ * NTSTATUS NtQueryVirtualMemory(PVOID BaseAddress,
+ *     PMEMORY_BASIC_INFORMATION MemoryInformation,
+ *     ULONG MemoryInformationLength, PULONG ReturnLength)
+ *
+ * The game passes an XBOX VA as BaseAddress (e.g. the image-base
+ * region during heap init in sub_000854CF). The host VirtualQuery
+ * must receive the NATIVE address (VA + g_xbox_mem_offset), not the
+ * raw guest VA — otherwise it fails with STATUS_INVALID_PARAMETER and
+ * the game's heap init returns 0, leaving 0x46A154=0 and driving the
+ * allocator pool-grow recursion (sub_000858F3). */
+static void bridge_NtQueryVirtualMemory(void)
+{
+    uint32_t base_va = STACK_ARG(0);
+    uint32_t info_ptr = STACK_ARG(1);
+    uint32_t info_len = STACK_ARG(2);
+    uint32_t ret_len_ptr = STACK_ARG(3);
+
+    /* Translate the guest VA to the native mapping (critical). */
+    void *native_base = XBOX_TO_NATIVE(base_va);
+
+    if (g_kernel_call_count <= 200) {
+        fprintf(stderr, "  [KERNEL] NtQueryVirtualMemory: base=0x%08X (native %p) len=%u\n",
+                base_va, native_base, info_len);
+        fflush(stderr);
+    }
+
+    NTSTATUS status = xbox_NtQueryVirtualMemory(
+        native_base, XBOX_TO_NATIVE(info_ptr), info_len,
+        (PULONG)XBOX_TO_NATIVE(ret_len_ptr));
+
+    if (g_kernel_call_count <= 200) {
+        fprintf(stderr, "  [KERNEL] NtQueryVirtualMemory: → status=0x%08X\n",
+                (uint32_t)status);
+        fflush(stderr);
+    }
+
+    g_eax = (uint32_t)status;
+}
+
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─
  * Must allocate from Xbox heap so the returned pointer is an Xbox VA
  * that can be accessed via MEM32(). Native HeapAlloc returns 64-bit
@@ -1615,6 +1655,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* Memory - virtual */
     case 184: return bridge_NtAllocateVirtualMemory;
     case 199: return bridge_NtFreeVirtualMemory;
+    case 217: return bridge_NtQueryVirtualMemory;
 
     /* Pool */
     case  15: return bridge_ExAllocatePool;
@@ -1705,9 +1746,50 @@ static void kernel_thunk_dispatch(void)
         fflush(stderr);
     }
 
-    {
-        static DWORD last_summary_tick = 0;
+    /* Diagnostic: dump the 0x3929D0/0x3929EC lock-list state once when the
+     * EnterCS/LeaveCS recursion signature appears (esp deep in the thread
+     * stack while EnterCS is called repeatedly). NON-M4. */
+    if (ordinal == 277 && g_esp < 0x0277F000u && g_esp > 0x02700000u) {
+        static int s_lock_dump = 0;
+        if (s_lock_dump < 3) {
+            fprintf(stderr, "[LOCKDUMP] #%d esp=0x%08X seh_ebp=0x%08X\n",
+                g_kernel_call_count, g_esp, g_seh_ebp);
+            {
+                extern ptrdiff_t g_xbox_mem_offset;
+                uint32_t *m = (uint32_t *)((uintptr_t)g_xbox_mem_offset);
+                fprintf(stderr, "[LOCKDUMP]   MEM32(0x46A154)=0x%08X MEM32(0x3C01C8)=0x%08X\n",
+                    *(volatile uint32_t*)((uintptr_t)0x46A154u + g_xbox_mem_offset),
+                    *(volatile uint32_t*)((uintptr_t)0x3C01C8u + g_xbox_mem_offset));
+                fprintf(stderr, "[LOCKDUMP]   IAT: 0x361FA8=0x%08X 0x361FB0=0x%08X 0x361FB4=0x%08X\n",
+                    *(volatile uint32_t*)((uintptr_t)0x361FA8u + g_xbox_mem_offset),
+                    *(volatile uint32_t*)((uintptr_t)0x361FB0u + g_xbox_mem_offset),
+                    *(volatile uint32_t*)((uintptr_t)0x361FB4u + g_xbox_mem_offset));
+                fprintf(stderr, "[LOCKDUMP]   slot44 ordinal=%u slot20 ordinal=%u\n",
+                    g_slot_ordinals[44], g_slot_ordinals[20]);
+                uint32_t base10118 = *(volatile uint32_t*)((uintptr_t)0x10118u + g_xbox_mem_offset);
+                fprintf(stderr, "[LOCKDUMP]   MEM32(0x10118)=0x%08X\n", base10118);
+                if (base10118 && base10118 < 0x01000000u) {
+                    for (int i = 0; i < 6; i++) {
+                        uint32_t v = *(volatile uint32_t*)((uintptr_t)(base10118 + i*4) + g_xbox_mem_offset);
+                        fprintf(stderr, "[LOCKDUMP]     [0x%08X+%d]=0x%08X\n", base10118, i*4, v);
+                    }
+                }
+            }
+            /* Native caller chain: who is calling EnterCS recursively? */
+            void *frames[20];
+            USHORT n = CaptureStackBackTrace(0, 20, frames, NULL);
+            HMODULE mod = GetModuleHandle(NULL);
+            for (USHORT i = 0; i < n; i++) {
+                fprintf(stderr, "[LOCKDUMP]   [%u] module+0x%zX\n", i,
+                    (uintptr_t)frames[i] - (uintptr_t)mod);
+            }
+            s_lock_dump++;
+            fflush(stderr);
+        }
+    }
         DWORD now = GetTickCount();
+        {
+        static DWORD last_summary_tick = 0;
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",

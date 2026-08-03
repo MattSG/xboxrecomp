@@ -338,8 +338,19 @@ class FunctionTranslator:
         # ebp is a local variable that would start uninitialized, causing
         # crashes when the function reads MEM32(ebp + offset). The g_seh_ebp
         # global bridges ebp across function boundaries.
-        if frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue:
-            lines.append(f"    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */")
+        #
+        # The same init is REQUIRED for functions with a classic
+        # "push ebp; mov ebp, esp" prologue: the first instruction pushes
+        # EBP (the caller's frame) onto the stack to save it. In C, that
+        # PUSH32(esp, ebp) reads the local ebp, which is uninitialized,
+        # pushing a garbage "saved frame" that later propagates into the
+        # simulated frame chain and g_seh_ebp via tail jumps and SEH
+        # epilogs (observed: g_seh_ebp = 0x????1038 native-heap fragments,
+        # then AV when a callee dereferences the poisoned frame). Initializing
+        # ebp from g_seh_ebp before the push makes the saved-frame slot hold
+        # the true caller frame, exactly like real x86.
+        if "ebp" in used_regs:
+            lines.append(f"    ebp = g_seh_ebp; /* bridge caller frame from SEH global */")
 
         lines.append(f"")
 

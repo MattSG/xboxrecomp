@@ -551,12 +551,21 @@ class FunctionDetector:
         """Determine where a function ends."""
         max_addr = start
         addr = start
+        visited = set()
 
         upper = sec_end if sec_end else start + 0x100000
         if next_func and next_func < upper:
             upper = next_func
 
         while addr < upper:
+            # Guard against infinite loops when following internal jmp
+            # targets (e.g. a jmp back to an earlier block). Since the walk
+            # only follows forward jumps inside [start, upper), a revisit
+            # means we are in a cycle we already covered.
+            if addr in visited:
+                break
+            visited.add(addr)
+
             insn = self.engine.get_instruction(addr)
             if insn is None:
                 break
@@ -571,6 +580,16 @@ class FunctionDetector:
                     max_addr = target
 
             if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
+                # Unconditional jmp: if the target is INSIDE this function's
+                # extent (a local forward/backward branch, e.g. a jump over a
+                # block or a loop), keep walking from the target — the
+                # function continues there until a ret. Only a jump to a
+                # target at/after upper (another function) terminates.
+                if (insn.is_jump and not insn.is_cond_jump
+                        and insn.jump_target is not None
+                        and start <= insn.jump_target < upper):
+                    addr = insn.jump_target
+                    continue
                 if addr + insn.size >= max_addr:
                     break
                 addr = insn.end_address
