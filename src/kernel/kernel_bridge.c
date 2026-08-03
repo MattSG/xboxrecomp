@@ -904,6 +904,7 @@ static NTSTATUS bridge_create_file_impl(
     HANDLE   h  = NULL;
     NTSTATUS st;
     FILE    *win_fp = NULL;  /* Windows FILE* from xbox_file_open */
+    int      win_slot = 0;   /* slot index in file table */
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
     if (!name.Buffer) {
@@ -950,7 +951,8 @@ static NTSTATUS bridge_create_file_impl(
             FILE *fp = xbox_file_open(win_path, "rb");
             if (fp) {
                 int slot = xbox_file_register(fp);
-                win_fp = fp; /* save for later HANDLE mapping */
+                win_fp = fp;   /* save for later HANDLE mapping */
+                win_slot = slot; /* save slot index */
                 fprintf(stderr, "[FILE] opened '%s' -> slot %d\n", win_path, slot);
             } else if (s_file_log < 10) {
                 fprintf(stderr, "[FILE] not found: '%s'\n", win_path);
@@ -963,10 +965,12 @@ static NTSTATUS bridge_create_file_impl(
                            file_attrs, share, disposition, options);
 
     if (NT_SUCCESS(st)) {
-        bridge_write_handle(handle_va, h);
+        /* If we opened a Windows file, write the slot index as handle.
+         * fread/fread_s macros look up the real FILE* from the slot. */
+        HANDLE write_handle = win_slot ? (HANDLE)(uintptr_t)win_slot : h;
+        bridge_write_handle(handle_va, write_handle);
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
-        /* Register Xbox HANDLE → Windows FILE* mapping */
-        if (win_fp) xbox_handle_register_file(h, win_fp);
+        if (win_fp) xbox_handle_register_file(write_handle, win_fp);
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
     }
