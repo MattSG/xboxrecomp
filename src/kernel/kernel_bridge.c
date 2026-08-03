@@ -42,6 +42,8 @@ extern FILE *xbox_file_lookup(int handle);
 extern void xbox_file_close(int handle);
 extern size_t xbox_file_read(int handle, void *buf, size_t size);
 extern FILE *xbox_file_open(const char *path, const char *mode);
+extern void xbox_handle_register_file(HANDLE xbox_handle, FILE *fp);
+extern FILE *xbox_handle_lookup_file(int xbox_handle);
 
 /* Dispatch table lookup (for function pointer args) */
 typedef void (*recomp_func_t)(void);
@@ -901,6 +903,7 @@ static NTSTATUS bridge_create_file_impl(
     XBOX_IO_STATUS_BLOCK   ios;
     HANDLE   h  = NULL;
     NTSTATUS st;
+    FILE    *win_fp = NULL;  /* Windows FILE* from xbox_file_open */
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
     if (!name.Buffer) {
@@ -947,6 +950,7 @@ static NTSTATUS bridge_create_file_impl(
             FILE *fp = xbox_file_open(win_path, "rb");
             if (fp) {
                 int slot = xbox_file_register(fp);
+                win_fp = fp; /* save for later HANDLE mapping */
                 fprintf(stderr, "[FILE] opened '%s' -> slot %d\n", win_path, slot);
             } else if (s_file_log < 10) {
                 fprintf(stderr, "[FILE] not found: '%s'\n", win_path);
@@ -961,6 +965,8 @@ static NTSTATUS bridge_create_file_impl(
     if (NT_SUCCESS(st)) {
         bridge_write_handle(handle_va, h);
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
+        /* Register Xbox HANDLE → Windows FILE* mapping */
+        if (win_fp) xbox_handle_register_file(h, win_fp);
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
     }
