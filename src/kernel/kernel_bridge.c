@@ -29,6 +29,8 @@
 #include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <float.h>
+#include <io.h>       /* _open_osfhandle */
+#include <fcntl.h>    /* _O_RDONLY, etc. */
 
 /* Access to recompiled code globals */
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
@@ -965,12 +967,42 @@ static NTSTATUS bridge_create_file_impl(
                            file_attrs, share, disposition, options);
 
     if (NT_SUCCESS(st)) {
-        /* If we opened a Windows file, write the slot index as handle.
-         * fread/fread_s macros look up the real FILE* from the slot. */
-        HANDLE write_handle = win_slot ? (HANDLE)(uintptr_t)win_slot : h;
-        bridge_write_handle(handle_va, write_handle);
+        /* Convert Windows HANDLE → CRT FILE* via _open_osfhandle + _fdopen.
+         * Store the slot index as the Xbox handle (32-bit safe).
+         * This ensures the game never receives a raw HANDLE as FILE*. */
+        FILE *fp = NULL;
+        int slot = 0;
+
+        if (h && h != INVALID_HANDLE_VALUE) {
+            int fd = _open_osfhandle((intptr_t)h, _O_RDONLY);
+            if (fd != -1) {
+                fp = _fdopen(fd, "rb");
+                if (fp) {
+                    /* Register in the shared FILE* table → get slot index */
+                    slot = xbox_file_register(fp);
+                    if (!slot) {
+                        fclose(fp); /* slot table full */
+                        fp = NULL;
+                    }
+                } else {
+                    _close(fd);
+                }
+            }
+        }
+
+        /* Write slot index as handle (or original HANDLE if conversion failed) */
+        bridge_write_handle(handle_va, (HANDLE)(uintptr_t)(slot ? (uintptr_t)slot : (uintptr_t)h));
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
-        if (win_fp) xbox_handle_register_file(write_handle, win_fp);
+
+        /* Register slot → FILE* mapping for CRT interception */
+        if (slot && fp) {
+            xbox_handle_register_file(slot, fp);
+        }
+
+        /* Also keep win_fp mapping if we had a separate Windows file open */
+        if (win_fp) {
+            xbox_handle_register_file(win_slot ? win_slot : slot, win_fp);
+        }
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
     }
