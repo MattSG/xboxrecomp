@@ -29,3 +29,7 @@ build/
 bin/
 *.obj
 *.exe
+
+# Generated title output lives in the outer repo only
+src/game/
+

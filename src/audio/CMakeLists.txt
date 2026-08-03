@@ -15,7 +15,7 @@ target_link_libraries(xbox_dsound PUBLIC xbox_apu)
 target_link_libraries(xbox_dsound PUBLIC platform)
 
 if(MSVC)
-    target_compile_options(xbox_dsound PRIVATE /W4 /O2)
+    target_compile_options(xbox_dsound PRIVATE /W4 $<$<CONFIG:Release>:/O2>$<$<CONFIG:Debug>:/Od>)
 else()
     target_compile_options(xbox_dsound PRIVATE -Wall -Wextra -O2)
 endif()

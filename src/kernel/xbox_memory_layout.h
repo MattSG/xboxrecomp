@@ -128,7 +128,7 @@ ptrdiff_t xbox_GetMemoryOffset(void);
  *  Increased from 1 MB because failed RECOMP_ICALL indirect calls
  *  can leak stdcall args onto the stack each frame. An 8 MB stack
  *  provides enough headroom for extended gameplay sessions. */
-#define XBOX_STACK_SIZE     (8 * 1024 * 1024)
+#define XBOX_STACK_SIZE     (32 * 1024 * 1024)
 
 /** Base VA of the stack area (above last XBE section). */
 #define XBOX_STACK_BASE     0x00780000
