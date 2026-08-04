@@ -135,6 +135,32 @@ def _fixup_unbalanced_saves(lines, func_addr=None, seh_epilog=None):
     if not pop_order:
         return lines
 
+    # Arg-cleanup epilogues: when the first pop immediately follows a call,
+    # the pops are stdcall arg cleanup that loads the call's args back into
+    # edi/esi/ebx (e.g. sub_0008726E: push [ebp-4]/ecx/eax; call sub_00086ED2;
+    # pop edi/esi/ebx). Rebalancing such a function injects self-pushes that
+    # rotate the pop targets (edi/esi/ebx receive the arg slots instead of the
+    # saved frame slots), exactly like the __SEH_epilog bug. Only skip when a
+    # call is immediately above the first pop (the shared-epilogue restore
+    # pattern has no such call).
+    first_pop_idx = None
+    for i, line in enumerate(lines):
+        if pop_re.match(line):
+            first_pop_idx = i
+            break
+    if first_pop_idx is not None and first_pop_idx > 0:
+        prev_idx = first_pop_idx - 1
+        while prev_idx > 0:
+            _s = lines[prev_idx].strip()
+            if (re.match(r'^loc_[0-9A-Fa-f]+:', _s) or not _s
+                    or _s.startswith('/*')):
+                prev_idx -= 1
+                continue
+            break
+        prev = lines[prev_idx]
+        if re.search(r'sub_[0-9A-Fa-f]+\(\);', prev) or 'RECOMP_ICALL' in prev:
+            return lines
+
     push_count = {}
     for line in lines:
         m = push_re.match(line)

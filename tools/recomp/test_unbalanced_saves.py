@@ -145,10 +145,44 @@ def test_seh_epilog_is_not_rebalanced():
     print("ok  seh_epilog_is_not_rebalanced")
 
 
+def _sample_arg_cleanup_epilog():
+    """sub_0008726E-style shared epilogue helper: pushes the call args
+    ([ebp-4], ecx, eax), calls a function, then pops the args back into
+    edi/esi/ebx (stdcall arg cleanup that loads the args into the registers).
+    The pops outnumber the pushes, but rebalancing would inject self-pushes
+    that rotate the pop targets (edi/esi/ebx receive the arg slots instead of
+    the saved frame slots), leaking callee-saved registers to the caller."""
+    return [
+        "void sub_0008726E(void)",
+        "{",
+        "loc_0008726E: ;",
+        "    PUSH32(esp, MEM32(ebp + -4));",
+        "    PUSH32(esp, ecx);",
+        "    PUSH32(esp, eax);",
+        "    PUSH32(esp, 0); sub_00086ED2(); /* call 0x00086ED2 */",
+        "loc_00087278: ;",
+        "    POP32(esp, edi);",
+        "    POP32(esp, esi);",
+        "    POP32(esp, ebx);",
+        "    esp = ebp;",
+        "    POP32(esp, ebp); /* leave */",
+        "    esp += 4; return;",
+        "}",
+    ]
+
+
+def test_arg_cleanup_epilog_is_not_rebalanced():
+    sample = _sample_arg_cleanup_epilog()
+    out = _fixup_unbalanced_saves(list(sample))
+    assert out == sample, "arg-cleanup epilog must not be rebalanced"
+    print("ok  arg_cleanup_epilog_is_not_rebalanced")
+
+
 if __name__ == "__main__":
     test_unbalanced_is_balanced_after_fixup()
     test_balanced_function_is_untouched()
     test_no_pop_means_no_change()
     test_preserves_function_entry_label()
     test_seh_epilog_is_not_rebalanced()
+    test_arg_cleanup_epilog_is_not_rebalanced()
     print("\nall passed")
