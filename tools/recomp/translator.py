@@ -14,9 +14,11 @@ Produces compilable C code using recomp_types.h macros.
 import json
 import os
 
-from .config import va_to_file_offset, is_code_address, TEXT_VA_START, TEXT_VA_END
+# Import the functions, not the VA constants: configure_from_xbe() rebinds those
+# at startup, so a by-value import would freeze the fallback layout.
+from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
-from .lifter import Lifter, lift_basic_block
+from .lifter import Lifter, lift_basic_block, detect_seh_helpers
 
 
 def _fixup_icall_esp_save(lines):
@@ -90,17 +92,141 @@ def _fixup_icall_esp_save(lines):
     return result
 
 
+def _fixup_unbalanced_saves(lines, func_addr=None, seh_epilog=None):
+    """
+    Balance callee-saved register save/restore in intra-function
+    shared-epilogue functions.
+
+    The disassembler registers intra-function jump targets (e.g. 0x84506, a
+    fall-through continuation of sub_000844B9) as standalone functions. Those
+    functions legitimately pop registers (edi/esi/ebx/ebp) that their own
+    prologue never pushed, because in the original binary the enclosing
+    function's prologue did the pushes. When lifted as a standalone C
+    function the epilogue then over-pops the simulated stack, corrupting
+    g_edi/g_ebx/g_ebp and leaking g_esp (observed: pool allocator's g_ebx
+    corrupted to 0x1C, free-list walk spins forever).
+
+    Fix: if a function pops more callee-saved registers than it pushes,
+    replace the initial register-push sequence with a balanced push of every
+    popped register in reverse-pop order, so the epilogue restores exactly
+    what the entry saved.
+
+    The __SEH_epilog is the one deliberate exception: it pops edi/esi/ebx
+    that the __SEH_prolog (a *different* function) pushed, so within the
+    epilog alone the pops outnumber the pushes. Rebalancing it injects
+    self-pushes that make the epilog pop its own current registers (a
+    rotation) instead of the prolog's saved frame slots, leaking callee-saved
+    registers to the caller (observed: the DICE allocator leaking g_esi =
+    pool base 0x02780000 into the vector grow, corrupting the copy args and
+    causing a runaway copy loop).
+    """
+    if seh_epilog is not None and func_addr == seh_epilog:
+        return lines
+    import re
+    CALLEE = ("edi", "esi", "ebx", "ebp")
+    push_re = re.compile(r'^\s*PUSH32\(esp, (edi|esi|ebx|ebp)\);')
+    pop_re = re.compile(r'^\s*POP32\(esp, (edi|esi|ebx|ebp)\);')
+
+    pop_order = []
+    for line in lines:
+        m = pop_re.match(line)
+        if m:
+            pop_order.append(m.group(1))
+    if not pop_order:
+        return lines
+
+    # Arg-cleanup epilogues: when the first pop immediately follows a call,
+    # the pops are stdcall arg cleanup that loads the call's args back into
+    # edi/esi/ebx (e.g. sub_0008726E: push [ebp-4]/ecx/eax; call sub_00086ED2;
+    # pop edi/esi/ebx). Rebalancing such a function injects self-pushes that
+    # rotate the pop targets (edi/esi/ebx receive the arg slots instead of the
+    # saved frame slots), exactly like the __SEH_epilog bug. Only skip when a
+    # call is immediately above the first pop (the shared-epilogue restore
+    # pattern has no such call).
+    first_pop_idx = None
+    for i, line in enumerate(lines):
+        if pop_re.match(line):
+            first_pop_idx = i
+            break
+    if first_pop_idx is not None and first_pop_idx > 0:
+        prev_idx = first_pop_idx - 1
+        while prev_idx > 0:
+            _s = lines[prev_idx].strip()
+            if (re.match(r'^loc_[0-9A-Fa-f]+:', _s) or not _s
+                    or _s.startswith('/*')):
+                prev_idx -= 1
+                continue
+            break
+        prev = lines[prev_idx]
+        if re.search(r'sub_[0-9A-Fa-f]+\(\);', prev) or 'RECOMP_ICALL' in prev:
+            return lines
+
+    push_count = {}
+    for line in lines:
+        m = push_re.match(line)
+        if m:
+            push_count[m.group(1)] = push_count.get(m.group(1), 0) + 1
+    pop_count = {}
+    for r in pop_order:
+        pop_count[r] = pop_count.get(r, 0) + 1
+
+    # Only fix functions with a net over-pop (the shared-epilogue pattern).
+    # The leave's "esp = ebp; POP ebp" restores the caller's frame, so ebp is
+    # never a genuine over-pop by itself: a normal function that balances its
+    # edi/esi/ebx pushes with matching pops (e.g. sub_00023213) would otherwise
+    # be rebalanced purely because of the leave, injecting self-pushes that
+    # shift every subsequent call's args on the simulated stack.
+    if not any(pop_count.get(r, 0) > push_count.get(r, 0) for r in ("edi", "esi", "ebx")):
+        return lines
+
+    # Locate the entry label and the initial consecutive register pushes.
+    label_idx = None
+    for i, line in enumerate(lines):
+        if re.match(r'^loc_[0-9A-Fa-f]+:', line):
+            label_idx = i
+            break
+    if label_idx is None:
+        return lines
+
+    init_pushes = []
+    j = label_idx + 1
+    while j < len(lines):
+        m = push_re.match(lines[j])
+        if m:
+            init_pushes.append((j, m.group(1)))
+            j += 1
+        else:
+            break
+
+    # Balanced push block: every popped register, in reverse-pop order.
+    needed = [f"    PUSH32(esp, {r});" for r in reversed(pop_order)]
+
+    for idx, _ in reversed(init_pushes):
+        del lines[idx]
+    # Re-locate the entry label after the deletions, then insert the block.
+    new_label_idx = None
+    for i, line in enumerate(lines):
+        if re.match(r'^loc_[0-9A-Fa-f]+:', line):
+            new_label_idx = i
+            break
+    if new_label_idx is None:
+        return lines
+    lines[new_label_idx + 1:new_label_idx + 1] = needed
+    return lines
+
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
-                 abi_db=None):
+                 abi_db=None, seh_prolog=None, seh_epilog=None):
         """
         xbe_data: bytes - raw XBE file contents
         func_db: dict - addr → function info from functions.json
         label_db: dict - addr → name from labels.json
         classification_db: dict - addr → classification from identified_functions.json
         abi_db: dict - addr → ABI info from abi_functions.json
+        seh_prolog/seh_epilog: override the detected SEH helper addresses
         """
         self.xbe_data = xbe_data
         self.func_db = func_db
@@ -108,7 +234,9 @@ class FunctionTranslator:
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
         self.disasm = Disassembler()
-        self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db, xbe_data=xbe_data)
+        self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
+                             xbe_data=xbe_data, seh_prolog=seh_prolog,
+                             seh_epilog=seh_epilog)
 
     def _read_func_bytes(self, start_va, end_va):
         """Read raw bytes for a function from the XBE."""
@@ -223,21 +351,19 @@ class FunctionTranslator:
         if has_tail_jump:
             used_regs.add("ebp")
 
-        # Conditional jumps can also leave a detector-split function and must
-        # publish the inherited frame before entering the continuation.
-        if any(insn.is_cond_jump and insn.jump_target and
-               not (start <= insn.jump_target < end)
-               for insn in instructions):
-            used_regs.add("ebp")
-
-        # Direct calls may enter an fpo_leaf callee that inherits EBP through
-        # g_seh_ebp, so every direct caller must retain and publish its frame.
-        if any(insn.call_target for insn in instructions):
-            used_regs.add("ebp")
-
         # Ensure ebp tracked if function calls __SEH_prolog or __SEH_epilog
         # (lifter emits ebp = g_seh_ebp readback after these calls).
-        SEH_FUNCS = {0x00244784, 0x002447BF, 0x00094FC0, 0x00094FFB}
+        # Use the per-title detected helpers (self.SEH_PROLOG/SEH_EPILOG),
+        # NOT the hardcoded fallback set — those addresses are stale for
+        # MM3 (real helpers: 0x00094FC0 prolog / 0x00094FFB epilog) and
+        # intra-function entry points that start at an SEH-epilog call
+        # would miss the ebp declaration and fail to compile.
+        SEH_FUNCS = {
+            self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG,
+            # keep the legacy constants as a fallback for titles where the
+            # detector does not run (single-function translation)
+            0x00244784, 0x002447BF,
+        }
         if any(insn.call_target in SEH_FUNCS for insn in instructions):
             used_regs.add("ebp")
 
@@ -282,7 +408,7 @@ class FunctionTranslator:
         # Volatile registers (eax, ecx, edx, esp) are also global via macros.
         reg_decls = []
         if "ebp" in used_regs:
-            reg_decls.append("ebp = g_seh_ebp")
+            reg_decls.append("ebp")
         if reg_decls:
             lines.append(f"    uint32_t {', '.join(reg_decls)};")
 
@@ -294,8 +420,15 @@ class FunctionTranslator:
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
 
-        # Add _cf for instructions which consume or produce carry.
-        has_carry = any(insn.mnemonic in ("sbb", "adc", "neg")
+        # Add _cf for carry-dependent instructions (sbb, adc) and for every
+        # instruction that produces or clears the carry flag (cmp, test,
+        # add/sub, and/or/xor, neg, shifts, rotates). Consumers must read a
+        # value that producers store; declaring it whenever either appears
+        # keeps the generated C valid for both cases.
+        has_carry = any(insn.mnemonic in (
+                "sbb", "adc", "neg", "cmp", "test", "add", "sub",
+                "and", "or", "xor", "shl", "sal", "shr", "sar",
+                "rol", "ror", "rcl", "rcr")
                         for insn in instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
@@ -329,8 +462,27 @@ class FunctionTranslator:
             lines.append(f"    #define fp_top() _fp_stack[_fp_top & 7]")
             lines.append(f"    #define fp_st1() _fp_stack[(_fp_top + 1) & 7]")
 
+        # For fpo_leaf functions that use ebp: initialize from g_seh_ebp.
+        # In x86, these functions inherit EBP from their caller (typically
+        # via a tail jump that shares the caller's frame). In our C translation,
+        # ebp is a local variable that would start uninitialized, causing
+        # crashes when the function reads MEM32(ebp + offset). The g_seh_ebp
+        # global bridges ebp across function boundaries.
+        #
+        # The same init is REQUIRED for functions with a classic
+        # "push ebp; mov ebp, esp" prologue: the first instruction pushes
+        # EBP (the caller's frame) onto the stack to save it. In C, that
+        # PUSH32(esp, ebp) reads the local ebp, which is uninitialized,
+        # pushing a garbage "saved frame" that later propagates into the
+        # simulated frame chain and g_seh_ebp via tail jumps and SEH
+        # epilogs (observed: g_seh_ebp = 0x????1038 native-heap fragments,
+        # then AV when a callee dereferences the poisoned frame). Initializing
+        # ebp from g_seh_ebp before the push makes the saved-frame slot hold
+        # the true caller frame, exactly like real x86.
+        if "ebp" in used_regs:
+            lines.append(f"    ebp = g_seh_ebp; /* bridge caller frame from SEH global */")
+
         lines.append(f"")
-        lines.append(f"    recomp_trace_enter(0x{start:08X}u);")
 
         # Generate code for each basic block
         # Create a set of addresses that need labels
@@ -375,6 +527,14 @@ class FunctionTranslator:
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
 
+        # Balance callee-saved register saves in shared-epilogue functions
+        # (see _fixup_unbalanced_saves). Must run after the ICALL fixup so the
+        # register-push scan sees the final prologue layout. The SEH epilog is
+        # excluded: its pops consume the SEH prolog's pushes (a different
+        # function), so rebalancing it would rotate callee-saved registers.
+        lines = _fixup_unbalanced_saves(
+            lines, func_addr=start, seh_epilog=self.lifter.SEH_EPILOG)
+
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)
         import re
@@ -413,11 +573,6 @@ class FunctionTranslator:
         if _last_label_idx is not None and not _has_stmt_after:
             lines.insert(_last_label_idx + 1, "    (void)0;")
 
-        # Every translated return must balance the trace entry. This also
-        # handles inline conditional returns emitted by the lifter.
-        lines = [line.replace("return;", "recomp_trace_leave(); return;")
-                 for line in lines]
-
         # Undefine FPU macros
         if has_fpu:
             lines.append(f"    #undef fp_push")
@@ -426,7 +581,6 @@ class FunctionTranslator:
             lines.append(f"    #undef fp_top")
             lines.append(f"    #undef fp_st1")
 
-        lines.append(f"    recomp_trace_leave();")
         lines.append(f"}}")
         lines.append(f"")
 
@@ -472,7 +626,7 @@ class BatchTranslator:
 
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
-                 output_dir=None):
+                 output_dir=None, seh_prolog=None, seh_epilog=None):
         self.xbe_path = xbe_path
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
@@ -520,10 +674,21 @@ class BatchTranslator:
                 addr = int(entry["address"], 16)
                 self.abi_db[addr] = entry
 
+        # Detect the SEH helpers once here rather than per-Lifter, so the
+        # result can be reported and overridden from the command line.
+        if seh_prolog is None or seh_epilog is None:
+            found_prolog, found_epilog = detect_seh_helpers(
+                self.func_db, self.xbe_data, verbose=True)
+            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
+            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
+        self.seh_prolog = seh_prolog
+        self.seh_epilog = seh_epilog
+
         # Create translator
         self.translator = FunctionTranslator(
             self.xbe_data, self.func_db, self.label_db,
-            self.classification_db, self.abi_db)
+            self.classification_db, self.abi_db,
+            seh_prolog=seh_prolog, seh_epilog=seh_epilog)
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
         """
@@ -591,6 +756,8 @@ class BatchTranslator:
         c_chunks.append('#define RECOMP_GENERATED_CODE')
         c_chunks.append('#include "recomp_types.h"')
         c_chunks.append('#include <math.h>')
+        c_chunks.append('#include <intrin.h>')
+        c_chunks.append('#include <windows.h>')
         c_chunks.append("")
         c_chunks.append("/* Forward declarations */")
 
@@ -710,6 +877,21 @@ class BatchTranslator:
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
 
+        # Any address called but never defined needs a stub, or the link fails.
+        # These are almost all mid-function entry points the function detector
+        # did not split out: a call lands a few bytes inside (or just past) a
+        # function it already found. Emitting an empty stub keeps the build
+        # linking; hitting one at runtime is a silent no-op, so they are
+        # reported and written to their own file rather than hidden among the
+        # translated chunks.
+        defined = {name for _, name, _ in translations}
+        unresolved = {
+            addr: name
+            for addr, name in self.translator.lifter.referenced_calls.items()
+            if name not in defined
+        }
+        stats["unresolved_stubs"] = len(unresolved)
+
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)
         header_lines = [
@@ -727,6 +909,13 @@ class BatchTranslator:
         for addr, name, _ in translations:
             decl = self._make_declaration(addr, name)
             header_lines.append(f"{decl};")
+
+        if unresolved:
+            header_lines.append("")
+            header_lines.append("/* Unresolved call targets (stubbed) */")
+            for addr in sorted(unresolved):
+                header_lines.append(f"void {unresolved[addr]}(void);")
+
         header_lines.extend(["", "#endif /* RECOMP_FUNCS_H */", ""])
 
         with open(header_path, "w", encoding="utf-8") as f:
@@ -749,6 +938,8 @@ class BatchTranslator:
                 "#define RECOMP_GENERATED_CODE",
                 f'#include "{header_name}"',
                 '#include <math.h>',
+                '#include <intrin.h>',
+                '#include <windows.h>',
                 "",
             ]
             for addr, name, code in chunk:
@@ -760,6 +951,35 @@ class BatchTranslator:
 
             if verbose:
                 print(f"  Wrote {c_path} ({len(chunk)} functions)",
+                      file=sys.stderr)
+
+        # Emit the stub bodies for call targets with no definition.
+        if unresolved:
+            stub_path = os.path.join(output_dir, f"{prefix}_stubs_unresolved.c")
+            stub_lines = [
+                "/**",
+                " * Unresolved call target stubs",
+                f" * {len(unresolved)} addresses called by translated code but not",
+                " * detected as functions - typically mid-function entry points.",
+                " * Auto-generated by tools/recomp.",
+                " */",
+                "",
+                "#define RECOMP_GENERATED_CODE",
+                f'#include "{header_name}"',
+                "",
+            ]
+            for addr in sorted(unresolved):
+                stub_lines.append(
+                    f"void {unresolved[addr]}(void) {{ /* 0x{addr:08X}: not detected */ }}"
+                )
+            stub_lines.append("")
+
+            with open(stub_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(stub_lines))
+            generated_files.append(stub_path)
+
+            if verbose:
+                print(f"  Wrote {stub_path} ({len(unresolved)} stubs)",
                       file=sys.stderr)
 
         # Generate dispatch table
