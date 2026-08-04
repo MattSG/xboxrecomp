@@ -115,6 +115,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
+    if (getenv("MM3_TRACE_PATHS")) {
+        fprintf(stderr, "[PATHTRACE] NtCreateFile win_path='%S' access=0x%X opts=0x%X\n",
+                (const wchar_t*)win_path, DesiredAccess, CreateOptions);
+    }
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
@@ -129,6 +134,18 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL,
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            /* The path may map to a directory (e.g. the CD-ROM device root
+             * "\Device\CdRom0" -> game_files/). Directories need
+             * FILE_FLAG_BACKUP_SEMANTICS; without it CreateFileW fails with
+             * ERROR_ACCESS_DENIED. Retry so volume queries on the device work. */
+            DWORD attr = GetFileAttributesW(win_path);
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
+                    xbox_share_to_win32(ShareAccess), NULL,
+                    OPEN_EXISTING, flags_and_attrs | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+            }
+        }
     }
 
     if (h == INVALID_HANDLE_VALUE) {

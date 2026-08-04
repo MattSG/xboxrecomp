@@ -43,6 +43,12 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* The CD-ROM device itself (no trailing backslash): the D3D8 init opens
+     * "\Device\CdRom0" and queries its volume info. Map it to the game dir
+     * root so the open succeeds (NtQueryVolumeInformationFile on it returns
+     * the extracted-data volume). Must come after the trailing-backslash rule
+     * so disc files still strip the prefix. */
+    { "\\Device\\CdRom0",                     0, NULL,         NULL          },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     { "D:\\",                                 0, NULL,         NULL          },
     { "d:\\",                                 0, NULL,         NULL          },
@@ -149,8 +155,12 @@ translate:
             swprintf_s(dir_path, MAX_PATH, L"%s%s", base_dir, sub_wide);
             CreateDirectoryW(s_save_dir, NULL);
             CreateDirectoryW(dir_path, NULL);
-        } else {
+        } else if (remainder_wide[0]) {
             swprintf_s(host_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
+        } else {
+            /* Device root (e.g. "\Device\CdRom0"): no trailing backslash,
+             * otherwise CreateFileW rejects the path (ERROR_INVALID_NAME). */
+            swprintf_s(host_path_buf, buf_size, L"%s", base_dir);
         }
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %S", xbox_path, host_path_buf);
