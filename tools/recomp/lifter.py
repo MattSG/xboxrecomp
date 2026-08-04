@@ -878,7 +878,8 @@ class Lifter:
             return ["/* int 0x2d — Xbox kernel service dispatch */",
                     "eax = xbox_int_0x2d(eax, ecx, edx);"]
         if m in ("leave",):
-            return ["esp = ebp;", "POP32(esp, ebp); /* leave */"]
+            return ["esp = ebp;", "POP32(esp, ebp); /* leave */",
+                    "g_seh_ebp = ebp; /* restore frame for callees */"]
         if m in ("cld", "std"):
             return [f"/* {m} - direction flag */"]
         if m == "lahf":
@@ -959,7 +960,17 @@ class Lifter:
         if nops := len(ops) < 2:
             return [f"/* mov: bad operands */"]
         src = _fmt_operand_read(ops[1])
-        return [_fmt_operand_write(ops[0], src)]
+        lines = [_fmt_operand_write(ops[0], src)]
+        # "mov ebp, esp" establishes this function's frame pointer. Mirror it
+        # into g_seh_ebp so a leaf callee that inherits the caller frame via
+        # "ebp = g_seh_ebp" sees the current frame instead of a stale frame
+        # from the last __SEH_prolog. Without this, such leaves read args
+        # through a stale pointer (observed: sub_0007829E reading the arena
+        # from an old frame and AVing on the copy destination).
+        if (ops[0].type == "reg" and ops[0].reg == "ebp" and
+                ops[1].type == "reg" and ops[1].reg == "esp"):
+            lines.append("g_seh_ebp = ebp; /* bridge frame to callees */")
+        return lines
 
     def _lift_movzx(self, insn, ops):
         if len(ops) < 2:
@@ -1027,6 +1038,10 @@ class Lifter:
             # Segment register pop → discard from stack
             if r in ("fs", "gs", "cs", "ds", "es", "ss"):
                 return [f"{{ uint32_t _tmp; POP32(esp, _tmp); }} /* pop {r} - segment register */"]
+            if r == "ebp":
+                # Restore the caller frame and mirror it back into g_seh_ebp
+                # (paired with the "mov ebp, esp" bridge above).
+                return [f"POP32(esp, ebp);", "g_seh_ebp = ebp; /* restore frame for callees */"]
             return [f"POP32(esp, {r});"]
         else:
             return [f"{{ uint32_t _tmp; POP32(esp, _tmp); {_fmt_operand_write(ops[0], '_tmp')} }}"]

@@ -92,7 +92,7 @@ def _fixup_icall_esp_save(lines):
     return result
 
 
-def _fixup_unbalanced_saves(lines):
+def _fixup_unbalanced_saves(lines, func_addr=None, seh_epilog=None):
     """
     Balance callee-saved register save/restore in intra-function
     shared-epilogue functions.
@@ -110,7 +110,18 @@ def _fixup_unbalanced_saves(lines):
     replace the initial register-push sequence with a balanced push of every
     popped register in reverse-pop order, so the epilogue restores exactly
     what the entry saved.
+
+    The __SEH_epilog is the one deliberate exception: it pops edi/esi/ebx
+    that the __SEH_prolog (a *different* function) pushed, so within the
+    epilog alone the pops outnumber the pushes. Rebalancing it injects
+    self-pushes that make the epilog pop its own current registers (a
+    rotation) instead of the prolog's saved frame slots, leaking callee-saved
+    registers to the caller (observed: the DICE allocator leaking g_esi =
+    pool base 0x02780000 into the vector grow, corrupting the copy args and
+    causing a runaway copy loop).
     """
+    if seh_epilog is not None and func_addr == seh_epilog:
+        return lines
     import re
     CALLEE = ("edi", "esi", "ebx", "ebp")
     push_re = re.compile(r'^\s*PUSH32\(esp, (edi|esi|ebx|ebp)\);')
@@ -480,8 +491,11 @@ class FunctionTranslator:
 
         # Balance callee-saved register saves in shared-epilogue functions
         # (see _fixup_unbalanced_saves). Must run after the ICALL fixup so the
-        # register-push scan sees the final prologue layout.
-        lines = _fixup_unbalanced_saves(lines)
+        # register-push scan sees the final prologue layout. The SEH epilog is
+        # excluded: its pops consume the SEH prolog's pushes (a different
+        # function), so rebalancing it would rotate callee-saved registers.
+        lines = _fixup_unbalanced_saves(
+            lines, func_addr=start, seh_epilog=self.lifter.SEH_EPILOG)
 
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)

@@ -109,9 +109,46 @@ def test_preserves_function_entry_label():
     print("ok  preserves_function_entry_label")
 
 
+def _sample_seh_epilog():
+    """The MSVC __SEH_epilog: pops edi/esi/ebx that the __SEH_prolog (a
+    different function) pushed. Within this one function the pops outnumber
+    the pushes, but rebalancing would inject self-pushes that make the epilog
+    pop its own current registers (a rotation) instead of the prolog's saved
+    frame slots — leaking callee-saved registers to the caller."""
+    return [
+        "void sub_00094FFB(void)",
+        "{",
+        "loc_00094FFB: ;",
+        "    ecx = MEM32(ebp + -16);",
+        "    MEM32(0) = ecx;",
+        "    POP32(esp, ecx);",
+        "    POP32(esp, edi);",
+        "    POP32(esp, esi);",
+        "    POP32(esp, ebx);",
+        "    esp = ebp;",
+        "    POP32(esp, ebp); /* leave */",
+        "    PUSH32(esp, ecx);",
+        "    g_seh_ebp = ebp; esp += 4; return;",
+        "}",
+    ]
+
+
+def test_seh_epilog_is_not_rebalanced():
+    sample = _sample_seh_epilog()
+    # Without the exclusion the fixup injects 4 pushes (a rotation).
+    changed = _fixup_unbalanced_saves(list(sample))
+    assert len(_pushes(changed)) == 4, _pushes(changed)
+    # With func_addr == seh_epilog the fixup must leave it untouched.
+    out = _fixup_unbalanced_saves(list(sample),
+                                  func_addr=0x00094FFB, seh_epilog=0x00094FFB)
+    assert out == sample, "SEH epilog must not be rebalanced"
+    print("ok  seh_epilog_is_not_rebalanced")
+
+
 if __name__ == "__main__":
     test_unbalanced_is_balanced_after_fixup()
     test_balanced_function_is_untouched()
     test_no_pop_means_no_change()
     test_preserves_function_entry_label()
+    test_seh_epilog_is_not_rebalanced()
     print("\nall passed")
