@@ -465,6 +465,11 @@ typedef VOID (*PIO_APC_ROUTINE)(
  */
 void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
 
+/* Override the stdcall arg-byte count for a specific ordinal (per-title
+ * workaround for titles whose thunk calls pass a different number of args
+ * than the default table). Call after xbox_kernel_bridge_init(). */
+void xbox_kernel_set_ordinal_arg_bytes(ULONG ordinal, int bytes);
+
 extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
 /* Initialize the thunk table - must be called before game code runs */

@@ -1905,6 +1905,32 @@ void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
     }
 }
 
+/* Override the stdcall arg-byte count for a specific ordinal. The default
+ * stdcall_args_for_ordinal table is a best-guess from one XDK build; some
+ * titles call a thunk with a different number of arguments than the default
+ * (observed: MM3 calls the ordinal-47 and ordinal-67 thunks with 2 args, but
+ * the default table says 24/40, so kernel_thunk_dispatch over-popped the
+ * simulated stack by 16 bytes and corrupted the caller's callee-saved
+ * restore). Call after xbox_kernel_bridge_init(). */
+void xbox_kernel_set_ordinal_arg_bytes(ULONG ordinal, int bytes)
+{
+    int i;
+    int n = 0;
+    for (i = 0; i < g_thunk_table_count; i++) {
+        if (g_slot_ordinals[i] == ordinal) {
+            g_slot_arg_bytes[i] = bytes;
+            n++;
+        }
+    }
+    if (n) {
+        fprintf(stderr, "  Kernel thunk bridge: overrode ordinal %u arg bytes to %d (%d slots)\n",
+                ordinal, bytes, n);
+    } else {
+        fprintf(stderr, "  Kernel thunk bridge: WARNING ordinal %u not found for arg override\n",
+                ordinal);
+    }
+}
+
 /**
  * Resolve the kernel thunk table in Xbox memory.
  *
