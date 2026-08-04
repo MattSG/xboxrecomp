@@ -178,6 +178,40 @@ def test_arg_cleanup_epilog_is_not_rebalanced():
     print("ok  arg_cleanup_epilog_is_not_rebalanced")
 
 
+def _sample_leave_ebp_balanced():
+    """A normal function whose edi/esi/ebx pushes are balanced by matching
+    pops and whose epilogue is a leave ("esp = ebp; POP ebp" restores the
+    caller frame). Without the ebp exclusion the fixup sees pop(ebp) >
+    push(ebp) and rebalances it, injecting self-pushes that shift every
+    subsequent call's args on the simulated stack (observed sub_00023213)."""
+    return [
+        "void sub_00023213(void)",
+        "{",
+        "loc_00023213: ;",
+        "    eax = 0x254768;",
+        "    PUSH32(esp, 0); sub_00097AA4(); /* call 0x00097AA4 */",
+        "loc_0002321D: ;",
+        "    esp = esp - 0x18;",
+        "    PUSH32(esp, ebx);",
+        "    PUSH32(esp, esi);",
+        "    PUSH32(esp, edi);",
+        "    POP32(esp, edi);",
+        "    POP32(esp, esi);",
+        "    POP32(esp, ebx);",
+        "    esp = ebp;",
+        "    POP32(esp, ebp); /* leave */",
+        "    esp += 8; return;",
+        "}",
+    ]
+
+
+def test_leave_ebp_balanced_is_not_rebalanced():
+    sample = _sample_leave_ebp_balanced()
+    out = _fixup_unbalanced_saves(list(sample))
+    assert out == sample, "leave-ebp balanced function must not be rebalanced"
+    print("ok  leave_ebp_balanced_is_not_rebalanced")
+
+
 if __name__ == "__main__":
     test_unbalanced_is_balanced_after_fixup()
     test_balanced_function_is_untouched()
@@ -185,4 +219,5 @@ if __name__ == "__main__":
     test_preserves_function_entry_label()
     test_seh_epilog_is_not_rebalanced()
     test_arg_cleanup_epilog_is_not_rebalanced()
+    test_leave_ebp_balanced_is_not_rebalanced()
     print("\nall passed")

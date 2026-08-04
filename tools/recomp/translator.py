@@ -171,7 +171,12 @@ def _fixup_unbalanced_saves(lines, func_addr=None, seh_epilog=None):
         pop_count[r] = pop_count.get(r, 0) + 1
 
     # Only fix functions with a net over-pop (the shared-epilogue pattern).
-    if not any(pop_count.get(r, 0) > push_count.get(r, 0) for r in CALLEE):
+    # The leave's "esp = ebp; POP ebp" restores the caller's frame, so ebp is
+    # never a genuine over-pop by itself: a normal function that balances its
+    # edi/esi/ebx pushes with matching pops (e.g. sub_00023213) would otherwise
+    # be rebalanced purely because of the leave, injecting self-pushes that
+    # shift every subsequent call's args on the simulated stack.
+    if not any(pop_count.get(r, 0) > push_count.get(r, 0) for r in ("edi", "esi", "ebx")):
         return lines
 
     # Locate the entry label and the initial consecutive register pushes.
