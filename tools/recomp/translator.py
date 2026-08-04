@@ -420,8 +420,10 @@ class FunctionTranslator:
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
 
-        # Add _cf for carry-dependent instructions (sbb, adc)
-        has_carry = any(insn.mnemonic in ("sbb", "adc")
+        # Add _cf for carry-dependent instructions (sbb, adc). neg also
+        # produces a carry flag (CF = operand != 0) consumed by "sbb reg,reg"
+        # idioms, so it needs the variable declared too.
+        has_carry = any(insn.mnemonic in ("sbb", "adc", "neg")
                         for insn in instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")

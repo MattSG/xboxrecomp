@@ -1088,7 +1088,13 @@ class Lifter:
         if len(ops) < 1:
             return ["/* neg: no operand */"]
         val = _fmt_operand_read(ops[0])
-        return [_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})")]
+        # x86 neg sets CF=1 iff the operand was non-zero. The common
+        # "neg; sbb reg,reg; and" idiom (0 or value depending on NULL check)
+        # depends on this carry flag being stored.
+        return [
+            _fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})"),
+            f"_cf = ({val} != 0); /* neg: CF = (operand != 0) */"
+        ]
 
     def _lift_not(self, insn, ops):
         if len(ops) < 1:
