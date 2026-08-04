@@ -834,6 +834,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("bsf", "bsr"):
+            return self._lift_bsf_bsr(insn, ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -1172,6 +1174,14 @@ class Lifter:
         cnt = _fmt_operand_read(ops[1])
         func = "ROL32" if m == "rol" else "ROR32"
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+
+    def _lift_bsf_bsr(self, insn, ops, m):
+        """bsf r, src / bsr r, src — bit scan, ZF set if src is zero."""
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        src = _fmt_operand_read(ops[1])
+        func = "BSF32" if m == "bsf" else "BSR32"
+        return [_fmt_operand_write(ops[0], f"{func}({src}) /* {m}: bit scan */")]
 
     # ── Compare / Test (standalone) ──
 

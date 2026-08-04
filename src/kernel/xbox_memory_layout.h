@@ -33,8 +33,16 @@ extern "C" {
  * Xbox memory map constants
  * ================================================================ */
 
-/* Base address of all XBE files in Xbox memory */
+/* Base address of all XBE files in Xbox memory (guest VA of the image). */
 #define XBOX_BASE_ADDRESS       0x00010000
+
+/* Host native address where the 64 MB Xbox region is mapped.
+ * Relocated to 4 GB: the host reserves 0x7FFE0000-0x80000000 for system
+ * structures, so the original 0x00010000 base cannot provide the full
+ * 64 MB-wrapped guest range (the game's arena lands just below 0x80000000
+ * and must stay writable). Mapping the Xbox region at 4 GB moves every
+ * 64 MB mirror view clear of the host's low-address reservations. */
+#define XBOX_NATIVE_BASE        0x100000000u
 
 /* Start of mapped region - includes low memory (KPCR at 0x0) because
  * game code reads from addresses like 0x20 and 0x28 (Xbox kernel structures). */
@@ -155,8 +163,12 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 #define XBOX_MIRROR_SIZE    0
 #define XBOX_GUARD_SIZE     0
 
-/** Number of 64 MB mirror views to pre-map (covers 1.75 GB of address space). */
-#define XBOX_NUM_MIRRORS    28
+/** Number of 64 MB mirror views to pre-map.
+ *  Covers guest addresses up to the kernel boundary (0x80000000). MM3's
+ *  DICE engine writes large structures at high wrapped addresses (e.g.
+ *  a sorted array base at 0x74000000 aliases physical page 0 via the
+ *  26-bit address bus); without enough views those writes fault. */
+#define XBOX_NUM_MIRRORS    32
 
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.

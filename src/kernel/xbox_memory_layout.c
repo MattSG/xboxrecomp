@@ -118,6 +118,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         static const uintptr_t try_bases[] = {
+            XBOX_NATIVE_BASE,       /* 4 GB - above the host's low reservations */
             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
             0x00800000,             /* 8 MB - above typical PEB/TEB region */
             0x01000000,             /* 16 MB */
@@ -425,6 +426,33 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #undef KERNEL_PAGE_SIZE
     }
 
+    /*
+     * Provide a writable region at guest 0x80000000, just below the fake
+     * kernel PE (0x80010000). The DICE engine places its large arena at the
+     * first guest address its memory probe finds unmapped — with the full
+     * 64 MB-wrapped range mapped this is the kernel boundary, so the arena
+     * base lands at 0x80000000 and its writes must not fault. Kept separate
+     * (not a mirror view) so it never conflicts with the kernel PE page.
+     */
+    {
+        #define ARENA_BASE 0x80000000u
+        #define ARENA_SIZE 0x10000u   /* 64 KB below the kernel page */
+        uintptr_t arena_native = ARENA_BASE + g_memory_offset;
+        void *arena_mem = VirtualAlloc(
+            (LPVOID)arena_native, ARENA_SIZE,
+            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (arena_mem) {
+            memset(arena_mem, 0, ARENA_SIZE);
+            fprintf(stderr, "  Kernel-adjacent arena: 64 KB at Xbox VA 0x%08X\n",
+                    ARENA_BASE);
+        } else {
+            fprintf(stderr, "  WARNING: arena region alloc failed at 0x%08X (err=%lu)\n",
+                    ARENA_BASE, GetLastError());
+        }
+        #undef ARENA_BASE
+        #undef ARENA_SIZE
+    }
+
     /* Initialize the dynamic heap. */
     fprintf(stderr, "  Heap: %u MB at Xbox VA 0x%08X-0x%08X\n",
             XBOX_HEAP_SIZE / (1024 * 1024), XBOX_HEAP_BASE,
@@ -461,6 +489,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             } else {
                 fprintf(stderr, "  Mirror %d: FAILED at %p (error %lu)\n",
                         m + 1, (void *)mirror_base, GetLastError());
+                /* Diagnose the address so a view-mapping failure is explainable. */
+                MEMORY_BASIC_INFORMATION mbi;
+                if (VirtualQuery((LPCVOID)mirror_base, &mbi, sizeof(mbi))) {
+                    fprintf(stderr, "    region: base=0x%p size=0x%zX "
+                        "state=0x%X type=0x%X\n",
+                        mbi.BaseAddress, mbi.RegionSize, mbi.State, mbi.Type);
+                }
             }
         }
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",

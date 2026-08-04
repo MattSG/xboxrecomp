@@ -92,6 +92,87 @@ def _fixup_icall_esp_save(lines):
     return result
 
 
+def _fixup_unbalanced_saves(lines):
+    """
+    Balance callee-saved register save/restore in intra-function
+    shared-epilogue functions.
+
+    The disassembler registers intra-function jump targets (e.g. 0x84506, a
+    fall-through continuation of sub_000844B9) as standalone functions. Those
+    functions legitimately pop registers (edi/esi/ebx/ebp) that their own
+    prologue never pushed, because in the original binary the enclosing
+    function's prologue did the pushes. When lifted as a standalone C
+    function the epilogue then over-pops the simulated stack, corrupting
+    g_edi/g_ebx/g_ebp and leaking g_esp (observed: pool allocator's g_ebx
+    corrupted to 0x1C, free-list walk spins forever).
+
+    Fix: if a function pops more callee-saved registers than it pushes,
+    replace the initial register-push sequence with a balanced push of every
+    popped register in reverse-pop order, so the epilogue restores exactly
+    what the entry saved.
+    """
+    import re
+    CALLEE = ("edi", "esi", "ebx", "ebp")
+    push_re = re.compile(r'^\s*PUSH32\(esp, (edi|esi|ebx|ebp)\);')
+    pop_re = re.compile(r'^\s*POP32\(esp, (edi|esi|ebx|ebp)\);')
+
+    pop_order = []
+    for line in lines:
+        m = pop_re.match(line)
+        if m:
+            pop_order.append(m.group(1))
+    if not pop_order:
+        return lines
+
+    push_count = {}
+    for line in lines:
+        m = push_re.match(line)
+        if m:
+            push_count[m.group(1)] = push_count.get(m.group(1), 0) + 1
+    pop_count = {}
+    for r in pop_order:
+        pop_count[r] = pop_count.get(r, 0) + 1
+
+    # Only fix functions with a net over-pop (the shared-epilogue pattern).
+    if not any(pop_count.get(r, 0) > push_count.get(r, 0) for r in CALLEE):
+        return lines
+
+    # Locate the entry label and the initial consecutive register pushes.
+    label_idx = None
+    for i, line in enumerate(lines):
+        if re.match(r'^loc_[0-9A-Fa-f]+:', line):
+            label_idx = i
+            break
+    if label_idx is None:
+        return lines
+
+    init_pushes = []
+    j = label_idx + 1
+    while j < len(lines):
+        m = push_re.match(lines[j])
+        if m:
+            init_pushes.append((j, m.group(1)))
+            j += 1
+        else:
+            break
+
+    # Balanced push block: every popped register, in reverse-pop order.
+    needed = [f"    PUSH32(esp, {r});" for r in reversed(pop_order)]
+
+    for idx, _ in reversed(init_pushes):
+        del lines[idx]
+    # Re-locate the entry label after the deletions, then insert the block.
+    new_label_idx = None
+    for i, line in enumerate(lines):
+        if re.match(r'^loc_[0-9A-Fa-f]+:', line):
+            new_label_idx = i
+            break
+    if new_label_idx is None:
+        return lines
+    lines[new_label_idx + 1:new_label_idx + 1] = needed
+    return lines
+
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
@@ -396,6 +477,11 @@ class FunctionTranslator:
         # The pattern is: optional PUSH32 args, then PUSH32(esp, 0); RECOMP_ICALL_SAFE(...).
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
+
+        # Balance callee-saved register saves in shared-epilogue functions
+        # (see _fixup_unbalanced_saves). Must run after the ICALL fixup so the
+        # register-push scan sees the final prologue layout.
+        lines = _fixup_unbalanced_saves(lines)
 
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)

@@ -1,0 +1,117 @@
+"""
+Self-check for shared-epilogue register-balance fixup.
+
+Run: py -3 tools/recomp/test_unbalanced_saves.py
+
+Regression guard for the bug where an intra-function jump target that falls
+through to a shared epilogue (e.g. sub_00084506 inside sub_000844B9) was
+lifted as a standalone function that pops edi/esi/ebx/ebp but pushes only
+esi. The over-pop corrupted g_ebx / g_edi / g_ebp and leaked g_esp, making
+the pool allocator's free-list walk spin forever.
+"""
+
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from tools.recomp.translator import _fixup_unbalanced_saves  # noqa: E402
+
+
+def _sample_unbalanced():
+    return [
+        "void sub_00084506(void)",
+        "{",
+        "loc_00084506: ;",
+        "    PUSH32(esp, esi);",
+        "    PUSH32(esp, 0); sub_00084378();",
+        "loc_00084510: ;",
+        "    MEM32(eax + 4) = ecx;",
+        "loc_0008452A: ;",
+        "    POP32(esp, edi);",
+        "    POP32(esp, esi);",
+        "    POP32(esp, ebx);",
+        "    POP32(esp, ebp);",
+        "    esp += 16; return;",
+        "}",
+    ]
+
+
+def _sample_balanced():
+    """A normal function that already saves all four registers."""
+    return [
+        "void sub_00084531(void)",
+        "{",
+        "loc_00084531: ;",
+        "    PUSH32(esp, edi);",
+        "    PUSH32(esp, esi);",
+        "    PUSH32(esp, ebx);",
+        "loc_00084534: ;",
+        "    MEM32(eax + 4) = ecx;",
+        "loc_0008453F: ;",
+        "    POP32(esp, ebx);",
+        "    POP32(esp, esi);",
+        "    POP32(esp, edi);",
+        "    esp += 12; return;",
+        "}",
+    ]
+
+
+def _pushes(lines):
+    return [l for l in lines if re.match(r'^\s*PUSH32\(esp, (edi|esi|ebx|ebp)\);', l)]
+
+
+def _pops(lines):
+    return [l for l in lines if re.match(r'^\s*POP32\(esp, (edi|esi|ebx|ebp)\);', l)]
+
+
+def test_unbalanced_is_balanced_after_fixup():
+    out = _fixup_unbalanced_saves(_sample_unbalanced())
+    pushes = _pushes(out)
+    pops = _pops(out)
+    assert len(pushes) == len(pops), (pushes, pops)
+    # Entry pushes must mirror the epilogue pops in reverse order.
+    pop_regs = [re.match(r'\s*POP32\(esp, (\w+)\);', l).group(1) for l in pops]
+    push_regs = [re.match(r'\s*PUSH32\(esp, (\w+)\);', l).group(1) for l in pushes]
+    assert push_regs == list(reversed(pop_regs)), (push_regs, pop_regs)
+    print("ok  unbalanced_is_balanced_after_fixup:", push_regs)
+
+
+def test_balanced_function_is_untouched():
+    sample = _sample_balanced()
+    out = _fixup_unbalanced_saves(list(sample))
+    assert out == sample, "balanced function should be unchanged"
+    print("ok  balanced_function_is_untouched")
+
+
+def test_no_pop_means_no_change():
+    lines = [
+        "loc_0009504E: ;",
+        "    PUSH32(esp, ebx);",
+        "    PUSH32(esp, esi);",
+        "    PUSH32(esp, edi);",
+        "    esp += 4; return;",
+    ]
+    out = _fixup_unbalanced_saves(list(lines))
+    assert out == lines
+    print("ok  no_pop_means_no_change")
+
+
+def test_preserves_function_entry_label():
+    out = _fixup_unbalanced_saves(_sample_unbalanced())
+    text = "\n".join(out)
+    assert "loc_00084506: ;" in text
+    # The very first statement after the label must be the first balanced push.
+    idx = text.index("loc_00084506: ;")
+    rest = text[idx:].split("\n")
+    assert rest[1].strip() == "PUSH32(esp, ebp);", rest[1]
+    print("ok  preserves_function_entry_label")
+
+
+if __name__ == "__main__":
+    test_unbalanced_is_balanced_after_fixup()
+    test_balanced_function_is_untouched()
+    test_no_pop_means_no_change()
+    test_preserves_function_entry_label()
+    print("\nall passed")
