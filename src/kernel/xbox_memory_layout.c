@@ -391,66 +391,45 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
-     * Allocate a page at Xbox kernel address space (0x80010000).
+     * Map a plain 16 MB region covering guest 0x80000000-0x81000000:
+     * the wrapped-RAM boundary, the fake kernel PE (0x80010000), and the
+     * DICE pool the engine places just past the kernel.
      *
      * RenderWare's Xbox driver code (xbcache.c) reads MEM32(0x8001003C)
      * to parse the Xbox kernel's PE header and find the INIT section for
      * CPU cache line sizing. On PC, we provide a minimal fake PE header
      * with 0 sections so the function gracefully skips the cache init.
      *
-     * The actual native address is 0x80010000 + g_memory_offset.
+     * MM3's DICE memory manager computes its arena base as pool_start -
+     * pool_size where pool_start is the detected memory top and the pool
+     * size is 0xF000. The arena therefore lands just below the memory top
+     * and must be writable. A single 16 MB plain region gives the engine
+     * room no matter where its (page-granular) probe decides the top is.
      */
     {
-        #define XBOX_KERNEL_BASE 0x80010000u
-        #define KERNEL_PAGE_SIZE 4096
-        uintptr_t kernel_native = XBOX_KERNEL_BASE + g_memory_offset;
+        #define KP_BASE      0x80000000u
+        #define KP_SIZE      0x01000000u   /* 16 MB */
+        uintptr_t kp_native = KP_BASE + g_memory_offset;
         g_kernel_memory = VirtualAlloc(
-            (LPVOID)kernel_native,
-            KERNEL_PAGE_SIZE,
+            (LPVOID)kp_native,
+            KP_SIZE,
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE
         );
         if (g_kernel_memory) {
-            /* Zero-fill then set e_lfanew = 0x80 (offset to PE header).
-             * With the rest zeroed, NumberOfSections = 0 and the INIT
-             * section search finds nothing, which is the safe path. */
-            memset(g_kernel_memory, 0, KERNEL_PAGE_SIZE);
-            *(uint32_t *)((uint8_t *)g_kernel_memory + 0x3C) = 0x80;  /* e_lfanew */
-            fprintf(stderr, "  Kernel: fake PE header at Xbox VA 0x%08X (native %p)\n",
-                    XBOX_KERNEL_BASE, g_kernel_memory);
+            memset(g_kernel_memory, 0, KP_SIZE);
+            /* Fake kernel PE at 0x80010000: e_lfanew = 0x80, rest zeroed
+             * => 0 sections, so the INIT-section search finds nothing. */
+            *(uint32_t *)((uint8_t *)g_kernel_memory + 0x10000 + 0x3C) = 0x80;
+            fprintf(stderr, "  Kernel+pool region: 16 MB at Xbox VA "
+                "0x%08X-0x%08X (native %p)\n",
+                KP_BASE, KP_BASE + KP_SIZE, g_kernel_memory);
         } else {
-            fprintf(stderr, "  WARNING: could not map Xbox kernel VA 0x%08X\n",
-                    XBOX_KERNEL_BASE);
+            fprintf(stderr, "  WARNING: could not map kernel/pool region "
+                "at 0x%08X (err=%lu)\n", KP_BASE, GetLastError());
         }
-        #undef XBOX_KERNEL_BASE
-        #undef KERNEL_PAGE_SIZE
-    }
-
-    /*
-     * Provide a writable region at guest 0x80000000, just below the fake
-     * kernel PE (0x80010000). The DICE engine places its large arena at the
-     * first guest address its memory probe finds unmapped — with the full
-     * 64 MB-wrapped range mapped this is the kernel boundary, so the arena
-     * base lands at 0x80000000 and its writes must not fault. Kept separate
-     * (not a mirror view) so it never conflicts with the kernel PE page.
-     */
-    {
-        #define ARENA_BASE 0x80000000u
-        #define ARENA_SIZE 0x10000u   /* 64 KB below the kernel page */
-        uintptr_t arena_native = ARENA_BASE + g_memory_offset;
-        void *arena_mem = VirtualAlloc(
-            (LPVOID)arena_native, ARENA_SIZE,
-            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (arena_mem) {
-            memset(arena_mem, 0, ARENA_SIZE);
-            fprintf(stderr, "  Kernel-adjacent arena: 64 KB at Xbox VA 0x%08X\n",
-                    ARENA_BASE);
-        } else {
-            fprintf(stderr, "  WARNING: arena region alloc failed at 0x%08X (err=%lu)\n",
-                    ARENA_BASE, GetLastError());
-        }
-        #undef ARENA_BASE
-        #undef ARENA_SIZE
+        #undef KP_BASE
+        #undef KP_SIZE
     }
 
     /* Initialize the dynamic heap. */
