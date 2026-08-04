@@ -443,6 +443,40 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #undef KP_SIZE
     }
 
+    /*
+     * Initialize the DICE software memory map (guest 0x46E6C0).
+     *
+     * The DICE engine addresses memory in 16-bit segments (high 16 bits of
+     * the address) mapped through this table. With a zeroed table the mapper
+     * (sub_0009C317 / callback 0x9D33E) maps identity, so the arena at
+     * guest 0x81000000 (segment 0x8100) is never wrapped to physical RAM and
+     * faults. On the real Xbox the 64 MB bus wrap maps segment 0x8100 to
+     * segment 0x0100 (physical 16 MB). Provide that map here as a stand-in
+     * for sub_0009E74B's setup (which is not reached before the crash).
+     *
+     * Table layout (all little-endian):
+     *   +0x00 u16 range0_lo, +0x02 u16 range0_hi, +0x04 u32 range0_offset
+     *   +0x06 u16 range1_lo, +0x08 u16 range1_hi, +0x0A u32 range1_offset
+     */
+    {
+        #define MEMAP_BASE 0x46E6C0u
+        #define MEMAP_WRITE16(off, v) \
+            (*(volatile uint16_t *)((uintptr_t)(MEMAP_BASE + off) + g_memory_offset) = (uint16_t)(v))
+        #define MEMAP_WRITE32(off, v) \
+            (*(volatile uint32_t *)((uintptr_t)(MEMAP_BASE + off) + g_memory_offset) = (uint32_t)(v))
+        MEMAP_WRITE16(0x00, 0x0000);           /* range0_lo */
+        MEMAP_WRITE16(0x02, 0x7FFF);           /* range0_hi */
+        MEMAP_WRITE32(0x04, 0x00000000);       /* range0_offset (identity) */
+        MEMAP_WRITE16(0x06, 0x8000);           /* range1_lo */
+        MEMAP_WRITE16(0x08, 0xFFFF);           /* range1_hi */
+        MEMAP_WRITE32(0x0A, 0xFFFF8000);       /* range1_offset (-0x8000 wrap) */
+        fprintf(stderr, "  DICE memory map: initialized at guest 0x%08X "
+            "(segments 0x8000-0xFFFF wrap to 0x0000-0x7FFF)\n", MEMAP_BASE);
+        #undef MEMAP_BASE
+        #undef MEMAP_WRITE16
+        #undef MEMAP_WRITE32
+    }
+
     /* Initialize the dynamic heap. */
     fprintf(stderr, "  Heap: %u MB at Xbox VA 0x%08X-0x%08X\n",
             XBOX_HEAP_SIZE / (1024 * 1024), XBOX_HEAP_BASE,
