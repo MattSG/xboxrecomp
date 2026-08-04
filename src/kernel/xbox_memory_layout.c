@@ -418,11 +418,22 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         );
         if (g_kernel_memory) {
             memset(g_kernel_memory, 0, KP_SIZE);
-            /* Fake kernel PE at 0x80010000: e_lfanew = 0x80, rest zeroed
-             * => 0 sections, so the INIT-section search finds nothing. */
-            *(uint32_t *)((uint8_t *)g_kernel_memory + 0x10000 + 0x3C) = 0x80;
+            /* Fake kernel PE at 0x80010000. Complete PE header so the game's
+             * PE parse (for cache sizing AND possibly the memory top) sees a
+             * well-formed kernel: MZ, e_lfanew, PE sig, COFF header with 0
+             * sections, optional header with a configurable SizeOfImage. */
+            uint8_t *kp = (uint8_t *)g_kernel_memory + 0x10000;
+            *(uint16_t *)(kp + 0x00) = 0x5A4D;                    /* "MZ" */
+            *(uint32_t *)(kp + 0x3C) = 0x80;                      /* e_lfanew */
+            *(uint32_t *)(kp + 0x80) = 0x00004550;                /* "PE\0\0" */
+            *(uint16_t *)(kp + 0x84) = 0x14C;                     /* Machine i386 */
+            *(uint16_t *)(kp + 0x86) = 0;                         /* NumberOfSections */
+            *(uint16_t *)(kp + 0x94) = 0xE0;                      /* SizeOfOptionalHeader */
+            *(uint16_t *)(kp + 0x96) = 0x0102;                    /* Characteristics */
+            *(uint16_t *)(kp + 0x98) = 0x10B;                     /* Optional magic PE32 */
+            *(uint32_t *)(kp + 0xD0) = 0x01000000u;               /* SizeOfImage 16MB */
             fprintf(stderr, "  Kernel+pool region: 16 MB at Xbox VA "
-                "0x%08X-0x%08X (native %p)\n",
+                "0x%08X-0x%08X (native %p), SizeOfImage=0x01000000\n",
                 KP_BASE, KP_BASE + KP_SIZE, g_kernel_memory);
         } else {
             fprintf(stderr, "  WARNING: could not map kernel/pool region "
