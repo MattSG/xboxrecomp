@@ -1081,6 +1081,12 @@ static void bridge_NtOpenFile(void)
         const char* path = bridge_get_xbox_path(obj_attrs);
         fprintf(stderr, "  [KERNEL] NtOpenFile: path='%s' access=0x%X\n",
             path ? path : "(null)", access);
+        if (!path && getenv("MM3_TRACE_PATHS")) {
+            fprintf(stderr, "[NTOPTRACE] obj_attrs=0x%08X ansi=0x%08X buf=0x%08X\n",
+                obj_attrs,
+                obj_attrs ? BRIDGE_MEM32(obj_attrs + 4) : 0,
+                obj_attrs ? BRIDGE_MEM32(BRIDGE_MEM32(obj_attrs + 4) + 4) : 0);
+        }
     }
 
     /* NtOpenFile = NtCreateFile with FILE_OPEN disposition */
@@ -1741,8 +1747,8 @@ static void kernel_thunk_dispatch(void)
     g_kernel_call_count++;
 
     if (g_kernel_call_count <= 500) {
-        fprintf(stderr, "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X\n",
-                g_kernel_call_count, ordinal, slot, g_esp);
+        fprintf(stderr, "  [KERNEL] #%d: ordinal %u (slot %d) ab=%d esp=0x%08X\n",
+                g_kernel_call_count, ordinal, slot, g_slot_arg_bytes[slot], g_esp);
         fflush(stderr);
     }
 

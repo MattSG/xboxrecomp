@@ -718,6 +718,17 @@ def detect_seh_helpers(func_db, xbe_data, verbose=False):
     return prolog, epilog
 
 
+# Direct (static) calls to these functions are routed through the manual
+# dispatch (RECOMP_ICALL_SAFE) instead of calling the generated function
+# directly, so recomp_manual.c can override mis-lifted functions. A function
+# needs this when its indirect jump (switch table) targets were not lifted
+# into the CFG (they are reached only at runtime via the table), leaving an
+# unresolvable RECOMP_ITAIL that pops the wrong amount and drifts the
+# simulated stack. Observed: sub_00093860 (a CRT memcpy whose byte-copy
+# tails at 0x939BC+ are not in the CFG).
+DISPATCH_DIRECT = {0x00093860}
+
+
 class Lifter:
     """Translates x86 instructions to C statements."""
 
@@ -1245,7 +1256,12 @@ class Lifter:
         # The callee's 'ret' will pop it back off.
         if insn.call_target:
             name = self._call_target_name(insn.call_target)
-            lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
+            if insn.call_target in DISPATCH_DIRECT:
+                # Route through the manual dispatch so recomp_manual.c can
+                # override functions the lifter cannot generate correctly.
+                lines = [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE(0x{insn.call_target:08X}, _icall_esp); /* call 0x{insn.call_target:08X} */"]
+            else:
+                lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
             # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
             if insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG):
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
