@@ -1065,10 +1065,25 @@ class Lifter:
         c_op = {"add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^"}[m]
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
-        # XOR reg, reg → zero
+        # XOR reg, reg → zero (clears CF like any xor)
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-            return [_fmt_operand_write(ops[0], "0") + " /* xor self */"]
+            return [_fmt_operand_write(ops[0], "0") + " /* xor self */", "_cf = 0; /* xor clears CF */"]
         expr = f"{dst} {c_op} {src}"
+        # Store the carry flag for sbb/adc consumers. add/sub set it; and/or/xor clear it.
+        if m == "sub":
+            # CF = borrow = (dst < src) unsigned; must read dst before the write
+            return [
+                f"_cf = ((uint32_t)({dst}) < (uint32_t)({src})); /* sub: CF = borrow */",
+                _fmt_operand_write(ops[0], expr)
+            ]
+        if m == "add":
+            # CF = carry out = (sum < src) unsigned; dst now holds the sum
+            return [
+                _fmt_operand_write(ops[0], expr),
+                f"_cf = ((uint32_t)({dst}) < (uint32_t)({src})); /* add: CF = carry out */"
+            ]
+        if m in ("and", "or", "xor"):
+            return [_fmt_operand_write(ops[0], expr), "_cf = 0; /* and/or/xor clear CF */"]
         return [_fmt_operand_write(ops[0], expr)]
 
     def _lift_inc_dec(self, insn, ops, m):
@@ -1190,14 +1205,25 @@ class Lifter:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        return [_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}")]
+        # Store CF = the last bit shifted out (x86 masks the count to 5 bits,
+        # which also keeps the C shift well-defined). _cf is unchanged for a
+        # count of 0, matching x86.
+        if c_op == "<<":
+            return [f"{{ uint32_t _d = {dst}; uint32_t _c = ({cnt}) & 31;"
+                    f" if (_c) _cf = ((_d >> (32 - _c)) & 1);"
+                    f" {_fmt_operand_write(ops[0], '_d << _c')} }}"]
+        return [f"{{ uint32_t _d = {dst}; uint32_t _c = ({cnt}) & 31;"
+                f" if (_c) _cf = ((_d >> (_c - 1)) & 1);"
+                f" {_fmt_operand_write(ops[0], '_d >> _c')} }}"]
 
     def _lift_sar(self, insn, ops):
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})")]
+        return [f"{{ uint32_t _d = {dst}; uint32_t _c = ({cnt}) & 31;"
+                f" if (_c) _cf = ((_d >> (_c - 1)) & 1);"
+                f" {_fmt_operand_write(ops[0], '(uint32_t)((int32_t)_d >> _c)')} }}"]
 
     def _lift_rotate(self, insn, ops, m):
         if len(ops) < 2:
@@ -1205,7 +1231,11 @@ class Lifter:
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
         func = "ROL32" if m == "rol" else "ROR32"
-        return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+        # CF = the bit that rotates out the top (rol) / bottom (ror)
+        bit = f"((_d >> (32 - _c)) & 1)" if m == "rol" else f"((_d >> (_c - 1)) & 1)"
+        return [f"{{ uint32_t _d = {dst}; uint32_t _c = ({cnt}) & 31;"
+                f" if (_c) _cf = {bit};"
+                f" {_fmt_operand_write(ops[0], f'{func}(_d, _c)')} }}"]
 
     def _lift_bsf_bsr(self, insn, ops, m):
         """bsf r, src / bsr r, src — bit scan, ZF set if src is zero."""
@@ -1222,14 +1252,22 @@ class Lifter:
             return ["/* cmp: bad operands */"]
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
-        return [f"(void)0; /* cmp {lhs}, {rhs} - flags set for next jcc */"]
+        # Store CF for sbb/adc consumers. The following jcc re-evaluates the
+        # operands itself, so this is purely for carry-dependent instructions.
+        return [
+            f"_cf = ((uint32_t)({lhs}) < (uint32_t)({rhs})); /* cmp: CF = (lhs < rhs) unsigned */",
+            f"(void)0; /* cmp {lhs}, {rhs} - flags set for next jcc */"
+        ]
 
     def _lift_test(self, insn, ops):
         if len(ops) < 2:
             return ["/* test: bad operands */"]
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
-        return [f"(void)0; /* test {lhs}, {rhs} - flags set for next jcc */"]
+        return [
+            "_cf = 0; /* test clears CF */",
+            f"(void)0; /* test {lhs}, {rhs} - flags set for next jcc */"
+        ]
 
     # ── Control flow ──
 
