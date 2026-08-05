@@ -730,7 +730,7 @@ def detect_seh_helpers(func_db, xbe_data, verbose=False):
 # unresolvable RECOMP_ITAIL that pops the wrong amount and drifts the
 # simulated stack. Observed: sub_00093860 (a CRT memcpy whose byte-copy
 # tails at 0x939BC+ are not in the CFG).
-DISPATCH_DIRECT = {0x00093860}
+DISPATCH_DIRECT = {0x00093860, 0x000858F3}
 
 
 class Lifter:
