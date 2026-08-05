@@ -570,9 +570,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── repe cmpsb / repne scasb: string comparison ──
     if "cmps" in flag_setter or "scas" in flag_setter:
         if jcc in ("je", "jz"):
-            return "1 /* strings matched (repe cmpsb) */", desc
+            return "_cmps_zf", desc
         if jcc in ("jne", "jnz"):
-            return "0 /* strings differed (repe cmpsb) */", desc
+            return "!_cmps_zf", desc
+        if jcc in ("jb", "jc", "jnae"):
+            return "_cf", desc
+        if jcc in ("jae", "jnc", "jnb"):
+            return "!_cf", desc
         return None
 
     return None
@@ -1458,9 +1462,31 @@ class Lifter:
                 "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*2) = LO16(eax); }",
                 "edi += ecx * 2; ecx = 0; /* rep stosw */"
             ]
-        if "cmpsb" in m or "cmpsw" in m or "cmpsd" in m:
-            return [f"/* {m} - string compare, ecx iterations */"]
-        if "scasb" in m or "scasw" in m or "scasd" in m:
+        if "cmpsb" in m:
+            return ["{ uint32_t _i; _cmps_zf = 1; "
+                    "for (_i = 0; _i < ecx; _i++) { "
+                    "if (MEM8(esi+_i) != MEM8(edi+_i)) { _cmps_zf = 0; "
+                    "_cf = (MEM8(esi+_i) < MEM8(edi+_i)); break; } } "
+                    "esi += _i; edi += _i; ecx -= _i; } /* repe cmpsb */"]
+        if "cmpsw" in m:
+            return ["{ uint32_t _i; _cmps_zf = 1; "
+                    "for (_i = 0; _i < ecx; _i++) { "
+                    "if (MEM16(esi+_i*2) != MEM16(edi+_i*2)) { _cmps_zf = 0; "
+                    "_cf = (MEM16(esi+_i*2) < MEM16(edi+_i*2)); break; } } "
+                    "esi += _i*2; edi += _i*2; ecx -= _i; } /* repe cmpsw */"]
+        if "cmpsd" in m:
+            return ["{ uint32_t _i; _cmps_zf = 1; "
+                    "for (_i = 0; _i < ecx; _i++) { "
+                    "if (MEM32(esi+_i*4) != MEM32(edi+_i*4)) { _cmps_zf = 0; "
+                    "_cf = (MEM32(esi+_i*4) < MEM32(edi+_i*4)); break; } } "
+                    "esi += _i*4; edi += _i*4; ecx -= _i; } /* repe cmpsd */"]
+        if "scasb" in m:
+            return ["{ uint32_t _i; _cmps_zf = 1; "
+                    "for (_i = 0; _i < ecx; _i++) { "
+                    "if (MEM8(edi+_i) != LO8(eax)) { _cmps_zf = 0; "
+                    "_cf = (MEM8(edi+_i) < LO8(eax)); break; } } "
+                    "edi += _i; ecx -= _i; } /* repne scasb */"]
+        if "scasw" in m or "scasd" in m:
             return [f"/* {m} - string scan, ecx iterations */"]
         return [f"/* {m} */"]
 

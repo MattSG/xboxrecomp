@@ -429,9 +429,16 @@ class FunctionTranslator:
                 "sbb", "adc", "neg", "cmp", "test", "add", "sub",
                 "and", "or", "xor", "shl", "sal", "shr", "sar",
                 "rol", "ror", "rcl", "rcr")
+                or ("cmps" in insn.mnemonic) or ("scas" in insn.mnemonic)
                         for insn in instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
+
+        # repe cmpsb / repne scasb set ZF; the lifter stores it in _cmps_zf.
+        has_cmps = any("cmps" in insn.mnemonic or "scas" in insn.mnemonic
+                       for insn in instructions)
+        if has_cmps:
+            lines.append(f"    int _cmps_zf = 0; /* string-compare ZF */")
 
         # Add _fpu_cmp for FPU compare instructions (both old and new style)
         has_fpu_cmp = any(insn.mnemonic in ("fcompi", "fcomip", "fucomi",
