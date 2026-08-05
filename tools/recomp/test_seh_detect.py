@@ -16,7 +16,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tools.recomp import config  # noqa: E402
-from tools.recomp.lifter import detect_seh_helpers  # noqa: E402
+from tools.recomp.lifter import detect_seh_helpers, Lifter  # noqa: E402
+from tools.recomp.disasm import Disassembler  # noqa: E402
 
 # Real bytes from Halo build 2276 cachebeta.xbe, 0x001DD5C8.
 SEH_PROLOG_BYTES = bytes.fromhex(
@@ -161,6 +162,41 @@ def test_missing_xbe_data_is_skipped():
     print("ok  missing_xbe_data_is_skipped")
 
 
+def _lift_ret_for(func_start):
+    """Lift a plain 'ret' as if it belonged to the given function."""
+    ds = Disassembler()
+    insns = ds.disassemble_function(bytes.fromhex("c3"), func_start, func_start + 1)
+    lifter = Lifter(seh_prolog=0x00094FC0, seh_epilog=0x00094FFB)
+    lifter.func_start = func_start
+    lifter.func_end = func_start + 1
+    return " ".join(s for i in insns for s in lifter.lift_instruction(i))
+
+
+def test_alt_seh_prologs_bridge_ebp():
+    """MSVC emits several __SEH_prolog variants (fs:[0] write + lea ebp,[esp+N]).
+    All of them must write g_seh_ebp before returning, or the caller's
+    'ebp = g_seh_ebp' readback gets a stale frame and the SEH epilog's
+    'esp = ebp' resets the emulated stack to the wrong address (observed as a
+    +0x3C esp drift in sub_0002AE7A -> sub_00018494, corrupting the tree
+    handle from 0x02780C40 to 0x398084)."""
+    assert "g_seh_ebp = ebp;" in _lift_ret_for(0x00097AA4)
+    assert "g_seh_ebp = ebp;" in _lift_ret_for(0x0009504E)
+    print("ok  alt_seh_prologs_bridge_ebp")
+
+
+def test_alt_seh_prolog_call_reads_back_ebp():
+    """A caller of the alternate SEH prolog must re-read ebp from g_seh_ebp
+    right after the call, exactly like the detected __SEH_prolog."""
+    ds = Disassembler()
+    # call 0x00097AA4 at address 0x00097000 (rel32 = 0xA9F)
+    insns = ds.disassemble_function(bytes.fromhex("e89f0a0000"), 0x00097000, 0x00097005)
+    lifter = Lifter(seh_prolog=0x00094FC0, seh_epilog=0x00094FFB)
+    out = " ".join(s for i in insns for s in lifter.lift_instruction(i))
+    assert "sub_00097AA4()" in out, out
+    assert "ebp = g_seh_ebp; /* read back frame from SEH helper */" in out, out
+    print("ok  alt_seh_prolog_call_reads_back_ebp")
+
+
 if __name__ == "__main__":
     test_detects_both()
     test_decoy_alone_is_not_a_prolog()
@@ -169,4 +205,6 @@ if __name__ == "__main__":
     test_oversized_match_is_rejected()
     test_unmapped_address_is_skipped()
     test_missing_xbe_data_is_skipped()
+    test_alt_seh_prologs_bridge_ebp()
+    test_alt_seh_prolog_call_reads_back_ebp()
     print("\nall passed")

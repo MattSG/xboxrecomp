@@ -1311,7 +1311,10 @@ class Lifter:
             else:
                 lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
             # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
-            if insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG):
+            # Also after the alternate prolog variants (fs:[0] write + lea
+            # ebp,[esp+N]) that establish ebp but are not the detected helper.
+            if (insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG)
+                    or insn.call_target in (0x00097AA4, 0x0009504E)):
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
             return lines
         elif len(ops) >= 1:
@@ -1326,7 +1329,8 @@ class Lifter:
         # If this function IS __SEH_prolog or __SEH_epilog, bridge ebp
         # so the caller can read back the frame pointer.
         prefix = ""
-        if self.func_start in (self.SEH_PROLOG, self.SEH_EPILOG):
+        if (self.func_start in (self.SEH_PROLOG, self.SEH_EPILOG)
+                or self.func_start in (0x00097AA4, 0x0009504E)):
             prefix = "g_seh_ebp = ebp; "
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
