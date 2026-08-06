@@ -95,7 +95,7 @@ def _smem_accessor(size):
     return {1: "SMEM8", 2: "SMEM16", 4: "SMEM32"}.get(size, "SMEM32")
 
 
-def _fmt_mem(op):
+def _fmt_mem(op, disp_bias=0):
     """Format a memory operand as a C expression (the address computation)."""
     parts = []
     if op.mem_base:
@@ -106,29 +106,26 @@ def _fmt_mem(op):
             parts.append(f"{idx} * {op.mem_scale}")
         else:
             parts.append(idx)
-    if op.mem_disp:
-        if op.mem_disp < 0:
-            # Negative displacement - but we stored unsigned, check sign
-            if op.mem_disp > 0x80000000:
-                # Actually negative (two's complement)
-                signed_disp = op.mem_disp - 0x100000000
-                if parts:
-                    parts.append(f"- {_fmt_imm(-signed_disp)}")
-                else:
-                    parts.append(_fmt_imm(op.mem_disp))
+    disp = (op.mem_disp + disp_bias) & 0xFFFFFFFF if disp_bias else op.mem_disp
+    if disp:
+        if disp > 0x80000000:
+            # Actually negative (two's complement)
+            signed_disp = disp - 0x100000000
+            if parts:
+                parts.append(f"- {_fmt_imm(-signed_disp)}")
             else:
-                parts.append(_fmt_imm(op.mem_disp))
+                parts.append(_fmt_imm(disp))
         else:
-            parts.append(_fmt_imm(op.mem_disp))
+            parts.append(_fmt_imm(disp))
     if not parts:
         return "0"
     return " + ".join(parts)
 
 
-def _fmt_mem_read(op):
+def _fmt_mem_read(op, disp_bias=0):
     """Format reading from a memory operand."""
     accessor = _mem_accessor(op.mem_size)
-    addr = _fmt_mem(op)
+    addr = _fmt_mem(op, disp_bias)
     return f"{accessor}({addr})"
 
 
@@ -139,14 +136,14 @@ def _fmt_mem_write(op, value_expr):
     return f"{accessor}({addr}) = {value_expr};"
 
 
-def _fmt_operand_read(op):
+def _fmt_operand_read(op, disp_bias=0):
     """Format reading any operand type."""
     if op.type == "reg":
         return _fmt_reg(op.reg)
     elif op.type == "imm":
         return _fmt_imm(op.imm)
     elif op.type == "mem":
-        return _fmt_mem_read(op)
+        return _fmt_mem_read(op, disp_bias)
     return "/* unknown operand */"
 
 
@@ -1318,7 +1315,12 @@ class Lifter:
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
             return lines
         elif len(ops) >= 1:
-            target = _fmt_operand_read(ops[0])
+            # The dummy-return PUSH32(esp, 0) executes before the ICALL
+            # target expression is evaluated, so an esp-relative operand reads
+            # 4 bytes above the original 'call [esp+X]' slot. Bump the disp
+            # to hit the slot the original instruction addressed.
+            bias = 4 if (ops[0].type == "mem" and ops[0].mem_base == "esp") else 0
+            target = _fmt_operand_read(ops[0], disp_bias=bias)
             # Mark indirect calls for post-processing by _fixup_icall_esp_save
             return [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
         return ["/* call: no target */"]
