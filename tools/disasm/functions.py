@@ -548,54 +548,59 @@ class FunctionDetector:
 
     def _find_function_end(self, start: int, next_func: Optional[int],
                            sec_end: Optional[int]) -> int:
-        """Determine where a function ends."""
+        """Determine where a function ends.
+
+        Walks the function's control flow, following every forward jump
+        target inside [start, upper). A mid-function continuation reachable
+        only through a conditional branch (shared epilogue / if-else chunk
+        after an early ret) is still part of this function: the original
+        single-addr walk stopped at the first ret and left those targets
+        outside the extent, so pass 5b split one function into fragments
+        (MM3 pool allocator: 0x8454C split from its 0x84592 continuation,
+        corrupting callee-saved register/arg semantics).
+        """
         max_addr = start
-        addr = start
         visited = set()
 
         upper = sec_end if sec_end else start + 0x100000
         if next_func and next_func < upper:
             upper = next_func
 
-        while addr < upper:
-            # Guard against infinite loops when following internal jmp
-            # targets (e.g. a jmp back to an earlier block). Since the walk
-            # only follows forward jumps inside [start, upper), a revisit
-            # means we are in a cycle we already covered.
-            if addr in visited:
-                break
-            visited.add(addr)
-
-            insn = self.engine.get_instruction(addr)
-            if insn is None:
-                break
-
-            end = insn.end_address
-            if end > max_addr:
-                max_addr = end
-
-            if insn.is_cond_jump and insn.jump_target is not None:
-                target = insn.jump_target
-                if start <= target < upper and target > max_addr:
-                    max_addr = target
-
-            if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
-                # Unconditional jmp: if the target is INSIDE this function's
-                # extent (a local forward/backward branch, e.g. a jump over a
-                # block or a loop), keep walking from the target — the
-                # function continues there until a ret. Only a jump to a
-                # target at/after upper (another function) terminates.
-                if (insn.is_jump and not insn.is_cond_jump
-                        and insn.jump_target is not None
-                        and start <= insn.jump_target < upper):
-                    addr = insn.jump_target
-                    continue
-                if addr + insn.size >= max_addr:
+        worklist = [start]
+        while worklist:
+            addr = worklist.pop()
+            while addr < upper:
+                # Guard against infinite loops when following internal jmp
+                # targets (e.g. a jmp back to an earlier block). Since the
+                # walk only follows forward jumps inside [start, upper), a
+                # revisit means we are in a cycle we already covered.
+                if addr in visited:
                     break
-                addr = insn.end_address
-                continue
+                visited.add(addr)
 
-            addr = insn.end_address
+                insn = self.engine.get_instruction(addr)
+                if insn is None:
+                    break
+
+                end = insn.end_address
+                if end > max_addr:
+                    max_addr = end
+
+                if insn.jump_target is not None:
+                    target = insn.jump_target
+                    if (start <= target < upper and target not in visited):
+                        if insn.is_cond_jump:
+                            # Conditional branch into the same function's
+                            # continuation: walk it like any other block.
+                            worklist.append(target)
+                        elif insn.is_jump:
+                            addr = target
+                            continue
+
+                if insn.is_ret:
+                    break
+
+                addr = insn.end_address
 
         return max_addr
 

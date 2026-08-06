@@ -367,6 +367,12 @@ class FunctionTranslator:
         if any(insn.call_target in SEH_FUNCS for insn in instructions):
             used_regs.add("ebp")
 
+        # Ensure ebp tracked if this function IS an SEH helper or alternate
+        # prolog variant (lifter emits g_seh_ebp = ebp at the ret bridge).
+        if start in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG,
+                     0x00097AA4, 0x0009504E):
+            used_regs.add("ebp")
+
         # Build call targets list
         call_targets = set()
         for insn in instructions:
@@ -929,6 +935,7 @@ class BatchTranslator:
             f.write("\n".join(header_lines))
 
         # Split translations into chunks and write .c files
+        import glob
         generated_files = [header_path]
         chunks = [translations[i:i+chunk_size]
                   for i in range(0, len(translations), chunk_size)]
@@ -959,6 +966,12 @@ class BatchTranslator:
             if verbose:
                 print(f"  Wrote {c_path} ({len(chunk)} functions)",
                       file=sys.stderr)
+
+        # Remove stale chunk files from previous generations (the function
+        # count can shrink when disassembly merges mid-function fragments).
+        for stale in glob.glob(os.path.join(output_dir, f"{prefix}_*.c")):
+            if stale not in generated_files:
+                os.remove(stale)
 
         # Emit the stub bodies for call targets with no definition.
         if unresolved:
