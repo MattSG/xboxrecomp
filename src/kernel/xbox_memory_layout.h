@@ -136,7 +136,7 @@ ptrdiff_t xbox_GetMemoryOffset(void);
  *  Increased from 1 MB because failed RECOMP_ICALL indirect calls
  *  can leak stdcall args onto the stack each frame. An 8 MB stack
  *  provides enough headroom for extended gameplay sessions. */
-#define XBOX_STACK_SIZE     (32 * 1024 * 1024)
+#define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
 /** Base VA of the stack area (above last XBE section). */
 #define XBOX_STACK_BASE     0x00780000
@@ -149,14 +149,14 @@ ptrdiff_t xbox_GetMemoryOffset(void);
  * ================================================================ */
 
 /** Base VA of the dynamic heap area (above stack). */
-#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00880000 */
+#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 */
 
 /** Size of the dynamic heap.
  *  Xbox has 64 MB total RAM. The total mapped region (data + stack + heap)
  *  must equal 64 MB so the RenderWare engine's memory probing stops at the
  *  correct boundary. On a real Xbox, probing past 64 MB causes a page fault
  *  that the engine catches via SEH to determine available memory. */
-#define XBOX_HEAP_SIZE      (XBOX_TOTAL_RAM - XBOX_HEAP_BASE)  /* ~55.5 MB */
+#define XBOX_HEAP_SIZE      (XBOX_TOTAL_RAM - XBOX_HEAP_BASE)  /* ~50.8 MB */
 
 /** No static mirror/guard region. RAM mirror is handled via file mapping
  *  views that alias the same physical pages as the base 64 MB region. */
