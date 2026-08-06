@@ -135,6 +135,24 @@ def _fixup_unbalanced_saves(lines, func_addr=None, seh_epilog=None):
     if not pop_order:
         return lines
 
+    # Whole-function pop counts are only meaningful for a single epilogue
+    # pop block. Pops spread across multiple sites are exclusive exit paths
+    # (e.g. sub_0002B087: 1 push ebx at entry, then 1 pop ebx on each of two
+    # exits); naive pop>push would inject phantom entry pushes that leak g_esp.
+    # ebp is excluded: its only pop is the leave ("esp = ebp; POP ebp") that
+    # every normal epilogue ends with, not an exclusive-exit signal.
+    pop_run_re = re.compile(r'^\s*POP32\(esp, (edi|esi|ebx)\);')
+    seen_pop = False
+    run_ended = False
+    for line in lines:
+        if pop_run_re.match(line):
+            if run_ended:
+                return lines
+            seen_pop = True
+        elif seen_pop and line.strip() and not line.strip().startswith(
+                ("loc_", "/*", "*", "//")):
+            run_ended = True
+
     # Arg-cleanup epilogues: when the first pop immediately follows a call,
     # the pops are stdcall arg cleanup that loads the call's args back into
     # edi/esi/ebx (e.g. sub_0008726E: push [ebp-4]/ecx/eax; call sub_00086ED2;

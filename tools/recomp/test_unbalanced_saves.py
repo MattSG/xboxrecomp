@@ -212,6 +212,43 @@ def test_leave_ebp_balanced_is_not_rebalanced():
     print("ok  leave_ebp_balanced_is_not_rebalanced")
 
 
+def _sample_exclusive_exit_pops():
+    """sub_0002B087: pushes ebx once at entry but pops ebx once on each of
+    two exclusive exit paths. Whole-function pop(ebx)=2 > push(ebx)=1 would
+    naively trigger rebalancing and inject phantom entry pushes, leaking 8
+    guest bytes per call (observed: settings name-table loop edi corruption).
+    The fixup must leave the function untouched."""
+    return [
+        "void sub_0002B087(void)",
+        "{",
+        "loc_0002B087: ;",
+        "    PUSH32(esp, ebx);",
+        "    eax = MEM32(ecx);",
+        "    if (CMP_EQ(MEM8(eax + 0x2D), 0)) goto loc_0002B096;",
+        "loc_0002B091: ;",
+        "    eax = MEM32(eax + 8);",
+        "    goto loc_0002B0C4;",
+        "loc_0002B096: ;",
+        "    eax = MEM32(edx + 8);",
+        "    MEM32(ecx) = edx;",
+        "    POP32(esp, ebx);",
+        "    esp += 4; return; /* ret */",
+        "loc_0002B0C4: ;",
+        "    POP32(esp, ebx);",
+        "    esp += 4; return; /* ret */",
+        "}",
+    ]
+
+
+def test_exclusive_exit_pops_are_not_rebalanced():
+    sample = _sample_exclusive_exit_pops()
+    out = _fixup_unbalanced_saves(list(sample))
+    assert out == sample, "exclusive-exit pops must not be rebalanced"
+    pushes = _pushes(out)
+    assert len(pushes) == 1 and pushes[0].strip() == "PUSH32(esp, ebx);", pushes
+    print("ok  exclusive_exit_pops_are_not_rebalanced")
+
+
 if __name__ == "__main__":
     test_unbalanced_is_balanced_after_fixup()
     test_balanced_function_is_untouched()
@@ -220,4 +257,5 @@ if __name__ == "__main__":
     test_seh_epilog_is_not_rebalanced()
     test_arg_cleanup_epilog_is_not_rebalanced()
     test_leave_ebp_balanced_is_not_rebalanced()
+    test_exclusive_exit_pops_are_not_rebalanced()
     print("\nall passed")
