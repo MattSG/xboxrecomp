@@ -423,6 +423,26 @@ static void bridge_NtAllocateVirtualMemory(void)
         return;
     }
 
+    /* MEM_RESERVE at a mirror-backed guest address: the 26-bit bus wrap
+     * already makes every address below the mirror ceiling real physical
+     * RAM, exactly like the real Xbox. The DICE pool carves its large
+     * regions here (pool cursor 0x84000000); grant the request at the
+     * requested base instead of failing on the tiny bump heap and forcing
+     * the pool's broken fake-large-node fallback (garbage descriptors ->
+     * runaway 12-byte copy past the mirror seam). */
+    if (base_hint != 0 && (alloc_type & 0x2000) &&
+        base_hint < (uint32_t)((XBOX_NUM_MIRRORS + 1) * XBOX_TOTAL_RAM)) {
+        if (g_kernel_call_count <= 200) {
+            fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: mirror-backed region base=0x%08X size=%u (wrapped RAM)\n",
+                    base_hint, size);
+            fflush(stderr);
+        }
+        if (base_ptr) BRIDGE_MEM32(base_ptr) = base_hint;
+        if (size_ptr) BRIDGE_MEM32(size_ptr) = size;
+        g_eax = 0; /* STATUS_SUCCESS */
+        return;
+    }
+
     /* Allocate from Xbox heap (MEM_RESERVE or MEM_RESERVE|MEM_COMMIT) */
     uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
     if (!xbox_va) {
@@ -446,6 +466,17 @@ static void bridge_NtFreeVirtualMemory(void)
     uint32_t base_ptr = STACK_ARG(0);
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
+
+    /* Mirror-backed guest addresses are wrapped RAM that must stay mapped;
+     * releasing them is a success no-op (real Xbox RAM is never released). */
+    if (base_ptr) {
+        uint32_t base_va = BRIDGE_MEM32(base_ptr);
+        if (base_va != 0 &&
+            base_va < (uint32_t)((XBOX_NUM_MIRRORS + 1) * XBOX_TOTAL_RAM)) {
+            g_eax = 0; /* STATUS_SUCCESS */
+            return;
+        }
+    }
 
     g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
         XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
