@@ -164,11 +164,12 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 #define XBOX_GUARD_SIZE     0
 
 /** Number of 64 MB mirror views to pre-map.
- *  Covers guest addresses up to the kernel boundary (0x80000000). MM3's
- *  DICE engine writes large structures at high wrapped addresses (e.g.
- *  a sorted array base at 0x74000000 aliases physical page 0 via the
- *  26-bit address bus); without enough views those writes fault. */
-#define XBOX_NUM_MIRRORS    32
+ *  Covers guest addresses up to 0x8C000000 so the full high half
+ *  (0x80000000-0x88000000, plus one wrap) aliases low RAM exactly like
+ *  the 26-bit address bus: DICE allocates its arena at the detected
+ *  memory top (0x84000000) and its wrapping copies go through
+ *  0x84000000 -> 0x00000000. */
+#define XBOX_NUM_MIRRORS    34
 
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.

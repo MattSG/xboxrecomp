@@ -47,10 +47,6 @@ static HANDLE g_mapping_handle = NULL;
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
 
-/* Separate allocation for Xbox kernel address space (0x80010000+).
- * Some RenderWare code reads the kernel PE header to detect features. */
-static void *g_kernel_memory = NULL;
-
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
 
@@ -391,57 +387,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
-     * Map a plain 16 MB region covering guest 0x80000000-0x81000000:
-     * the wrapped-RAM boundary, the fake kernel PE (0x80010000), and the
-     * DICE pool the engine places just past the kernel.
-     *
-     * RenderWare's Xbox driver code (xbcache.c) reads MEM32(0x8001003C)
-     * to parse the Xbox kernel's PE header and find the INIT section for
-     * CPU cache line sizing. On PC, we provide a minimal fake PE header
-     * with 0 sections so the function gracefully skips the cache init.
-     *
-     * MM3's DICE memory manager computes its arena base as pool_start -
-     * pool_size where pool_start is the detected memory top and the pool
-     * size is 0xF000. The arena therefore lands just below the memory top
-     * and must be writable. A single 16 MB plain region gives the engine
-     * room no matter where its (page-granular) probe decides the top is.
+     * The high half (guest 0x80000000-0x8C000000) is covered by mirror
+     * views of the base 64 MB region (see below), exactly like the real
+     * Xbox 26-bit address bus: 0x80010000 aliases 0x00010000, 0x84000000
+     * aliases 0x00000000, etc. A separate VirtualAlloc region previously
+     * occupied the mirror addresses (error 487) and made the DICE arena
+     * land on unmapped memory at the region end (0x84000000). The fake
+     * kernel PE is written through mirror 31 after the views map.
      */
-    {
-        #define KP_BASE      0x80000000u
-        #define KP_SIZE      0x01000000u   /* 16 MB */
-        uintptr_t kp_native = KP_BASE + g_memory_offset;
-        g_kernel_memory = VirtualAlloc(
-            (LPVOID)kp_native,
-            KP_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
-        if (g_kernel_memory) {
-            memset(g_kernel_memory, 0, KP_SIZE);
-            /* Fake kernel PE at 0x80010000. Complete PE header so the game's
-             * PE parse (for cache sizing AND possibly the memory top) sees a
-             * well-formed kernel: MZ, e_lfanew, PE sig, COFF header with 0
-             * sections, optional header with a configurable SizeOfImage. */
-            uint8_t *kp = (uint8_t *)g_kernel_memory + 0x10000;
-            *(uint16_t *)(kp + 0x00) = 0x5A4D;                    /* "MZ" */
-            *(uint32_t *)(kp + 0x3C) = 0x80;                      /* e_lfanew */
-            *(uint32_t *)(kp + 0x80) = 0x00004550;                /* "PE\0\0" */
-            *(uint16_t *)(kp + 0x84) = 0x14C;                     /* Machine i386 */
-            *(uint16_t *)(kp + 0x86) = 0;                         /* NumberOfSections */
-            *(uint16_t *)(kp + 0x94) = 0xE0;                      /* SizeOfOptionalHeader */
-            *(uint16_t *)(kp + 0x96) = 0x0102;                    /* Characteristics */
-            *(uint16_t *)(kp + 0x98) = 0x10B;                     /* Optional magic PE32 */
-            *(uint32_t *)(kp + 0xD0) = 0x01000000u;               /* SizeOfImage 16MB */
-            fprintf(stderr, "  Kernel+pool region: 16 MB at Xbox VA "
-                "0x%08X-0x%08X (native %p), SizeOfImage=0x01000000\n",
-                KP_BASE, KP_BASE + KP_SIZE, g_kernel_memory);
-        } else {
-            fprintf(stderr, "  WARNING: could not map kernel/pool region "
-                "at 0x%08X (err=%lu)\n", KP_BASE, GetLastError());
-        }
-        #undef KP_BASE
-        #undef KP_SIZE
-    }
 
     /*
      * Initialize the DICE software memory map (guest 0x46E6C0).
@@ -527,16 +480,38 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
     }
 
+    /* Fake kernel PE at guest 0x80010000 (mirror 31, which aliases guest
+     * 0x00010000 = the XBE header). RenderWare's Xbox driver code
+     * (xbcache.c) reads MEM32(0x8001003C) to parse the kernel PE header
+     * for CPU cache line sizing; we provide a minimal PE with 0 sections
+     * so the parse gracefully skips the cache init. The overlay touches
+     * only XBE header offsets 0x00-0xD4 (magic + signature), which nothing
+     * re-reads at runtime; certificate/section fields at 0x104+ survive.
+     * On real hardware the kernel image occupies the same wrapped pages. */
+    if (g_mirror_views[31]) {
+        uint8_t *kp = (uint8_t *)g_mirror_views[31] + 0x10000;
+        *(uint16_t *)(kp + 0x00) = 0x5A4D;                    /* "MZ" */
+        *(uint32_t *)(kp + 0x3C) = 0x80;                      /* e_lfanew */
+        *(uint32_t *)(kp + 0x80) = 0x00004550;                /* "PE\0\0" */
+        *(uint16_t *)(kp + 0x84) = 0x14C;                     /* Machine i386 */
+        *(uint16_t *)(kp + 0x86) = 0;                         /* NumberOfSections */
+        *(uint16_t *)(kp + 0x94) = 0xE0;                      /* SizeOfOptionalHeader */
+        *(uint16_t *)(kp + 0x96) = 0x0102;                    /* Characteristics */
+        *(uint16_t *)(kp + 0x98) = 0x10B;                     /* Optional magic PE32 */
+        *(uint32_t *)(kp + 0xD0) = 0x01000000u;               /* SizeOfImage */
+        fprintf(stderr, "  Fake kernel PE: written at guest 0x80010000 "
+            "(mirror 31, aliases XBE header at 0x10000)\n");
+    } else {
+        fprintf(stderr, "  WARNING: mirror 31 (guest 0x80000000) not "
+            "mapped; fake kernel PE unavailable\n");
+    }
+
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }
 
 void xbox_MemoryLayoutShutdown(void)
 {
-    if (g_kernel_memory) {
-        VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
-        g_kernel_memory = NULL;
-    }
     /* Unmap mirror views first */
     for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
         if (g_mirror_views[m]) {
