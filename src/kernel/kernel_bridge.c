@@ -31,6 +31,7 @@
 #include <float.h>
 #include <io.h>       /* _open_osfhandle */
 #include <fcntl.h>    /* _O_RDONLY, etc. */
+#include <setjmp.h>
 
 /* Access to recompiled code globals */
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
@@ -214,6 +215,16 @@ static int g_kernel_call_count = 0;
  * thread and returns, and the thread runs the actual game.
  */
 static int g_thread_call_count = 0;
+/* Worker threads run synchronously inline on the main native thread (see
+ * bridge_PsCreateSystemThreadEx below). On real Xbox, PsTerminateSystemThread
+ * ends the calling thread and never returns, so the guest stub's trailing
+ * int3 is unreachable. Calling native ExitThread here would kill the main
+ * native thread, which is the whole game, so a terminating worker longjmps
+ * back to its runner instead; the runner restores the caller's register set
+ * and the game continues after the thread creation. Single-level only:
+ * nested workers would need a jmp_buf stack. */
+static jmp_buf g_worker_exit_jmp;
+static volatile int g_worker_active = 0;
 
 static void bridge_PsCreateSystemThreadEx(void)
 {
@@ -273,7 +284,11 @@ static void bridge_PsCreateSystemThreadEx(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
                 g_seh_ebp = g_esp;
+                g_worker_active = 1;
+                if (setjmp(g_worker_exit_jmp) == 0) {
                 fn();
+                }
+                g_worker_active = 0;
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: worker returned\n");
                 fflush(stderr);
 
@@ -298,21 +313,34 @@ static void bridge_PsCreateSystemThreadEx(void)
 /* Handle-table helpers; defined further below. Xbox memory slots are 32-bit
  * but native HANDLEs are 64-bit pointers, so handles are kept in a table and
  * referenced by tagged 32-bit tokens. */
+#define BRIDGE_HANDLE_TAG  0x48000000u
+#define BRIDGE_HANDLE_MASK 0x00FFFFFFu
+#define BRIDGE_HANDLE_MAX  16384
+static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
+static int     s_handle_file_slot[BRIDGE_HANDLE_MAX];
+
 static void   bridge_write_handle(uint32_t handle_va, HANDLE h);
 static HANDLE bridge_take_handle(uint32_t token);
 
 static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
-
-    if (g_kernel_call_count <= 200) {
-        fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
-        fflush(stderr);
-    }
+    int file_slot = 0;
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
+        if ((raw_handle & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
+            uint32_t ti = raw_handle & BRIDGE_HANDLE_MASK;
+            if (ti > 0 && ti < BRIDGE_HANDLE_MAX) {
+                file_slot = s_handle_file_slot[ti];
+                if (file_slot) {
+                    xbox_file_close(file_slot);
+                    s_handle_file_slot[ti] = 0;
+                }
+            }
+        }
         HANDLE h = bridge_take_handle(raw_handle);
+        fprintf(stderr, "  [NTC] close tok=0x%08X h=%p file_slot=%d\n", raw_handle, h, file_slot);
         if (h && h != INVALID_HANDLE_VALUE)
             CloseHandle(h);
     }
@@ -338,6 +366,26 @@ static void bridge_MmAllocateContiguousMemory(void)
     g_eax = xbox_va;
 }
 
+/* ── MmAllocateSystemMemory (ordinal 167) ────────────────
+ * PVOID MmAllocateSystemMemory(ULONG NumberOfBytes)
+ *
+ * Boot path sub_000824F6 allocates 64KB of system memory; NULL means boot
+ * failure and routes to the BadGameDisc screen. Allocate from the Xbox heap
+ * like the other Mm bridges.
+ */
+static void bridge_MmAllocateSystemMemory(void)
+{
+    uint32_t size = STACK_ARG(0);
+    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+
+    if (g_kernel_call_count <= 100) {
+        fprintf(stderr, "  [KERNEL] MmAllocateSystemMemory: size=%u → Xbox VA 0x%08X\n",
+                size, xbox_va);
+        fflush(stderr);
+    }
+    g_eax = xbox_va;
+}
+
 /* ── MmAllocateContiguousMemoryEx (ordinal 166) ───────────
  * PVOID MmAllocateContiguousMemoryEx(SIZE_T size, ULONG_PTR low, ULONG_PTR high,
  *                                     ULONG alignment, ULONG protect)
@@ -349,6 +397,22 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     uint32_t high = STACK_ARG(2);
     uint32_t align = STACK_ARG(3);
     uint32_t prot = STACK_ARG(4);
+    /* Whole-RAM D3D surface-heap reservation: sub_00346450 (loc_003466AF)
+     * requests the full 64 MB arena (size 0x4000000, align 0x4000, tag 0x404)
+     * as the device surface heap. On real Xbox this succeeds against all of
+     * physical RAM and D3D surfaces live in the non-cached 0x80000000 alias;
+     * the bump-only ~50.8 MB heap cannot express it, so return the 64 MB
+     * mirror base directly and let the game's descriptor sub-allocator manage
+     * the arena (the mirror aliases the whole base RAM, like real hardware). */
+    if (size >= XBOX_TOTAL_RAM) {
+        if (g_kernel_call_count <= 100) {
+            fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u"
+                " -> surface arena 0x80000000\n", size, align);
+            fflush(stderr);
+        }
+        g_eax = 0x80000000u;
+        return;
+    }
 
     /* Allocate from Xbox heap with requested alignment */
     if (align < 4096) align = 4096;
@@ -359,7 +423,6 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
                 size, align, xbox_va);
         fflush(stderr);
     }
-
     g_eax = xbox_va;
 }
 
@@ -733,9 +796,15 @@ static void bridge_PsTerminateSystemThread(void)
 {
     uint32_t exit_status = STACK_ARG(0);
 
+    if (g_worker_active) {
+        fprintf(stderr, "  [KERNEL] PsTerminateSystemThread: status=0x%08X - worker unwind\n", exit_status);
+    fflush(stderr);
+        g_worker_active = 0;
+        longjmp(g_worker_exit_jmp, 1);
+    }
+
     fprintf(stderr, "  [KERNEL] PsTerminateSystemThread: status=0x%08X - calling ExitThread\n", exit_status);
     fflush(stderr);
-
     ExitThread(exit_status);
     /* Never returns */
 }
@@ -899,11 +968,6 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
  * Xbox memory. Tokens carry a tag in the high byte so they never collide
  * with the synthetic handles (0xDEAD0001 / 0xBEEF0010) used elsewhere.
  */
-#define BRIDGE_HANDLE_TAG  0x48000000u
-#define BRIDGE_HANDLE_MASK 0x00FFFFFFu
-#define BRIDGE_HANDLE_MAX  16384
-static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
-
 static uint32_t bridge_handle_token(HANDLE h)
 {
     int i;
@@ -1036,14 +1100,29 @@ static NTSTATUS bridge_create_file_impl(
         }
     }
 
+    DWORD gle = 0;
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
                            file_attrs, share, disposition, options);
+    gle = GetLastError();
+
+    {
+        static int s_res_log = 0;
+        if (s_res_log < 20) {
+            fprintf(stderr, "[FILE] result path='%s' st=0x%08X h=%p access=0x%X share=0x%X disp=%d opts=0x%X gle=%u seh_ebp=0x%08X\n",
+                    name.Buffer ? name.Buffer : "(null)", (uint32_t)st, h,
+                    access, share, disposition, options, gle, g_seh_ebp);
+            s_res_log++;
+        }
+    }
 
     if (NT_SUCCESS(st)) {
         /* Always store the native Windows HANDLE for kernel I/O
          * (NtReadFile, NtClose, etc.). The handle-table token
          * is tagged and stored in Xbox memory. */
         bridge_write_handle(handle_va, h);
+        fprintf(stderr, "  [HANDLE] open path='%s' va=0x%08X tok=0x%08X h=%p\n",
+                name.Buffer ? name.Buffer : "(null)", handle_va,
+                handle_va ? BRIDGE_MEM32(handle_va) : 0, h);
 
         /* Also register a CRT FILE* for fread/fread_s interception.
          * Uses a duplicated handle so CRT owns the dup while the
@@ -1060,6 +1139,12 @@ static NTSTATUS bridge_create_file_impl(
                         int slot = xbox_file_register(fp);
                         if (slot) {
                             xbox_handle_register_file(slot, fp);
+                            uint32_t tok = handle_va ? BRIDGE_MEM32(handle_va) : 0;
+                            if ((tok & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
+                                uint32_t ti = tok & BRIDGE_HANDLE_MASK;
+                                if (ti > 0 && ti < BRIDGE_HANDLE_MAX)
+                                    s_handle_file_slot[ti] = slot;
+                            }
                         } else {
                             fclose(fp);
                         }
@@ -1112,6 +1197,16 @@ static void bridge_NtOpenFile(void)
         const char* path = bridge_get_xbox_path(obj_attrs);
         fprintf(stderr, "  [KERNEL] NtOpenFile: path='%s' access=0x%X\n",
             path ? path : "(null)", access);
+        if (path) {
+            static int s_hex = 0;
+            if (s_hex < 24) {
+                const uint8_t *pb = (const uint8_t *)path;
+                fprintf(stderr, "  [KERNEL] NtOpenFile pathhex:");
+                for (int i = 0; i < 32; i++) fprintf(stderr, " %02X", pb[i]);
+                fprintf(stderr, "\n");
+                s_hex++;
+            }
+        }
         if (!path && getenv("MM3_TRACE_PATHS")) {
             fprintf(stderr, "[NTOPTRACE] obj_attrs=0x%08X ansi=0x%08X buf=0x%08X\n",
                 obj_attrs,
@@ -1190,6 +1285,20 @@ static void bridge_NtQueryInformationFile(void)
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
+    {
+        static int s_q_log = 0;
+        if (s_q_log < 20) {
+            uint64_t eof = 0;
+            if (info_va < 0x04000000u)
+                eof = (uint64_t)BRIDGE_MEM32(info_va + 8) |
+                      ((uint64_t)BRIDGE_MEM32(info_va + 0xC) << 32);
+            fprintf(stderr, "[QFILE] tok=0x%08X h=%p class=%u len=%u "
+                    "st=0x%08X eof64=%llu\n",
+                    STACK_ARG(0), handle, infoclass, length,
+                    (uint32_t)ios.Status, (unsigned long long)eof);
+            s_q_log++;
+        }
+    }
 }
 
 /* ── NtSetInformationFile (ordinal 226, 5 args = 20 bytes) ─ */
@@ -1368,10 +1477,104 @@ static void bridge_NtCreateDirectoryObject(void)
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
+/* ── RtlInitAnsiString (ordinal 289, 2 args = 8 bytes) ───
+ * VOID RtlInitAnsiString(PANSI_STRING Dest, PCSZ Source)
+ * MM3's XPP memory-unit driver builds "\Device\MU_n" names with it.
+ */
+static void bridge_RtlInitAnsiString(void)
+{
+    uint32_t dst = STACK_ARG(0);
+    uint32_t src = STACK_ARG(1);
+    if (!dst || !src) {
+        g_eax = 0;
+        return;
+    }
+    size_t len = 0;
+    const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(src);
+    while (p[len]) len++;
+    if (len > 0xFFFF) len = 0xFFFF;
+    {
+        static int s_ansi = 0;
+        if (dst < 0x04000000u) {
+            const uint8_t *dp = (const uint8_t *)XBOX_TO_NATIVE(dst);
+            fprintf(stderr, "[ANSI]   dst=%08X struct: %02X%02X %02X%02X %02X%02X%02X%02X\n",
+                    dst, dp[0], dp[1], dp[2], dp[3], dp[4], dp[5], dp[6], dp[7]);
+        }
+        if (src >= 0x01080000u && src < 0x010A0000u) {
+            const uint8_t *sp = (const uint8_t *)XBOX_TO_NATIVE(src - 0x20 < src ? src - 0x20 : 0);
+            (void)sp;
+            fprintf(stderr, "[ANSI]   around src:");
+            for (int k = -8; k < 24; k += 4) {
+                uint32_t a = (uint32_t)((int32_t)src + k * 4);
+                const uint8_t *ap = (const uint8_t *)XBOX_TO_NATIVE(a);
+                fprintf(stderr, " %02X%02X%02X%02X", ap[0], ap[1], ap[2], ap[3]);
+            }
+            fprintf(stderr, "\n");
+        }
+        s_ansi++;
+        if (s_ansi < 24) {
+            extern volatile uint32_t g_icall_trace[16], g_icall_trace_idx;
+            { uint32_t pi = g_icall_trace_idx; fprintf(stderr, "[ANSI]   ring:");
+              for (int k = 0; k < 8; k++) fprintf(stderr, " %08X", g_icall_trace[(pi - 1 - k) & 15]);
+              fprintf(stderr, " esp=0x%08X\n", g_esp); }
+            fprintf(stderr, "[ANSI] src=0x%08X ret=0x%08X len=%u str=%.40s "
+                    "hostrva=0x%llX seh_ebp=0x%08X\n",
+                    src, BRIDGE_MEM32(g_esp - 4), (uint32_t)len, (const char*)p,
+                    (unsigned long long)((uintptr_t)_ReturnAddress() - (uintptr_t)GetModuleHandle(NULL)),
+                    g_seh_ebp);
+            if (src >= 0x00700000u && src < 0x01000000u) {
+                const uint8_t *bp = (const uint8_t *)XBOX_TO_NATIVE(src);
+                fprintf(stderr, "[ANSI]   dump:");
+                for (int j = 0; j < 48; j += 4)
+                    fprintf(stderr, " %02X%02X%02X%02X", bp[j], bp[j+1], bp[j+2], bp[j+3]);
+                fprintf(stderr, "\n");
+                s_ansi++;
+            }
+        }
+    }
+    BRIDGE_MEM16(dst) = (uint16_t)len;
+    BRIDGE_MEM16(dst + 2) = (uint16_t)(len + 1);
+    BRIDGE_MEM32(dst + 4) = src;
+    g_eax = 0;
+}
 /* ── IoCreateSymbolicLink (ordinal 63) ───────────────────── */
 static void bridge_IoCreateSymbolicLink(void)
 {
     g_eax = 0;  /* STATUS_SUCCESS */
+}
+
+/* ── IoCreateDevice (ordinal 65, 6 args = 24 bytes) ───────
+ * NTSTATUS IoCreateDevice(DriverObject, ExtensionSize, DeviceName,
+ *                         DeviceType, Exclusive, DeviceObject)
+ * MM3's XPP memory-unit driver calls this in a loop (up to 8 MU devices) and
+ * reads [DeviceObject+0x18] as the DeviceExtension pointer, so the object is
+ * allocated from the Xbox heap with the extension at offset 0x18.
+ */
+static void bridge_IoCreateDevice(void)
+{
+    uint32_t ext_size = STACK_ARG(1);
+    uint32_t dev_type = STACK_ARG(3);
+    uint32_t dev_out  = STACK_ARG(5);
+
+    uint32_t total = 0x18 + ext_size;
+    uint32_t device = xbox_HeapAlloc(total, 16);
+    if (!device) {
+        if (dev_out) BRIDGE_MEM32(dev_out) = 0;
+        g_eax = 0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
+        return;
+    }
+    memset(XBOX_TO_NATIVE(device), 0, total);
+    BRIDGE_MEM16(device) = (uint16_t)dev_type;
+    BRIDGE_MEM32(device + 4) = total;
+    BRIDGE_MEM32(device + 0x18) = device + 0x18; /* DeviceExtension */
+    if (dev_out) BRIDGE_MEM32(dev_out) = device;
+    g_eax = 0; /* STATUS_SUCCESS */
+
+    if (g_kernel_call_count <= 200) {
+        fprintf(stderr, "  [KERNEL] IoCreateDevice: ext=0x%X type=0x%X -> 0x%08X\n",
+                ext_size, dev_type, device);
+        fflush(stderr);
+    }
 }
 
 /* ── ObReferenceObjectByHandle (ordinal 246) ─────────────── */
@@ -1456,6 +1659,16 @@ static void bridge_MmPersistContiguousMemory(void)
 }
 
 /* ── Generic fallback for simple value-only functions ────── */
+/* ── MmLockUnlockBufferPages (ordinal 175) ────────────────
+ * NTSTATUS MmLockUnlockBufferPages(PVOID BaseAddress, ULONG NumberOfBytes,
+ *                                  BOOLEAN Lock)
+ * Locks/unlocks DMA-visible pages. No real DMA in recompilation; accept and
+ * report success so the XPP USB init path can proceed.
+ */
+static void bridge_MmLockUnlockBufferPages(void)
+{
+    g_eax = 0; /* STATUS_SUCCESS */
+}
 static void bridge_generic_stub(void)
 {
     /* Success-returning stub for functions whose callers only check for 0.
@@ -1492,7 +1705,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  42: return  0;  /* Unknown_42(void) */
 
     /* ── Pool Allocator ── */
-    case  15: return  4;  /* ExAllocatePool(1) */
+    case  15: return  8;  /* ExAllocatePool(2) */
     case  16: return  8;  /* ExAllocatePoolWithTag(2) */
     /* case  17: DATA export - ExEventObjectType */
     case  24: return  4;  /* ExQueryPoolBlockSize(1) */
@@ -1508,6 +1721,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
 
     /* ── I/O Manager ── */
     case  62: return 36;  /* IoBuildDeviceIoControlRequest(9) */
+    case  65: return 24;  /* IoCreateDevice(6) */
     /* case  65: DATA export - IoCompletionObjectType */
     case  67: return 40;  /* IoCreateFile(10) */
     case  69: return  4;  /* IoDeleteDevice(1) */
@@ -1524,7 +1738,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     /* ── Kernel Synchronization ── */
     case  95: return  8;  /* KeAlertThread(2) */
     case  97: return  4;  /* KeBugCheck(1) */
-    case  98: return 20;  /* KeBugCheckEx(5) */
+    case  98: return  4;  /* MM3/XDK5233 calls slot-102 ordinal 98 as KeConnectInterrupt(1) */
     case  99: return  4;  /* KeCancelTimer(1) */
     case 100: return  4;  /* KeConnectInterrupt(1) */
     case 107: return 12;  /* KeInitializeDpc(3) */
@@ -1557,10 +1771,12 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     /* ── Memory Management ── */
     case 165: return  4;  /* MmAllocateContiguousMemory(1) */
     case 166: return 20;  /* MmAllocateContiguousMemoryEx(5) */
+    case 167: return  4;  /* MmAllocateSystemMemory(1) */
     case 168: return  8;  /* MmClaimGpuInstanceMemory(2) */
     case 169: return  8;  /* MmCreateKernelStack(2) */
     case 170: return  8;  /* MmDeleteKernelStack(2) */
     case 171: return  4;  /* MmFreeContiguousMemory(1) */
+    case 172: return  4;  /* MmFreeSystemMemory(1) */
     case 173: return  4;  /* MmGetPhysicalAddress(1) */
     case 175: return 12;  /* MmLockUnlockBufferPages(3) */
     case 176: return  8;  /* MmLockUnlockPhysicalPage(2) */
@@ -1684,6 +1900,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* Memory - contiguous */
     case 165: return bridge_MmAllocateContiguousMemory;
     case 166: return bridge_MmAllocateContiguousMemoryEx;
+    case 167: return bridge_MmAllocateSystemMemory;
     case 171: return bridge_MmFreeContiguousMemory;
     case 173: return bridge_MmGetPhysicalAddress;
     case 182: return bridge_MmSetAddressProtect;
@@ -1734,15 +1951,18 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* I/O */
     case  63: return bridge_IoCreateSymbolicLink;
+    case  65: return bridge_IoCreateDevice;
     case  67: return bridge_IoCreateFile;
     case 188: return bridge_NtCreateDirectoryObject;
     case 246: return bridge_ObReferenceObjectByHandle;
 
+    case 175: return bridge_MmLockUnlockBufferPages;
     /* Memory - I/O mapping */
     case 177: return bridge_MmMapIoSpace;
     case 178: return bridge_MmPersistContiguousMemory;
 
     /* RTL */
+    case 289: return bridge_RtlInitAnsiString;
     case 301: return bridge_RtlNtStatusToDosError;
     case 302: return bridge_RtlRaiseException;
 
@@ -2048,5 +2268,4 @@ void xbox_kernel_bridge_init(void)
             resolved, g_thunk_table_count, bridged, unbridged);
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
-
 }
