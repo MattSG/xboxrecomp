@@ -317,6 +317,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     #undef XBOX_VA
 
+
     /* Set the global offset for recompiled code MEM macros */
     g_xbox_mem_offset = g_memory_offset;
 
@@ -382,6 +383,51 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         #undef FAKE_TLS_VA
         #undef FAKE_RWDATA_VA
+        #undef MEM32_INIT
+        #undef XBOX_VA
+    }
+
+    /*
+     * Relocated fake KPCR/TIB page.
+     *
+     * The recompiler translates fs: reads (KPCR/TIB) to flat reads at
+     * 0x0-0xFFF, and XBOX_PTR redirects those to FAKE_KPCR_VA (see
+     * recomp_types.h). The real low page (0x0-0xFFF) is ordinary RAM the
+     * game uses through 64 MB-mirror aliases (0x80000000-0x80001000): the
+     * XPP push-buffer allocator (sub_0035B4A1) bumps down from 0x80001000
+     * and 0xCCCCCCCC-fills it, which clobbered a fake TIB at VA 0x0
+     * (m250=0xCCCCCCCC -> [[0x20]+0x250] ICALL crashed). On the real Xbox
+     * the KPCR sits above the XPP range, so there is no clash.
+     */
+    {
+        #ifndef FAKE_KPCR_VA
+        #define FAKE_KPCR_VA 0x00762000u
+        #endif
+        #define XBOX_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
+        #define MEM32_INIT(va, val) (*(uint32_t *)XBOX_VA(va) = (uint32_t)(val))
+        #define FAKE_TLS_VA 0x00760000
+
+        /* Fake KPCR page: keep the fields the game's fs: reads expect. */
+        memset(XBOX_VA(FAKE_KPCR_VA), 0, 0x1000);
+        MEM32_INIT(FAKE_KPCR_VA + 0x00, 0xFFFFFFFF);   /* SEH end of chain */
+        MEM32_INIT(FAKE_KPCR_VA + 0x04, XBOX_STACK_TOP);
+        MEM32_INIT(FAKE_KPCR_VA + 0x08, XBOX_STACK_BASE);
+        MEM32_INIT(FAKE_KPCR_VA + 0x18, 0x00000000);   /* self pointer */
+        MEM32_INIT(FAKE_KPCR_VA + 0x20, 0x00000000);   /* Prcb -> 0: D3D cache skipped */
+        MEM32_INIT(FAKE_KPCR_VA + 0x24, 0x00000000);   /* IRQL */
+        MEM32_INIT(FAKE_KPCR_VA + 0x28, FAKE_TLS_VA);  /* TLS pointer */
+        MEM32_INIT(FAKE_KPCR_VA + 0x250, 0x00000000);  /* D3D cache (skip) */
+        /* Fake XPP device register page (guest 0xFED00000, redirected by
+         * XBOX_PTR): the XPP push-buffer driver polls the busy bit at +0x04
+         * and writes config at +0x48/+0x4C/+0x50; on real hardware this is
+         * device MMIO. Zeroed = idle so the sub_0035A1DE wait passes. */
+        #ifndef FAKE_XPP_VA
+        #define FAKE_XPP_VA 0x00763000u
+        #endif
+        memset(XBOX_VA(FAKE_XPP_VA), 0, 0x1000);
+
+
+        #undef FAKE_TLS_VA
         #undef MEM32_INIT
         #undef XBOX_VA
     }
@@ -562,7 +608,6 @@ static int g_heap_alloc_count = 0;
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
-
     if (alignment < 4) alignment = 4;
 
     /* Enforce minimum allocation size.
