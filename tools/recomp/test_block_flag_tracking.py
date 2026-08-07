@@ -27,10 +27,10 @@ def _block(code_bytes, start=0x400000):
     return BasicBlock(start=start, instructions=insns, successors=[])
 
 
-def _lift(code_bytes, flag_state=None, snap_counter=None):
+def _lift(code_bytes, flag_state=None, snap_counter=None, start=0x400000):
     lifter = Lifter()
     stmts, out_state = lift_basic_block(
-        lifter, _block(code_bytes), flag_state=flag_state,
+        lifter, _block(code_bytes, start=start), flag_state=flag_state,
         snap_counter=snap_counter)
     return "\n".join(stmts), out_state
 
@@ -66,6 +66,20 @@ def test_second_consumer_after_pair_uses_snapshot():
     print("ok  second_consumer_after_pair_uses_snapshot")
 
 
+def test_cmp_jcc_snapshot_precedes_branch_for_taken_path():
+    counter = [0]
+    out1, fs = _lift(bytes.fromhex("85 c0 7d 0a"), snap_counter=counter)
+    # test eax, eax; jge +0xa: the snapshot must be emitted before the
+    # conditional goto so the taken-path successor sees initialized flag
+    # temporaries. If it is emitted after, a jcc in the successor reads
+    # uninitialized locals whenever the jge is taken.
+    assert out1.index("_fcmp_0_a") < out1.index("CMP_GE"), out1
+    out2, _ = _lift(bytes.fromhex("75 13"), start=0x40000C, flag_state=fs,
+                    snap_counter=counter)
+    assert "TEST_NZ(_fcmp_0_a, _fcmp_1_b)" in out2, out2
+    print("ok  cmp_jcc_snapshot_precedes_branch_for_taken_path")
+
+
 def test_flag_state_crosses_block_boundary_with_snapshot():
     counter = [0]
     out1, fs = _lift(bytes.fromhex("39 d8"), snap_counter=counter)  # cmp eax, ebx
@@ -83,5 +97,6 @@ if __name__ == "__main__":
     test_setcc_uses_snapshot()
     test_cmovcc_uses_snapshot()
     test_second_consumer_after_pair_uses_snapshot()
+    test_cmp_jcc_snapshot_precedes_branch_for_taken_path()
     test_flag_state_crosses_block_boundary_with_snapshot()
     print("\nall block flag-tracking checks passed")

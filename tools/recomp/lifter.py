@@ -1846,16 +1846,16 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None):
         match = try_match_cmp_jcc(insns, i, lifter=lifter)
         if match:
             stmt, consumed = match
-            stmts.append(stmt)
-            # Preserve the flag-setter from the cmp/test since jcc
-            # doesn't modify flags - subsequent jcc can reuse them.
-            # Snapshot the operand values: any later consumer (this block
-            # or a successor) may run after instructions that clobber the
-            # registers/memory the condition reads, so re-deriving from
-            # live values would evaluate flags from the wrong operands.
+            # Snapshot BEFORE the conditional goto. cmp/test only reads its
+            # operands, so the snapshot values are identical on the taken and
+            # fall-through paths; but the taken-path successors inherit this
+            # flag_state too, and emitting the snapshot after the goto leaves
+            # those temporaries uninitialized when the branch is taken, so a
+            # later jcc/setcc/cmovcc in a successor evaluates garbage flags.
             flag_insn = insns[i]
             last_flag_ops = _snapshot_flag_operands(
                 stmts, flag_insn, snap_counter)
+            stmts.append(stmt)
             last_flag_setter = flag_insn.mnemonic
             i += consumed
             continue
