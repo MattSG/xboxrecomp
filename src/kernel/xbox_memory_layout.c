@@ -621,9 +621,14 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
-    if (result + size > XBOX_HEAP_BASE + XBOX_HEAP_SIZE) {
-        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
-                size, g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
+    if ((uint64_t)result + (uint64_t)size >
+        (uint64_t)XBOX_HEAP_BASE + XBOX_HEAP_SIZE) {
+        /* 64-bit bound check: the 32-bit result+size wraps for requests
+         * near 4 GB, which previously bypassed this check and let memset
+         * walk the mirror region to the 0xA4000000 ceiling and fault.
+         * Reject oversized requests; the game pool checks the NTSTATUS. */
+        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, result 0x%08X, used %u/%u)\n",
+                size, result, g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
         return 0;
     }
 

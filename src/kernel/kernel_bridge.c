@@ -509,6 +509,9 @@ static void bridge_NtAllocateVirtualMemory(void)
     /* Allocate from Xbox heap (MEM_RESERVE or MEM_RESERVE|MEM_COMMIT) */
     uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
     if (!xbox_va) {
+        fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: HEAP REJECT size=%u base_hint=0x%08X type=0x%X prot=0x%X\n",
+                size, base_hint, alloc_type, protect);
+        fflush(stderr);
         g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
         return;
     }
