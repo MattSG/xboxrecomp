@@ -1776,7 +1776,39 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
-def lift_basic_block(lifter, bb, flag_state=None):
+# Flag setters whose condition expressions read their operand values. A
+# jcc/setcc/cmovcc consumer must evaluate those values as they were when the
+# flags were set, so lift_basic_block snapshots them into temporaries at the
+# setter. FPU compares and rep cmps/scas are excluded: their conditions read
+# _fpu_cmp/_cmps_zf/_cf, not the operands.
+_SNAPSHOT_SETTERS = (FLAG_SETTERS | _EFLAGS_SETTERS) - {
+    "comiss", "comisd", "ucomiss", "ucomisd",
+}
+
+
+def _snapshot_flag_operands(stmts, insn, snap_counter):
+    """Capture a flag setter's operand values into fresh temporaries.
+
+    The C statements must be emitted immediately after the setter's own
+    statements so dest-operand setters (sub/add/inc/dec/neg) capture the
+    result. Returns snapshot_ops, Operand objects formatting to the
+    temporaries. snap_counter is a one-element list (function-wide counter)
+    so temp names stay unique within the generated function.
+    """
+    snapshot_ops = []
+    for k, op in enumerate(insn.operands[:2]):
+        if op.type not in ("reg", "imm", "mem"):
+            continue
+        name = f"_fcmp_{snap_counter[0]}_{'a' if k == 0 else 'b'}"
+        stmts.append(
+            f"uint32_t {name} = {_fmt_operand_read(op)};"
+            " /* snapshot flags operand */")
+        snapshot_ops.append(Operand(type="reg", reg=name))
+        snap_counter[0] += 1
+    return snapshot_ops
+
+
+def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None):
     """
     Lift a basic block to C statements.
     Tracks flags to generate proper conditions for jcc/setcc/cmovcc.
@@ -1784,8 +1816,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
     Args:
         lifter: Lifter instance
         bb: BasicBlock with instructions
-        flag_state: tuple of (flag_setter_mnemonic, flag_operands) from
-                    a preceding block, or None
+        flag_state: tuple of (flag_setter_mnemonic, flag_operands) from a
+                    preceding block, or None. flag_operands may be snapshot
+                    temporaries captured when flags were set.
+        snap_counter: one-element list shared across all blocks of one
+                    generated function (uniquifies snapshot temp names).
 
     Returns:
         (stmts, flag_state) where stmts is a list of C statement strings
@@ -1796,6 +1831,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
     i = 0
 
     # Track the last instruction that set flags
+    if snap_counter is None:
+        snap_counter = [0]
     if flag_state:
         last_flag_setter, last_flag_ops = flag_state
     else:
@@ -1811,10 +1848,15 @@ def lift_basic_block(lifter, bb, flag_state=None):
             stmt, consumed = match
             stmts.append(stmt)
             # Preserve the flag-setter from the cmp/test since jcc
-            # doesn't modify flags - subsequent jcc can reuse them
+            # doesn't modify flags - subsequent jcc can reuse them.
+            # Snapshot the operand values: any later consumer (this block
+            # or a successor) may run after instructions that clobber the
+            # registers/memory the condition reads, so re-deriving from
+            # live values would evaluate flags from the wrong operands.
             flag_insn = insns[i]
+            last_flag_ops = _snapshot_flag_operands(
+                stmts, flag_insn, snap_counter)
             last_flag_setter = flag_insn.mnemonic
-            last_flag_ops = list(flag_insn.operands)
             i += consumed
             continue
 
@@ -1873,16 +1915,21 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         # Track flag-setting instructions
         if curr.mnemonic in FLAG_SETTERS:
+            if curr.mnemonic in _SNAPSHOT_SETTERS:
+                last_flag_ops = _snapshot_flag_operands(
+                    stmts, curr, snap_counter)
+            else:
+                last_flag_ops = list(curr.operands)
             last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
         elif curr.mnemonic in _FLAGS_UNDEFINED:
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
             last_flag_ops = []
         elif curr.mnemonic in _EFLAGS_SETTERS:
             # Additional flag-setting instructions
+            last_flag_ops = _snapshot_flag_operands(
+                stmts, curr, snap_counter)
             last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
         elif curr.mnemonic in _EFLAGS_PRESERVE:
             pass  # These don't affect EFLAGS
         elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",

@@ -533,6 +533,7 @@ class FunctionTranslator:
                     label_addrs.add(t)
 
         flag_state = None
+        snap_counter = [0]  # function-wide flag-snapshot temp name counter
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -547,7 +548,8 @@ class FunctionTranslator:
             # This handles patterns like: test eax,eax / ja X / jb Y
             # where jb uses the same flags as ja from the preceding block.
             stmts, flag_state = lift_basic_block(
-                self.lifter, bb, flag_state=flag_state)
+                self.lifter, bb, flag_state=flag_state,
+                snap_counter=snap_counter)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 
