@@ -395,6 +395,45 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     /* Compute MMIO offset within NV2A register space */
     uint32_t mmio_offset = fault_xbox_va - NV2A_MMIO_BASE;
 
+    /* Emulated pushbuffer completion: the game flushes the write-back cache
+     * after kicking a command ring (sub_00344AB0's NV_PFB_WBC write) and then
+     * waits for the GPU to consume it by polling the DMA GET mirror at
+     * *(dev+0x17C0)+0x44 until it equals dev->field_0 (sub_00345740
+     * loc_00345EE0). Real PFIFO pushbuffer processing is a stub (Phase 2-3),
+     * so satisfy the poll contract here: on the WBC flush write, report the
+     * ring as fully consumed. ponytail: Phase-1 "GPU idle" contract like the
+     * PFIFO idle flags; replace with real pushbuffer processing for M4. */
+    if (is_write && mmio_offset == 0x100000u + NV_PFB_WBC) {
+        uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
+        uint32_t dev = *g351f48;
+        if (dev < 0x04000000u) {
+            uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
+            uint32_t sub = devp[0x17C0 / 4];
+            uint32_t expected = *devp;   /* submitted PUT (obj->field_0) */
+            /* Report the emulated DMA_GET through the NV2A register state:
+             * the guest poll reads NV_USER_DMA_GET (0xFD800044) via the VEH,
+             * which serves nv2a_mmio_read from d->puser.regs. A raw write to
+             * host memory here was never visible to the guest, so the poll at
+             * sub_00345740 loc_345EE0 spun forever (icalls stuck at 12069). */
+            if (sub >= NV2A_MMIO_BASE && sub < NV2A_MMIO_BASE + NV2A_MMIO_SIZE) {
+                nv2a_mmio_write(nv2a_get_state(),
+                                (sub - NV2A_MMIO_BASE) + 0x44u, expected, 4);
+            }
+            /* The ring-header GET (sub_00344640 loc_00344733 spins while
+             * requested > MEM32(MEM32(dev+0x30))). Emulate "GPU consumed
+             * everything": GET = ring size (dev+0x2C). */
+            uint32_t ring = *(uint32_t *)(uintptr_t)(dev + 0x30u + g_mem_offset);
+            uint32_t ring_size = *(uint32_t *)(uintptr_t)(dev + 0x2Cu + g_mem_offset);
+            if (ring < 0x10000000u && ring_size != 0u && ring_size < 0x10000u) {
+                *(uint32_t *)(uintptr_t)(ring + g_mem_offset) = ring_size;
+            }
+            fprintf(stderr, "[NV2A] WBC flush: GET mirror 0x%08X -> 0x%08X "
+                "ring 0x%08X -> 0x%08X (dev=0x%08X)\n",
+                sub + 0x44u, expected, ring, ring_size, dev);
+            fflush(stderr);
+        }
+    }
+
     return decode_and_handle(ctx, mmio_offset, is_write);
 }
 

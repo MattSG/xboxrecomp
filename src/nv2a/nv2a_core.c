@@ -654,6 +654,27 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
  * Stub handler for unimplemented blocks
  * ============================================================ */
 
+/* NV_USER block: DMA_PUT/DMA_GET live here (0x40/0x44); the game polls
+ * DMA_GET after a WBC flush to learn how far the GPU consumed its push
+ * buffer. Phase-1 stub: store reads/writes so the emulated WBC-flush
+ * completion is visible to the guest poll. */
+uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    (void)size;
+    if (addr < sizeof(d->puser.regs))
+        return d->puser.regs[addr / 4];
+    return 0;
+}
+
+void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    (void)size;
+    if (addr < sizeof(d->puser.regs))
+        d->puser.regs[addr / 4] = (uint32_t)val;
+}
+
 uint64_t nv2a_stub_read(void *opaque, hwaddr addr, unsigned int size)
 {
     (void)opaque; (void)size;
@@ -709,7 +730,7 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
     /* NV_PRAMIN = 19 */
     { .name = NULL },
     /* NV_USER = 20 */
-    STUB_ENTRY(USER,          0x800000, 0x800000),
+    ENTRY(USER,      user,     0x800000, 0x800000),
 };
 
 #undef ENTRY
@@ -788,6 +809,14 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
     qemu_mutex_init(&d->pfifo.lock);
     qemu_cond_init(&d->pfifo.fifo_cond);
     qemu_cond_init(&d->pfifo.fifo_idle_cond);
+
+    /* Phase-1 stub: report the GPU as idle with the pushbuffer drained.
+     * sub_00347E6D blocks until CACHE1_STATUS LOW_MARK (0x3214 bit 0x10) and
+     * RUNOUT_STATUS bit 0x10 (0x2400) are set with DMA_PUSH STATE (0x3220)
+     * clear before each command batch; real PFIFO/PGRAPH never runs, so these
+     * must read as "ready" or the game spins in the wait loop. */
+    d->pfifo.regs[NV_PFIFO_CACHE1_STATUS] |= NV_PFIFO_CACHE1_STATUS_LOW_MARK;
+    d->pfifo.regs[NV_PFIFO_RUNOUT_STATUS] |= NV_PFIFO_RUNOUT_STATUS_LOW_MARK;
 
     g_nv2a = d;
 

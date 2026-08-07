@@ -153,6 +153,11 @@ typedef struct NV2AState {
         uint8_t palette[256*3];
     } puserdac;
 
+    /* NV_USER DMA submission area: DMA_PUT (0x40) / DMA_GET (0x44). */
+    struct {
+        uint32_t regs[0x200];
+    } puser;
+
 } NV2AState;
 
 /* ============================================================
