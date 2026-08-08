@@ -16,7 +16,7 @@ Memory model:
 
 import struct
 
-from .disasm import Instruction, Operand
+from .disasm import Disassembler, Instruction, Operand
 from .config import is_code_address, is_data_address, va_to_file_offset
 
 
@@ -749,6 +749,10 @@ class Lifter:
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
+        # {callee_addr: cleanup_bytes or None} for direct-call ret-N comments
+        # (None = cleanup unknown, so the icall-esp fixup stops at the call).
+        self._callee_cleanup_cache = {}
+        self._disasm = None  # lazy Disassembler for _callee_cleanup()
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
@@ -762,6 +766,39 @@ class Lifter:
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
         self.SEH_PROLOG = seh_prolog
         self.SEH_EPILOG = seh_epilog
+
+    def _callee_cleanup(self, addr):
+        """Return the arg bytes a direct callee pops via `ret N`, or None.
+
+        Reads the callee's first few instructions from the XBE and returns
+        N when every `ret` seen agrees (stdcall/thiscall cleanup). The
+        icall-esp fixup uses this to skip an interleaved direct call's own
+        arg pushes when scanning back for an icall's args; None means the
+        fixup must stop at the call instead of guessing.
+        """
+        if addr in self._callee_cleanup_cache:
+            return self._callee_cleanup_cache[addr]
+        cleanup = None
+        info = (self.func_db or {}).get(addr)
+        if info is not None and self.xbe_data is not None:
+            end = info.get("end") or (addr + info.get("size", 0))
+            size = min(end - addr, 64)
+            offset = va_to_file_offset(addr)
+            if size > 0 and offset is not None:
+                raw = self.xbe_data[offset:offset + size]
+                if self._disasm is None:
+                    self._disasm = Disassembler()
+                insns = self._disasm.disassemble_function(raw, addr, addr + size)
+                rets = set()
+                for insn in insns[:16]:
+                    if insn.mnemonic == "ret":
+                        rets.add(insn.operands[0].imm
+                                 if insn.operands and insn.operands[0].type == "imm"
+                                 else 0)
+                if len(rets) == 1:
+                    cleanup = rets.pop()
+        self._callee_cleanup_cache[addr] = cleanup
+        return cleanup
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -1306,7 +1343,9 @@ class Lifter:
                 # override functions the lifter cannot generate correctly.
                 lines = [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE(0x{insn.call_target:08X}, _icall_esp); /* call 0x{insn.call_target:08X} */"]
             else:
-                lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
+                cleanup = self._callee_cleanup(insn.call_target)
+                ret_note = "" if cleanup is None else f" ret {cleanup}"
+                lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X}{ret_note} */"]
             # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
             # Also after the alternate prolog variants (fs:[0] write + lea
             # ebp,[esp+N]) that establish ebp but are not the detected helper.

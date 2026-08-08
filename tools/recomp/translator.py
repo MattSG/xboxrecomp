@@ -28,26 +28,32 @@ def _fixup_icall_esp_save(lines):
     When RECOMP_ICALL_SAFE is used, we need to save g_esp BEFORE any
     args are pushed so the macro can restore it on lookup failure.
 
-    Scans backwards from each RECOMP_ICALL_SAFE line to find consecutive
-    PUSH32 lines (the arg pushes), then inserts a save before the first.
+    Scans backwards from each RECOMP_ICALL_SAFE line to find the pushed
+    arg dwords, crossing interleaved computations, fall-through labels, and
+    direct calls whose `ret N` cleanup consumed part of those pushes.
+    Without that, a direct call interleaved between an icall's arg pushes
+    and the icall itself leaves the save placed after the remaining pending
+    args (observed: sub_001BE953 vtable call leaked 16 guest bytes and
+    crashed with eax=0xFF037AC4).
+
+    Stops at control flow (goto/return/if/POP32), esp reassignment, jump
+    labels, other icalls, and direct calls with unknown cleanup.
     """
     import re
-    result = []
-    # Find indices of all ICALL_SAFE lines
-    icall_indices = []
-    for i, line in enumerate(lines):
-        if 'RECOMP_ICALL_SAFE(' in line:
-            icall_indices.append(i)
+    call_re = re.compile(r'/\* call 0x[0-9A-Fa-f]{8}(?: ret (\d+))? \*/')
+    label_re = re.compile(r'^loc_([0-9A-Fa-f]+):')
+    goto_targets = set(re.findall(r'goto (loc_[0-9A-Fa-f]+);', "\n".join(lines)))
 
+    icall_indices = [i for i, line in enumerate(lines)
+                     if 'RECOMP_ICALL_SAFE(' in line]
     if not icall_indices:
         return lines  # nothing to do
 
     # For each ICALL, determine where to insert the save
-    insert_before = set()  # map: line_index → True (insert save before this line)
+    insert_before = set()
     for icall_idx in icall_indices:
-        # The ICALL line itself contains "PUSH32(esp, 0); RECOMP_ICALL_SAFE(...)"
-        # Look backwards for consecutive lines containing PUSH32(esp,
         first_push_idx = icall_idx
+        skip_dwords = 0  # arg dwords consumed by an interleaved direct call
         j = icall_idx - 1
         while j >= 0:
             stripped = lines[j].strip()
@@ -55,30 +61,42 @@ def _fixup_icall_esp_save(lines):
             if not stripped:
                 j -= 1
                 continue
-            # Check if this is a PUSH32 line (arg push)
-            if stripped.startswith('PUSH32(esp,'):
-                first_push_idx = j
-                j -= 1
-                continue
-            # Check if this is a non-push instruction that could be part of
-            # arg evaluation (e.g., "eax = MEM32(...);") - these are interleaved
-            # with pushes in the x86 code. We need to look past them.
-            # Stop at labels, gotos, other control flow, or other ICALL lines.
-            if (re.match(r'^loc_[0-9A-Fa-f]+:', stripped) or
-                'goto ' in stripped or
+            # Stop at control flow, stack reassignment, or other icalls.
+            if ('goto ' in stripped or
                 'RECOMP_ICALL' in stripped or
                 'return;' in stripped or
                 stripped.startswith('if (') or
                 stripped.startswith('POP32(') or
-                stripped.startswith('PUSH32(esp, 0); sub_')):
+                re.match(r'^esp\s*=', stripped)):
                 break
-            # It's an interleaved computation - skip past it
+            # Interleaved direct call: skip the arg dwords its `ret N`
+            # pops from the pushes before it (the return slot lives on the
+            # call's own line). Unknown cleanup cannot be attributed.
+            m = call_re.search(stripped)
+            if m:
+                if m.group(1) is None:
+                    break
+                skip_dwords += int(m.group(1)) // 4
+                j -= 1
+                continue
+            if stripped.startswith('PUSH32(esp,'):
+                if skip_dwords > 0:
+                    skip_dwords -= 1
+                else:
+                    first_push_idx = j
+                j -= 1
+                continue
+            # Stop at jump-target labels; cross fall-through labels and
+            # interleaved arg-evaluation computations.
+            lm = label_re.match(stripped)
+            if lm and f"loc_{lm.group(1)}" in goto_targets:
+                break
             j -= 1
-            continue
 
         insert_before.add(first_push_idx)
 
     # Build result with saves inserted
+    result = []
     for i, line in enumerate(lines):
         if i in insert_before:
             # Determine indentation from the current line
