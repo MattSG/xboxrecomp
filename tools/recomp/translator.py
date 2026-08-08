@@ -376,12 +376,15 @@ class FunctionTranslator:
             used_regs.add("ebp")
 
         # Ensure ebp tracked if function has tail jumps (lifter emits
-        # g_seh_ebp = ebp before external jmp and indirect jmp).
+        # g_seh_ebp = ebp before external jmp, indirect jmp, and conditional
+        # jumps to external targets).
         has_tail_jump = any(
-            insn.mnemonic == "jmp" and (
+            (insn.mnemonic == "jmp" and (
                 (insn.jump_target and not (start <= insn.jump_target < end))
                 or not insn.jump_target  # indirect jmp
-            )
+            ))
+            or (insn.is_cond_jump and insn.jump_target
+                and not (start <= insn.jump_target < end))
             for insn in instructions
         )
         if has_tail_jump:
