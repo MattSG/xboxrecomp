@@ -17,7 +17,7 @@ import struct
 from . import config
 from .engine import DisasmEngine, Instruction
 from .loader import BinaryImage, SectionInfo, DATA_SECTION_NAMES
-from .xrefs import XRefTracker
+from .xrefs import XRefTracker, XRefType
 from .labels import LabelManager, Label, LabelType
 
 
@@ -505,6 +505,25 @@ class FunctionDetector:
                 cand = sorted_starts[j]
                 cand_method = self._candidates[cand][1]
                 if cand_method in INTRA_METHODS:
+                    continue
+                # seh_prologue (push imm8; push imm32; call rel32) is byte-for-
+                # byte the same as a normal two-arg call sequence, so a
+                # continuation chunk of the previous function is routinely
+                # mis-detected as a function start (MM3 sub_001EC520 ->
+                # 0x001EC5D0: the chunk shares the parent's frame, pops the
+                # registers the parent pushed, and returns with the parent's
+                # ret 0xc). A continuation is entered only by a jump from the
+                # parent (or plain fall-through); it has no CALL, data-pointer,
+                # or other reference. Such a candidate must not bound the
+                # parent: let the parent's CFG walk fall through / jump into it
+                # and merge. Any non-jump reference (CALL, data_imm handler
+                # table, ...) means a real function start: keep it as a
+                # boundary (MM3 sub_00083A6C is an SEH handler reached via a
+                # data_imm xref from 0x83B16 and must stay split).
+                if (cand_method == "seh_prologue"
+                        and all(r.xref_type in (XRefType.JUMP,
+                                                XRefType.COND_JUMP)
+                                for r in self.xrefs.get_refs_to(cand))):
                     continue
                 next_func = cand
                 break
