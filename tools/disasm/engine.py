@@ -37,6 +37,7 @@ class Instruction:
     jump_target: Optional[int] = None     # For direct jumps
     memory_ref: Optional[int] = None      # For [addr] references
     imm_ref: Optional[int] = None         # For `push offset x` / `mov reg, offset x`
+    table_ref: Optional[int] = None       # For jmp [index*scale + disp] switch tables
 
     @property
     def is_branch(self) -> bool:
@@ -124,8 +125,17 @@ class DisasmEngine:
             elif insn.is_jump or insn.is_cond_jump:
                 if op.type == CS_OP_IMM:
                     insn.jump_target = op.imm & 0xFFFFFFFF
-                elif op.type == CS_OP_MEM and op.mem.base == 0 and op.mem.index == 0:
-                    insn.memory_ref = op.mem.disp & 0xFFFFFFFF
+                elif op.type == CS_OP_MEM:
+                    if op.mem.base == 0 and op.mem.index == 0:
+                        insn.memory_ref = op.mem.disp & 0xFFFFFFFF
+                    elif op.mem.base == 0 and op.mem.index != 0:
+                        # Register-indexed memory jump (switch dispatch):
+                        # jmp dword ptr [index*scale + table_base]. The
+                        # displacement is the jump-table base, not a target.
+                        disp = op.mem.disp & 0xFFFFFFFF
+                        if self.image.base_address <= disp < (
+                                self.image.base_address + self.image.image_size):
+                            insn.table_ref = disp
 
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:

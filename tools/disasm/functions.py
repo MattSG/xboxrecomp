@@ -108,6 +108,13 @@ class FunctionDetector:
         # Pass 4: Call targets
         self._pass_call_targets(sections)
 
+        # Pass 4a: Switch-dispatch jump tables
+        # jmp [index*scale + table] reads its destination from an embedded
+        # dword table the linear sweep decodes as code, so the case leaves
+        # never become instruction starts. Seed them before function
+        # building so each leaf gets its own translation.
+        self._pass_indirect_jump_tables(sections)
+
         # Pass 4b: Packed glue-thunk tables (no padding between leaf functions)
         # Runs after call_target so the CALL destinations are in _candidates.
         for sec in sections:
@@ -379,6 +386,91 @@ class FunctionDetector:
                         config.CONFIDENCE_CALL_TARGET,
                         "call_target"
                     )
+            else:
+                self._seed_call_target(target)
+
+    def _seed_call_target(self, target: int) -> None:
+        """Recover a call destination the linear sweep misaligned."""
+        self._seed_code_target(target, "call_target")
+
+    def _seed_code_target(self, target: int, method: str,
+                          stop_at_terminator: bool = False) -> None:
+        """Recover a code address the linear sweep misaligned.
+
+        The sweep walks embedded data (jump tables, padding) as code, so a
+        code address can land off every decoded boundary and never becomes
+        an instruction start (MM3 0x346B30: the sweep consumed its first
+        byte as the tail of a data-table instruction; sub_00346C80's switch
+        leaves at 0x346C95/0x346C9C/0x346CA3 were consumed by the jump-table
+        dwords). A call/jump-table destination is code by construction, so
+        decode it from the raw bytes at that address and add the
+        instructions for the function detector. stop_at_terminator bounds
+        the decode to the first ret/jmp for switch leaves, which sit right
+        before the data table the linear sweep already walked as garbage.
+        """
+        section = self.image.get_section_at_va(target)
+        if section is None or not section.executable:
+            return
+        data = self.image.get_section_data(section)
+        if not data:
+            return
+        off = target - section.virtual_addr
+        if off < 0 or off >= len(data):
+            return
+        insns = list(self.engine._cs.disasm(data[off:off + 4096], target))
+        if not insns:
+            return
+        for cs_insn in insns:
+            insn = self.engine._classify_instruction(cs_insn)
+            self.engine.instructions[insn.address] = insn
+            if stop_at_terminator and (insn.is_ret or insn.is_jump):
+                break
+        self.engine._sorted_addrs = None
+        confidence = (config.CONFIDENCE_CALL_TARGET if method == "call_target"
+                      else config.CONFIDENCE_CALL_TARGET * 0.85)
+        self._add_candidate(
+            target,
+            confidence,
+            method
+        )
+
+    def _pass_indirect_jump_tables(self, sections: List[SectionInfo]) -> None:
+        """Seed switch-dispatch case leaves (jmp [index*scale + table]).
+
+        The linear sweep walks the embedded jump table as code, so the case
+        leaves after the dispatch never decode to instruction starts. The
+        recomp then emits RECOMP_ITAIL for a VA with no generated function
+        -> unresolved switch tail that drops the caller's frame (MM3
+        sub_00346C80: the runtime fell to safe_stub and leaked 4 esp bytes
+        into sub_00341E50). Reading the table dwords recovers the leaves.
+        """
+        # Snapshot: _seed_jump_table mutates engine.instructions.
+        for insn in list(self.engine.instructions.values()):
+            if insn.table_ref is None:
+                continue
+            self._seed_jump_table(insn.table_ref)
+
+    def _seed_jump_table(self, table_va: int) -> None:
+        """Read a switch table's absolute dword targets and seed each leaf."""
+        section = self.image.get_section_at_va(table_va)
+        if section is None:
+            return
+        data = self.image.get_section_data(section)
+        if not data:
+            return
+        off = table_va - section.virtual_addr
+        if off < 0 or off + 4 > len(data):
+            return
+        for i in range(256):
+            o = off + i * 4
+            if o + 4 > len(data):
+                break
+            target = struct.unpack_from('<I', data, o)[0]
+            target_sec = self.image.get_section_at_va(target)
+            if target_sec is None or not target_sec.executable:
+                break
+            self._seed_code_target(target, "jump_table",
+                                   stop_at_terminator=True)
 
     def _pass_external_jump_targets(self, sections: List[SectionInfo]) -> int:
         """
@@ -481,7 +573,7 @@ class FunctionDetector:
         (overlapping ranges are intentional — trap #38: each entry point
         produces its own translation starting at the right offset).
         """
-        INTRA_METHODS = {"jump_target", "data_pointer"}
+        INTRA_METHODS = {"jump_target", "data_pointer", "jump_table"}
 
         sorted_starts = sorted(self._candidates.keys())
         if not sorted_starts:
