@@ -144,6 +144,14 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
 
+/* Guest stack for recomp worker threads (below the main stack, in free
+ * guest VA between the last XBE section ~0x00486500 and kernel data 0x740000
+ * ..0x741000). One worker stack; a second concurrent worker needs another
+ * region. */
+#define XBOX_WORKER_STACK_BASE  0x00774000
+#define XBOX_WORKER_STACK_SIZE  (16 * 1024)
+#define XBOX_WORKER_STACK_TOP   (XBOX_WORKER_STACK_BASE + XBOX_WORKER_STACK_SIZE - 16)
+
 /* ================================================================
  * Xbox dynamic heap (for MmAllocateContiguousMemory, etc.)
  * ================================================================ */

@@ -215,16 +215,90 @@ static int g_kernel_call_count = 0;
  * thread and returns, and the thread runs the actual game.
  */
 static int g_thread_call_count = 0;
-/* Worker threads run synchronously inline on the main native thread (see
- * bridge_PsCreateSystemThreadEx below). On real Xbox, PsTerminateSystemThread
- * ends the calling thread and never returns, so the guest stub's trailing
- * int3 is unreachable. Calling native ExitThread here would kill the main
- * native thread, which is the whole game, so a terminating worker longjmps
- * back to its runner instead; the runner restores the caller's register set
- * and the game continues after the thread creation. Single-level only:
- * nested workers would need a jmp_buf stack. */
+/* Fiber-based guest thread scheduling (single worker).
+ *
+ * The recomp engine runs on ONE host thread; the register globals
+ * (g_eax..g_edi, g_esp, g_seh_ebp) are shared by all guest threads, like real
+ * x86 registers are per-CPU. Guest workers created by PsCreateSystemThreadEx
+ * therefore run as Windows fibers on the same host thread, and the register
+ * globals are saved/restored around each fiber switch. The worker blends one
+ * screen, then its KeDelayExecutionThread parks it until the delay elapses;
+ * the main fiber resumes it at the next kernel thunk call. Single worker
+ * only: g_worker is one slot and g_worker_exit_jmp is one jmp_buf (nested
+ * workers would need a slot table). */
 static jmp_buf g_worker_exit_jmp;
 static volatile int g_worker_active = 0;
+
+typedef struct {
+    LPVOID fiber;            /* worker fiber handle (NULL until created) */
+    recomp_func_t fn;
+    uint32_t ctx1, ctx2;
+    volatile int parked;     /* 1 while the worker sleeps on KeDelay */
+    volatile int done;       /* 1 after the worker routine returned */
+    DWORD wake_tick;         /* GetTickCount() when the delay elapses */
+    /* Saved guest register set for this guest thread. */
+    uint32_t eax, ecx, edx, ebx, esi, edi, esp, seh_ebp;
+} worker_state_t;
+
+static worker_state_t g_worker;
+static worker_state_t g_main_state;
+static LPVOID g_main_fiber = NULL;
+
+static void worker_save_regs(worker_state_t *w)
+{
+    w->eax = g_eax; w->ecx = g_ecx; w->edx = g_edx;
+    w->ebx = g_ebx; w->esi = g_esi; w->edi = g_edi;
+    w->esp = g_esp; w->seh_ebp = g_seh_ebp;
+}
+
+static void worker_load_regs(const worker_state_t *w)
+{
+    g_eax = w->eax; g_ecx = w->ecx; g_edx = w->edx;
+    g_ebx = w->ebx; g_esi = w->esi; g_edi = w->edi;
+    g_esp = w->esp; g_seh_ebp = w->seh_ebp;
+}
+
+/* Park the worker fiber and resume the main one. */
+static void worker_switch_to_main(void)
+{
+    worker_save_regs(&g_worker);
+    worker_load_regs(&g_main_state);
+    SwitchToFiber(g_main_fiber);
+}
+
+/* Park the main fiber and resume the worker one (loads worker regs; the
+ * worker restores the main register set before switching back). */
+static void worker_switch_to_worker(void)
+{
+    worker_save_regs(&g_main_state);
+    worker_load_regs(&g_worker);
+    SwitchToFiber(g_worker.fiber);
+}
+
+static void WINAPI worker_fiber_main(LPVOID param)
+{
+    (void)param;
+    g_worker_active = 1;
+    g_esp = XBOX_WORKER_STACK_TOP;
+    g_seh_ebp = g_esp;
+
+    /* Xbox thread start routines receive (StartContext1, StartContext2). */
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = g_worker.ctx2;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = g_worker.ctx1;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+
+    if (setjmp(g_worker_exit_jmp) == 0) {
+        g_worker.fn();
+        fprintf(stderr, "  [KERNEL] worker routine returned\n");
+    } else {
+        fprintf(stderr, "  [KERNEL] worker unwound via PsTerminateSystemThread\n");
+    }
+    fflush(stderr);
+    g_worker_active = 0;
+    g_worker.done = 1;
+    g_worker.parked = 0;
+    worker_switch_to_main();   /* never returns */
+}
 
 static void bridge_PsCreateSystemThreadEx(void)
 {
@@ -244,7 +318,7 @@ static void bridge_PsCreateSystemThreadEx(void)
         BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0001;  /* fake handle */
     }
 
-    /* Call the start routine synchronously through the recomp dispatch.
+    /* Run the start routine through the recomp dispatch.
      * Xbox thread start routines receive two parameters:
      *   void ThreadRoutine(PVOID StartContext1, PVOID StartContext2)
      * We push both onto the simulated stack (right-to-left).
@@ -252,9 +326,9 @@ static void bridge_PsCreateSystemThreadEx(void)
      * First call: the game's main thread entry point. Must run synchronously
      * and inherit the current register state (this IS the game starting).
      *
-     * Subsequent calls: worker threads. Must save/restore ALL global registers
-     * because on real Xbox each thread has its own register set. Without this,
-     * the worker clobbers the caller's g_esi, g_ebx, etc. */
+     * Subsequent calls: worker threads run as fibers on the same host
+     * thread with their own guest stack (XBOX_WORKER_STACK_*); the pump
+     * resumes immediately, matching real Xbox concurrency. */
     if (start_routine) {
         recomp_func_t fn = recomp_lookup(start_routine);
         if (!fn) fn = recomp_lookup_manual(start_routine);
@@ -269,33 +343,34 @@ static void bridge_PsCreateSystemThreadEx(void)
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
                 fflush(stderr);
             } else {
-                /* Worker thread: run synchronously but save/restore all
-                 * global registers (each Xbox thread has its own register set).
-                 * The XIP file loader runs as a worker and must complete
-                 * before the scene graph can be built. */
-                uint32_t save_eax = g_eax, save_ecx = g_ecx, save_edx = g_edx;
-                uint32_t save_ebx = g_ebx, save_esi = g_esi, save_edi = g_edi;
-                uint32_t save_esp = g_esp, save_ebp = g_seh_ebp;
-                fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: running worker 0x%08X (ctx=0x%08X)\n",
+                /* Worker thread: run it as a fiber on the same host thread.
+                 * The worker runs until its first KeDelayExecutionThread
+                 * parks it, then the main fiber resumes here and the pump
+                 * continues (real Xbox concurrency: the pump keeps kicking
+                 * while the render worker blends). */
+                fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawning worker 0x%08X (ctx=0x%08X)\n",
                         start_routine, start_context1);
                 fflush(stderr);
 
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                g_seh_ebp = g_esp;
-                g_worker_active = 1;
-                if (setjmp(g_worker_exit_jmp) == 0) {
-                fn();
+                if (!g_main_fiber)
+                    g_main_fiber = ConvertThreadToFiber(NULL);
+                g_worker.fn = fn;
+                g_worker.ctx1 = start_context1;
+                g_worker.ctx2 = start_context2;
+                g_worker.parked = 0;
+                g_worker.done = 0;
+                g_worker.fiber = CreateFiber(0, worker_fiber_main, NULL);
+                if (g_worker.fiber) {
+                    worker_switch_to_worker();
+                    /* Worker parked on KeDelay or finished; main resumes here. */
+                    if (g_worker.done) {
+                        DeleteFiber(g_worker.fiber);
+                        g_worker.fiber = NULL;
+                    }
+                } else {
+                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: CreateFiber failed\n");
+                    fflush(stderr);
                 }
-                g_worker_active = 0;
-                fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: worker returned\n");
-                fflush(stderr);
-
-                /* Restore all registers */
-                g_eax = save_eax; g_ecx = save_ecx; g_edx = save_edx;
-                g_ebx = save_ebx; g_esi = save_esi; g_edi = save_edi;
-                g_esp = save_esp; g_seh_ebp = save_ebp;
             }
         } else {
             fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: start routine 0x%08X not found in dispatch!\n",
@@ -746,6 +821,37 @@ static void bridge_KeWaitForSingleObject(void)
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         XBOX_TO_NATIVE(object), wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+}
+
+/* ── KeDelayExecutionThread (ordinal 99/256) ────────────── */
+static void bridge_KeDelayExecutionThread(void)
+{
+    uint32_t wait_mode   = STACK_ARG(0);
+    uint32_t alertable   = STACK_ARG(1);
+    uint32_t interval_va = STACK_ARG(2);
+
+    if (g_worker_active) {
+        /* Worker context: the whole recomp runs on one host thread, so a
+         * native Sleep here would stall the pump too. Park the worker and
+         * let the main fiber resume it when the delay has elapsed. */
+        LARGE_INTEGER *iv = (LARGE_INTEGER *)XBOX_TO_NATIVE(interval_va);
+        DWORD ms = 0;
+        if (iv && iv->QuadPart < 0) {
+            LONGLONG rel = -iv->QuadPart;
+            ms = (DWORD)(rel / 10000);
+            if (ms == 0 && rel > 0) ms = 1;
+        }
+        if (ms > 0) {
+            g_worker.wake_tick = GetTickCount() + ms;
+            g_worker.parked = 1;
+            worker_switch_to_main();   /* resumes when the delay is due */
+            g_worker.parked = 0;
+        }
+        g_eax = 0;  /* STATUS_SUCCESS */
+        return;
+    }
+    g_eax = (uint32_t)xbox_KeDelayExecutionThread(
+        (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable, XBOX_TO_NATIVE(interval_va));
 }
 
 /* ── NtYieldExecution (ordinal 238) ──────────────────────── */
@@ -1757,7 +1863,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  95: return  8;  /* KeAlertThread(2) */
     case  97: return  4;  /* KeBugCheck(1) */
     case  98: return  4;  /* MM3/XDK5233 calls slot-102 ordinal 98 as KeConnectInterrupt(1) */
-    case  99: return  4;  /* KeCancelTimer(1) */
+    case  99: return 12;  /* KeDelayExecutionThread(3) - arg-bytes must match the real ordinal */
     case 100: return  4;  /* KeConnectInterrupt(1) */
     case 107: return 12;  /* KeInitializeDpc(3) */
     case 109: return 28;  /* KeInitializeInterrupt(7) */
@@ -1897,6 +2003,8 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* Threading */
     case 255: return bridge_PsCreateSystemThreadEx;
     case 258: return bridge_PsTerminateSystemThread;
+    case  99: return bridge_KeDelayExecutionThread;
+    case 256: return bridge_KeDelayExecutionThread;
 
     /* File/Handle */
     case 187: return bridge_NtClose;
@@ -2080,6 +2188,18 @@ static void kernel_thunk_dispatch(void)
      * so we must manually consume the dummy return address. */
     g_esp += 4;
 
+    /* Resume a parked worker whose delay has elapsed before servicing this
+     * thunk: the pump calls kernel thunks regularly, which is what paces the
+     * render worker on the same host thread. */
+    if (g_worker_active && g_worker.fiber && g_worker.parked && !g_worker.done &&
+        (int)(GetTickCount() - g_worker.wake_tick) >= 0) {
+        worker_switch_to_worker();
+        if (g_worker.done) {
+            DeleteFiber(g_worker.fiber);
+            g_worker.fiber = NULL;
+        }
+    }
+
     if (bridge) {
         bridge();
     } else {
@@ -2105,7 +2225,7 @@ static void kernel_thunk_dispatch(void)
 
     /* Detect ESP corruption: after the thunk, ESP should be near esp_before
      * (the dummy return + args were popped). Large deviations indicate a bug. */
-    if (g_esp < 0x00780000 || g_esp > 0x03000000) {
+    if (g_esp < 0x00770000 || g_esp > 0x03000000) {
         fprintf(stderr, "  [KERNEL] ESP CORRUPTION after ordinal %u (slot %d): "
             "before=0x%08X after=0x%08X delta=%d\n",
             ordinal, slot, esp_before, g_esp, (int)(g_esp - esp_before));
@@ -2118,7 +2238,7 @@ static void kernel_thunk_dispatch(void)
     }
 
     /* ESP-guard: catch corruption immediately */
-    if (g_esp < 0x00780000 || g_esp > 0x02780FFF) {
+    if (g_esp < 0x00770000 || g_esp > 0x02780FFF) {
         fprintf(stderr, "  [FATAL] ESP corrupt after kernel call #%d: esp=0x%08X\n",
             g_kernel_call_count, g_esp);
         fflush(stderr);
