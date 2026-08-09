@@ -404,6 +404,34 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"1 /* {jcc} after test - parity */", desc
         return None
 
+    # ── test ah, imm on the x87 status word (fnstsw ax; test ah, imm; jcc) ──
+    # AH holds C0=AH0, C1=AH1, C2=AH2, C3=AH6. _fpu_cmp encodes C3/C2
+    # (less/equal/greater; unordered collapses to equal). lift_basic_block
+    # only marks the setter "fpu_test" when the test directly follows
+    # fnstsw ax, so the flags genuinely come from the FPU compare. Mask
+    # semantics for fcomp ST0 vs operand:
+    #   0x40 (C3):    je <-> cmp!=0, jne <-> cmp==0, jp <-> cmp==0, jnp <-> cmp!=0
+    #   0x41 (C3|C0): je <-> cmp>0,  jne <-> cmp<=0, jp <-> cmp<=0, jnp <-> cmp>0
+    #   0x44 (C3|C2): je <-> cmp!=0, jne <-> cmp==0, jp <-> cmp==0, jnp <-> cmp!=0
+    # jp/jnp after 0x41/0x44 diverge from the original for unordered/NaN only
+    # (both status bits set -> even parity -> PF=1), the same limitation the
+    # fcomi path already has.
+    if flag_setter == "fpu_test":
+        mask = 0
+        if len(flag_ops) >= 1 and flag_ops[0].type == "imm":
+            mask = flag_ops[0].imm & 0xFF
+        ge = "_fpu_cmp > 0" if mask == 0x41 else "_fpu_cmp != 0"
+        le = "_fpu_cmp <= 0" if mask == 0x41 else "_fpu_cmp == 0"
+        if jcc in ("je", "jz"):
+            return ge, f"fpu test ah,{mask:#x}"
+        if jcc in ("jne", "jnz"):
+            return le, f"fpu test ah,{mask:#x}"
+        if jcc == "jp":
+            return le, f"fpu test ah,{mask:#x} parity"
+        if jcc == "jnp":
+            return ge, f"fpu test ah,{mask:#x} parity"
+        return None
+
     # ── sub: a = a - b, flags from (a_orig - b) ──
     if flag_setter == "sub":
         if jcc in ("je", "jz"):
@@ -630,6 +658,32 @@ def _make_cmovcc_cond(cmov_mnemonic, flag_setter, flag_ops):
 
 # ── Pattern matching for flag-setter + jcc ────────────────────
 
+# x87 status bits visible in AH after fnstsw ax: C0=0x01, C1=0x02, C2=0x04,
+# C3=0x40. These are the masks MM3 uses with the test-ah idiom; _fpu_cmp can
+# only resolve C3/C2, so masks pulling in C0/C1 keep the old behaviour.
+_FPU_STATUS_TEST_MASKS = (0x40, 0x41, 0x44)
+
+
+def _is_fpu_status_test(insn):
+    """True for `test ah, imm` where imm selects x87 status bits."""
+    if insn.mnemonic != "test" or len(insn.operands) < 2:
+        return False
+    o0, o1 = insn.operands[0], insn.operands[1]
+    return (o0.type == "reg" and o0.reg == "ah"
+            and o1.type == "imm" and (o1.imm & 0xFF) in _FPU_STATUS_TEST_MASKS)
+
+
+def _writes_eax(insn):
+    """True if an instruction writes eax/ax/al/ah (clobbers AH's FPU status)."""
+    m = insn.mnemonic
+    if m in ("test", "cmp", "push", "fnstsw", "sahf"):
+        return False  # read-only on eax
+    if m == "lahf":
+        return True   # loads AH
+    return any(op.type == "reg" and op.reg in ("eax", "ax", "al", "ah")
+               for op in insn.operands)
+
+
 def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
     """Emit a conditional goto or call for a jump target."""
     if target is None:
@@ -659,6 +713,12 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
         return None
 
     if len(first.operands) < 2:
+        return None
+
+    # test ah, imm on the x87 status word must not take the generic test+jcc
+    # path (its operand AH is stale in C); lift_basic_block marks it fpu_test
+    # and the jcc resolves against _fpu_cmp instead.
+    if first.mnemonic == "test" and _is_fpu_status_test(first):
         return None
 
     result = _make_condition(second.mnemonic, first.mnemonic, first.operands)
@@ -1882,7 +1942,8 @@ def _snapshot_flag_operands(stmts, insn, snap_counter):
     return snapshot_ops
 
 
-def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None):
+def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None,
+                     fpu_cmp_available=None):
     """
     Lift a basic block to C statements.
     Tracks flags to generate proper conditions for jcc/setcc/cmovcc.
@@ -1895,6 +1956,12 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None):
                     temporaries captured when flags were set.
         snap_counter: one-element list shared across all blocks of one
                     generated function (uniquifies snapshot temp names).
+        fpu_cmp_available: whether the generated function declares/sets
+                    _fpu_cmp (an in-function fcomp/fcomi). If None, detected
+                    from this block's own instructions. Fragments that start
+                    mid-comparison (fnstsw ax without a local fcomp) consume
+                    the caller's x87 status, which the recompiler does not
+                    model; those keep the old generic test handling.
 
     Returns:
         (stmts, flag_state) where stmts is a list of C statement strings
@@ -1912,12 +1979,27 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None):
     else:
         last_flag_setter = None
         last_flag_ops = []
+    # Set when the last fnstsw ax was followed only by instructions that keep
+    # AH intact, so `test ah, imm` branches on the FPU status, not a stale C
+    # register. Block-local: fnstsw -> test -> jcc is always one block in the
+    # MSVC FPU-comparison idioms; a cross-block split just falls back to the
+    # old (unproven) generic test handling.
+    ah_is_fpu = False
+    if fpu_cmp_available is None:
+        fpu_cmp_available = any(
+            insn.mnemonic in ("fcom", "fcomp", "fcompp", "fucom", "fucomp",
+                              "fucompp", "fcomi", "fcompi", "fcomip",
+                              "fucomi", "fucompi", "fucomip")
+            for insn in insns)
 
     while i < len(insns):
         curr = insns[i]
 
         # Try cmp/test + jcc pattern first (2-instruction match)
-        match = try_match_cmp_jcc(insns, i, lifter=lifter)
+        fpu_test = (ah_is_fpu and fpu_cmp_available
+                    and _is_fpu_status_test(curr))
+        match = (None if fpu_test
+                 else try_match_cmp_jcc(insns, i, lifter=lifter))
         if match:
             stmt, consumed = match
             # Snapshot BEFORE the conditional goto. cmp/test only reads its
@@ -1988,7 +2070,12 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None):
         stmts.extend(results)
 
         # Track flag-setting instructions
-        if curr.mnemonic in FLAG_SETTERS:
+        if fpu_test:
+            # test ah, imm on the x87 status word: no operand snapshot (the
+            # C register AH is stale; _fpu_cmp holds the compare result).
+            last_flag_setter = "fpu_test"
+            last_flag_ops = [curr.operands[1]]
+        elif curr.mnemonic in FLAG_SETTERS:
             if curr.mnemonic in _SNAPSHOT_SETTERS:
                 last_flag_ops = _snapshot_flag_operands(
                     stmts, curr, snap_counter)
@@ -2039,6 +2126,15 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None):
             # Unknown instruction - conservatively clear flag state
             last_flag_setter = None
             last_flag_ops = []
+
+        # Track whether AH still holds the x87 status word from fnstsw ax.
+        if curr.mnemonic == "fnstsw" and len(curr.operands) >= 1 and \
+                curr.operands[0].type == "reg" and curr.operands[0].reg == "ax":
+            ah_is_fpu = True
+        elif curr.mnemonic == "call":
+            ah_is_fpu = False
+        elif _writes_eax(curr):
+            ah_is_fpu = False
 
         i += 1
 

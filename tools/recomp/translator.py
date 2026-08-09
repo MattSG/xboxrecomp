@@ -570,7 +570,7 @@ class FunctionTranslator:
             # where jb uses the same flags as ja from the preceding block.
             stmts, flag_state = lift_basic_block(
                 self.lifter, bb, flag_state=flag_state,
-                snap_counter=snap_counter)
+                snap_counter=snap_counter, fpu_cmp_available=has_fpu_cmp)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 
