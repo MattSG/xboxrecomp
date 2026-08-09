@@ -45,6 +45,33 @@ def _fmt_reg(name, size=4):
     return name
 
 
+# Sub-register -> width in bytes, for masking immediates in cmp/test so the
+# flag math runs at the operand width (see _normalize_cmp_operands).
+REG_WIDTH = {
+    "eax": 4, "ebx": 4, "ecx": 4, "edx": 4, "esi": 4, "edi": 4,
+    "ebp": 4, "esp": 4,
+    "ax": 2, "bx": 2, "cx": 2, "dx": 2, "si": 2, "di": 2, "bp": 2, "sp": 2,
+    "al": 1, "bl": 1, "cl": 1, "dl": 1, "ah": 1, "bh": 1, "ch": 1, "dh": 1,
+}
+
+
+def _normalize_cmp_operands(ops):
+    """Mask 32-bit immediates down to a sub-32-bit register operand's width.
+
+    Capstone sign-extends e.g. cmp si,-1 to imm=0xFFFFFFFF, but x86 flag
+    math runs at the register width (16 bits). Without masking, conditions
+    like CMP_NE(LO16(si), 0xFFFFFFFFu) are always true, so 8/16-bit compare
+    guards never take the equal path (MM3 sub_20F77D crash trace). No-op for
+    full-width registers and non-imm pairs. Returns a new operand list.
+    """
+    if len(ops) >= 2 and ops[0].type == "reg" and ops[1].type == "imm":
+        w = REG_WIDTH.get(ops[0].reg)
+        if w and w < 4:
+            mask = (1 << (8 * w)) - 1
+            return [ops[0], Operand(type="imm", imm=ops[1].imm & mask)] + list(ops[2:])
+    return list(ops)
+
+
 def _fmt_set_reg(name, value_expr):
     """Format assignment to a register, handling sub-register writes."""
     # Segment registers → no-op
@@ -279,6 +306,8 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if not cond_info:
         return None
     cmp_macro, test_macro, desc = cond_info
+
+    flag_ops = _normalize_cmp_operands(flag_ops)
 
     if len(flag_ops) >= 2:
         lhs = _fmt_operand_read(flag_ops[0])
@@ -1291,6 +1320,7 @@ class Lifter:
     def _lift_cmp(self, insn, ops):
         if len(ops) < 2:
             return ["/* cmp: bad operands */"]
+        ops = _normalize_cmp_operands(ops)
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
         # Store CF for sbb/adc consumers. The following jcc re-evaluates the
@@ -1303,6 +1333,7 @@ class Lifter:
     def _lift_test(self, insn, ops):
         if len(ops) < 2:
             return ["/* test: bad operands */"]
+        ops = _normalize_cmp_operands(ops)
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
         return [
@@ -1838,7 +1869,8 @@ def _snapshot_flag_operands(stmts, insn, snap_counter):
     so temp names stay unique within the generated function.
     """
     snapshot_ops = []
-    for k, op in enumerate(insn.operands[:2]):
+    ops = _normalize_cmp_operands(insn.operands[:2])
+    for k, op in enumerate(ops):
         if op.type not in ("reg", "imm", "mem"):
             continue
         name = f"_fcmp_{snap_counter[0]}_{'a' if k == 0 else 'b'}"

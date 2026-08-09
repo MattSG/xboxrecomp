@@ -80,6 +80,18 @@ def test_cmp_jcc_snapshot_precedes_branch_for_taken_path():
     print("ok  cmp_jcc_snapshot_precedes_branch_for_taken_path")
 
 
+def test_cmp_si_neg1_masks_imm_to_reg_width():
+    out, _ = _lift(bytes.fromhex("66 83 fe ff 75 04"))
+    # cmp si, -1; jne +4: Capstone sign-extends the imm8 to 0xFFFFFFFF,
+    # but the flag math runs at 16-bit width. The condition must compare
+    # against 0xFFFF and the snapshot temp must hold 0xFFFF, or the
+    # CMP_NE is always true and the equal path never fires.
+    assert "CMP_NE(LO16(esi), 0xFFFF)" in out, out
+    assert "= 0xFFFF;" in out, out
+    assert "0xFFFFFFFFu" not in out, out
+    print("ok  cmp_si_neg1_masks_imm_to_reg_width")
+
+
 def test_flag_state_crosses_block_boundary_with_snapshot():
     counter = [0]
     out1, fs = _lift(bytes.fromhex("39 d8"), snap_counter=counter)  # cmp eax, ebx
@@ -99,4 +111,5 @@ if __name__ == "__main__":
     test_second_consumer_after_pair_uses_snapshot()
     test_cmp_jcc_snapshot_precedes_branch_for_taken_path()
     test_flag_state_crosses_block_boundary_with_snapshot()
+    test_cmp_si_neg1_masks_imm_to_reg_width()
     print("\nall block flag-tracking checks passed")
