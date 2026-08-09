@@ -1588,7 +1588,22 @@ static void bridge_ObReferenceObjectByHandle(void)
     uint32_t handle = STACK_ARG(0);
     uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
-    if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+    uint32_t object = 0;
+    /* The fake system-thread handle written by bridge_PsCreateSystemThreadEx.
+     * Workers run synchronously and have already completed by the time the
+     * game waits, so hand out a guest-resident "ready" thread object:
+     * [+4] != 0 (signaled) and [+0x120] != 0x103 (wait result), which is
+     * exactly what sub_00083989 / sub_001E7CF6 poll for. */
+    if (handle == 0xBEEF0001u) {
+        static uint32_t s_ready_thread_obj = 0;
+        if (!s_ready_thread_obj) {
+            s_ready_thread_obj = xbox_HeapAlloc(0x128, 4);
+            BRIDGE_MEM8(s_ready_thread_obj + 4) = 1;        /* signaled */
+            BRIDGE_MEM32(s_ready_thread_obj + 0x120) = 0;   /* STATUS_SUCCESS */
+        }
+        object = s_ready_thread_obj;
+    }
+    if (object_ptr) BRIDGE_MEM32(object_ptr) = object;
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
