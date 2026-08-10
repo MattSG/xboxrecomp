@@ -244,11 +244,28 @@ static worker_state_t g_worker;
 static worker_state_t g_main_state;
 static LPVOID g_main_fiber = NULL;
 
+/* Diagnostic: prove whether fiber resume restores the exact guest regset
+ * saved at the switch (run-360 register-provenance question). Bounded. */
+static uint32_t s_fsw_log = 0;
+static void fsw_log(const char *op, const worker_state_t *w)
+{
+    if (s_fsw_log < 128) {
+        s_fsw_log++;
+        fprintf(stderr, "[FSW] %s %s kc=%u eax=%08X ecx=%08X edx=%08X "
+            "ebx=%08X esi=%08X edi=%08X esp=%08X ebp=%08X\n", op,
+            (w == &g_main_state) ? "main" : "work",
+            (unsigned)g_kernel_call_count, w->eax, w->ecx, w->edx, w->ebx,
+            w->esi, w->edi, w->esp, w->seh_ebp);
+        fflush(stderr);
+    }
+}
+
 static void worker_save_regs(worker_state_t *w)
 {
     w->eax = g_eax; w->ecx = g_ecx; w->edx = g_edx;
     w->ebx = g_ebx; w->esi = g_esi; w->edi = g_edi;
     w->esp = g_esp; w->seh_ebp = g_seh_ebp;
+    fsw_log("save", w);
 }
 
 static void worker_load_regs(const worker_state_t *w)
@@ -256,6 +273,7 @@ static void worker_load_regs(const worker_state_t *w)
     g_eax = w->eax; g_ecx = w->ecx; g_edx = w->edx;
     g_ebx = w->ebx; g_esi = w->esi; g_edi = w->edi;
     g_esp = w->esp; g_seh_ebp = w->seh_ebp;
+    fsw_log("load", w);
 }
 
 /* Park the worker fiber and resume the main one. */
