@@ -9,12 +9,18 @@ model, so before the fix the block-lift path emitted `if (1 ...)` (always
 taken) for both jp and jnp, and je/jne read a stale C register via
 `TEST_*(HI8(eax), imm)` -- all diverging from the original.
 
-Correct semantics (fcomp ST0 vs operand; PF = parity of AH & imm):
-  - mask 0x44 (C3|C2): jp is taken iff exactly one bit is set, i.e. the
-    operands are EQUAL (C3=1,C2=0); jnp iff not-equal/unordered. The old
-    pinned test claimed jp meant "not equal" -- that was inverted.
-  - mask 0x41 (C3|C0): jne is taken iff (AH&0x41) != 0, i.e. less-or-equal
-    (unordered included) -- the shape seen in MM3 sub_00214EB9.
+Correct semantics (fcomp ST0 vs operand; PF = parity of AH & imm; jp/jnp
+jump on even/odd parity):
+  - mask 0x44 (C3|C2): PF=1 iff C3==C2, i.e. ST>op, ST<op or unordered --
+    jp is taken iff NOT equal; jnp iff equal. The pre-2026-08-11 pinned
+    tests had jp/jnp swapped (claimed jp == equal), which inverted the
+    MM3 sub_00343F40 flip-gate: `fcomp [0x384ef8(=1.0)]; test ah,0x44; jp`
+    set dev+8 bit 0x4000 when the frame was READY (ST==1.0) and cleared it
+    otherwise -- the stuck-0x4000 gate. Proven from the raw XBE: the
+    constant at 0x384ef8 is 1.0f.
+  - mask 0x41 (C3|C0): jp taken iff ST>op or unordered; jne iff
+    (AH&0x41)!=0, i.e. less-or-equal (unordered included) -- the shape seen
+    in MM3 sub_00214EB9.
 
 The lifter resolves these against _fpu_cmp (0 = equal/unordered, +/-1 =
 ordered less/greater). jp/jnp after 0x41/0x44 diverge from the original for
@@ -45,19 +51,33 @@ def _lift(code_bytes):
     return "\n".join(stmts)
 
 
-def test_jp_after_fcomp_0x44_is_equal():
+def test_jp_after_fcomp_0x44_is_not_equal():
     out = _lift(bytes.fromhex("d81df84e3800 dfe0 f6c444 7a03 90 c3"))
     # fcomp [0x384ef8]; fnstsw ax; test ah, 0x44; jp +3; nop; ret
-    assert "if (_fpu_cmp == 0)" in out, (
-        "jp after fcomp/fnstsw/test ah,0x44 must be taken iff equal")
+    assert "if (_fpu_cmp != 0)" in out, (
+        "jp after fcomp/fnstsw/test ah,0x44 must be taken iff not equal")
     assert "if (1 " not in out, "no unconditional parity branches allowed"
 
 
-def test_jnp_after_fcomp_0x44_is_not_equal():
+def test_jnp_after_fcomp_0x44_is_equal():
     out = _lift(bytes.fromhex("d81df84e3800 dfe0 f6c444 7b03 90 c3"))
     # fcomp [0x384ef8]; fnstsw ax; test ah, 0x44; jnp +3; nop; ret
-    assert "if (_fpu_cmp != 0)" in out, (
-        "jnp after fcomp/fnstsw/test ah,0x44 must be taken iff not equal")
+    assert "if (_fpu_cmp == 0)" in out, (
+        "jnp after fcomp/fnstsw/test ah,0x44 must be taken iff equal")
+
+
+def test_jp_after_fcomp_0x41_is_greater():
+    out = _lift(bytes.fromhex("d81df84e3800 dfe0 f6c441 7a03 90 c3"))
+    # fcomp [0x384ef8]; fnstsw ax; test ah, 0x41; jp +3; nop; ret
+    assert "if (_fpu_cmp > 0)" in out, (
+        "jp after fcomp/fnstsw/test ah,0x41 must be taken iff ST > operand")
+
+
+def test_jnp_after_fcomp_0x41_is_less_equal():
+    out = _lift(bytes.fromhex("d81df84e3800 dfe0 f6c441 7b03 90 c3"))
+    # fcomp [0x384ef8]; fnstsw ax; test ah, 0x41; jnp +3; nop; ret
+    assert "if (_fpu_cmp <= 0)" in out, (
+        "jnp after fcomp/fnstsw/test ah,0x41 must be taken iff ST <= operand")
     assert "if (1 " not in out, "no unconditional parity branches allowed"
 
 
@@ -75,8 +95,10 @@ def test_jne_after_fcomp_0x41_is_less_equal():
 if __name__ == "__main__":
     failed = []
     for name, fn in [
-        ("jp_after_fcomp_0x44", test_jp_after_fcomp_0x44_is_equal),
-        ("jnp_after_fcomp_0x44", test_jnp_after_fcomp_0x44_is_not_equal),
+        ("jp_after_fcomp_0x44", test_jp_after_fcomp_0x44_is_not_equal),
+        ("jnp_after_fcomp_0x44", test_jnp_after_fcomp_0x44_is_equal),
+        ("jp_after_fcomp_0x41", test_jp_after_fcomp_0x41_is_greater),
+        ("jnp_after_fcomp_0x41", test_jnp_after_fcomp_0x41_is_less_equal),
         ("jne_after_fcomp_0x41", test_jne_after_fcomp_0x41_is_less_equal),
     ]:
         try:

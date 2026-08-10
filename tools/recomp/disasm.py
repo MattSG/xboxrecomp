@@ -80,6 +80,7 @@ class Operand:
     mem_scale: int = 1
     mem_disp: int = 0
     mem_size: int = 0  # operand size in bytes
+    size: int = 0  # flag-operand width in bytes (1/2/4), 0 = unknown/32-bit
 
 
 @dataclass

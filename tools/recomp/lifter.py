@@ -72,6 +72,24 @@ def _normalize_cmp_operands(ops):
     return list(ops)
 
 
+def _flag_operand_size(op):
+    """Byte width of a flag-setter operand (1/2/4)."""
+    if op.type == "reg":
+        return getattr(op, "size", 0) or REG_WIDTH.get(op.reg) or 4
+    if op.type == "mem":
+        return op.mem_size or 4
+    return 4
+
+
+def _signed_cast(expr, size):
+    """Cast expr to the signed width of the flag-setter operands."""
+    if size == 1:
+        return f"(int8_t)({expr})"
+    if size == 2:
+        return f"(int16_t)({expr})"
+    return f"(int32_t)({expr})"
+
+
 def _fmt_set_reg(name, value_expr):
     """Format assignment to a register, handling sub-register writes."""
     # Segment registers → no-op
@@ -343,6 +361,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if lhs is None:
         return None
 
+    # Flag math runs at the smallest operand width (1/2/4 bytes). Without
+    # this, 8-bit ops like `test bl,bl; js` are zero-extended to 32 bits and
+    # the sign flag can never be set (MM3 sub_0034E420 spin).
+    size = 4
+    if flag_ops:
+        size = min(_flag_operand_size(o) for o in flag_ops)
+
     # ── comiss/ucomiss: float comparison, sets CF/ZF/PF ──
     if flag_setter in ("comiss", "comisd", "ucomiss", "ucomisd"):
         def _sse_op(op):
@@ -377,25 +402,29 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── cmp: flags from (a - b), operands unchanged ──
     if flag_setter == "cmp":
         if cmp_macro:
+            if jcc in ("jl", "jge", "jle", "jg"):
+                return f"{cmp_macro}({_signed_cast(lhs, size)}, {_signed_cast(rhs, size)})", desc
             return f"{cmp_macro}({lhs}, {rhs})", desc
         if jcc == "js":
-            return f"((int32_t)({lhs} - {rhs}) < 0)", desc
+            return f"({_signed_cast(f'({lhs} - {rhs})', size)} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t)({lhs} - {rhs}) >= 0)", desc
+            return f"({_signed_cast(f'({lhs} - {rhs})', size)} >= 0)", desc
         if jcc in ("jp", "jnp"):
             return f"1 /* {jcc} after cmp - parity */", desc
         return None
 
     # ── test: flags from (a & b), operands unchanged ──
     if flag_setter == "test":
+        if test_macro == "TEST_S":
+            return f"{test_macro}({_signed_cast(lhs, size)}, {_signed_cast(rhs, size)})", desc
         if test_macro:
             return f"{test_macro}({lhs}, {rhs})", desc
         if cmp_macro:
-            return f"{cmp_macro}({lhs} & {rhs}, 0)", desc
+            return f"{cmp_macro}({_signed_cast(f'({lhs} & {rhs})', size)}, 0)", desc
         if jcc == "js":
-            return f"((int32_t)({lhs} & {rhs}) < 0)", desc
+            return f"({_signed_cast(f'({lhs} & {rhs})', size)} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t)({lhs} & {rhs}) >= 0)", desc
+            return f"({_signed_cast(f'({lhs} & {rhs})', size)} >= 0)", desc
         if jcc == "jo":
             return "0", desc  # OF=0 after test
         if jcc == "jno":
@@ -420,16 +449,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
         mask = 0
         if len(flag_ops) >= 1 and flag_ops[0].type == "imm":
             mask = flag_ops[0].imm & 0xFF
-        ge = "_fpu_cmp > 0" if mask == 0x41 else "_fpu_cmp != 0"
-        le = "_fpu_cmp <= 0" if mask == 0x41 else "_fpu_cmp == 0"
+        if mask == 0x41:
+            ge, le = "_fpu_cmp > 0", "_fpu_cmp <= 0"
+        elif mask == 0x05:
+            # C0|C2: jp taken iff C0 == C2 (ST >= operand / unordered)
+            ge, le = "_fpu_cmp >= 0", "_fpu_cmp < 0"
+        else:
+            ge, le = "_fpu_cmp != 0", "_fpu_cmp == 0"
         if jcc in ("je", "jz"):
             return ge, f"fpu test ah,{mask:#x}"
         if jcc in ("jne", "jnz"):
             return le, f"fpu test ah,{mask:#x}"
         if jcc == "jp":
-            return le, f"fpu test ah,{mask:#x} parity"
+            return (le if mask == 0x40 else ge), f"fpu test ah,{mask:#x} parity"
         if jcc == "jnp":
-            return ge, f"fpu test ah,{mask:#x} parity"
+            return (ge if mask == 0x40 else le), f"fpu test ah,{mask:#x} parity"
         return None
 
     # ── sub: a = a - b, flags from (a_orig - b) ──
@@ -439,9 +473,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         # Ordered: reconstruct original a = result + b
         if cmp_macro and rhs:
             return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
@@ -450,13 +484,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_signed_cast(lhs, size)} <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_signed_cast(lhs, size)} > 0)", desc
         return None
 
     # ── add: a = a + b, flags from result ──
@@ -466,21 +500,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         if jcc in ("jb", "jnae", "jc"):
             return f"({lhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_signed_cast(lhs, size)} <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_signed_cast(lhs, size)} > 0)", desc
         return None
 
     # ── adc/sbb: result-based (like add/sub but with carry) ──
@@ -490,9 +524,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         return None
 
     # ── and/or/xor: result-based, CF=0, OF=0 ──
@@ -502,13 +536,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc in ("js", "jl"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc in ("jns", "jge"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         if jcc == "jle":
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_signed_cast(lhs, size)} <= 0)", desc
         if jcc == "jg":
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_signed_cast(lhs, size)} > 0)", desc
         if jcc in ("jb", "jnae", "jbe", "jna"):
             return "0", desc  # CF=0 after and/or/xor
         if jcc in ("jae", "jnb", "ja", "jnbe"):
@@ -522,11 +556,11 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         if jcc in ("jl", "jle", "jg", "jge"):
-            cast = "(int32_t)" + lhs
+            cast = _signed_cast(lhs, size)
             op = {"jl": "<", "jle": "<=", "jg": ">", "jge": ">="}[jcc]
             return f"({cast} {op} 0)", desc
         return None
@@ -543,17 +577,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} == 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_signed_cast(lhs, size)} > 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_signed_cast(lhs, size)} <= 0)", desc
         return None
 
     # ── shift: result-based ──
@@ -563,9 +597,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         return None
 
     # ── shld/shrd: double-precision shift, result-based ──
@@ -575,9 +609,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_signed_cast(lhs, size)} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_signed_cast(lhs, size)} >= 0)", desc
         return None
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
@@ -661,7 +695,7 @@ def _make_cmovcc_cond(cmov_mnemonic, flag_setter, flag_ops):
 # x87 status bits visible in AH after fnstsw ax: C0=0x01, C1=0x02, C2=0x04,
 # C3=0x40. These are the masks MM3 uses with the test-ah idiom; _fpu_cmp can
 # only resolve C3/C2, so masks pulling in C0/C1 keep the old behaviour.
-_FPU_STATUS_TEST_MASKS = (0x40, 0x41, 0x44)
+_FPU_STATUS_TEST_MASKS = (0x40, 0x41, 0x44, 0x05)
 
 
 def _is_fpu_status_test(insn):
@@ -1860,22 +1894,23 @@ class Lifter:
                 return [f"{mem_acc}({_fmt_mem(ops[0])}) = (int32_t)fp_top(); /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
-        if m == "fadd":
-            return [f"fp_st1() += fp_top(); fp_pop(); /* fadd */"]
-        if m == "faddp":
-            return [f"fp_st1() += fp_top(); fp_pop(); /* faddp */"]
-        if m == "fsub":
-            return [f"fp_st1() -= fp_top(); fp_pop(); /* fsub */"]
-        if m == "fsubp":
-            return [f"fp_st1() -= fp_top(); fp_pop(); /* fsubp */"]
-        if m == "fmul":
-            return [f"fp_st1() *= fp_top(); fp_pop(); /* fmul */"]
-        if m == "fmulp":
-            return [f"fp_st1() *= fp_top(); fp_pop(); /* fmulp */"]
-        if m == "fdiv":
-            return [f"fp_st1() /= fp_top(); fp_pop(); /* fdiv */"]
-        if m == "fdivp":
-            return [f"fp_st1() /= fp_top(); fp_pop(); /* fdivp */"]
+        if m in ("fadd", "faddp", "fsub", "fsubp", "fmul", "fmulp", "fdiv", "fdivp"):
+            arith = {"fadd": "+=", "faddp": "+=", "fsub": "-=", "fsubp": "-=",
+                     "fmul": "*=", "fmulp": "*=", "fdiv": "/=", "fdivp": "/="}[m]
+            if len(ops) >= 1 and ops[0].type == "mem":
+                # Memory operand: ST0 op= [mem]. Push the operand so the
+                # register pattern below computes old_ST0 op mem, then pop.
+                acc = "MEMD" if ops[0].mem_size == 8 else "MEMF"
+                return [f"fp_push({acc}({_fmt_mem(ops[0])})); fp_st1(){arith} fp_top(); fp_pop(); /* {m} [mem] */"]
+            return [f"fp_st1(){arith} fp_top(); fp_pop(); /* {m} */"]
+        if m in ("fsubr", "fdivr"):
+            # ST0 = [mem] - ST0 / ST0 = [mem] / ST0: push the operand, compute
+            # top = operand OP st1 (the pre-push ST0), then drop the old ST0.
+            if len(ops) >= 1 and ops[0].type == "mem":
+                acc = "MEMD" if ops[0].mem_size == 8 else "MEMF"
+                op = "-" if m == "fsubr" else "/"
+                return [f"fp_push({acc}({_fmt_mem(ops[0])})); fp_top() = fp_top() {op} fp_st1(); fp_pop(); /* {m} [mem] */"]
+            return [f"/* FPU: {m} {insn.op_str} */"]
         if m == "fchs":
             return [f"fp_top() = -fp_top(); /* fchs */"]
         if m == "fabs":
@@ -1886,7 +1921,12 @@ class Lifter:
             return [f"{{ double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; }} /* fxch */"]
         if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
             # Set _fpu_cmp for the fcomp/fnstsw/sahf pattern
-            return [f"_fpu_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
+            if len(ops) >= 1 and ops[0].type == "mem":
+                acc = "MEMD" if ops[0].mem_size == 8 else "MEMF"
+                rhs = f"{acc}({_fmt_mem(ops[0])})"
+            else:
+                rhs = "fp_st1()"
+            return [f"_fpu_cmp = (fp_top() < {rhs}) ? -1 : (fp_top() > {rhs}) ? 1 : 0;"
                     f" /* {m} {insn.op_str} */"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
             # These set EFLAGS directly (CF, ZF, PF) from FPU comparison
@@ -1937,7 +1977,7 @@ def _snapshot_flag_operands(stmts, insn, snap_counter):
         stmts.append(
             f"uint32_t {name} = {_fmt_operand_read(op)};"
             " /* snapshot flags operand */")
-        snapshot_ops.append(Operand(type="reg", reg=name))
+        snapshot_ops.append(Operand(type="reg", reg=name, size=_flag_operand_size(op)))
         snap_counter[0] += 1
     return snapshot_ops
 
