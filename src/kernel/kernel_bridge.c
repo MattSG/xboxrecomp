@@ -249,7 +249,7 @@ static LPVOID g_main_fiber = NULL;
 static uint32_t s_fsw_log = 0;
 static void fsw_log(const char *op, const worker_state_t *w)
 {
-    if (s_fsw_log < 128) {
+    if (s_fsw_log < 200000) {
         s_fsw_log++;
         fprintf(stderr, "[FSW] %s %s kc=%u eax=%08X ecx=%08X edx=%08X "
             "ebx=%08X esi=%08X edi=%08X esp=%08X ebp=%08X\n", op,
@@ -934,6 +934,35 @@ static void bridge_PsTerminateSystemThread(void)
     fflush(stderr);
     ExitThread(exit_status);
     /* Never returns */
+}
+
+/* -- KeBugCheck / KeBugCheckEx (ordinals 95/96) -----------
+ * VOID KeBugCheck(ULONG BugCheckCode)
+ * VOID KeBugCheckEx(ULONG BugCheckCode, PVOID P1, PVOID P2, PVOID P3, PVOID P4)
+ *
+ * On real Xbox these halt the system and never return. The title only calls
+ * them on fatal/assert paths. Emulate the original semantics: log the code
+ * and halt the host run instead of returning 0 into poisoned guest state.
+ */
+static void bridge_KeBugCheck(void)
+{
+    uint32_t code = STACK_ARG(0);
+    fprintf(stderr, "\n  [KERNEL] KeBugCheck: code=0x%08X - guest requested fatal halt, terminating run\n", code);
+    fflush(stderr);
+    ExitProcess(1);
+}
+
+static void bridge_KeBugCheckEx(void)
+{
+    uint32_t code = STACK_ARG(0);
+    uint32_t p1 = STACK_ARG(1);
+    uint32_t p2 = STACK_ARG(2);
+    uint32_t p3 = STACK_ARG(3);
+    uint32_t p4 = STACK_ARG(4);
+    fprintf(stderr, "\n  [KERNEL] KeBugCheckEx: code=0x%08X p1=0x%08X p2=0x%08X p3=0x%08X p4=0x%08X - guest requested fatal halt, terminating run\n",
+            code, p1, p2, p3, p4);
+    fflush(stderr);
+    ExitProcess(1);
 }
 
 /* ── HalReadSMCTrayState (ordinal 47) ─────────────────────
@@ -1878,8 +1907,9 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 359: return  4;  /* IoMarkIrpMustComplete(1) */
 
     /* ── Kernel Synchronization ── */
-    case  95: return  8;  /* KeAlertThread(2) */
-    case  97: return  4;  /* KeBugCheck(1) */
+    case  95: return  4;  /* KeBugCheck(1) - stdcall, never returns on real Xbox */
+    case  96: return 20;  /* KeBugCheckEx(5) - stdcall, never returns on real Xbox */
+    case  97: return  4;  /* KeCancelTimer(1) */
     case  98: return  4;  /* MM3/XDK5233 calls slot-102 ordinal 98 as KeConnectInterrupt(1) */
     case  99: return 12;  /* KeDelayExecutionThread(3) - arg-bytes must match the real ordinal */
     case 100: return  4;  /* KeConnectInterrupt(1) */
@@ -2082,6 +2112,8 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 113: return bridge_KeInitializeTimerEx;
 
     /* Synchronization */
+    case  95: return bridge_KeBugCheck;
+    case  96: return bridge_KeBugCheckEx;
     case 189: return bridge_NtCreateEvent;
     case 145: return bridge_KeSetEvent;
     case 159: return bridge_KeWaitForSingleObject;
