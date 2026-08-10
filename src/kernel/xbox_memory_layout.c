@@ -629,6 +629,39 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
          * Reject oversized requests; the game pool checks the NTSTATUS. */
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, result 0x%08X, used %u/%u)\n",
                 size, result, g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
+        /* run-371 (read-only): the requested sizes (0xF80290 / 0x104D2C0 /
+         * 0x104D2A0) are stale heap-region pointers passed as sizes. Pin the
+         * guest caller: [g_esp] = guest return address of the thunk call,
+         * native bt names the bridge, penter ring names the recomp callers. */
+        {
+            uint32_t ret = (g_esp >= 0x1000u && g_esp < 0x04000000u)
+                ? *(volatile uint32_t *)((uintptr_t)g_esp + g_xbox_mem_offset) : 0;
+            void *bt[8];
+            USHORT bn = RtlCaptureStackBackTrace(1, 8, bt, NULL);
+            fprintf(stderr, "  [HEAPOOM] ic=%llu size=%u align=%u esp=0x%08X guest_ret=0x%08X\n",
+                    (unsigned long long)g_icall_count, size, alignment, g_esp, ret);
+            fprintf(stderr, "  [HEAPOOM] args:");
+            for (int ai = 0; ai < 8; ai++) {
+                uint32_t a = 0;
+                if (g_esp >= 0x1000u && g_esp + 4u + (uint32_t)ai * 4u < 0x04000000u)
+                    a = *(volatile uint32_t *)((uintptr_t)g_esp + 4u +
+                        (uint32_t)ai * 4u + g_xbox_mem_offset);
+                fprintf(stderr, " %08X", a);
+            }
+            fprintf(stderr, "\n  [HEAPOOM] nat:");
+            for (USHORT bi = 0; bi < bn; bi++)
+                fprintf(stderr, " %zX", (uintptr_t)bt[bi] -
+                    (uintptr_t)GetModuleHandle(NULL));
+            fprintf(stderr, "\n  [HEAPOOM] ring:");
+            extern volatile uintptr_t g_penter_trace[256];
+            extern volatile uint32_t g_penter_trace_idx;
+            for (int ri = 0; ri < 12; ri++) {
+                uint32_t idx = (g_penter_trace_idx - 1 - (uint32_t)ri) & 255u;
+                fprintf(stderr, " %zX", g_penter_trace[idx]);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
         return 0;
     }
 
