@@ -693,6 +693,15 @@ void pramin_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     NV2AState *d = (NV2AState *)opaque;
     if (addr + size <= memory_region_size(&d->ramin) && size <= sizeof(val))
         memcpy(d->ramin_ptr + addr, &val, size);
+
+    /* Bounded producer trace: decode the first object records before adding
+     * any registration semantics.  This is the authentic write boundary. */
+    static unsigned int trace_count;
+    if (trace_count < 64 && size == 4 && addr < 0x100) {
+        fprintf(stderr, "[RAMIN-PROBE] off=0x%05llX val=0x%08llX\n",
+                (unsigned long long)addr, (unsigned long long)val);
+        trace_count++;
+    }
 }
 
 uint64_t nv2a_stub_read(void *opaque, hwaddr addr, unsigned int size)
