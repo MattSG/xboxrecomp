@@ -18,6 +18,7 @@
 #include "d3d8_internal.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* ================================================================
  * Internal device state
@@ -83,6 +84,74 @@ static IDirect3DBaseTexture8  *g_cur_textures[4] = { NULL };
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
 
+/* Diagnostic M4 frame capture (env MM3_CAPTURE=1): read back the swapchain
+ * backbuffer before Present and write frame_%03d.bmp. Read-only wrt guest
+ * state; disabled for final M4 runs. */
+static void d3d8_capture_frame(D3D8DeviceState *state, int idx)
+{
+    ID3D11Texture2D *bb = NULL;
+    HRESULT hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
+        &IID_ID3D11Texture2D, (void **)&bb);
+    if (FAILED(hr) || !bb) return;
+    D3D11_TEXTURE2D_DESC d, sd;
+    ID3D11Texture2D_GetDesc(bb, &d);
+    sd = d;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.BindFlags = 0;
+    sd.MiscFlags = 0;
+    ID3D11Texture2D *st = NULL;
+    hr = ID3D11Device_CreateTexture2D(state->d3d11_device, &sd, NULL, &st);
+    if (FAILED(hr) || !st) { ID3D11Texture2D_Release(bb); return; }
+    ID3D11DeviceContext_CopyResource(state->d3d11_context,
+        (ID3D11Resource *)st, (ID3D11Resource *)bb);
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (ID3D11DeviceContext_Map(state->d3d11_context,
+            (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &map) == S_OK) {
+        int w = (int)d.Width, h = (int)d.Height;
+        int row = w * 3; row = (row + 3) & ~3;
+        char name[64];
+        snprintf(name, sizeof(name), "frame_%03d.bmp", idx);
+        FILE *f = fopen(name, "wb");
+        if (f) {
+            unsigned char hdr[54];
+            memset(hdr, 0, sizeof(hdr));
+            hdr[0] = 'B'; hdr[1] = 'M';
+            uint32_t pix = (uint32_t)row * (uint32_t)h;
+            uint32_t fsz = 54 + pix;
+            memcpy(hdr + 2, &fsz, 4);
+            uint32_t off = 54;
+            memcpy(hdr + 10, &off, 4);
+            uint32_t ih = 40;
+            memcpy(hdr + 14, &ih, 4);
+            int32_t ww = w, hh = h;
+            memcpy(hdr + 18, &ww, 4);
+            memcpy(hdr + 22, &hh, 4);
+            uint16_t planes = 1, bpp = 24;
+            memcpy(hdr + 26, &planes, 2);
+            memcpy(hdr + 28, &bpp, 2);
+            fwrite(hdr, 1, sizeof(hdr), f);
+            const unsigned char *src = map.pData;
+            for (int y = h - 1; y >= 0; y--) {
+                const unsigned char *p = src + (size_t)y * map.RowPitch;
+                for (int x = 0; x < w; x++) {
+                    fputc(p[x * 4 + 0], f);
+                    fputc(p[x * 4 + 1], f);
+                    fputc(p[x * 4 + 2], f);
+                }
+                for (int pad = w * 3; pad < row; pad++) fputc(0, f);
+            }
+            fclose(f);
+            fprintf(stderr, "[CAPTURE] %s %dx%d written\n", name, w, h);
+            fflush(stderr);
+        }
+        ID3D11DeviceContext_Unmap(state->d3d11_context,
+            (ID3D11Resource *)st, 0);
+    }
+    ID3D11Texture2D_Release(st);
+    ID3D11Texture2D_Release(bb);
+}
+
 /* ================================================================
  * Public frame pump (called from recompiled game code)
  * ================================================================ */
@@ -94,6 +163,14 @@ void d3d8_PresentFrame(void)
         if (msg.message == WM_QUIT) ExitProcess(0);
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
+    }
+
+    /* Diagnostic M4 capture (env MM3_CAPTURE=1): first presents + burst. */
+    if (getenv("MM3_CAPTURE") && g_device_state.swap_chain) {
+        static int s_cap_n = 0;
+        int idx = s_cap_n++;
+        if (idx < 6 || (idx >= 100 && idx < 106))
+            d3d8_capture_frame(&g_device_state, idx);
     }
 
     /* Present the backbuffer (VSync = 1) */
