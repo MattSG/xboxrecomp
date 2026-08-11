@@ -829,6 +829,12 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
     qemu_cond_init(&d->pfifo.fifo_cond);
     qemu_cond_init(&d->pfifo.fifo_idle_cond);
 
+    /* Xbox GPU bootstrap places the 4 KiB RAMHT at PRAMIN 0x1F0000.
+     * The standalone host has no MCPX/BIOS PFIFO setup, so leaving this
+     * register zero makes every otherwise-natural object lookup read RAMHT
+     * from PRAMIN zero (the DMA-object area). */
+    d->pfifo.regs[NV_PFIFO_RAMHT] = 0x000001F0;
+
     /* Phase-1 stub: report the GPU as idle with the pushbuffer drained.
      * sub_00347E6D blocks until CACHE1_STATUS LOW_MARK (0x3214 bit 0x10) and
      * RUNOUT_STATUS bit 0x10 (0x2400) are set with DMA_PUSH STATE (0x3220)
