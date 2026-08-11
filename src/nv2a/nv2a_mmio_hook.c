@@ -370,14 +370,11 @@ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 {
     g_mem_offset = xbox_mem_offset;
 
-    /* Allocate NV2A VRAM (64MB) */
-    g_nv2a_vram = (uint8_t *)VirtualAlloc(NULL, NV2A_VRAM_SIZE + NV2A_RAMIN_SIZE,
-                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!g_nv2a_vram) {
-        fprintf(stderr, "[NV2A] Failed to allocate %u MB for VRAM!\n",
-                (NV2A_VRAM_SIZE + NV2A_RAMIN_SIZE) / (1024*1024));
-        return;
-    }
+    /* The guest VRAM aperture (0xF0000000-0xF3FFFFFF) is pre-committed
+     * PAGE_READWRITE by main.c. Point the standalone GPU's VRAM at that
+     * same backing so CPU texture/geometry writes land where PGRAPH samples
+     * them (real Xbox: the aperture IS VRAM). RAMIN follows at +64MB. */
+    g_nv2a_vram = (uint8_t *)(uintptr_t)(NV2A_VRAM_BASE + (uintptr_t)g_mem_offset);
 
     uint8_t *ramin_ptr = g_nv2a_vram + NV2A_VRAM_SIZE;
 
@@ -395,41 +392,100 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     /* Compute MMIO offset within NV2A register space */
     uint32_t mmio_offset = fault_xbox_va - NV2A_MMIO_BASE;
 
-    /* Emulated pushbuffer completion: the game flushes the write-back cache
+    /* Stand in for the GPU DMA engine: the emulated GPU is always caught up,
+     * so when the guest reads NV_USER_DMA_GET (0xFD800044, USER block +0x44)
+     * advance the guest GET (dev+0x24) and the register mirror to the
+     * submitted PUT. The builder polls this register to learn how far the GPU
+     * consumed the ring; a kick-time-only advance left dev+0x24 stuck after
+     * the single early WBC flush (runs 404/406 froze in sub_0034E420). */
+    if (!is_write && mmio_offset == 0x800000u + 0x44u) {
+        uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
+        uint32_t dev = *g351f48;
+        if (dev < 0x04000000u) {
+            uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
+            uint32_t put = devp[0];
+            uint32_t get = devp[0x24 / 4];
+            uint32_t rend = devp[0x28 / 4];
+            /* Emulated GPU is always caught up: NV_USER_DMA_GET mirrors PUT
+             * even when PUT wrapped past the ring end, so completion polls
+             * (sub_00345740 loc_345EE0: mirror == dev[0]) pass. The software
+             * cursor dev+0x24 only advances while PUT stays in-ring; once
+             * wrapped, PFIFO_CACHE1_DMA_SUBROUTINE (0x324C) serves the
+             * in-ring position for the sub_003444C0 free-space math. */
+            uint32_t consumed = put;
+            if (get < 0x04000000u && put < 0x04000000u && put >= get &&
+                put <= (rend < 0x04000000u ? rend : 0x04000000u)) {
+                devp[0x24 / 4] = consumed;
+            }
+            nv2a_mmio_write(nv2a_get_state(), 0x800000u + 0x44u, consumed, 4);
+        }
+    }
+
+    /* PFIFO_CACHE1_DMA_SUBROUTINE (0xFD00324C): the guest falls back to this
+     * register when NV_USER_DMA_GET has wrapped past the ring end
+     * (sub_003444C0 0x003444DA). The emulated GPU is always caught up, so its
+     * DMA GET equals the guest's own GET cursor (dev+0x24); serve that so the
+     * free-space math in sub_003444C0/sub_00344640 sees real room. */
+    if (!is_write && mmio_offset == 0x324Cu) {
+        uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
+        uint32_t dev = *g351f48;
+        uint32_t value = 0;
+        if (dev >= 0x00001000u && dev < 0x04000000u) {
+            value = ((uint32_t *)(uintptr_t)(dev + g_mem_offset))[0x24 / 4];
+        }
+        nv2a_mmio_write(nv2a_get_state(), 0x324Cu, value, 4);
+    }
+
+    /* Emulated pushbuffer consumption: the game flushes the write-back cache
      * after kicking a command ring (sub_00344AB0's NV_PFB_WBC write) and then
      * waits for the GPU to consume it by polling the DMA GET mirror at
      * *(dev+0x17C0)+0x44 until it equals dev->field_0 (sub_00345740
-     * loc_00345EE0). Real PFIFO pushbuffer processing is a stub (Phase 2-3),
-     * so satisfy the poll contract here: on the WBC flush write, report the
-     * ring as fully consumed. ponytail: Phase-1 "GPU idle" contract like the
-     * PFIFO idle flags; replace with real pushbuffer processing for M4. */
+     * loc_00345EE0) and by spinning on the ring-header GET watermark
+     * (sub_00344640 loc_00344733). Real PFIFO pushbuffer processing is a stub
+     * (Phase 2-3), so stand in for the GPU DMA engine here: consume the
+     * submitted ring from the current GET up to PUT and publish that through
+     * the two places the guest reads -- NV_USER_DMA_GET (d->puser.regs) and
+     * dev+0x24. This is the legitimate producer the original GPU uses; the
+     * previous fake left GET stuck, which froze the sub_0034E420 batch loop
+     * (run 404). The ring-header GET at [dev+0x30] is NOT an absolute
+     * watermark: the guest treats it as a slot-count index (sub_00344640
+     * spins on dev+0x2C - requested vs dev+0x2C - ringGET), so writing an
+     * absolute address there poisoned length math and stalled earlier in a
+     * table copy (run 405). Keep the legacy all-slots-consumed slot index. */
     if (is_write && mmio_offset == 0x100000u + NV_PFB_WBC) {
         uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
         uint32_t dev = *g351f48;
         if (dev < 0x04000000u) {
             uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
             uint32_t sub = devp[0x17C0 / 4];
-            uint32_t expected = *devp;   /* submitted PUT (obj->field_0) */
-            /* Report the emulated DMA_GET through the NV2A register state:
-             * the guest poll reads NV_USER_DMA_GET (0xFD800044) via the VEH,
-             * which serves nv2a_mmio_read from d->puser.regs. A raw write to
-             * host memory here was never visible to the guest, so the poll at
-             * sub_00345740 loc_345EE0 spun forever (icalls stuck at 12069). */
+            uint32_t put = devp[0];              /* submitted PUT */
+            uint32_t get = devp[0x24 / 4];       /* guest-side GET cursor */
+            uint32_t rend = devp[0x28 / 4];      /* ring end */
+            uint32_t ring = devp[0x30 / 4];      /* ring-header struct */
+            uint32_t ring_slots = devp[0x2C / 4];/* ring slot count */
+            /* Mirror PUT unconditionally (always-caught-up GPU), advance the
+             * in-ring software cursor only while PUT is inside the ring. */
+            uint32_t consumed = put;
+            if (get < 0x04000000u && put < 0x04000000u && put >= get &&
+                put <= (rend < 0x04000000u ? rend : 0x04000000u)) {
+                devp[0x24 / 4] = consumed;
+            }
+            if (ring < 0x04000000u && ring_slots != 0u &&
+                ring_slots < 0x10000u) {
+                uint32_t *rh = (uint32_t *)(uintptr_t)(ring + g_mem_offset);
+                rh[0] = ring_slots;  /* all ring slots consumed */
+            }
+            /* NV_USER_DMA_GET (0xFD800044) is served from d->puser.regs by
+             * the VEH, so the guest poll at sub_00345740 loc_345EE0 sees it. */
             if (sub >= NV2A_MMIO_BASE && sub < NV2A_MMIO_BASE + NV2A_MMIO_SIZE) {
                 nv2a_mmio_write(nv2a_get_state(),
-                                (sub - NV2A_MMIO_BASE) + 0x44u, expected, 4);
+                                (sub - NV2A_MMIO_BASE) + 0x44u, consumed, 4);
             }
-            /* The ring-header GET (sub_00344640 loc_00344733 spins while
-             * requested > MEM32(MEM32(dev+0x30))). Emulate "GPU consumed
-             * everything": GET = ring size (dev+0x2C). */
-            uint32_t ring = *(uint32_t *)(uintptr_t)(dev + 0x30u + g_mem_offset);
-            uint32_t ring_size = *(uint32_t *)(uintptr_t)(dev + 0x2Cu + g_mem_offset);
-            if (ring < 0x10000000u && ring_size != 0u && ring_size < 0x10000u) {
-                *(uint32_t *)(uintptr_t)(ring + g_mem_offset) = ring_size;
-            }
-            fprintf(stderr, "[NV2A] WBC flush: GET mirror 0x%08X -> 0x%08X "
-                "ring 0x%08X -> 0x%08X (dev=0x%08X)\n",
-                sub + 0x44u, expected, ring, ring_size, dev);
+            fprintf(stderr, "[NV2A] WBC flush: GET 0x%08X -> 0x%08X (PUT) "
+                "ring-header 0x%08X -> 0x%08X slots (dev=0x%08X)\n",
+                get, consumed, ring,
+                (ring < 0x04000000u && ring_slots < 0x10000u) ? ring_slots : 0,
+                dev);
             fflush(stderr);
         }
     }
