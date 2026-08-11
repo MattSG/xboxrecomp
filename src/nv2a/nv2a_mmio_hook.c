@@ -8,6 +8,7 @@
 #include "nv2a_mmio_hook.h"
 #include "nv2a_state.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 /* NV2A MMIO base in Xbox VA space */
 #define NV2A_MMIO_BASE  0xFD000000u
@@ -23,6 +24,60 @@ static uint8_t *g_nv2a_vram = NULL;
 static int g_mmio_read_count = 0;
 static int g_mmio_write_count = 0;
 static int g_mmio_decode_fail = 0;
+static int g_pb_retire_log = 0;
+static int g_dma_get_log = 0;
+
+/* Decode guest push-buffer packets. Return last valid cursor; malformed or
+ * incomplete packet stops retirement. */
+static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
+{
+    NV2AState *gpu = nv2a_get_state();
+    uint32_t cursor = get;
+    uint32_t packets = 0;
+
+    if (!gpu || get >= 0x04000000u || put >= 0x04000000u || put < get)
+        return get;
+
+    if (getenv("MM3_TRACE_PB")) {
+        fprintf(stderr, "[NV2A-PB] get=%08X put=%08X words:", get, put);
+        for (uint32_t i = 0; i < 8 && get + i * 4u < put; ++i)
+            fprintf(stderr, " %08X",
+                    *(uint32_t *)(uintptr_t)(get + i * 4u + g_mem_offset));
+        fprintf(stderr, "\n");
+    }
+
+    while (cursor < put && packets++ < 0x100000u) {
+        uint32_t header = *(uint32_t *)(uintptr_t)(cursor + g_mem_offset);
+        if (header == 0u) {
+            cursor += 4u; /* push-buffer NOP/padding */
+            continue;
+        }
+        uint32_t mode = header & 0xE0030003u;
+        uint32_t count = (header >> 18) & 0x7FFu;
+        uint32_t method = header & 0x1FFCu;
+        uint32_t subchannel = (header >> 13) & 7u;
+        uint32_t words = count + 1u;
+        int non_incrementing = (mode == 0x40000000u);
+
+        if ((mode != 0u && !non_incrementing) || count == 0u ||
+            cursor + words * 4u > put)
+            break;
+
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t param = *(uint32_t *)(uintptr_t)(cursor + 4u * (i + 1u)
+                                                       + g_mem_offset);
+            pgraph_method(gpu, subchannel,
+                          non_incrementing ? method : method + i * 4u,
+                          param);
+        }
+        cursor += words * 4u;
+    }
+
+    if (cursor != get && g_pb_retire_log++ < 8)
+        fprintf(stderr, "[NV2A-PB] retired GET=%08X PUT=%08X -> %08X\n",
+                get, put, cursor);
+    return cursor;
+}
 
 /* Global APU state pointer is declared in apu.h and referenced from main.c
  * (regardless of whether the MMIO hook is active). Keep its definition
@@ -406,17 +461,18 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
             uint32_t put = devp[0];
             uint32_t get = devp[0x24 / 4];
             uint32_t rend = devp[0x28 / 4];
+            if (g_dma_get_log++ < 12)
+                fprintf(stderr, "[NV2A-DMA-GET] dev=%08X get=%08X put=%08X rend=%08X\n",
+                        dev, get, put, rend);
             /* Emulated GPU is always caught up: NV_USER_DMA_GET mirrors PUT
              * even when PUT wrapped past the ring end, so completion polls
              * (sub_00345740 loc_345EE0: mirror == dev[0]) pass. The software
              * cursor dev+0x24 only advances while PUT stays in-ring; once
              * wrapped, PFIFO_CACHE1_DMA_SUBROUTINE (0x324C) serves the
              * in-ring position for the sub_003444C0 free-space math. */
-            uint32_t consumed = put;
-            if (get < 0x04000000u && put < 0x04000000u && put >= get &&
-                put <= (rend < 0x04000000u ? rend : 0x04000000u)) {
+            uint32_t consumed = nv2a_consume_pushbuffer(get, put);
+            if (consumed != get)
                 devp[0x24 / 4] = consumed;
-            }
             nv2a_mmio_write(nv2a_get_state(), 0x800000u + 0x44u, consumed, 4);
         }
     }
@@ -463,14 +519,12 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
             uint32_t rend = devp[0x28 / 4];      /* ring end */
             uint32_t ring = devp[0x30 / 4];      /* ring-header struct */
             uint32_t ring_slots = devp[0x2C / 4];/* ring slot count */
-            /* Mirror PUT unconditionally (always-caught-up GPU), advance the
-             * in-ring software cursor only while PUT is inside the ring. */
-            uint32_t consumed = put;
-            if (get < 0x04000000u && put < 0x04000000u && put >= get &&
-                put <= (rend < 0x04000000u ? rend : 0x04000000u)) {
+            /* Decode and retire only complete packets. A malformed packet
+             * leaves GET at its last known-good cursor. */
+            uint32_t consumed = nv2a_consume_pushbuffer(get, put);
+            if (consumed != get)
                 devp[0x24 / 4] = consumed;
-            }
-            if (ring < 0x04000000u && ring_slots != 0u &&
+            if (consumed != get && ring < 0x04000000u && ring_slots != 0u &&
                 ring_slots < 0x10000u) {
                 uint32_t *rh = (uint32_t *)(uintptr_t)(ring + g_mem_offset);
                 rh[0] = ring_slots;  /* all ring slots consumed */
@@ -481,16 +535,40 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                 nv2a_mmio_write(nv2a_get_state(),
                                 (sub - NV2A_MMIO_BASE) + 0x44u, consumed, 4);
             }
-            fprintf(stderr, "[NV2A] WBC flush: GET 0x%08X -> 0x%08X (PUT) "
-                "ring-header 0x%08X -> 0x%08X slots (dev=0x%08X)\n",
-                get, consumed, ring,
+            fprintf(stderr, "[NV2A] WBC flush: GET 0x%08X PUT 0x%08X -> 0x%08X "
+                "words=%08X/%08X/%08X/%08X ring-header 0x%08X -> 0x%08X "
+                "slots (dev=0x%08X)\n", get, put, consumed,
+                *(uint32_t *)(uintptr_t)(get + g_mem_offset),
+                *(uint32_t *)(uintptr_t)(get + 4u + g_mem_offset),
+                *(uint32_t *)(uintptr_t)(get + 8u + g_mem_offset),
+                *(uint32_t *)(uintptr_t)(get + 12u + g_mem_offset), ring,
                 (ring < 0x04000000u && ring_slots < 0x10000u) ? ring_slots : 0,
                 dev);
             fflush(stderr);
         }
     }
 
-    return decode_and_handle(ctx, mmio_offset, is_write);
+    bool handled = decode_and_handle(ctx, mmio_offset, is_write);
+
+    /* DMA PUT is the submission doorbell. Retire newly submitted complete
+     * packets immediately after the register write becomes visible. */
+    if (handled && is_write && mmio_offset == 0x800000u + 0x40u) {
+        uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
+        uint32_t dev = *g351f48;
+        if (dev < 0x04000000u) {
+            uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
+            uint32_t get = devp[0x24 / 4];
+            uint32_t put = devp[0];
+            uint32_t consumed = nv2a_consume_pushbuffer(get, put);
+            if (consumed != get) {
+                devp[0x24 / 4] = consumed;
+                nv2a_mmio_write(nv2a_get_state(), 0x800000u + 0x44u,
+                                consumed, 4);
+            }
+        }
+    }
+
+    return handled;
 }
 
 bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
