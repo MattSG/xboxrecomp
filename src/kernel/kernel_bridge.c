@@ -831,6 +831,7 @@ static void bridge_KeSetEvent(void)
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
 {
+    static unsigned wait_log_count;
     uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
     uint32_t wait_mode = STACK_ARG(2);
@@ -840,6 +841,9 @@ static void bridge_KeWaitForSingleObject(void)
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         XBOX_TO_NATIVE(object), wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    if (wait_log_count++ < 8)
+        fprintf(stderr, "[KEWAIT] object=%08X timeout=%08X status=%08X\n",
+                object, timeout_ptr, (unsigned)g_eax);
 }
 
 /* ── KeDelayExecutionThread (ordinal 99/256) ────────────── */
