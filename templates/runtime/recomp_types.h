@@ -137,7 +137,9 @@ void recomp_icall_fail_log(uint32_t va);
  */
 #define XBOX_PTR(addr) \
     (((uintptr_t)(uint32_t)(addr) >= 0xFE000000u) \
-        ? ((uintptr_t)((uint32_t)(addr) & 0x0000FFFFu) + g_xbox_mem_offset) \
+        ? (((uint32_t)(addr) >= 0xFE800000u && (uint32_t)(addr) < 0xFF000000u) \
+            ? ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset) \
+            : ((uintptr_t)((uint32_t)(addr) & 0x0000FFFFu) + g_xbox_mem_offset)) \
         : ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset))
 
 /** Read/write N bytes at a flat Xbox memory address. */
