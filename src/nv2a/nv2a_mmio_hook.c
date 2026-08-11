@@ -26,6 +26,8 @@ static int g_mmio_write_count = 0;
 static int g_mmio_decode_fail = 0;
 static int g_pb_retire_log = 0;
 static int g_dma_get_log = 0;
+static uint32_t g_semaphore_offset;
+static int g_semaphore_log;
 
 /* Decode guest push-buffer packets. Return last valid cursor; malformed or
  * incomplete packet stops retirement. */
@@ -66,9 +68,33 @@ static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t param = *(uint32_t *)(uintptr_t)(cursor + 4u * (i + 1u)
                                                        + g_mem_offset);
-            pgraph_method(gpu, subchannel,
-                          non_incrementing ? method : method + i * 4u,
-                          param);
+            uint32_t actual_method = non_incrementing ? method : method + i * 4u;
+            if (actual_method == 0x1D6Cu) {
+                g_semaphore_offset = param;
+            } else if (actual_method == 0x1D70u) {
+                uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
+                uint32_t dev = *g351f48;
+                if (dev < 0x04000000u) {
+                    uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
+                    uint32_t ring = devp[0x30 / 4];
+                    for (uint32_t off = 0; off < 0x400u; off += 0x10u) {
+                        uint32_t *obj = (uint32_t *)(gpu->ramin_ptr + off);
+                        uint32_t address = (obj[2] & NV_DMA_ADDRESS) |
+                                           (obj[0] & NV_DMA_ADJUST);
+                        if ((obj[0] & NV_DMA_CLASS) == 0x3Du &&
+                            address == (ring & NV_DMA_ADDRESS) &&
+                            g_semaphore_offset < obj[1]) {
+                            *(uint32_t *)(uintptr_t)(address + g_semaphore_offset +
+                                                      g_mem_offset) = param;
+                            if (g_semaphore_log++ < 4)
+                                fprintf(stderr, "[NV2A-SEMA] release=%08X target=%08X offset=%08X inst=%04X\n",
+                                        param, address, g_semaphore_offset, off);
+                            break;
+                        }
+                    }
+                }
+            }
+            pgraph_method(gpu, subchannel, actual_method, param);
         }
         cursor += words * 4u;
     }
@@ -507,7 +533,7 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
      * watermark: the guest treats it as a slot-count index (sub_00344640
      * spins on dev+0x2C - requested vs dev+0x2C - ringGET), so writing an
      * absolute address there poisoned length math and stalled earlier in a
-     * table copy (run 405). Keep the legacy all-slots-consumed slot index. */
+     * table copy (run 405). */
     if (is_write && mmio_offset == 0x100000u + NV_PFB_WBC) {
         uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
         uint32_t dev = *g351f48;
@@ -524,11 +550,6 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
             uint32_t consumed = nv2a_consume_pushbuffer(get, put);
             if (consumed != get)
                 devp[0x24 / 4] = consumed;
-            if (consumed != get && ring < 0x04000000u && ring_slots != 0u &&
-                ring_slots < 0x10000u) {
-                uint32_t *rh = (uint32_t *)(uintptr_t)(ring + g_mem_offset);
-                rh[0] = ring_slots;  /* all ring slots consumed */
-            }
             /* NV_USER_DMA_GET (0xFD800044) is served from d->puser.regs by
              * the VEH, so the guest poll at sub_00345740 loc_345EE0 sees it. */
             if (sub >= NV2A_MMIO_BASE && sub < NV2A_MMIO_BASE + NV2A_MMIO_SIZE) {
