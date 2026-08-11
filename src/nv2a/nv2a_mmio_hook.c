@@ -7,15 +7,17 @@
 
 #include "nv2a_mmio_hook.h"
 #include "nv2a_state.h"
+#include "../kernel/kernel.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <windows.h>
 
 /* NV2A MMIO base in Xbox VA space */
 #define NV2A_MMIO_BASE  0xFD000000u
 #define NV2A_MMIO_SIZE  0x01000000u  /* 16MB */
 #define NV2A_VRAM_BASE  0xF0000000u
 #define NV2A_VRAM_SIZE  (64 * 1024 * 1024)  /* 64MB Xbox VRAM */
-#define NV2A_RAMIN_SIZE (1 * 1024 * 1024)   /* 1MB RAMIN */
+#define NV2A_RAMIN_SIZE (2 * 1024 * 1024)   /* includes Xbox RAMHT at 0x1F0000 */
 
 static ptrdiff_t g_mem_offset = 0;
 static uint8_t *g_nv2a_vram = NULL;
@@ -28,6 +30,29 @@ static int g_pb_retire_log = 0;
 static int g_dma_get_log = 0;
 static uint32_t g_semaphore_offset;
 static int g_semaphore_log;
+
+static DWORD WINAPI nv2a_completion_signal_thread(LPVOID parameter)
+{
+    uint32_t dev = (uint32_t)(uintptr_t)parameter;
+    volatile uint32_t *state = (volatile uint32_t *)(uintptr_t)
+        (dev + 0x1970u + g_mem_offset);
+    /* The original GPU interrupt is asynchronous.  Wait for the guest's
+     * sub_00344640 arm/clear write before delivering the pending completion. */
+    Sleep(1);
+    for (unsigned i = 0; i < 1000 && *state != 0; ++i)
+        Sleep(1);
+    if (*state == 0)
+        xbox_KeSetEvent((PVOID)(uintptr_t)(dev + 0x196Cu), 0, 0);
+    return 0;
+}
+
+static void nv2a_defer_completion_signal(uint32_t dev)
+{
+    HANDLE thread = CreateThread(NULL, 0, nv2a_completion_signal_thread,
+                                 (LPVOID)(uintptr_t)dev, 0, NULL);
+    if (thread)
+        CloseHandle(thread);
+}
 
 /* Decode guest push-buffer packets. Return last valid cursor; malformed or
  * incomplete packet stops retirement. */
@@ -69,6 +94,12 @@ static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
             uint32_t param = *(uint32_t *)(uintptr_t)(cursor + 4u * (i + 1u)
                                                        + g_mem_offset);
             uint32_t actual_method = non_incrementing ? method : method + i * 4u;
+            if (actual_method == 0x0000u) {
+                uint32_t context = 0;
+                nv2a_trace_ramht_lookup(param, 0u, subchannel);
+                if (nv2a_bind_ramht_object(param, 0u, subchannel, &context))
+                    continue; /* PFIFO SET_OBJECT does not reach PGRAPH. */
+            }
             if (actual_method == 0x1D6Cu) {
                 g_semaphore_offset = param;
             } else if (actual_method == 0x1D70u) {
@@ -497,8 +528,15 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
              * wrapped, PFIFO_CACHE1_DMA_SUBROUTINE (0x324C) serves the
              * in-ring position for the sub_003444C0 free-space math. */
             uint32_t consumed = nv2a_consume_pushbuffer(get, put);
-            if (consumed != get)
+            if (consumed != get) {
                 devp[0x24 / 4] = consumed;
+                /* Original sub_00344640 waits on the device completion
+                 * dispatcher object at dev+0x196C after the GPU advances
+                 * the ring. Signal that authentic producer transition. */
+                fprintf(stderr, "[NV2A-WAKE] dev=%08X get=%08X put=%08X consumed=%08X object=%08X\n",
+                        dev, get, put, consumed, dev + 0x196Cu);
+                nv2a_defer_completion_signal(dev);
+            }
             nv2a_mmio_write(nv2a_get_state(), 0x800000u + 0x44u, consumed, 4);
         }
     }
@@ -548,13 +586,20 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
             /* Decode and retire only complete packets. A malformed packet
              * leaves GET at its last known-good cursor. */
             uint32_t consumed = nv2a_consume_pushbuffer(get, put);
-            if (consumed != get)
+            if (consumed != get) {
                 devp[0x24 / 4] = consumed;
+                fprintf(stderr, "[NV2A-WAKE] dev=%08X get=%08X put=%08X consumed=%08X object=%08X\n",
+                        dev, get, put, consumed, dev + 0x196Cu);
+                nv2a_defer_completion_signal(dev);
+            }
             /* NV_USER_DMA_GET (0xFD800044) is served from d->puser.regs by
              * the VEH, so the guest poll at sub_00345740 loc_345EE0 sees it. */
             if (sub >= NV2A_MMIO_BASE && sub < NV2A_MMIO_BASE + NV2A_MMIO_SIZE) {
                 nv2a_mmio_write(nv2a_get_state(),
                                 (sub - NV2A_MMIO_BASE) + 0x44u, consumed, 4);
+            } else if (sub >= 0x00001000u && sub < 0xA0000000u - 0x44u) {
+                /* DMA GET mirrors may be guest RAM, not NV2A MMIO. */
+                *(uint32_t *)(uintptr_t)(sub + 0x44u + g_mem_offset) = consumed;
             }
             fprintf(stderr, "[NV2A] WBC flush: GET 0x%08X PUT 0x%08X -> 0x%08X "
                 "words=%08X/%08X/%08X/%08X ring-header 0x%08X -> 0x%08X "
@@ -583,8 +628,15 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
             uint32_t consumed = nv2a_consume_pushbuffer(get, put);
             if (consumed != get) {
                 devp[0x24 / 4] = consumed;
+                fprintf(stderr, "[NV2A-WAKE] dev=%08X get=%08X put=%08X consumed=%08X object=%08X\n",
+                        dev, get, put, consumed, dev + 0x196Cu);
+                nv2a_defer_completion_signal(dev);
                 nv2a_mmio_write(nv2a_get_state(), 0x800000u + 0x44u,
                                 consumed, 4);
+                uint32_t sub = devp[0x17C0 / 4];
+                if (sub >= 0x00001000u && sub < 0xA0000000u - 0x44u) {
+                    *(uint32_t *)(uintptr_t)(sub + 0x44u + g_mem_offset) = consumed;
+                }
             }
         }
     }
