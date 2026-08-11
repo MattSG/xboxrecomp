@@ -12,6 +12,8 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -30,6 +32,8 @@
  * ============================================================================ */
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
+static PXBOX_KINTERRUPT g_connected_interrupt;
+static volatile LONG g_interrupt_pending;
 
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
@@ -337,6 +341,11 @@ VOID __stdcall xbox_KeInitializeInterrupt(
     Interrupt->Irql = Irql;
     Interrupt->Connected = FALSE;
 
+    if (getenv("MM3_IRQ_TRACE"))
+        fprintf(stderr, "[IRQ] init object=%p routine=%p context=%p vector=%u irql=%u\n",
+                (void *)Interrupt, ServiceRoutine, ServiceContext,
+                (unsigned)Vector, (unsigned)Irql);
+
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
         "KeInitializeInterrupt: interrupt=%p, routine=%p, vector=%u",
         Interrupt, ServiceRoutine, Vector);
@@ -348,12 +357,41 @@ BOOLEAN __stdcall xbox_KeConnectInterrupt(PXBOX_KINTERRUPT Interrupt)
         return FALSE;
 
     Interrupt->Connected = TRUE;
+    g_connected_interrupt = Interrupt;
+
+    if (getenv("MM3_IRQ_TRACE"))
+        fprintf(stderr, "[IRQ] connect object=%p routine=%p context=%p\n",
+                (void *)Interrupt, Interrupt->ServiceRoutine,
+                Interrupt->ServiceContext);
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
         "KeConnectInterrupt: interrupt=%p (stubbed - no real HW interrupts)",
         Interrupt);
 
     return TRUE;
+}
+
+void xbox_kernel_publish_interrupt(void)
+{
+    if (getenv("MM3_IRQ_TRACE"))
+        fprintf(stderr, "[IRQ] publish connected=%p pending=%ld\n",
+                (void *)g_connected_interrupt, (long)g_interrupt_pending);
+    if (g_connected_interrupt && g_connected_interrupt->Connected) {
+        InterlockedExchange(&g_interrupt_pending, 1);
+    }
+}
+
+PXBOX_KINTERRUPT xbox_kernel_take_interrupt(void)
+{
+    LONG pending = InterlockedExchange(&g_interrupt_pending, 0);
+    if (pending != 0 && g_connected_interrupt && g_connected_interrupt->Connected) {
+        static LONG take_diag;
+        if (getenv("MM3_IRQ_TRACE") && InterlockedIncrement(&take_diag) <= 8)
+            fprintf(stderr, "[IRQ] take pending=%ld connected=%p\n",
+                    (long)pending, (void *)g_connected_interrupt);
+        return g_connected_interrupt;
+    }
+    return NULL;
 }
 
 BOOLEAN __stdcall xbox_KeDisconnectInterrupt(PXBOX_KINTERRUPT Interrupt)
@@ -366,6 +404,8 @@ BOOLEAN __stdcall xbox_KeDisconnectInterrupt(PXBOX_KINTERRUPT Interrupt)
     /* Returns the PREVIOUS connected state, not success. */
     was_connected = Interrupt->Connected;
     Interrupt->Connected = FALSE;
+    if (g_connected_interrupt == Interrupt)
+        g_connected_interrupt = NULL;
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
         "KeDisconnectInterrupt: interrupt=%p was_connected=%d",

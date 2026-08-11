@@ -534,6 +534,10 @@ class FunctionTranslator:
         if "ebp" in used_regs:
             lines.append(f"    ebp = g_seh_ebp; /* bridge caller frame from SEH global */")
 
+        # Every translated function is a safe guest-thread execution boundary.
+        # Host producers only publish work; this call is where the owning guest
+        # thread may accept an IRQ or dispatch a queued DPC.
+        lines.append("    recomp_guest_boundary();")
         lines.append(f"")
 
         # Generate code for each basic block
@@ -626,6 +630,12 @@ class FunctionTranslator:
             break
         if _last_label_idx is not None and not _has_stmt_after:
             lines.insert(_last_label_idx + 1, "    (void)0;")
+
+        # 0x00348120 is an original mid-function DPC entry added to the
+        # generated metadata. Its shared tail owns the ret 0x10, but the
+        # recovered entry has no terminal block in the generated CFG.
+        if start == 0x00348120 and not any("return;" in line for line in lines):
+            lines.append("    esp += 20; return; /* recovered ret 0x10 */")
 
         # Undefine FPU macros
         if has_fpu:

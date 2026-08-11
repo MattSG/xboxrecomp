@@ -10,6 +10,7 @@
 
 #include "nv2a_state.h"
 #include "nv2a_pgraph_d3d11.h"
+#include "../kernel/kernel.h"
 
 /* ============================================================
  * Global state
@@ -18,9 +19,108 @@
 static NV2AState *g_nv2a = NULL;
 static MemoryRegion g_vram_region;
 static MemoryRegion g_ramin_region;
+typedef struct { uint32_t handle, dma_class, instance, channel_id; } PendingDMAObject;
+static PendingDMAObject g_pending_dma[32];
+static unsigned int g_pending_dma_count;
+
+static DWORD WINAPI nv2a_vblank_thread(LPVOID parameter)
+{
+    NV2AState *d = (NV2AState *)parameter;
+    while (!d->exiting) {
+        Sleep(16); /* Xbox display refresh is nominally 60 Hz. */
+        if (d->exiting) break;
+        d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+        nv2a_update_irq(d);
+    }
+    return 0;
+}
 
 NV2AState *nv2a_get_state(void) {
     return g_nv2a;
+}
+
+void nv2a_register_dma_object(uint32_t handle, uint32_t dma_class,
+                              uint32_t instance, uint32_t channel_id)
+{
+    NV2AState *d = g_nv2a;
+    if (!d || !d->ramin_ptr) {
+        if (g_pending_dma_count < 32)
+            g_pending_dma[g_pending_dma_count++] = (PendingDMAObject){
+                handle, dma_class, instance, channel_id};
+        fprintf(stderr, "[RAMHT-PENDING] handle=%08X class=%X instance=%05X channel=%u\n",
+                handle, dma_class, instance, channel_id);
+        return;
+    }
+
+    uint32_t hash = 0;
+    for (uint32_t h = handle; h; h >>= 11)
+        hash ^= h & 0x7FFu;
+    hash ^= (channel_id & 0x1Fu) << 7;
+
+    uint32_t context = (instance >> 4) | (1u << 16) |
+                       ((channel_id & 0x1Fu) << 24) | 0x80000000u;
+    hwaddr off = 0x1F0000u + (hwaddr)hash * 8u;
+    if (off + 8u > memory_region_size(&d->ramin)) return;
+    memcpy(d->ramin_ptr + off, &handle, 4);
+    memcpy(d->ramin_ptr + off + 4, &context, 4);
+    fprintf(stderr, "[RAMHT-PRODUCER] handle=%08X class=%X instance=%05X "
+            "channel=%u hash=%03X slot=%05llX context=%08X\n",
+            handle, dma_class, instance, channel_id, hash,
+            (unsigned long long)off, context);
+}
+
+void nv2a_trace_ramht_lookup(uint32_t handle, uint32_t channel_id,
+                             uint32_t subchannel)
+{
+    NV2AState *d = g_nv2a;
+    if (!d || !d->ramin_ptr) return;
+    uint32_t hash = 0;
+    for (uint32_t h = handle; h; h >>= 11) hash ^= h & 0x7FFu;
+    hash ^= (channel_id & 0x1Fu) << 7;
+    hwaddr off = 0x1F0000u + (hwaddr)hash * 8u;
+    uint32_t entry_handle = 0, context = 0;
+    if (off + 8u <= memory_region_size(&d->ramin)) {
+        memcpy(&entry_handle, d->ramin_ptr + off, 4);
+        memcpy(&context, d->ramin_ptr + off + 4, 4);
+    }
+    fprintf(stderr, "[RAMHT-LOOKUP] handle=%08X channel=%u sub=%u hash=%03X "
+            "slot=%05llX entry=%08X context=%08X\n", handle, channel_id,
+            subchannel, hash, (unsigned long long)off, entry_handle, context);
+}
+
+int nv2a_bind_ramht_object(uint32_t handle, uint32_t channel_id,
+                           uint32_t subchannel, uint32_t *context_out)
+{
+    NV2AState *d = g_nv2a;
+    uint32_t hash = 0;
+    for (uint32_t h = handle; h; h >>= 11) hash ^= h & 0x7FFu;
+    hash ^= (channel_id & 0x1Fu) << 7;
+    hwaddr off = 0x1F0000u + (hwaddr)hash * 8u;
+    uint32_t entry = 0, context = 0;
+    if (!d || !d->ramin_ptr || off + 8u > memory_region_size(&d->ramin))
+        return 0;
+    memcpy(&entry, d->ramin_ptr + off, 4);
+    memcpy(&context, d->ramin_ptr + off + 4, 4);
+    if (entry != handle) return 0;
+    if (context_out) *context_out = context;
+    d->pgraph.object_handle[subchannel & 7u] = handle;
+    d->pgraph.object_context[subchannel & 7u] = context;
+    fprintf(stderr, "[PFIFO-OBJECT] sub=%u handle=%08X context=%08X\n",
+            subchannel & 7u, handle, context);
+    return 1;
+}
+
+void nv2a_register_ramht_entry(uint32_t handle, uint32_t hash,
+                               uint32_t context)
+{
+    NV2AState *d = g_nv2a;
+    if (!d || !d->ramin_ptr) return;
+    hwaddr off = 0x1F0000u + (hwaddr)(hash & 0x7FFu) * 8u;
+    if (off + 8u > memory_region_size(&d->ramin)) return;
+    memcpy(d->ramin_ptr + off, &handle, 4);
+    memcpy(d->ramin_ptr + off + 4, &context, 4);
+    fprintf(stderr, "[RAMHT-ORIGINAL] handle=%08X hash=%03X slot=%05llX context=%08X\n",
+            handle, hash & 0x7FFu, (unsigned long long)off, context);
 }
 
 /* ============================================================
@@ -29,6 +129,7 @@ NV2AState *nv2a_get_state(void) {
 
 void nv2a_update_irq(NV2AState *d)
 {
+    static unsigned irq_diag;
     /* PFIFO */
     if (d->pfifo.pending_interrupts & d->pfifo.enabled_interrupts) {
         d->pmc.pending_interrupts |= NV_PMC_INTR_0_PFIFO;
@@ -51,10 +152,21 @@ void nv2a_update_irq(NV2AState *d)
     }
 
     if (d->pmc.pending_interrupts && d->pmc.enabled_interrupts) {
+        if (getenv("MM3_IRQ_TRACE"))
+            fprintf(stderr, "[IRQ] nv2a assert pending=%08X enabled=%08X\n",
+                    d->pmc.pending_interrupts, d->pmc.enabled_interrupts);
+        xbox_kernel_publish_interrupt();
         pci_irq_assert(PCI_DEVICE(d));
     } else {
         pci_irq_deassert(PCI_DEVICE(d));
     }
+    if (getenv("MM3_IRQ_TRACE") && irq_diag++ < 80)
+        fprintf(stderr, "[IRQ] state pmc_pending=%08X pmc_enabled=%08X "
+                "pfifo=%08X/%08X pcrtc=%08X/%08X pgraph=%08X/%08X\n",
+                d->pmc.pending_interrupts, d->pmc.enabled_interrupts,
+                d->pfifo.pending_interrupts, d->pfifo.enabled_interrupts,
+                d->pcrtc.pending_interrupts, d->pcrtc.enabled_interrupts,
+                d->pgraph.pending_interrupts, d->pgraph.enabled_interrupts);
 }
 
 /* ============================================================
@@ -697,7 +809,9 @@ void pramin_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     /* Bounded producer trace: decode the first object records before adding
      * any registration semantics.  This is the authentic write boundary. */
     static unsigned int trace_count;
-    if (trace_count < 64 && size == 4 && addr < 0x100) {
+    if (size == 4 && (trace_count < 64 && addr < 0x100 ||
+                      addr == 0x68 || addr == 0x6C || addr == 0x70 ||
+                      addr == 0x74 || addr == 0x80 || addr == 0x84)) {
         fprintf(stderr, "[RAMIN-PROBE] off=0x%05llX val=0x%08llX\n",
                 (unsigned long long)addr, (unsigned long long)val);
         trace_count++;
@@ -853,6 +967,18 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
     d->pfifo.regs[NV_PFIFO_RUNOUT_STATUS] |= NV_PFIFO_RUNOUT_STATUS_LOW_MARK;
 
     g_nv2a = d;
+
+    /* Standalone build has no QEMU VGA refresh callback. Keep hardware-side
+     * VBLANK generation on its own host thread; it only publishes IRQ state. */
+    HANDLE vblank_thread = CreateThread(NULL, 0, nv2a_vblank_thread, d, 0, NULL);
+    if (vblank_thread) CloseHandle(vblank_thread);
+
+    for (unsigned int i = 0; i < g_pending_dma_count; i++)
+        nv2a_register_dma_object(g_pending_dma[i].handle,
+                                 g_pending_dma[i].dma_class,
+                                 g_pending_dma[i].instance,
+                                 g_pending_dma[i].channel_id);
+    g_pending_dma_count = 0;
 
     fprintf(stderr, "[NV2A] Standalone GPU initialized: VRAM=%uMB RAMIN=%uKB\n",
             vram_size / (1024*1024), ramin_size / 1024);

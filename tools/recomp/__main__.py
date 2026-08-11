@@ -258,13 +258,15 @@ def main():
         funcs = translator.get_functions_by_category(categories=categories)
     elif args.game_only:
         # Game-specific functions only
-        categories = {"game_engine", "game_vtable", "unknown"}
+        categories = {"game_engine", "game_vtable", "game_network",
+                      "game_render", "unknown"}
         funcs = translator.get_functions_by_category(categories=categories)
     elif args.all:
         funcs = translator.get_functions_by_category()
     else:
         # Default: game functions only
-        categories = {"game_engine", "game_vtable", "unknown"}
+        categories = {"game_engine", "game_vtable", "game_network",
+                      "game_render", "unknown"}
         funcs = translator.get_functions_by_category(categories=categories)
 
     print(f"\nTranslating {len(funcs)} functions...", file=sys.stderr)

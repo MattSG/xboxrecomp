@@ -38,6 +38,7 @@
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern uint32_t g_ebx, g_esi, g_edi;
 extern uint32_t g_seh_ebp;
+extern volatile uint64_t g_icall_count;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* Xbox file I/O bridge (src/xbox_file_bridge.c) */
@@ -832,15 +833,44 @@ static void bridge_KeSetEvent(void)
 static void bridge_KeWaitForSingleObject(void)
 {
     static unsigned wait_log_count;
+    static int cf_trace = -1;
     uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
     uint32_t wait_mode = STACK_ARG(2);
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
+    uint32_t esp_before = g_esp;
+    if (cf_trace < 0) cf_trace = getenv("MM3_CF_TRACE") ? 1 : 0;
 
+    if ((g_icall_count >= 12295ULL && g_icall_count <= 12305ULL) ||
+        (g_icall_count >= 321678ULL && g_icall_count <= 321679ULL)) {
+        void *frames[6];
+        USHORT n = CaptureStackBackTrace(0, 6, frames, NULL);
+        HMODULE mod = GetModuleHandle(NULL);
+        fprintf(stderr, "[FRONTIER-KEWAIT-BEGIN] ic=%llu object=%08X reason=%08X mode=%08X alert=%08X timeout=%08X esp=%08X ebp=%08X\n",
+                (unsigned long long)g_icall_count, object, wait_reason,
+                wait_mode, alertable, timeout_ptr, g_esp, g_seh_ebp);
+        for (USHORT i = 0; i < n; ++i)
+            fprintf(stderr, "[FRONTIER-KEWAIT-FRAME] i=%u host_rva=%zX\n", i,
+                    (uintptr_t)frames[i] - (uintptr_t)mod);
+    }
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         (PVOID)(uintptr_t)object, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    if (cf_trace && g_icall_count >= 321600ULL && g_icall_count <= 321700ULL) {
+        fprintf(stderr, "[CF] ic=%llu RET fn=KeWaitForSingleObject "
+                        "ret=unknown stack20=%08X esp_before=%08X esp_after=%08X "
+                        "expected_delta=0 actual_delta=%d guest=FE0000F0\n",
+                (unsigned long long)g_icall_count,
+                BRIDGE_MEM32(esp_before + 20), esp_before, g_esp,
+                (int)g_esp - (int)esp_before);
+    }
+    if ((g_icall_count >= 12295ULL && g_icall_count <= 12305ULL) ||
+        (g_icall_count >= 321678ULL && g_icall_count <= 321679ULL))
+        fprintf(stderr, "[FRONTIER-KEWAIT] ic=%llu object=%08X reason=%08X mode=%08X alert=%08X timeout=%08X status=%08X esp=%08X ebp=%08X\n",
+                (unsigned long long)g_icall_count, object, wait_reason,
+                wait_mode, alertable, timeout_ptr, (unsigned)g_eax,
+                g_esp, g_seh_ebp);
     if (wait_log_count++ < 8)
         fprintf(stderr, "[KEWAIT] object=%08X timeout=%08X status=%08X\n",
                 object, timeout_ptr, (unsigned)g_eax);
@@ -913,6 +943,11 @@ static void bridge_AvSetDisplayMode(void)
     uint32_t format = STACK_ARG(3);
     uint32_t pitch = STACK_ARG(4);
     uint32_t fb = STACK_ARG(5);
+
+    if (g_icall_count >= 321670ULL && g_icall_count <= 321690ULL)
+        fprintf(stderr, "[FRONTIER-AV] ic=%llu addr=%08X step=%08X mode=%08X format=%08X pitch=%08X fb=%08X esp=%08X\n",
+                (unsigned long long)g_icall_count, addr, step, mode, format,
+                pitch, fb, g_esp);
 
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
     g_eax = 0;
@@ -1006,6 +1041,34 @@ static void bridge_KeInitializeDpc(void)
     BRIDGE_MEM32(dpc_va + 12) = routine; /* DeferredRoutine */
     BRIDGE_MEM32(dpc_va + 16) = context; /* DeferredContext */
     g_eax = 0;
+}
+
+static void bridge_KeInitializeInterrupt(void)
+{
+    uint32_t interrupt_va = STACK_ARG(0);
+    xbox_KeInitializeInterrupt(
+        (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(interrupt_va),
+        (PVOID)(uintptr_t)STACK_ARG(1),
+        (PVOID)(uintptr_t)STACK_ARG(2),
+        STACK_ARG(3), (KIRQL)STACK_ARG(4), STACK_ARG(5),
+        (BOOLEAN)STACK_ARG(6));
+    g_eax = 0;
+}
+
+static void bridge_KeConnectInterrupt(void)
+{
+    uint32_t interrupt_va = STACK_ARG(0);
+    g_eax = xbox_KeConnectInterrupt(
+        (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(interrupt_va));
+}
+
+static void bridge_KeInsertQueueDpc(void)
+{
+    uint32_t dpc_va = STACK_ARG(0);
+    g_eax = xbox_KeInsertQueueDpc(
+        (PXBOX_KDPC)XBOX_TO_NATIVE(dpc_va),
+        (PVOID)(uintptr_t)STACK_ARG(1),
+        (PVOID)(uintptr_t)STACK_ARG(2));
 }
 
 /* ── KeInitializeTimerEx (ordinal 113) ────────────────────
@@ -1890,7 +1953,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  40: return  4;  /* HalClearSoftwareInterrupt(1) */
     case  41: return  8;  /* HalDisableSystemInterrupt(2) */
     case  44: return  8;  /* HalGetInterruptVector(2) */
-    case  46: return  8;  /* HalReadSMCTrayState(2) */
+    case  46: return 12;  /* MM3 ISR IAT alias for KeInsertQueueDpc(3) */
     case  47: return 24;  /* HalReadWritePCISpace(6) */
     case  49: return  4;  /* HalRequestSoftwareInterrupt(1) */
     case 358: return  0;  /* HalIsResetOrShutdownPending(void) */
@@ -2114,7 +2177,12 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* DPC / Timer init */
     case 107: return bridge_KeInitializeDpc;
+    case 109: return bridge_KeInitializeInterrupt;
+    case 119: return bridge_KeInsertQueueDpc;
+    /* This XBE's IAT maps the ISR's 0x3620AC entry to ordinal 46. */
+    case 46: return bridge_KeInsertQueueDpc;
     case 113: return bridge_KeInitializeTimerEx;
+    case  98: return bridge_KeConnectInterrupt;
 
     /* Synchronization */
     case  95: return bridge_KeBugCheck;
@@ -2158,6 +2226,69 @@ static int g_slot_arg_bytes[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
 /* Current dispatching slot */
 static int g_kernel_dispatch_slot = -1;
+static XBOX_THREAD_LOCAL int g_guest_work_depth;
+
+void xbox_kernel_pump_guest_work(void)
+{
+    if (g_guest_work_depth++) {
+        g_guest_work_depth--;
+        return;
+    }
+    PXBOX_KINTERRUPT interrupt = xbox_kernel_take_interrupt();
+    if (interrupt && interrupt->ServiceRoutine) {
+        uint32_t saved_eax = g_eax, saved_ecx = g_ecx, saved_edx = g_edx;
+        uint32_t saved_ebx = g_ebx, saved_esi = g_esi, saved_edi = g_edi;
+        uint32_t saved_esp = g_esp, saved_seh = g_seh_ebp;
+        uint32_t routine_va = (uint32_t)(uintptr_t)interrupt->ServiceRoutine;
+        recomp_func_t isr = recomp_lookup(routine_va);
+        if (!isr) isr = recomp_lookup_manual(routine_va);
+        fprintf(stderr, "[IRQ] accept routine=%08X context=%p esp=%08X\n",
+                routine_va, interrupt->ServiceContext, saved_esp);
+        if (isr) {
+            /* Generated ISR expects ESP to point at the dummy return slot,
+             * followed by (Interrupt, ServiceContext). */
+            g_esp = saved_esp - 4;
+            BRIDGE_MEM32(g_esp) = 0;
+            BRIDGE_MEM32(g_esp + 4) = (uint32_t)(uintptr_t)interrupt;
+            BRIDGE_MEM32(g_esp + 8) = (uint32_t)(uintptr_t)interrupt->ServiceContext;
+            isr();
+            g_esp = saved_esp;
+            fprintf(stderr, "[IRQ] return routine=%08X esp=%08X\n", routine_va, g_esp);
+        } else {
+            fprintf(stderr, "[IRQ] unresolved routine=%08X\n", routine_va);
+        }
+        g_eax = saved_eax; g_ecx = saved_ecx; g_edx = saved_edx;
+        g_ebx = saved_ebx; g_esi = saved_esi; g_edi = saved_edi;
+        g_esp = saved_esp; g_seh_ebp = saved_seh;
+    }
+
+    PXBOX_KDPC dpc;
+    PVOID arg1, arg2;
+    while (xbox_kernel_take_guest_dpc(&dpc, &arg1, &arg2)) {
+        if (!dpc) continue;
+        uint32_t dpc_va = (uint32_t)((uintptr_t)dpc - (uintptr_t)g_xbox_mem_offset);
+        uint32_t routine_va = BRIDGE_MEM32(dpc_va + 12);
+        recomp_func_t fn = recomp_lookup(routine_va);
+        if (!fn) fn = recomp_lookup_manual(routine_va);
+        fprintf(stderr, "[DPC] dispatch routine=%08X esp=%08X\n",
+                routine_va, g_esp);
+        if (fn) {
+            uint32_t saved_esp = g_esp;
+            uint32_t context_va = BRIDGE_MEM32(dpc_va + 16);
+            g_esp = saved_esp - 4;
+            BRIDGE_MEM32(g_esp) = 0;
+            BRIDGE_MEM32(g_esp + 4) = dpc_va;
+            BRIDGE_MEM32(g_esp + 8) = context_va;
+            BRIDGE_MEM32(g_esp + 12) = (uint32_t)(uintptr_t)arg1;
+            BRIDGE_MEM32(g_esp + 16) = (uint32_t)(uintptr_t)arg2;
+            fn();
+            g_esp = saved_esp;
+        } else {
+            fprintf(stderr, "[DPC] unresolved routine=%08X\n", routine_va);
+        }
+    }
+    g_guest_work_depth--;
+}
 
 static void kernel_thunk_dispatch(void)
 {
@@ -2175,6 +2306,9 @@ static void kernel_thunk_dispatch(void)
 
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
+
+    /* Guest thread owns register globals here; host producers only queue. */
+    xbox_kernel_pump_guest_work();
 
     g_kernel_call_count++;
 

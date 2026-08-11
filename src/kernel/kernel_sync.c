@@ -18,6 +18,8 @@
 #include <stdio.h>
 
 extern ptrdiff_t g_xbox_mem_offset;
+extern volatile uint64_t g_icall_count;
+extern volatile uintptr_t g_penter_last_rva;
 
 static uint32_t xbox_guest_dispatcher_va(PVOID object)
 {
@@ -136,7 +138,17 @@ LONG __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait)
 
     /* We can't easily query previous state, so just set and return 0 */
     if (guest) {
+        if (guest == 0x0035186Cu || guest == 0x0035185Cu)
+            fprintf(stderr, "[FRONTIER-SET] ic=%llu guest=%08X before=%08X caller_rva=%p\n",
+                    (unsigned long long)g_icall_count, guest,
+                    *(volatile uint32_t *)(uintptr_t)(guest + 4u + g_xbox_mem_offset),
+                    (void *)g_penter_last_rva);
         *(volatile LONG *)(uintptr_t)(guest + 4u + g_xbox_mem_offset) = 1;
+        if (guest == 0x0035186Cu || guest == 0x0035185Cu)
+            fprintf(stderr, "[FRONTIER-SET-AFTER] guest=%08X host=%p state=%08X type=%08X\n",
+                    guest, (void *)(uintptr_t)(guest + 4u + g_xbox_mem_offset),
+                    *(volatile uint32_t *)(uintptr_t)(guest + 4u + g_xbox_mem_offset),
+                    *(volatile uint32_t *)(uintptr_t)(guest + g_xbox_mem_offset));
     } else {
         SetEvent((HANDLE)Event);
     }
@@ -279,16 +291,27 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
     if (guest) {
         volatile LONG *state = (volatile LONG *)(uintptr_t)(guest + 4u + g_xbox_mem_offset);
+        if ((guest == 0x0035186Cu || guest == 0x0035185Cu) &&
+            ((g_icall_count >= 12295ULL && g_icall_count <= 12305ULL) ||
+             (g_icall_count >= 321670ULL && g_icall_count <= 321690ULL)))
+            fprintf(stderr, "[FRONTIER-WAIT-STATE] ic=%llu guest=%08X type=%08X state=%08X caller_rva=%p\n",
+                    (unsigned long long)g_icall_count, guest,
+                    *(volatile uint32_t *)(uintptr_t)(guest + g_xbox_mem_offset),
+                    (unsigned)*state, (void *)g_penter_last_rva);
         DWORD start = GetTickCount();
         for (;;) {
             if (*state > 0) {
                 /* Synchronization events release one waiter and reset. */
                 if (*(volatile uint8_t *)(uintptr_t)(guest + g_xbox_mem_offset) == XboxSynchronizationEvent)
                     *state = 0;
+                if ((guest == 0x0035186Cu || guest == 0x0035185Cu) && g_icall_count >= 321670ULL && g_icall_count <= 321690ULL)
+                    fprintf(stderr, "[MEMWRITE] guest=%08X size=4 before=00000001 after=%08X pc=%08X fn=KeWaitForSingleObject\n",
+                            guest + 4u, (unsigned)*state, (unsigned)g_penter_last_rva);
                 return STATUS_SUCCESS;
             }
             if (ms == 0 || (ms != INFINITE && GetTickCount() - start >= ms))
                 return STATUS_TIMEOUT;
+            xbox_kernel_pump_guest_work();
             Sleep(0);
         }
     }
@@ -336,6 +359,65 @@ static HANDLE g_timer_queue = NULL;
 static CRITICAL_SECTION g_timer_cs;
 static BOOL g_timer_cs_init = FALSE;
 
+typedef struct {
+    PXBOX_KDPC dpc;
+    PVOID arg1;
+    PVOID arg2;
+} guest_dpc_work_t;
+
+#define GUEST_DPC_QUEUE_SIZE 64
+static guest_dpc_work_t g_guest_dpc_queue[GUEST_DPC_QUEUE_SIZE];
+static volatile LONG g_guest_dpc_head;
+static volatile LONG g_guest_dpc_tail;
+static CRITICAL_SECTION g_guest_dpc_cs;
+static volatile LONG g_guest_dpc_cs_ready;
+
+static void xbox_guest_dpc_lock_init(void)
+{
+    if (InterlockedCompareExchange(&g_guest_dpc_cs_ready, 1, 0) == 0) {
+        InitializeCriticalSection(&g_guest_dpc_cs);
+        InterlockedExchange(&g_guest_dpc_cs_ready, 2);
+    } else {
+        while (g_guest_dpc_cs_ready != 2) Sleep(0);
+    }
+}
+
+static void xbox_queue_guest_dpc(PXBOX_KDPC dpc, PVOID arg1, PVOID arg2)
+{
+    xbox_guest_dpc_lock_init();
+    EnterCriticalSection(&g_guest_dpc_cs);
+    LONG tail = g_guest_dpc_tail;
+    LONG next = (tail + 1) % GUEST_DPC_QUEUE_SIZE;
+    if (next == g_guest_dpc_head) {
+        LeaveCriticalSection(&g_guest_dpc_cs);
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC, "guest DPC queue full");
+        return;
+    }
+    g_guest_dpc_queue[tail].dpc = dpc;
+    g_guest_dpc_queue[tail].arg1 = arg1;
+    g_guest_dpc_queue[tail].arg2 = arg2;
+    InterlockedExchange(&g_guest_dpc_tail, next);
+    LeaveCriticalSection(&g_guest_dpc_cs);
+}
+
+BOOLEAN xbox_kernel_take_guest_dpc(PXBOX_KDPC *Dpc, PVOID *Arg1, PVOID *Arg2)
+{
+    xbox_guest_dpc_lock_init();
+    EnterCriticalSection(&g_guest_dpc_cs);
+    LONG head = g_guest_dpc_head;
+    if (head == g_guest_dpc_tail) {
+        LeaveCriticalSection(&g_guest_dpc_cs);
+        return FALSE;
+    }
+    if (Dpc) *Dpc = g_guest_dpc_queue[head].dpc;
+    if (Arg1) *Arg1 = g_guest_dpc_queue[head].arg1;
+    if (Arg2) *Arg2 = g_guest_dpc_queue[head].arg2;
+    InterlockedExchange(&g_guest_dpc_head,
+                        (head + 1) % GUEST_DPC_QUEUE_SIZE);
+    LeaveCriticalSection(&g_guest_dpc_cs);
+    return TRUE;
+}
+
 static void xbox_ensure_timer_queue(void)
 {
     if (!g_timer_cs_init) {
@@ -371,15 +453,9 @@ static VOID CALLBACK xbox_timer_callback(PVOID lpParameter, BOOLEAN TimerOrWaitF
         SetEvent(timer->win32_event);
 
     /* Fire the DPC if one is associated */
-    if (timer->Dpc && timer->Dpc->DeferredRoutine) {
-        xbox_log(XBOX_LOG_TRACE, XBOX_LOG_SYNC, "Timer DPC firing: routine=%p",
-            timer->Dpc->DeferredRoutine);
-        timer->Dpc->DeferredRoutine(
-            timer->Dpc,
-            timer->Dpc->DeferredContext,
-            timer->Dpc->SystemArgument1,
-            timer->Dpc->SystemArgument2);
-    }
+    if (timer->Dpc && timer->Dpc->DeferredRoutine)
+        xbox_queue_guest_dpc(timer->Dpc, timer->Dpc->SystemArgument1,
+                             timer->Dpc->SystemArgument2);
 
     /* If not periodic, mark as no longer inserted */
     if (timer->Period == 0)
@@ -548,20 +624,16 @@ BOOLEAN __stdcall xbox_KeInsertQueueDpc(
     PVOID SystemArgument1,
     PVOID SystemArgument2)
 {
-    if (!Dpc || !Dpc->DeferredRoutine)
+    if (!Dpc)
         return FALSE;
 
     Dpc->SystemArgument1 = SystemArgument1;
     Dpc->SystemArgument2 = SystemArgument2;
 
-    /* Submit to the Windows thread pool for async execution */
-    if (!TrySubmitThreadpoolCallback(xbox_dpc_work_callback, Dpc, NULL)) {
-        /* Fallback: execute synchronously */
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_SYNC,
-            "KeInsertQueueDpc: threadpool submit failed, executing synchronously");
-        Dpc->DeferredRoutine(Dpc, Dpc->DeferredContext,
-                            SystemArgument1, SystemArgument2);
-    }
+    xbox_queue_guest_dpc(Dpc, SystemArgument1, SystemArgument2);
+    fprintf(stderr, "[DPC] enqueue dpc=%p routine=%08X\n", (void *)Dpc,
+            (unsigned)*(uint32_t *)((uint8_t *)Dpc + 12));
+    fflush(stderr);
 
     return TRUE;
 }

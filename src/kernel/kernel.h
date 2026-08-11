@@ -351,6 +351,7 @@ struct _XBOX_KTIMER {
 
 /* Deferred Procedure Call */
 struct _XBOX_KDPC {
+    uint8_t         Reserved[12];  /* Xbox KDPC header/type/lock fields */
     PKDEFERRED_ROUTINE DeferredRoutine;
     PVOID              DeferredContext;
     PVOID              SystemArgument1;
@@ -739,6 +740,10 @@ VOID    __stdcall xbox_KeBugCheckEx(ULONG BugCheckCode, ULONG_PTR Param1, ULONG_
 
 VOID    __stdcall xbox_KeInitializeInterrupt(PXBOX_KINTERRUPT Interrupt, PVOID ServiceRoutine, PVOID ServiceContext, ULONG Vector, KIRQL Irql, ULONG InterruptMode, BOOLEAN ShareVector);
 BOOLEAN __stdcall xbox_KeConnectInterrupt(PXBOX_KINTERRUPT Interrupt);
+void xbox_kernel_publish_interrupt(void);
+PXBOX_KINTERRUPT xbox_kernel_take_interrupt(void);
+BOOLEAN xbox_kernel_take_guest_dpc(PXBOX_KDPC *Dpc, PVOID *Arg1, PVOID *Arg2);
+void xbox_kernel_pump_guest_work(void);
 
 /* KeTickCount - exported as a data pointer, not a function */
 extern volatile ULONG xbox_KeTickCount;
