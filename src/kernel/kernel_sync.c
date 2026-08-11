@@ -15,56 +15,18 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
 
 extern ptrdiff_t g_xbox_mem_offset;
 
-typedef struct {
-    uint32_t guest;
-    HANDLE handle;
-} xbox_guest_dispatcher_t;
-
-static xbox_guest_dispatcher_t g_guest_dispatchers[64];
-static CRITICAL_SECTION g_guest_dispatcher_cs;
-static BOOL g_guest_dispatcher_cs_init;
-
-static HANDLE xbox_dispatcher_handle(PVOID object)
+static uint32_t xbox_guest_dispatcher_va(PVOID object)
 {
     uintptr_t value = (uintptr_t)object;
-    unsigned i;
 
     if (g_xbox_mem_offset && value >= (uintptr_t)g_xbox_mem_offset &&
         value < (uintptr_t)g_xbox_mem_offset + 0x10000000u)
         value -= (uintptr_t)g_xbox_mem_offset;
-
-    /* Guest dispatcher objects are VAs; host handles remain native values. */
-    if (value < 0x10000u || value >= 0x10000000u)
-        return (HANDLE)object;
-
-    if (!g_guest_dispatcher_cs_init) {
-        InitializeCriticalSection(&g_guest_dispatcher_cs);
-        g_guest_dispatcher_cs_init = TRUE;
-    }
-    EnterCriticalSection(&g_guest_dispatcher_cs);
-    for (i = 0; i < ARRAYSIZE(g_guest_dispatchers); ++i) {
-        if (g_guest_dispatchers[i].guest == (uint32_t)value) {
-            HANDLE handle = g_guest_dispatchers[i].handle;
-            LeaveCriticalSection(&g_guest_dispatcher_cs);
-            return handle;
-        }
-    }
-    for (i = 0; i < ARRAYSIZE(g_guest_dispatchers); ++i) {
-        if (!g_guest_dispatchers[i].guest) {
-            g_guest_dispatchers[i].guest = (uint32_t)value;
-            g_guest_dispatchers[i].handle = CreateEventW(NULL, TRUE, FALSE, NULL);
-            HANDLE handle = g_guest_dispatchers[i].handle;
-            LeaveCriticalSection(&g_guest_dispatcher_cs);
-            xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_SYNC,
-                "dispatcher map: guest=%08X host=%p", (unsigned)value, handle);
-            return handle;
-        }
-    }
-    LeaveCriticalSection(&g_guest_dispatcher_cs);
-    return NULL;
+    return (value >= 0x10000u && value < 0x10000000u) ? (uint32_t)value : 0;
 }
 
 /* ============================================================================
@@ -166,14 +128,17 @@ NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState)
  */
 LONG __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait)
 {
-    HANDLE hEvent = xbox_dispatcher_handle(Event);
+    uint32_t guest = xbox_guest_dispatcher_va(Event);
 
     (void)Increment;
     (void)Wait;
 
     /* We can't easily query previous state, so just set and return 0 */
-    if (hEvent)
-        SetEvent(hEvent);
+    if (guest) {
+        *(volatile LONG *)(uintptr_t)(guest + 4u + g_xbox_mem_offset) = 1;
+    } else {
+        SetEvent((HANDLE)Event);
+    }
     return 0;
 }
 
@@ -309,8 +274,24 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
     (void)WaitReason;
     (void)WaitMode;
 
-    HANDLE hObject = xbox_dispatcher_handle(Object);
+    uint32_t guest = xbox_guest_dispatcher_va(Object);
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    if (guest) {
+        volatile LONG *state = (volatile LONG *)(uintptr_t)(guest + 4u + g_xbox_mem_offset);
+        DWORD start = GetTickCount();
+        for (;;) {
+            if (*state > 0) {
+                /* Synchronization events release one waiter and reset. */
+                if (*(volatile uint8_t *)(uintptr_t)(guest + g_xbox_mem_offset) == XboxSynchronizationEvent)
+                    *state = 0;
+                return STATUS_SUCCESS;
+            }
+            if (ms == 0 || (ms != INFINITE && GetTickCount() - start >= ms))
+                return STATUS_TIMEOUT;
+            Sleep(0);
+        }
+    }
+    HANDLE hObject = (HANDLE)Object;
     DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
