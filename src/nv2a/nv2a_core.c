@@ -524,7 +524,6 @@ static uint32_t g_pgraph_clear_count = 0;
 static uint32_t g_pgraph_flip_count = 0;
 static uint32_t g_pgraph_inline_verts = 0;
 static int g_pgraph_in_begin = 0;
-static uint32_t g_pgraph_trace_count = 0;
 
 /* NV097 method constants for dispatch */
 #define M_NO_OPERATION          0x0100
@@ -548,9 +547,6 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
 {
     g_pgraph_method_count++;
 
-    if (g_pgraph_trace_count++ < 100)
-        fprintf(stderr, "[PGRAPH-M] #%u sub=%u method=0x%04X param=0x%08X\n",
-                g_pgraph_method_count, subchannel, method, param);
 
     /* Route through D3D11 translator first */
     if (pgraph_d3d11_method(subchannel, method, param)) {

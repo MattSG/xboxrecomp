@@ -29,6 +29,7 @@ static uint32_t xbox_guest_dispatcher_va(PVOID object)
     return (value >= 0x10000u && value < 0x10000000u) ? (uint32_t)value : 0;
 }
 
+
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
  *
