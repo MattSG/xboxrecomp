@@ -39,6 +39,7 @@ extern uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern uint32_t g_ebx, g_esi, g_edi;
 extern uint32_t g_seh_ebp;
 extern volatile uint64_t g_icall_count;
+extern volatile uintptr_t g_penter_last_rva;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* Xbox file I/O bridge (src/xbox_file_bridge.c) */
@@ -987,7 +988,12 @@ static void bridge_PsTerminateSystemThread(void)
 static void bridge_KeBugCheck(void)
 {
     uint32_t code = STACK_ARG(0);
-    fprintf(stderr, "\n  [KERNEL] KeBugCheck: code=0x%08X - guest requested fatal halt, terminating run\n", code);
+    fprintf(stderr, "\n  [KERNEL] KeBugCheck: code=0x%08X ic=%llu caller_rva=0x%zX "
+        "eip_hint=%08X esp=%08X eax=%08X ecx=%08X edx=%08X "
+        "- guest requested fatal halt, terminating run\n", code,
+        (unsigned long long)g_icall_count, (size_t)g_penter_last_rva,
+        *(uint32_t *)(uintptr_t)(g_esp + g_xbox_mem_offset), g_esp,
+        g_eax, g_ecx, g_edx);
     fflush(stderr);
     ExitProcess(1);
 }
@@ -2247,7 +2253,10 @@ void xbox_kernel_pump_guest_work(void)
         if (isr) {
             /* Generated ISR expects ESP to point at the dummy return slot,
              * followed by (Interrupt, ServiceContext). */
-            g_esp = saved_esp - 4;
+            /* Reserve dummy return + two 32-bit arguments below the
+             * interrupted stack. Writing arguments above saved_esp would
+             * overwrite the interrupted guest frame. */
+            g_esp = saved_esp - 12;
             BRIDGE_MEM32(g_esp) = 0;
             BRIDGE_MEM32(g_esp + 4) = (uint32_t)(uintptr_t)interrupt;
             BRIDGE_MEM32(g_esp + 8) = (uint32_t)(uintptr_t)interrupt->ServiceContext;
@@ -2273,15 +2282,23 @@ void xbox_kernel_pump_guest_work(void)
         fprintf(stderr, "[DPC] dispatch routine=%08X esp=%08X\n",
                 routine_va, g_esp);
         if (fn) {
+            uint32_t saved_eax = g_eax, saved_ecx = g_ecx, saved_edx = g_edx;
+            uint32_t saved_ebx = g_ebx, saved_esi = g_esi, saved_edi = g_edi;
+            uint32_t saved_seh = g_seh_ebp;
             uint32_t saved_esp = g_esp;
             uint32_t context_va = BRIDGE_MEM32(dpc_va + 16);
-            g_esp = saved_esp - 4;
+            /* Reserve dummy return + four DPC arguments below the saved
+             * guest stack; never write the synthetic frame over its caller. */
+            g_esp = saved_esp - 20;
             BRIDGE_MEM32(g_esp) = 0;
             BRIDGE_MEM32(g_esp + 4) = dpc_va;
             BRIDGE_MEM32(g_esp + 8) = context_va;
             BRIDGE_MEM32(g_esp + 12) = (uint32_t)(uintptr_t)arg1;
             BRIDGE_MEM32(g_esp + 16) = (uint32_t)(uintptr_t)arg2;
             fn();
+            g_eax = saved_eax; g_ecx = saved_ecx; g_edx = saved_edx;
+            g_ebx = saved_ebx; g_esi = saved_esi; g_edi = saved_edi;
+            g_seh_ebp = saved_seh;
             g_esp = saved_esp;
         } else {
             fprintf(stderr, "[DPC] unresolved routine=%08X\n", routine_va);
