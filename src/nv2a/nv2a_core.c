@@ -676,6 +676,25 @@ void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         d->puser.regs[addr / 4] = (uint32_t)val;
 }
 
+/* PRAMIN is directly visible to the Xbox through the 0x700000 aperture.
+ * PFIFO RAMHT entries and DMA objects live there; dropping these accesses
+ * leaves object lookup reading the initial 0xFFFFFFFF poison. */
+uint64_t pramin_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    uint64_t value = 0;
+    if (addr + size <= memory_region_size(&d->ramin) && size <= sizeof(value))
+        memcpy(&value, d->ramin_ptr + addr, size);
+    return value;
+}
+
+void pramin_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    if (addr + size <= memory_region_size(&d->ramin) && size <= sizeof(val))
+        memcpy(d->ramin_ptr + addr, &val, size);
+}
+
 uint64_t nv2a_stub_read(void *opaque, hwaddr addr, unsigned int size)
 {
     (void)opaque; (void)size;
@@ -728,8 +747,7 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
     STUB_ENTRY(PRMCIO,        0x601000, 0x001000),
     ENTRY(PRAMDAC,  pramdac,  0x680000, 0x001000),
     STUB_ENTRY(PRMDIO,        0x681000, 0x001000),
-    /* NV_PRAMIN = 19 */
-    { .name = NULL },
+    ENTRY(PRAMIN,   pramin,   0x700000, 0x100000),
     /* NV_USER = 20 */
     ENTRY(USER,      user,     0x800000, 0x800000),
 };
