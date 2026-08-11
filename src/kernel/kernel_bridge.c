@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <float.h>
 #include <io.h>       /* _open_osfhandle */
 #include <fcntl.h>    /* _O_RDONLY, etc. */
@@ -249,7 +250,7 @@ static LPVOID g_main_fiber = NULL;
 static uint32_t s_fsw_log = 0;
 static void fsw_log(const char *op, const worker_state_t *w)
 {
-    if (s_fsw_log < 200000) {
+    if (getenv("MM3_TRACE_FSW") && s_fsw_log < 200000) {
         s_fsw_log++;
         fprintf(stderr, "[FSW] %s %s kc=%u eax=%08X ecx=%08X edx=%08X "
             "ebx=%08X esi=%08X edi=%08X esp=%08X ebp=%08X\n", op,

@@ -606,6 +606,12 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         return 1;
     }
 
+    case NV097_FLIP_INCREMENT_WRITE:  /* 0x12C: flip requested -> present */
+        d3d8_PresentFrame();
+        return 1;
+    case NV097_FLIP_STALL:            /* 0x130: wait, satisfied by Present */
+        return 1;
+
     default:
         /* Check if it's in a known range we can safely ignore */
         if ((method >= 0x0B80 && method < 0x0C00) ||  /* Transform program */
