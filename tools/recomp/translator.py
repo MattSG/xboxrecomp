@@ -941,6 +941,22 @@ class BatchTranslator:
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
 
+        # A call target can be absent from the selected roots while still being
+        # a complete function in the disassembly database. Translate that
+        # function before falling back to a stub; an empty body silently leaks
+        # the guest fake-return slot and corrupts the caller's stack.
+        defined = {name for _, name, _ in translations}
+        for addr, name in sorted(self.translator.lifter.referenced_calls.items()):
+            if name in defined or addr not in self.translator.func_db:
+                continue
+            info = self.translator.func_db[addr]
+            code = self.translator.translate_function(addr, info)
+            if code:
+                translations.append((addr, name, code))
+                defined.add(name)
+                stats["translated"] += 1
+                stats["total_lines"] += code.count("\n")
+
         # Any address called but never defined needs a stub, or the link fails.
         # These are almost all mid-function entry points the function detector
         # did not split out: a call lands a few bytes inside (or just past) a
