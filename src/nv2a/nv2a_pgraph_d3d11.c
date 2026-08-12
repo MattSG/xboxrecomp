@@ -524,6 +524,12 @@ static void prepare_vsh(void)
                     g_pg.vsh_handle, insns);
     }
     if (g_pg.vsh_handle) {
+        if (getenv("MM3_TRACE_VSH"))
+            fprintf(stderr, "[NV2A-VSH] c0=(%g,%g,%g,%g) c60=(%g,%g,%g,%g)\n",
+                    g_pg.vsh_constants[0], g_pg.vsh_constants[1],
+                    g_pg.vsh_constants[2], g_pg.vsh_constants[3],
+                    g_pg.vsh_constants[240], g_pg.vsh_constants[241],
+                    g_pg.vsh_constants[242], g_pg.vsh_constants[243]);
         d3d8_vsh_set_constant(0, g_pg.vsh_constants, 192);
         d3d8_vsh_prepare_draw(g_pg.vsh_handle);
     }
