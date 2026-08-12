@@ -239,6 +239,8 @@ void pgraph_d3d11_shutdown(void)
  * Draw Submission
  * ══════════════════════════════════════════════════════════════════════ */
 
+static void prepare_vsh(void);
+
 static void submit_draw(void)
 {
     if (g_pg.inline_count == 0)
@@ -371,6 +373,10 @@ static void submit_draw(void)
 
     /* Set FVF for pre-transformed 2D with texture */
     dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    /* DrawPrimitiveUP prepares the device pipeline from the current shader;
+     * bind the game NV2A program after the FVF setup, not earlier at PB method
+     * execution where this call would overwrite it. */
+    prepare_vsh();
 
     /* Bind texture based on NV2A VRAM offset.
      * Game-specific texture mapping is handled via GAME_HAS_FONT_ATLAS
