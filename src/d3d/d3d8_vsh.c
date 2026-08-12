@@ -179,8 +179,8 @@ static inline uint32_t vsh_extract(const DWORD *insn, int start, int count)
 #define VSH_FIELD_MAC_DST_TEMP_SIZE    4
 #define VSH_FIELD_MAC_DST_MASK_START   96+24
 #define VSH_FIELD_MAC_DST_MASK_SIZE    4
-#define VSH_FIELD_MAC_DST_OUT_START    96+2
-#define VSH_FIELD_MAC_DST_OUT_SIZE     1
+#define VSH_FIELD_MAC_DST_OUT_START    96+3
+#define VSH_FIELD_MAC_DST_OUT_SIZE     8
 
 /* ILU destination (word 3) */
 #define VSH_FIELD_ILU_DST_TEMP_START   96+20
@@ -386,6 +386,8 @@ void d3d8_vsh_parse(const DWORD *microcode, int num_insns,
                                              VSH_FIELD_MAC_DST_TEMP_SIZE);
             uint32_t mask     = vsh_extract(insn, VSH_FIELD_MAC_DST_MASK_START,
                                              VSH_FIELD_MAC_DST_MASK_SIZE);
+            if (!mask)
+                mask = vsh_extract(insn, 96+12, 4);
             uint32_t out_mux  = vsh_extract(insn, VSH_FIELD_MAC_DST_OUT_START,
                                              VSH_FIELD_MAC_DST_OUT_SIZE);
 
