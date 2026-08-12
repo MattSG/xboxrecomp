@@ -21,6 +21,7 @@
 
 /* D3D8 device — we include the full header for COM vtable access */
 #include "../d3d/d3d8_xbox.h"
+#include "../d3d/d3d8_vsh.h"
 extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
 /* Global.txd texture lookup */
@@ -148,6 +149,7 @@ static struct {
     uint32_t inline_data[MAX_INLINE_VERTS * INLINE_VERT_DWORDS];
     uint32_t inline_count; /* Number of dwords accumulated */
     uint32_t vert_stride;  /* Dwords per vertex (auto-detected) */
+    int attr_immediate;    /* Vertices arrived via 0x1880/0x18C8 (stride 4) */
 
     /* Clear state */
     uint32_t clear_color;
@@ -168,6 +170,13 @@ static struct {
     float vp_scale[4];
     uint32_t surface_clip_h;
     uint32_t surface_clip_v;
+    uint32_t flip_read;
+    uint32_t flip_write;
+    uint32_t flip_modulo;
+    uint32_t vsh_program[256 * 4];
+    uint32_t vsh_program_load;
+    uint32_t vsh_program_words;
+    int vsh_trace_dumped;
 
     /* Texture state per stage (4 stages) */
     struct {
@@ -229,10 +238,14 @@ void pgraph_d3d11_shutdown(void)
 
 static void submit_draw(void)
 {
-    if (g_pg.inline_count == 0 || g_pg.vert_stride == 0)
+    if (g_pg.inline_count == 0)
         return;
 
-    uint32_t num_verts = g_pg.inline_count / g_pg.vert_stride;
+    uint32_t stride = g_pg.attr_immediate ? 4 : g_pg.vert_stride;
+    if (stride == 0)
+        return;
+
+    uint32_t num_verts = g_pg.inline_count / stride;
     if (num_verts < 3)
         return;
 
@@ -266,14 +279,14 @@ static void submit_draw(void)
 
     /* Helper to convert one inline vertex */
     #define CONVERT_VERT(dst_idx, src_idx) do { \
-        uint32_t _b = (src_idx) * g_pg.vert_stride; \
-        out[dst_idx].x     = u2f(src[_b + 0]); \
-        out[dst_idx].y     = u2f(src[_b + 1]); \
+        uint32_t _b = (src_idx) * stride; \
+        out[dst_idx].x     = u2f(g_pg.attr_immediate ? src[_b + 2] : src[_b + 0]); \
+        out[dst_idx].y     = u2f(g_pg.attr_immediate ? src[_b + 3] : src[_b + 1]); \
         out[dst_idx].z     = 0.0f; \
         out[dst_idx].rhw   = 1.0f; \
-        out[dst_idx].u     = u2f(src[_b + 2]); \
-        out[dst_idx].v     = u2f(src[_b + 3]); \
-        out[dst_idx].color = src[_b + 4]; \
+        out[dst_idx].u     = u2f(g_pg.attr_immediate ? src[_b + 0] : src[_b + 2]); \
+        out[dst_idx].v     = u2f(g_pg.attr_immediate ? src[_b + 1] : src[_b + 3]); \
+        out[dst_idx].color = g_pg.attr_immediate ? 0xFFFFFFFFu : src[_b + 4]; \
     } while(0)
 
     if (is_quads) {
@@ -335,9 +348,9 @@ static void submit_draw(void)
                 g_pg.draw_mode, num_verts, out_vert_count);
         uint32_t show = num_verts < 8 ? num_verts : 8;
         for (uint32_t i = 0; i < show; i++) {
-            uint32_t b = i * g_pg.vert_stride;
+            uint32_t b = i * stride;
             fprintf(stderr, "  [%u] pos=(%.1f, %.1f) uv=(%.3f, %.3f) color=0x%08X\n",
-                    i, u2f(src[b+0]), u2f(src[b+1]), u2f(src[b+2]), u2f(src[b+3]), src[b+4]);
+                    i, out[i].x, out[i].y, out[i].u, out[i].v, out[i].color);
         }
     }
 
@@ -437,6 +450,19 @@ static void submit_draw(void)
     /* Begin scene if needed */
     dev->lpVtbl->BeginScene(dev);
 
+    /* Diagnostic (MM3_CAPTURE): one blue warm-up draw before the very first
+     * real draw. Discriminates first-draw-only D3D11 failures: if the real
+     * draw (captured as frame_902) renders white, the first draw on the
+     * context was the problem; if still black, the divergence is inside the
+     * game path itself. Does not alter the real draw call. */
+    if (getenv("MM3_CAPTURE") && g_pg.stats.draw_calls == 0 && num_verts >= 3) {
+        OutputVertex *warm = (OutputVertex *)_alloca(3 * sizeof(OutputVertex));
+        memcpy(warm, out, 3 * sizeof(OutputVertex));
+        warm[0].color = warm[1].color = warm[2].color = 0xFF0000FFu; /* blue */
+        dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)g_pg.d3d_prim_type,
+                                     1, warm, sizeof(OutputVertex));
+    }
+
     /* Draw */
     dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)g_pg.d3d_prim_type,
                                   prim_count, out, sizeof(OutputVertex));
@@ -450,6 +476,23 @@ static void submit_draw(void)
     }
 }
 
+static void trace_vsh_program(void)
+{
+    if (!getenv("MM3_TRACE_VSH") || g_pg.vsh_trace_dumped ||
+        g_pg.vsh_program_words < 4)
+        return;
+
+    NV2AVshProgram program;
+    char hlsl[16384];
+    uint32_t insns = g_pg.vsh_program_words / 4;
+    d3d8_vsh_parse(g_pg.vsh_program, (int)insns, &program);
+    int len = d3d8_vsh_generate_hlsl(&program, hlsl, sizeof(hlsl));
+    fprintf(stderr, "[NV2A-VSH] decoded instructions=%u hlsl=%d\n", insns, len);
+    if (len > 0)
+        fprintf(stderr, "[NV2A-VSH-HLSL]\n%.*s\n[/NV2A-VSH-HLSL]\n", len, hlsl);
+    g_pg.vsh_trace_dumped = 1;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * Method Handler
  * ══════════════════════════════════════════════════════════════════════ */
@@ -458,6 +501,46 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 {
     if (!g_pg.initialized)
         return 0;
+
+    /* Opt-in attribution for the NV2A transform stream. The translator does
+     * not yet lower these methods, so keep this diagnostic at the shared
+     * boundary rather than scattering probes through generated code. */
+    if (getenv("MM3_TRACE_VSH") &&
+        ((method >= NV097_SET_TRANSFORM_CONSTANT &&
+          method < NV097_SET_TRANSFORM_CONSTANT + 0x80) ||
+         (method >= NV097_SET_TRANSFORM_PROGRAM &&
+          method < NV097_SET_TRANSFORM_PROGRAM + 0x40) ||
+         method == NV097_SET_TRANSFORM_CONSTANT_LOAD ||
+         method == NV097_SET_TRANSFORM_PROGRAM_LOAD ||
+         method == NV097_SET_TRANSFORM_EXECUTION_MODE)) {
+        fprintf(stderr, "[NV2A-VSH] method=0x%04X param=0x%08X\n", method, param);
+    }
+
+    if (method == NV097_SET_TRANSFORM_PROGRAM_LOAD) {
+        g_pg.vsh_program_load = param / 4;
+        g_pg.vsh_program_words = g_pg.vsh_program_load * 4;
+        g_pg.vsh_trace_dumped = 0;
+        return 1;
+    }
+
+    if (method >= NV097_SET_TRANSFORM_PROGRAM &&
+        method < NV097_SET_TRANSFORM_PROGRAM + 0x40) {
+        uint32_t slot = (method - NV097_SET_TRANSFORM_PROGRAM) / 4;
+        uint32_t word = g_pg.vsh_program_load * 4 + slot;
+        if (word < sizeof(g_pg.vsh_program) / sizeof(g_pg.vsh_program[0])) {
+            g_pg.vsh_program[word] = param;
+            if (word + 1 > g_pg.vsh_program_words)
+                g_pg.vsh_program_words = word + 1;
+        }
+        if (slot == 3)
+            g_pg.vsh_program_load++;
+        return 1;
+    }
+
+    if (method == NV097_SET_TRANSFORM_EXECUTION_MODE) {
+        trace_vsh_program();
+        return 1;
+    }
 
     g_pg.stats.methods_handled++;
 
@@ -477,6 +560,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             g_pg.draw_mode = param;
             g_pg.d3d_prim_type = nv2a_draw_mode_to_d3d(param);
             g_pg.inline_count = 0;
+            g_pg.attr_immediate = 0;
         }
         return 1;
 
@@ -484,6 +568,18 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     case NV097_INLINE_ARRAY:
         if (g_pg.in_draw && g_pg.inline_count < MAX_INLINE_VERTS * INLINE_VERT_DWORDS) {
             g_pg.inline_data[g_pg.inline_count++] = param;
+        }
+        return 1;
+
+    /* ── Immediate vertex attributes (MM3 D3D8 driver emits these between
+     * BEGIN/END instead of INLINE_ARRAY): per vertex 0x18C8 (2 dwords) then
+     * 0x1880 (2 dwords). The 0x1884/0x18CC are the second data dwords of the
+     * incremented methods. Accumulated in arrival order, stride 4. ── */
+    case 0x1880: case 0x1884:   /* SET_VERTEX_DATA2F_M data dwords (position) */
+    case 0x18C8: case 0x18CC:   /* attr pair data dwords (uv/color) */
+        if (g_pg.in_draw && g_pg.inline_count < MAX_INLINE_VERTS * INLINE_VERT_DWORDS) {
+            g_pg.inline_data[g_pg.inline_count++] = param;
+            g_pg.attr_immediate = 1;
         }
         return 1;
 
@@ -555,6 +651,8 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     {
         int idx = (method - NV097_SET_VIEWPORT_OFFSET) / 4;
         g_pg.vp_offset[idx] = u2f(param);
+        if (getenv("MM3_TRACE_VIEWPORT"))
+            fprintf(stderr, "[NV2A-VP] offset[%d]=%g\n", idx, g_pg.vp_offset[idx]);
         return 1;
     }
 
@@ -565,15 +663,21 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     {
         int idx = (method - NV097_SET_VIEWPORT_SCALE) / 4;
         g_pg.vp_scale[idx] = u2f(param);
+        if (getenv("MM3_TRACE_VIEWPORT"))
+            fprintf(stderr, "[NV2A-VP] scale[%d]=%g\n", idx, g_pg.vp_scale[idx]);
         return 1;
     }
 
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         g_pg.surface_clip_h = param;
+        if (getenv("MM3_TRACE_VIEWPORT"))
+            fprintf(stderr, "[NV2A-VP] clip_h=0x%08X\n", param);
         return 1;
 
     case NV097_SET_SURFACE_CLIP_VERTICAL:
         g_pg.surface_clip_v = param;
+        if (getenv("MM3_TRACE_VIEWPORT"))
+            fprintf(stderr, "[NV2A-VP] clip_v=0x%08X\n", param);
         return 1;
 
     /* ── Texture state tracking (4 stages, 0x40 stride) ── */
@@ -606,10 +710,40 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         return 1;
     }
 
-    case NV097_FLIP_INCREMENT_WRITE:  /* 0x12C: flip requested -> present */
-        d3d8_PresentFrame();
+    case NV097_SET_FLIP_READ:
+        g_pg.flip_read = param;
+        if (getenv("MM3_TRACE_FLIP_METHODS"))
+            fprintf(stderr, "[NV2A-FLIP] method=SET_READ value=%u\n", param);
         return 1;
-    case NV097_FLIP_STALL:            /* 0x130: wait, satisfied by Present */
+
+    case NV097_SET_FLIP_WRITE:
+        g_pg.flip_write = param;
+        if (getenv("MM3_TRACE_FLIP_METHODS"))
+            fprintf(stderr, "[NV2A-FLIP] method=SET_WRITE value=%u\n", param);
+        return 1;
+
+    case NV097_SET_FLIP_MODULO:
+        g_pg.flip_modulo = param;
+        if (getenv("MM3_TRACE_FLIP_METHODS"))
+            fprintf(stderr, "[NV2A-FLIP] method=SET_MODULO value=%u\n", param);
+        return 1;
+
+    case NV097_FLIP_INCREMENT_WRITE:
+        if (g_pg.flip_modulo)
+            g_pg.flip_write = (g_pg.flip_write + 1) % g_pg.flip_modulo;
+        else
+            g_pg.flip_write++;
+        if (getenv("MM3_TRACE_FLIP_METHODS"))
+            fprintf(stderr, "[NV2A-FLIP] method=INCREMENT_WRITE write=%u modulo=%u\n",
+                    g_pg.flip_write, g_pg.flip_modulo);
+        return 1;
+
+    case NV097_FLIP_STALL:
+        /* xemu: increment selects the pending surface; stall commits it. */
+        if (getenv("MM3_TRACE_FLIP_METHODS"))
+            fprintf(stderr, "[NV2A-FLIP] method=STALL read=%u write=%u modulo=%u\n",
+                    g_pg.flip_read, g_pg.flip_write, g_pg.flip_modulo);
+        d3d8_PresentFrame();
         return 1;
 
     default:
