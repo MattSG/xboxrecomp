@@ -177,6 +177,9 @@ static struct {
     uint32_t vsh_program_load;
     uint32_t vsh_program_words;
     int vsh_trace_dumped;
+    uint32_t vsh_constant_load;
+    float vsh_constants[192 * 4];
+    DWORD vsh_handle;
 
     /* Texture state per stage (4 stages) */
     struct {
@@ -484,13 +487,40 @@ static void trace_vsh_program(void)
 
     NV2AVshProgram program;
     char hlsl[16384];
-    uint32_t insns = g_pg.vsh_program_words / 4;
-    d3d8_vsh_parse(g_pg.vsh_program, (int)insns, &program);
+    uint32_t base = (g_pg.vsh_program_words >= 5 && g_pg.vsh_program[0] == 0) ? 1 : 0;
+    uint32_t insns = (g_pg.vsh_program_words - base) / 4;
+    d3d8_vsh_parse(g_pg.vsh_program + base, (int)insns, &program);
+    if (getenv("MM3_TRACE_VSH"))
+        for (uint32_t i = 0; i < g_pg.vsh_program_words; i++)
+            fprintf(stderr, "[NV2A-VSH] word[%u]=0x%08X\n", i, g_pg.vsh_program[i]);
+    if (getenv("MM3_TRACE_VSH"))
+        for (uint32_t i = 0; i < insns; i++)
+            fprintf(stderr, "[NV2A-VSH] decoded[%u] mac=%d ilu=%d input=%d const=%d\n",
+                    i, program.insns[i].mac_op, program.insns[i].ilu_op,
+                    program.insns[i].input_index, program.insns[i].const_index);
     int len = d3d8_vsh_generate_hlsl(&program, hlsl, sizeof(hlsl));
     fprintf(stderr, "[NV2A-VSH] decoded instructions=%u hlsl=%d\n", insns, len);
     if (len > 0)
         fprintf(stderr, "[NV2A-VSH-HLSL]\n%.*s\n[/NV2A-VSH-HLSL]\n", len, hlsl);
     g_pg.vsh_trace_dumped = 1;
+}
+
+static void prepare_vsh(void)
+{
+    if (g_pg.vsh_program_words < 4)
+        return;
+    if (!g_pg.vsh_handle) {
+        uint32_t base = (g_pg.vsh_program_words >= 5 && g_pg.vsh_program[0] == 0) ? 1 : 0;
+        uint32_t insns = (g_pg.vsh_program_words - base) / 4;
+        if (SUCCEEDED(d3d8_vsh_create_shader(g_pg.vsh_program + base, (int)insns,
+                                              &g_pg.vsh_handle)))
+            fprintf(stderr, "[NV2A-VSH] bound program handle=0x%08X insns=%u\n",
+                    g_pg.vsh_handle, insns);
+    }
+    if (g_pg.vsh_handle) {
+        d3d8_vsh_set_constant(0, g_pg.vsh_constants, 192);
+        d3d8_vsh_prepare_draw(g_pg.vsh_handle);
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -523,10 +553,24 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         return 1;
     }
 
+    if (method == NV097_SET_TRANSFORM_CONSTANT_LOAD) {
+        g_pg.vsh_constant_load = param;
+        return 1;
+    }
+
+    if (method >= NV097_SET_TRANSFORM_CONSTANT &&
+        method < NV097_SET_TRANSFORM_CONSTANT + 0x80) {
+        uint32_t word = g_pg.vsh_constant_load +
+                        (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
+        if (word < sizeof(g_pg.vsh_constants) / sizeof(uint32_t))
+            ((uint32_t *)g_pg.vsh_constants)[word] = param;
+        return 1;
+    }
+
     if (method >= NV097_SET_TRANSFORM_PROGRAM &&
         method < NV097_SET_TRANSFORM_PROGRAM + 0x40) {
         uint32_t slot = (method - NV097_SET_TRANSFORM_PROGRAM) / 4;
-        uint32_t word = g_pg.vsh_program_load * 4 + slot;
+        uint32_t word = g_pg.vsh_program_load * 4 + (slot & 3);
         if (word < sizeof(g_pg.vsh_program) / sizeof(g_pg.vsh_program[0])) {
             g_pg.vsh_program[word] = param;
             if (word + 1 > g_pg.vsh_program_words)
@@ -539,6 +583,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 
     if (method == NV097_SET_TRANSFORM_EXECUTION_MODE) {
         trace_vsh_program();
+        prepare_vsh();
         return 1;
     }
 
