@@ -572,7 +572,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 
     if (method >= NV097_SET_TRANSFORM_CONSTANT &&
         method < NV097_SET_TRANSFORM_CONSTANT + 0x80) {
-        uint32_t word = g_pg.vsh_constant_load +
+        uint32_t word = g_pg.vsh_constant_load * 4 +
                         (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
         if (word < sizeof(g_pg.vsh_constants) / sizeof(uint32_t))
             ((uint32_t *)g_pg.vsh_constants)[word] = param;
