@@ -16,10 +16,12 @@
 
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 extern ptrdiff_t g_xbox_mem_offset;
 extern volatile uint64_t g_icall_count;
 extern volatile uintptr_t g_penter_last_rva;
+extern volatile uint32_t g_esp;
 
 static uint32_t xbox_guest_dispatcher_va(PVOID object)
 {
@@ -289,11 +291,25 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
 
     uint32_t guest = xbox_guest_dispatcher_va(Object);
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    int trace_wait = 0;
+    static unsigned trace_wait_count;
+    if ((guest == 0x0035185Cu || guest == 0x0035186Cu) &&
+        getenv("MM3_TRACE_WAIT") && g_icall_count >= 300000ULL) {
+        trace_wait = trace_wait_count++ < 80;
+        if (trace_wait)
+            fprintf(stderr, "[WAIT-TRACE] enter ic=%llu guest=%08X ms=%lu "
+                "state=%08X type=%08X esp=%08X\n", (unsigned long long)g_icall_count,
+                guest, (unsigned long)ms,
+                *(volatile uint32_t *)(uintptr_t)(guest + 4u + g_xbox_mem_offset),
+                *(volatile uint32_t *)(uintptr_t)(guest + g_xbox_mem_offset),
+                g_esp);
+    }
     if (guest) {
         volatile LONG *state = (volatile LONG *)(uintptr_t)(guest + 4u + g_xbox_mem_offset);
         if ((guest == 0x0035186Cu || guest == 0x0035185Cu) &&
             ((g_icall_count >= 12295ULL && g_icall_count <= 12305ULL) ||
-             (g_icall_count >= 321670ULL && g_icall_count <= 321690ULL)))
+             (g_icall_count >= 321670ULL && g_icall_count <= 321690ULL) ||
+             (g_icall_count >= 326430ULL && g_icall_count <= 326450ULL)))
             fprintf(stderr, "[FRONTIER-WAIT-STATE] ic=%llu guest=%08X type=%08X state=%08X caller_rva=%p\n",
                     (unsigned long long)g_icall_count, guest,
                     *(volatile uint32_t *)(uintptr_t)(guest + g_xbox_mem_offset),
@@ -304,6 +320,11 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
                 /* Synchronization events release one waiter and reset. */
                 if (*(volatile uint8_t *)(uintptr_t)(guest + g_xbox_mem_offset) == XboxSynchronizationEvent)
                     *state = 0;
+                if (trace_wait)
+                    fprintf(stderr, "[WAIT-TRACE] return ic=%llu guest=%08X "
+                        "state=%08X esp=%08X\n",
+                        (unsigned long long)g_icall_count, guest,
+                        (unsigned)*state, g_esp);
                 if ((guest == 0x0035186Cu || guest == 0x0035185Cu) && g_icall_count >= 321670ULL && g_icall_count <= 321690ULL)
                     fprintf(stderr, "[MEMWRITE] guest=%08X size=4 before=00000001 after=%08X pc=%08X fn=KeWaitForSingleObject\n",
                             guest + 4u, (unsigned)*state, (unsigned)g_penter_last_rva);

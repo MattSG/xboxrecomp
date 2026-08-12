@@ -41,8 +41,15 @@ static DWORD WINAPI nv2a_completion_signal_thread(LPVOID parameter)
     Sleep(1);
     for (unsigned i = 0; i < 1000 && *state != 0; ++i)
         Sleep(1);
-    if (*state == 0)
-        xbox_KeSetEvent((PVOID)(uintptr_t)(dev + 0x196Cu), 0, 0);
+    if (*state == 0) {
+        uint32_t event = dev + 0x196Cu;
+        fprintf(stderr, "[NV2A-SIGNAL] dev=%08X event=%08X state=%08X type=%08X offset=%p\\n",
+                dev, event, *(uint32_t *)(uintptr_t)(event + 4u + g_mem_offset),
+                *(uint32_t *)(uintptr_t)(event + g_mem_offset), (void *)g_mem_offset);
+        xbox_KeSetEvent((PVOID)(uintptr_t)event, 0, 0);
+        fprintf(stderr, "[NV2A-SIGNAL-AFTER] event=%08X state=%08X\\n",
+                event, *(uint32_t *)(uintptr_t)(event + 4u + g_mem_offset));
+    }
     return 0;
 }
 
