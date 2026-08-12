@@ -129,9 +129,9 @@ static inline uint32_t vsh_extract(const DWORD *insn, int start, int count)
 /* Source A (spans word 0 and word 1) */
 #define VSH_FIELD_SRC_A_NEG_START   32+8
 #define VSH_FIELD_SRC_A_NEG_SIZE    1
-#define VSH_FIELD_SRC_A_TYPE_START  32+26
+#define VSH_FIELD_SRC_A_TYPE_START  64+26
 #define VSH_FIELD_SRC_A_TYPE_SIZE   2
-#define VSH_FIELD_SRC_A_IDX_START   32+28
+#define VSH_FIELD_SRC_A_IDX_START   64+28
 #define VSH_FIELD_SRC_A_IDX_SIZE    4
 #define VSH_FIELD_SRC_A_SWZ_X_START 32+6
 #define VSH_FIELD_SRC_A_SWZ_X_SIZE  2
