@@ -487,9 +487,9 @@ static void trace_vsh_program(void)
 
     NV2AVshProgram program;
     char hlsl[16384];
-    uint32_t base = (g_pg.vsh_program_words >= 5 && g_pg.vsh_program[0] == 0) ? 1 : 0;
-    uint32_t insns = (g_pg.vsh_program_words - base) / 4;
-    d3d8_vsh_parse(g_pg.vsh_program + base, (int)insns, &program);
+    uint32_t base = 0;
+    uint32_t insns = g_pg.vsh_program_words / 4;
+    d3d8_vsh_parse(g_pg.vsh_program, (int)insns, &program);
     if (getenv("MM3_TRACE_VSH"))
         for (uint32_t i = 0; i < g_pg.vsh_program_words; i++)
             fprintf(stderr, "[NV2A-VSH] word[%u]=0x%08X\n", i, g_pg.vsh_program[i]);
@@ -498,6 +498,10 @@ static void trace_vsh_program(void)
             fprintf(stderr, "[NV2A-VSH] decoded[%u] mac=%d ilu=%d input=%d const=%d\n",
                     i, program.insns[i].mac_op, program.insns[i].ilu_op,
                     program.insns[i].input_index, program.insns[i].const_index);
+            fprintf(stderr, "[NV2A-VSH] dest[%u] mac_r=%d mac_m=0x%X mac_o=%d ilu_r=%d ilu_m=0x%X ilu_o=%d\n",
+                    i, program.insns[i].mac_dst.temp_reg, program.insns[i].mac_dst.write_mask,
+                    program.insns[i].mac_dst.output_reg, program.insns[i].ilu_dst.temp_reg,
+                    program.insns[i].ilu_dst.write_mask, program.insns[i].ilu_dst.output_reg);
     int len = d3d8_vsh_generate_hlsl(&program, hlsl, sizeof(hlsl));
     fprintf(stderr, "[NV2A-VSH] decoded instructions=%u hlsl=%d\n", insns, len);
     if (len > 0)
@@ -510,8 +514,8 @@ static void prepare_vsh(void)
     if (g_pg.vsh_program_words < 4)
         return;
     if (!g_pg.vsh_handle) {
-        uint32_t base = (g_pg.vsh_program_words >= 5 && g_pg.vsh_program[0] == 0) ? 1 : 0;
-        uint32_t insns = (g_pg.vsh_program_words - base) / 4;
+        uint32_t base = 0;
+        uint32_t insns = g_pg.vsh_program_words / 4;
         if (SUCCEEDED(d3d8_vsh_create_shader(g_pg.vsh_program + base, (int)insns,
                                               &g_pg.vsh_handle)))
             fprintf(stderr, "[NV2A-VSH] bound program handle=0x%08X insns=%u\n",
