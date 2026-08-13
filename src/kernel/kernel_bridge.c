@@ -946,7 +946,30 @@ static void bridge_MmSetAddressProtect(void)
     g_eax = 0;
 }
 
-/* ── AvSetDisplayMode (ordinal 3) ────────────────────────── */
+/* ── AV pack helpers (ordinals 1-4) ───────────────────────── */
+static void bridge_AvGetSavedDataAddress(void)
+{
+    g_eax = xbox_AvGetSavedDataAddress();
+}
+
+static void bridge_AvSendTVEncoderOption(void)
+{
+    uint32_t addr = STACK_ARG(0);
+    uint32_t option = STACK_ARG(1);
+    uint32_t param = STACK_ARG(2);
+    uint32_t result = STACK_ARG(3);
+
+    xbox_AvSendTVEncoderOption(XBOX_TO_NATIVE(addr), option, param,
+                               result ? (PULONG)XBOX_TO_NATIVE(result) : NULL);
+    g_eax = 0;
+}
+
+static void bridge_AvSetSavedDataAddress(void)
+{
+    xbox_AvSetSavedDataAddress(STACK_ARG(0));
+    g_eax = 0;
+}
+
 static void bridge_AvSetDisplayMode(void)
 {
     uint32_t addr = STACK_ARG(0);
@@ -1089,6 +1112,13 @@ static void bridge_KeConnectInterrupt(void)
 {
     uint32_t interrupt_va = STACK_ARG(0);
     g_eax = xbox_KeConnectInterrupt(
+        (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(interrupt_va));
+}
+
+static void bridge_KeDisconnectInterrupt(void)
+{
+    uint32_t interrupt_va = STACK_ARG(0);
+    g_eax = xbox_KeDisconnectInterrupt(
         (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(interrupt_va));
 }
 
@@ -2213,6 +2243,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 46: return bridge_KeInsertQueueDpc;
     case 113: return bridge_KeInitializeTimerEx;
     case  98: return bridge_KeConnectInterrupt;
+    case 100: return bridge_KeDisconnectInterrupt;
 
     /* Synchronization */
     case  95: return bridge_KeBugCheck;
@@ -2227,7 +2258,10 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  49: return bridge_HalRequestSoftwareInterrupt;
 
     /* Display */
+    case   1: return bridge_AvGetSavedDataAddress;
+    case   2: return bridge_AvSendTVEncoderOption;
     case   3: return bridge_AvSetDisplayMode;
+    case   4: return bridge_AvSetSavedDataAddress;
 
     /* I/O */
     case  63: return bridge_IoCreateSymbolicLink;
