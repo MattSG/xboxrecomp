@@ -33,6 +33,8 @@
 #include <io.h>       /* _open_osfhandle */
 #include <fcntl.h>    /* _O_RDONLY, etc. */
 #include <setjmp.h>
+#include <intrin.h>
+#include <windows.h>
 
 /* Access to recompiled code globals */
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
@@ -741,6 +743,13 @@ static void bridge_KeRaiseIrqlToDpcLevel(void)
     g_eax = (uint32_t)xbox_KeRaiseIrqlToDpcLevel();
 }
 
+/* MM3's imported slot 23 resolves ordinal 49 here.  The XBE uses this
+ * software-interrupt request while bringing up the callback scheduler. */
+static void bridge_HalRequestSoftwareInterrupt(void)
+{
+    xbox_HalRequestSoftwareInterrupt((KIRQL)STACK_ARG(0));
+}
+
 /* ── RtlInitializeCriticalSection / Enter / Leave (ordinals 291, 277, 294) ─ */
 static void bridge_RtlInitializeCriticalSection(void)
 {
@@ -844,7 +853,8 @@ static void bridge_KeWaitForSingleObject(void)
     if (cf_trace < 0) cf_trace = getenv("MM3_CF_TRACE") ? 1 : 0;
 
     if ((g_icall_count >= 12295ULL && g_icall_count <= 12305ULL) ||
-        (g_icall_count >= 321678ULL && g_icall_count <= 321679ULL)) {
+        (g_icall_count >= 321678ULL && g_icall_count <= 321679ULL) ||
+        (g_icall_count >= 326430ULL && g_icall_count <= 326450ULL)) {
         void *frames[6];
         USHORT n = CaptureStackBackTrace(0, 6, frames, NULL);
         HMODULE mod = GetModuleHandle(NULL);
@@ -867,7 +877,8 @@ static void bridge_KeWaitForSingleObject(void)
                 (int)g_esp - (int)esp_before);
     }
     if ((g_icall_count >= 12295ULL && g_icall_count <= 12305ULL) ||
-        (g_icall_count >= 321678ULL && g_icall_count <= 321679ULL))
+        (g_icall_count >= 321678ULL && g_icall_count <= 321679ULL) ||
+        (g_icall_count >= 326430ULL && g_icall_count <= 326450ULL))
         fprintf(stderr, "[FRONTIER-KEWAIT] ic=%llu object=%08X reason=%08X mode=%08X alert=%08X timeout=%08X status=%08X esp=%08X ebp=%08X\n",
                 (unsigned long long)g_icall_count, object, wait_reason,
                 wait_mode, alertable, timeout_ptr, (unsigned)g_eax,
@@ -945,7 +956,9 @@ static void bridge_AvSetDisplayMode(void)
     uint32_t pitch = STACK_ARG(4);
     uint32_t fb = STACK_ARG(5);
 
-    if (g_icall_count >= 321670ULL && g_icall_count <= 321690ULL)
+    if ((g_icall_count >= 321670ULL && g_icall_count <= 321690ULL) ||
+        (g_icall_count >= 326600ULL && g_icall_count <= 326900ULL) ||
+        g_icall_count >= 347500ULL)
         fprintf(stderr, "[FRONTIER-AV] ic=%llu addr=%08X step=%08X mode=%08X format=%08X pitch=%08X fb=%08X esp=%08X\n",
                 (unsigned long long)g_icall_count, addr, step, mode, format,
                 pitch, fb, g_esp);
@@ -988,12 +1001,23 @@ static void bridge_PsTerminateSystemThread(void)
 static void bridge_KeBugCheck(void)
 {
     uint32_t code = STACK_ARG(0);
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t module = (uintptr_t)GetModuleHandleW(NULL);
     fprintf(stderr, "\n  [KERNEL] KeBugCheck: code=0x%08X ic=%llu caller_rva=0x%zX "
         "eip_hint=%08X esp=%08X eax=%08X ecx=%08X edx=%08X "
         "- guest requested fatal halt, terminating run\n", code,
-        (unsigned long long)g_icall_count, (size_t)g_penter_last_rva,
+        (unsigned long long)g_icall_count, (size_t)(caller - module),
         *(uint32_t *)(uintptr_t)(g_esp + g_xbox_mem_offset), g_esp,
         g_eax, g_ecx, g_edx);
+    fprintf(stderr, "  [BUGCHECK-STATE] stack=%08X/%08X/%08X/%08X "
+        "46e900=%08X 46e904=%08X 362140=%08X 3c0000=%08X 3bfffc=%08X "
+        "dice=e584:%08X e588:%08X e6a4:%08X e6c0:%08X\n",
+        STACK_ARG(0), STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
+        BRIDGE_MEM32(0x46E900), BRIDGE_MEM32(0x46E904),
+        BRIDGE_MEM32(0x362140), BRIDGE_MEM32(0x3C0000),
+        BRIDGE_MEM32(0x3BFFFC), BRIDGE_MEM32(0x46E584),
+        BRIDGE_MEM32(0x46E588), BRIDGE_MEM32(0x46E6A4),
+        BRIDGE_MEM32(0x46E6C0));
     fflush(stderr);
     ExitProcess(1);
 }
@@ -2200,6 +2224,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* Hardware */
     case  47: return bridge_HalReadSMCTrayState;
+    case  49: return bridge_HalRequestSoftwareInterrupt;
 
     /* Display */
     case   3: return bridge_AvSetDisplayMode;
@@ -2236,11 +2261,22 @@ static XBOX_THREAD_LOCAL int g_guest_work_depth;
 
 void xbox_kernel_pump_guest_work(void)
 {
+    static int trace_frontier = -1;
+    if (trace_frontier < 0) trace_frontier = getenv("MM3_TRACE_PUMP") ? 1 : 0;
+    int trace_here = trace_frontier && g_icall_count >= 45280ULL && g_icall_count <= 45320ULL;
+    if (trace_here) fprintf(stderr, "[PUMP] enter ic=%llu depth=%d esp=%08X\n",
+        (unsigned long long)g_icall_count, g_guest_work_depth, g_esp);
     if (g_guest_work_depth++) {
         g_guest_work_depth--;
+        if (trace_here) fprintf(stderr, "[PUMP] nested-return ic=%llu\n",
+            (unsigned long long)g_icall_count);
         return;
     }
+    if (trace_here) fprintf(stderr, "[PUMP] before-irq-take ic=%llu\n",
+        (unsigned long long)g_icall_count);
     PXBOX_KINTERRUPT interrupt = xbox_kernel_take_interrupt();
+    if (trace_here) fprintf(stderr, "[PUMP] after-irq-take ic=%llu irq=%p\n",
+        (unsigned long long)g_icall_count, (void *)interrupt);
     if (interrupt && interrupt->ServiceRoutine) {
         uint32_t saved_eax = g_eax, saved_ecx = g_ecx, saved_edx = g_edx;
         uint32_t saved_ebx = g_ebx, saved_esi = g_esi, saved_edi = g_edi;
@@ -2251,6 +2287,8 @@ void xbox_kernel_pump_guest_work(void)
         fprintf(stderr, "[IRQ] accept routine=%08X context=%p esp=%08X\n",
                 routine_va, interrupt->ServiceContext, saved_esp);
         if (isr) {
+            if (trace_here) fprintf(stderr, "[PUMP] isr-enter ic=%llu routine=%08X\n",
+                (unsigned long long)g_icall_count, routine_va);
             /* Generated ISR expects ESP to point at the dummy return slot,
              * followed by (Interrupt, ServiceContext). */
             /* Reserve dummy return + two 32-bit arguments below the
@@ -2261,6 +2299,8 @@ void xbox_kernel_pump_guest_work(void)
             BRIDGE_MEM32(g_esp + 4) = (uint32_t)(uintptr_t)interrupt;
             BRIDGE_MEM32(g_esp + 8) = (uint32_t)(uintptr_t)interrupt->ServiceContext;
             isr();
+            if (trace_here) fprintf(stderr, "[PUMP] isr-exit ic=%llu routine=%08X\n",
+                (unsigned long long)g_icall_count, routine_va);
             g_esp = saved_esp;
             fprintf(stderr, "[IRQ] return routine=%08X esp=%08X\n", routine_va, g_esp);
         } else {
@@ -2273,7 +2313,11 @@ void xbox_kernel_pump_guest_work(void)
 
     PXBOX_KDPC dpc;
     PVOID arg1, arg2;
+    if (trace_here) fprintf(stderr, "[PUMP] before-dpc-loop ic=%llu\n",
+        (unsigned long long)g_icall_count);
     while (xbox_kernel_take_guest_dpc(&dpc, &arg1, &arg2)) {
+        if (trace_here) fprintf(stderr, "[PUMP] dpc-take ic=%llu dpc=%p\n",
+            (unsigned long long)g_icall_count, (void *)dpc);
         if (!dpc) continue;
         uint32_t dpc_va = (uint32_t)((uintptr_t)dpc - (uintptr_t)g_xbox_mem_offset);
         uint32_t routine_va = BRIDGE_MEM32(dpc_va + 12);
@@ -2287,6 +2331,21 @@ void xbox_kernel_pump_guest_work(void)
             uint32_t saved_seh = g_seh_ebp;
             uint32_t saved_esp = g_esp;
             uint32_t context_va = BRIDGE_MEM32(dpc_va + 16);
+            int trace_dpc_state = 0;
+            const char *trace_dpc_env = getenv("MM3_TRACE_DPC_STATE");
+            if (trace_dpc_env && routine_va == 0x00348120u)
+                trace_dpc_state = 1;
+            if (trace_dpc_state) {
+                uint32_t dpc_obj = BRIDGE_MEM32(context_va);
+                fprintf(stderr, "[DPC-STATE] pre routine=%08X dpc_va=%08X ctx=%08X "
+                    "obj=%08X obj100=%08X obj820=%08X obj824=%08X "
+                    "obj600100=%08X ic=%llu\n", routine_va, dpc_va, context_va,
+                    dpc_obj, BRIDGE_MEM32(dpc_obj + 0x100u),
+                    BRIDGE_MEM32(dpc_obj + 0x820u),
+                    BRIDGE_MEM32(dpc_obj + 0x824u),
+                    BRIDGE_MEM32(dpc_obj + 0x600100u),
+                    (unsigned long long)g_icall_count);
+            }
             /* Reserve dummy return + four DPC arguments below the saved
              * guest stack; never write the synthetic frame over its caller. */
             g_esp = saved_esp - 20;
@@ -2296,6 +2355,19 @@ void xbox_kernel_pump_guest_work(void)
             BRIDGE_MEM32(g_esp + 12) = (uint32_t)(uintptr_t)arg1;
             BRIDGE_MEM32(g_esp + 16) = (uint32_t)(uintptr_t)arg2;
             fn();
+            if (trace_dpc_state) {
+                uint32_t dpc_obj = BRIDGE_MEM32(context_va);
+                fprintf(stderr, "[DPC-STATE] post routine=%08X obj=%08X "
+                    "obj100=%08X obj820=%08X obj824=%08X obj600100=%08X "
+                    "ic=%llu\n", routine_va, dpc_obj,
+                    BRIDGE_MEM32(dpc_obj + 0x100u),
+                    BRIDGE_MEM32(dpc_obj + 0x820u),
+                    BRIDGE_MEM32(dpc_obj + 0x824u),
+                    BRIDGE_MEM32(dpc_obj + 0x600100u),
+                    (unsigned long long)g_icall_count);
+            }
+            if (trace_here) fprintf(stderr, "[PUMP] dpc-exit ic=%llu routine=%08X\n",
+                (unsigned long long)g_icall_count, routine_va);
             g_eax = saved_eax; g_ecx = saved_ecx; g_edx = saved_edx;
             g_ebx = saved_ebx; g_esi = saved_esi; g_edi = saved_edi;
             g_seh_ebp = saved_seh;
@@ -2304,6 +2376,8 @@ void xbox_kernel_pump_guest_work(void)
             fprintf(stderr, "[DPC] unresolved routine=%08X\n", routine_va);
         }
     }
+    if (trace_here) fprintf(stderr, "[PUMP] exit ic=%llu\n",
+        (unsigned long long)g_icall_count);
     g_guest_work_depth--;
 }
 
@@ -2323,6 +2397,25 @@ static void kernel_thunk_dispatch(void)
 
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
+
+    if (slot == 75 || ordinal == 95 || ordinal == 302 || ordinal == 312 || ordinal == 354) {
+        uintptr_t ra = (uintptr_t)_ReturnAddress();
+        fprintf(stderr, "[KERNEL-SPECIAL] ordinal=%u slot=%d ic=%llu guest_esp=%08X "
+            "dispatch_caller_rva=%zX penter_rva=%zX eax=%08X ecx=%08X edx=%08X\n",
+            ordinal, slot,
+            (unsigned long long)g_icall_count, g_esp,
+            (size_t)(ra - (uintptr_t)GetModuleHandleW(NULL)),
+            (size_t)g_penter_last_rva, g_eax, g_ecx, g_edx);
+        {
+            void *frames[6];
+            USHORT n = CaptureStackBackTrace(0, 6, frames, NULL);
+            HMODULE mod = GetModuleHandleW(NULL);
+            for (USHORT i = 0; i < n; ++i)
+                fprintf(stderr, "[KERNEL-SPECIAL-STACK] %u rva=%zX\n", i,
+                    (size_t)((uintptr_t)frames[i] - (uintptr_t)mod));
+        }
+        fflush(stderr);
+    }
 
     /* Guest thread owns register globals here; host producers only queue. */
     xbox_kernel_pump_guest_work();
