@@ -1511,8 +1511,12 @@ class Lifter:
             # to hit the slot the original instruction addressed.
             bias = 4 if (ops[0].type == "mem" and ops[0].mem_base == "esp") else 0
             target = _fmt_operand_read(ops[0], disp_bias=bias)
+            lines = [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
+            for slot in (0x00361F50, 0x003620A8, 0x003620A4):
+                if f"0x{slot:X}" in target:
+                    lines.insert(0, f"recomp_trace_init_icall(0x{slot:08X}, {target}, 0x{insn.address:08X});")
             # Mark indirect calls for post-processing by _fixup_icall_esp_save
-            return [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
+            return lines
         return ["/* call: no target */"]
 
     def _lift_ret(self, insn, ops):
