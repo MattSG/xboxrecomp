@@ -547,6 +547,9 @@ class FunctionTranslator:
                      0x00083BE1, 0x00083B04, 0x00083C55):
             lines.append(f"    recomp_trace_sched_entry(0x{start:08X});")
             lines.append(f"")
+        if start in (0x0027B8C0, 0x0027B742):
+            lines.append(f"    recomp_trace_sched_entry(0x{start:08X});")
+            lines.append(f"")
         if start in (0x00343E60, 0x00343BD0):
             lines.append(f"    recomp_trace_pump_entry(0x{start:08X});")
             lines.append(f"")
