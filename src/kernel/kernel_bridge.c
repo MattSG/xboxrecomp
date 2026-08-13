@@ -2543,7 +2543,18 @@ static void kernel_thunk_dispatch(void)
     }
 
     if (bridge) {
+        uint32_t dev_before = 0;
+        if (getenv("MM3_TRACE_KERNEL_WINDOW"))
+            dev_before = BRIDGE_MEM32(0x00351F48u);
         bridge();
+        if (getenv("MM3_TRACE_KERNEL_WINDOW")) {
+            uint32_t dev_after = BRIDGE_MEM32(0x00351F48u);
+            if (dev_before != dev_after || ordinal == 100)
+                fprintf(stderr, "[KERNEL-WINDOW-RET] ic=%llu ordinal=%u "
+                    "dev=%08X->%08X eax=%08X esp=%08X\n",
+                    (unsigned long long)g_icall_count, ordinal, dev_before,
+                    dev_after, g_eax, g_esp);
+        }
     } else {
         /* No specific bridge - return 0. Warn once per ordinal rather than
          * gating on g_kernel_call_count: a missing bridge is rare and is
