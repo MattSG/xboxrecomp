@@ -445,6 +445,10 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+        if start == 0x0003B493:
+            lines.append("    recomp_snapshot_3b493_entry();")
+        if start == 0x0003B4B4:
+            lines.append("    recomp_snapshot_3b4b4_entry();")
 
         # ebp is the only callee-saved register declared as a local.
         # ebx, esi, edi are global via #define macros (g_ebx, g_esi, g_edi)
@@ -539,7 +543,28 @@ class FunctionTranslator:
         # thread may accept an IRQ or dispatch a queued DPC.
         lines.append("    recomp_guest_boundary();")
         lines.append(f"")
-
+        if start in (0x001EC6EE, 0x001EC7F7):
+            lines.append(f"    recomp_trace_sched_entry(0x{start:08X});")
+            lines.append(f"")
+        if start in (0x00343E60, 0x00343BD0):
+            lines.append(f"    recomp_trace_pump_entry(0x{start:08X});")
+            lines.append(f"")
+        if start in (0x001EC7F7, 0x001EC6EE,
+                     0x00125950, 0x00125966, 0x00125A6C,
+                     0x00213CCB, 0x001DD0B8,
+                     0x0002B83A, 0x0002B8A1,
+                     0x001DB6E8):
+            lines.append(f"    recomp_trace_frame_callback(0x{start:08X});")
+            lines.append(f"")
+        if start == 0x001F443D:
+            lines.extend([
+                '    if (getenv("MM3_TRACE_1F443D") && g_icall_count >= 93800ULL) {',
+                '        fprintf(stderr, "[1F443D-ENTRY] ic=%llu eax=%08X ebx=%08X ecx=%08X edi=%08X esi=%08X esp=%08X a8=%08X\\n",',
+                '            (unsigned long long)g_icall_count, g_eax, g_ebx, g_ecx, g_edi, g_esi, g_esp,',
+                '            MEM32(g_esp + 4));',
+                '    }',
+                '',
+            ])
         # Generate code for each basic block
         # Create a set of addresses that need labels
         label_addrs = set()
