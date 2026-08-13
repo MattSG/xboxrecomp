@@ -1492,6 +1492,10 @@ class Lifter:
                 lines.insert(0, f"recomp_trace_pump_call(0x{insn.address:08X}, (uint32_t)eax);")
             if insn.call_target == 0x001EC7F7:
                 lines.insert(0, f"recomp_trace_frame_call(0x{insn.address:08X});")
+            if insn.call_target in (0x001E73AF, 0x001E7627):
+                lines.append(
+                    f"recomp_trace_sched_result(0x{insn.call_target:08X}, "
+                    f"0x{insn.address:08X}, (uint32_t)eax, (uint32_t)esp);")
             # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
             # Also after the alternate prolog variants (fs:[0] write + lea
             # ebp,[esp+N]) that establish ebp but are not the detected helper.
