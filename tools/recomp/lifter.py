@@ -170,6 +170,8 @@ def _fmt_mem(op, disp_bias=0):
 def _fmt_mem_read(op, disp_bias=0):
     """Format reading from a memory operand."""
     accessor = _mem_accessor(op.mem_size)
+    if op.mem_segment == "fs":
+        return f"FS{op.mem_size * 8}({_fmt_mem(op, disp_bias)})"
     addr = _fmt_mem(op, disp_bias)
     return f"{accessor}({addr})"
 
@@ -177,6 +179,8 @@ def _fmt_mem_read(op, disp_bias=0):
 def _fmt_mem_write(op, value_expr):
     """Format writing to a memory operand."""
     accessor = _mem_accessor(op.mem_size)
+    if op.mem_segment == "fs":
+        return f"FS{op.mem_size * 8}({_fmt_mem(op)}) = {value_expr};"
     addr = _fmt_mem(op)
     return f"{accessor}({addr}) = {value_expr};"
 
@@ -1474,6 +1478,20 @@ class Lifter:
                 cleanup = self._callee_cleanup(insn.call_target)
                 ret_note = "" if cleanup is None else f" ret {cleanup}"
                 lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X}{ret_note} */"]
+            if insn.call_target == 0x0008872F:
+                lines.insert(0, f"recomp_trace_guest_call(0x0008872F, 0x{insn.address:08X});")
+            if insn.call_target == 0x001F3163:
+                lines.insert(0, f"recomp_snapshot_f3163_call(0x{insn.address:08X});")
+            if insn.call_target == 0x00042921:
+                lines.insert(0, f"recomp_snapshot_42921_call(0x{insn.address:08X});")
+            if insn.call_target == 0x00343BD0:
+                lines.insert(0, f"recomp_trace_pump_entry(0x{insn.address:08X});")
+            if insn.call_target == 0x001EC6EE:
+                lines.insert(0, f"recomp_trace_frame_call(0x{insn.address:08X});")
+            if insn.call_target == 0x00343E60:
+                lines.insert(0, f"recomp_trace_pump_call(0x{insn.address:08X}, (uint32_t)eax);")
+            if insn.call_target == 0x001EC7F7:
+                lines.insert(0, f"recomp_trace_frame_call(0x{insn.address:08X});")
             # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
             # Also after the alternate prolog variants (fs:[0] write + lea
             # ebp,[esp+N]) that establish ebp but are not the detected helper.
@@ -1501,6 +1519,9 @@ class Lifter:
         if (self.func_start in (self.SEH_PROLOG, self.SEH_EPILOG)
                 or self.func_start in (0x00097AA4, 0x0009504E)):
             prefix = "g_seh_ebp = ebp; "
+        if self.func_start in (0x0033FC40, 0x00348C99, 0x001E73AF):
+            prefix += (f"recomp_trace_render_return(0x{self.func_start:08X}, "
+                       "(uint32_t)eax, (uint32_t)esp); ")
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
             return [f"{prefix}esp += {4 + n}; return; /* ret {n} */"]

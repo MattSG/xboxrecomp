@@ -2263,7 +2263,7 @@ void xbox_kernel_pump_guest_work(void)
 {
     static int trace_frontier = -1;
     if (trace_frontier < 0) trace_frontier = getenv("MM3_TRACE_PUMP") ? 1 : 0;
-    int trace_here = trace_frontier && g_icall_count >= 45280ULL && g_icall_count <= 45320ULL;
+    int trace_here = trace_frontier && g_icall_count >= 11800ULL && g_icall_count <= 12200ULL;
     if (trace_here) fprintf(stderr, "[PUMP] enter ic=%llu depth=%d esp=%08X\n",
         (unsigned long long)g_icall_count, g_guest_work_depth, g_esp);
     if (g_guest_work_depth++) {
