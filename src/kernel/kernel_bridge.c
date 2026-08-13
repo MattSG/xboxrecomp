@@ -2432,6 +2432,15 @@ static void kernel_thunk_dispatch(void)
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
 
+    if (getenv("MM3_TRACE_KERNEL_WINDOW") &&
+        g_icall_count >= 12080ULL && g_icall_count <= 12092ULL) {
+        fprintf(stderr, "[KERNEL-WINDOW] ic=%llu slot=%d ordinal=%u bridge=%p "
+            "esp=%08X a0=%08X a1=%08X a2=%08X a3=%08X\n",
+            (unsigned long long)g_icall_count, slot, ordinal, (void *)bridge,
+            g_esp, STACK_ARG(0), STACK_ARG(1), STACK_ARG(2), STACK_ARG(3));
+        fflush(stderr);
+    }
+
     if (slot == 75 || ordinal == 95 || ordinal == 302 || ordinal == 312 || ordinal == 354) {
         uintptr_t ra = (uintptr_t)_ReturnAddress();
         fprintf(stderr, "[KERNEL-SPECIAL] ordinal=%u slot=%d ic=%llu guest_esp=%08X "
