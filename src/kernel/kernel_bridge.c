@@ -802,6 +802,12 @@ static void bridge_MmQueryStatistics(void)
     g_eax = (uint32_t)xbox_MmQueryStatistics(XBOX_TO_NATIVE(stats_ptr));
 }
 
+static void bridge_MmQueryAddressProtect(void)
+{
+    uint32_t address = STACK_ARG(0);
+    g_eax = (uint32_t)xbox_MmQueryAddressProtect(XBOX_TO_NATIVE(address));
+}
+
 /* ── NtCreateEvent (ordinal 189) ─────────────────────────── */
 static void bridge_NtCreateEvent(void)
 {
@@ -961,6 +967,13 @@ static void bridge_AvSendTVEncoderOption(void)
 
     xbox_AvSendTVEncoderOption(XBOX_TO_NATIVE(addr), option, param,
                                result ? (PULONG)XBOX_TO_NATIVE(result) : NULL);
+    if (getenv("MM3_TRACE_AV_OPTION") && option == 6) {
+        fprintf(stderr, "[AV-OPTION] ic=%llu addr=%08X option=%08X param=%08X "
+            "result=%08X value=%08X\n",
+            (unsigned long long)g_icall_count, addr, option, param, result,
+            result ? BRIDGE_MEM32(result) : 0);
+        fflush(stderr);
+    }
     g_eax = 0;
 }
 
@@ -2207,6 +2220,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 173: return bridge_MmGetPhysicalAddress;
     case 182: return bridge_MmSetAddressProtect;
     case 181: return bridge_MmQueryStatistics;
+    case 179: return bridge_MmQueryAddressProtect;
 
     /* Memory - virtual */
     case 184: return bridge_NtAllocateVirtualMemory;
@@ -2433,7 +2447,8 @@ static void kernel_thunk_dispatch(void)
     bridge = g_slot_bridges[slot];
 
     if (getenv("MM3_TRACE_KERNEL_WINDOW") &&
-        g_icall_count >= 12080ULL && g_icall_count <= 12092ULL) {
+        ((g_icall_count >= 12055ULL && g_icall_count <= 12062ULL) ||
+         (g_icall_count >= 12080ULL && g_icall_count <= 12092ULL))) {
         fprintf(stderr, "[KERNEL-WINDOW] ic=%llu slot=%d ordinal=%u bridge=%p "
             "esp=%08X a0=%08X a1=%08X a2=%08X a3=%08X\n",
             (unsigned long long)g_icall_count, slot, ordinal, (void *)bridge,
@@ -2549,7 +2564,7 @@ static void kernel_thunk_dispatch(void)
         bridge();
         if (getenv("MM3_TRACE_KERNEL_WINDOW")) {
             uint32_t dev_after = BRIDGE_MEM32(0x00351F48u);
-            if (dev_before != dev_after || ordinal == 100)
+            if (dev_before != dev_after || ordinal == 100 || ordinal == 166)
                 fprintf(stderr, "[KERNEL-WINDOW-RET] ic=%llu ordinal=%u "
                     "dev=%08X->%08X eax=%08X esp=%08X\n",
                     (unsigned long long)g_icall_count, ordinal, dev_before,
