@@ -151,7 +151,7 @@ void nv2a_update_irq(NV2AState *d)
         d->pmc.pending_interrupts &= ~NV_PMC_INTR_0_PGRAPH;
     }
 
-    if (d->pmc.pending_interrupts && d->pmc.enabled_interrupts) {
+    if (d->pmc.pending_interrupts & d->pmc.enabled_interrupts) {
         if (getenv("MM3_IRQ_TRACE"))
             fprintf(stderr, "[IRQ] nv2a assert pending=%08X enabled=%08X\n",
                     d->pmc.pending_interrupts, d->pmc.enabled_interrupts);
@@ -246,6 +246,9 @@ void pmc_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         nv2a_update_irq(d);
         break;
     case NV_PMC_INTR_EN_0:
+        if (getenv("MM3_TRACE_PCRTC"))
+            fprintf(stderr, "[PMC-ENABLE] before=%08X write=%08llX\n",
+                    d->pmc.enabled_interrupts, (unsigned long long)val);
         d->pmc.enabled_interrupts = val;
         nv2a_update_irq(d);
         break;
@@ -449,10 +452,20 @@ void pcrtc_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     switch (addr) {
     case NV_PCRTC_INTR_0:
+        if (getenv("MM3_TRACE_PCRTC"))
+            fprintf(stderr, "[PCRTC-ACK] before=%08X write=%08llX\n",
+                    d->pcrtc.pending_interrupts, (unsigned long long)val);
         d->pcrtc.pending_interrupts &= ~val;
         nv2a_update_irq(d);
+        if (getenv("MM3_TRACE_PCRTC"))
+            fprintf(stderr, "[PCRTC-ACK] after=%08X\n",
+                    d->pcrtc.pending_interrupts);
         break;
     case NV_PCRTC_INTR_EN_0:
+        if (getenv("MM3_TRACE_PCRTC"))
+            fprintf(stderr, "[PCRTC-ENABLE] before=%08X write=%08llX pending=%08X\n",
+                    d->pcrtc.enabled_interrupts, (unsigned long long)val,
+                    d->pcrtc.pending_interrupts);
         d->pcrtc.enabled_interrupts = val;
         nv2a_update_irq(d);
         break;
