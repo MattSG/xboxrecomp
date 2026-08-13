@@ -1493,6 +1493,7 @@ class Lifter:
             if insn.call_target == 0x001EC7F7:
                 lines.insert(0, f"recomp_trace_frame_call(0x{insn.address:08X});")
             if insn.call_target in (0x001E73AF, 0x001E7627):
+                lines.insert(0, f"recomp_trace_sched_call(0x{insn.call_target:08X}, 0x{insn.address:08X});")
                 lines.append(
                     f"recomp_trace_sched_result(0x{insn.call_target:08X}, "
                     f"0x{insn.address:08X}, (uint32_t)eax, (uint32_t)esp);")
