@@ -543,7 +543,8 @@ class FunctionTranslator:
         # thread may accept an IRQ or dispatch a queued DPC.
         lines.append("    recomp_guest_boundary();")
         lines.append(f"")
-        if start in (0x001EC6EE, 0x001EC7F7):
+        if start in (0x001EC6EE, 0x001EC7F7,
+                     0x00083BE1, 0x00083B04, 0x00083C55):
             lines.append(f"    recomp_trace_sched_entry(0x{start:08X});")
             lines.append(f"")
         if start in (0x00343E60, 0x00343BD0):
@@ -552,6 +553,8 @@ class FunctionTranslator:
         if start in (0x001EC7F7, 0x001EC6EE,
                      0x00125950, 0x00125966, 0x00125A6C,
                      0x00213CCB, 0x001DD0B8,
+                     0x001E687A, 0x001E693F,
+                     0x00086ED2, 0x00080136,
                      0x0002B83A, 0x0002B8A1,
                      0x001DB6E8):
             lines.append(f"    recomp_trace_frame_callback(0x{start:08X});")
