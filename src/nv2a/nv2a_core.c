@@ -625,7 +625,16 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
-    uint64_t r = d->pgraph.regs[addr];
+    /* MMIO addresses are byte offsets; the backing register array is DWORD
+     * indexed, just like pgraph_method(). */
+    uint64_t r = (addr < sizeof(d->pgraph.regs))
+               ? d->pgraph.regs[addr / 4]
+               : 0;
+    if (addr == 0x700 && getenv("MM3_TRACE_PGRAPH_700")) {
+        static unsigned reads;
+        if (reads++ < 32)
+            fprintf(stderr, "[PGRAPH-700-READ] value=%08X\n", (uint32_t)r);
+    }
     nv2a_reg_log_read(NV_PGRAPH, addr, size, r);
     return r;
 }
@@ -634,7 +643,20 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
     nv2a_reg_log_write(NV_PGRAPH, addr, size, val);
-    d->pgraph.regs[addr] = val;
+    if (addr == NV_PGRAPH_INTR) {
+        /* NV_PGRAPH_INTR is W1C on NV2A: the guest acknowledges pending
+         * interrupt bits by writing the bits it wants cleared. */
+        d->pgraph.pending_interrupts &= ~(uint32_t)val;
+        d->pgraph.regs[addr / 4] = d->pgraph.pending_interrupts;
+        return;
+    }
+    if (addr < sizeof(d->pgraph.regs))
+        d->pgraph.regs[addr / 4] = (uint32_t)val;
+    if (addr == 0x700 && getenv("MM3_TRACE_PGRAPH_700")) {
+        static unsigned writes;
+        if (writes++ < 32)
+            fprintf(stderr, "[PGRAPH-700-WRITE] value=%08X\n", (uint32_t)val);
+    }
 }
 
 /* ============================================================
