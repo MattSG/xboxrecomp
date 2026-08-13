@@ -2680,6 +2680,11 @@ void xbox_kernel_bridge_init(void)
             /* FUNCTION export: use synthetic VA for dispatch */
             g_slot_bridges[i] = bridge_for_ordinal(ordinal);
             g_slot_arg_bytes[i] = stdcall_args_for_ordinal(ordinal);
+            if (i == 105 || i == 106) {
+                fprintf(stderr, "  [THUNK-DIAG] slot=%d ordinal=%u bridge=%p args=%d\n",
+                        i, ordinal, (void *)g_slot_bridges[i],
+                        g_slot_arg_bytes[i]);
+            }
             if (g_slot_bridges[i]) {
                 bridged++;
             } else {
