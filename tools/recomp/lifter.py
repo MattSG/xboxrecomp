@@ -1519,7 +1519,8 @@ class Lifter:
         if (self.func_start in (self.SEH_PROLOG, self.SEH_EPILOG)
                 or self.func_start in (0x00097AA4, 0x0009504E)):
             prefix = "g_seh_ebp = ebp; "
-        if self.func_start in (0x0033FC40, 0x00348C99, 0x001E73AF):
+        if self.func_start in (0x0033FC40, 0x00348C99, 0x001E73AF,
+                               0x001E7627, 0x001E77F3):
             prefix += (f"recomp_trace_render_return(0x{self.func_start:08X}, "
                        "(uint32_t)eax, (uint32_t)esp); ")
         if len(ops) >= 1 and ops[0].type == "imm":
