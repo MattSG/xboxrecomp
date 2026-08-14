@@ -30,24 +30,43 @@ static int g_pb_retire_log = 0;
 static int g_dma_get_log = 0;
 static uint32_t g_semaphore_offset;
 static int g_semaphore_log;
+static int g_release_complete_log;
+/* One authentic GPU completion per consumed semaphore release.  The guest
+ * arms the completion event (dev+0x1970 clear in sub_00344640) before each
+ * fence wait, so deliver one pending release completion per arm instead of
+ * one per advancing flush.  Fences 5/7/9/0B/0D are released in the ring but
+ * only four flush batches advance GET; flip #2 re-waits on the already-
+ * consumed fence 0B and needs the fifth completion. */
+static volatile LONG g_pending_release_count = 0;
+static volatile LONG g_completion_thread_started = 0;
+static uint32_t g_completion_dev = 0;
 
 static DWORD WINAPI nv2a_completion_signal_thread(LPVOID parameter)
 {
-    uint32_t dev = (uint32_t)(uintptr_t)parameter;
+    (void)parameter;
+    uint32_t dev = g_completion_dev;
     volatile uint32_t *state = (volatile uint32_t *)(uintptr_t)
         (dev + 0x1970u + g_mem_offset);
-    /* The original GPU interrupt is asynchronous.  Wait for the guest's
-     * sub_00344640 arm/clear write before delivering the pending completion. */
-    Sleep(1);
-    for (unsigned i = 0; i < 1000 && *state != 0; ++i)
+    for (;;) {
+        if (g_pending_release_count <= 0) {
+            Sleep(1);
+            continue;
+        }
+        /* The original GPU interrupt is asynchronous.  Wait for the guest's
+         * sub_00344640 arm/clear write before delivering the completion. */
         Sleep(1);
-    if (*state == 0) {
+        for (unsigned i = 0; i < 1000 && *state != 0; ++i)
+            Sleep(1);
+        if (*state != 0)
+            continue;
+        if (InterlockedDecrement(&g_pending_release_count) < 0)
+            continue;
         uint32_t event = dev + 0x196Cu;
-        fprintf(stderr, "[NV2A-SIGNAL] dev=%08X event=%08X state=%08X type=%08X offset=%p\\n",
+        fprintf(stderr, "[NV2A-SIGNAL] dev=%08X event=%08X state=%08X type=%08X offset=%p\n",
                 dev, event, *(uint32_t *)(uintptr_t)(event + 4u + g_mem_offset),
                 *(uint32_t *)(uintptr_t)(event + g_mem_offset), (void *)g_mem_offset);
         xbox_KeSetEvent((PVOID)(uintptr_t)event, 0, 0);
-        fprintf(stderr, "[NV2A-SIGNAL-AFTER] event=%08X state=%08X\\n",
+        fprintf(stderr, "[NV2A-SIGNAL-AFTER] event=%08X state=%08X\n",
                 event, *(uint32_t *)(uintptr_t)(event + 4u + g_mem_offset));
     }
     return 0;
@@ -55,10 +74,13 @@ static DWORD WINAPI nv2a_completion_signal_thread(LPVOID parameter)
 
 static void nv2a_defer_completion_signal(uint32_t dev)
 {
-    HANDLE thread = CreateThread(NULL, 0, nv2a_completion_signal_thread,
-                                 (LPVOID)(uintptr_t)dev, 0, NULL);
-    if (thread)
-        CloseHandle(thread);
+    if (InterlockedCompareExchange(&g_completion_thread_started, 1, 0) == 0) {
+        g_completion_dev = dev;
+        HANDLE thread = CreateThread(NULL, 0, nv2a_completion_signal_thread,
+                                     NULL, 0, NULL);
+        if (thread)
+            CloseHandle(thread);
+    }
 }
 
 /* Decode guest push-buffer packets. Return last valid cursor; malformed or
@@ -112,6 +134,13 @@ static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
             } else if (actual_method == 0x1D70u) {
                 uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
                 uint32_t dev = *g351f48;
+                /* The guest's fence completion is tied to the release packet
+                 * itself: count it as consumed work when the GPU retires it,
+                 * independent of the RAMIN object bookkeeping below. */
+                InterlockedIncrement(&g_pending_release_count);
+                if (g_release_complete_log++ < 16)
+                    fprintf(stderr, "[NV2A-RELEASE-COMPLETE] fence=%04X dev=%08X\n",
+                            param, dev);
                 if (dev < 0x04000000u) {
                     uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
                     uint32_t ring = devp[0x30 / 4];
