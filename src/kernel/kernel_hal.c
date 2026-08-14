@@ -479,8 +479,12 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
 
     switch (Option) {
     case AV_OPTION_QUERY_AVPACK:
-        /* Report HDTV/Component pack - allows games to offer 480p/720p */
-        *Result = AV_PACK_HDTV;
+        /* HDTV component pack on NTSC-M at 60Hz, in the XDK's packed
+         * AV-result layout: pack bits 0..7, standard bits 8..15,
+         * refresh bits 22..23. MM3's display-mode scan keys its mode
+         * table off this word; the refresh bit is required to select
+         * a 640x480 60Hz row, otherwise device creation fails. */
+        *Result = 0x00400104u;  /* AV_PACK_HDTV | AV_STANDARD_NTSC_M | AV_FLAGS_60Hz */
         break;
 
     case AV_OPTION_QUERY_MODE:
