@@ -151,7 +151,7 @@ void nv2a_update_irq(NV2AState *d)
         d->pmc.pending_interrupts &= ~NV_PMC_INTR_0_PGRAPH;
     }
 
-    if (d->pmc.pending_interrupts & d->pmc.enabled_interrupts) {
+    if (d->pmc.pending_interrupts && d->pmc.enabled_interrupts) {
         if (getenv("MM3_IRQ_TRACE"))
             fprintf(stderr, "[IRQ] nv2a assert pending=%08X enabled=%08X\n",
                     d->pmc.pending_interrupts, d->pmc.enabled_interrupts);

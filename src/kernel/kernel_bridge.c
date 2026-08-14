@@ -750,6 +750,17 @@ static void bridge_HalRequestSoftwareInterrupt(void)
     xbox_HalRequestSoftwareInterrupt((KIRQL)STACK_ARG(0));
 }
 
+/* ── HalGetInterruptVector (ordinal 44) ─────────────────── */
+static void bridge_HalGetInterruptVector(void)
+{
+    uint32_t level = STACK_ARG(0);
+    uint32_t irql_ptr = STACK_ARG(1);
+    KIRQL irql = PASSIVE_LEVEL;
+    g_eax = xbox_HalGetInterruptVector(level, irql_ptr ? &irql : NULL);
+    if (irql_ptr)
+        BRIDGE_MEM8(irql_ptr) = irql;
+}
+
 /* ── RtlInitializeCriticalSection / Enter / Leave (ordinals 291, 277, 294) ─ */
 static void bridge_RtlInitializeCriticalSection(void)
 {
@@ -923,6 +934,13 @@ static void bridge_KeDelayExecutionThread(void)
     }
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable, XBOX_TO_NATIVE(interval_va));
+}
+
+/* ── KeStallExecutionProcessor (ordinal 151) ────────────── */
+static void bridge_KeStallExecutionProcessor(void)
+{
+    xbox_KeStallExecutionProcessor(STACK_ARG(0));
+    g_eax = 0;
 }
 
 /* ── NtYieldExecution (ordinal 238) ──────────────────────── */
@@ -1532,6 +1550,8 @@ static void bridge_NtReadFile(void)
     XBOX_IO_STATUS_BLOCK ios;
     LARGE_INTEGER  off;
     PLARGE_INTEGER poff = NULL;
+    LARGE_INTEGER  cur = {0};
+    LARGE_INTEGER  zero = {0};
 
     memset(&ios, 0, sizeof(ios));
     if (offset_va) {
@@ -1539,9 +1559,35 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
+    if (handle && handle != INVALID_HANDLE_VALUE)
+        SetFilePointerEx(handle, zero, &cur, FILE_CURRENT);
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
+    {
+        /* MM3 run-1048 (read-only): loader-window read trace. Logs the
+         * guest-requested ByteOffset (off) plus the host file pointer before
+         * the read (cur) so a VFS/zip stream rewind shows up as either an
+         * explicit guest seek or a repeating host read position. Window
+         * ic>=400000, capped at 3000 lines. Env-gated via MM3_TRACE_READS. */
+        static int s_read_log = 0;
+        if (getenv("MM3_TRACE_READS") && g_icall_count >= 400000ULL &&
+            s_read_log < 3000) {
+            uint32_t rb0 = 0, rb1 = 0;
+            if (buffer_va < 0x04000000u) {
+                rb0 = BRIDGE_MEM32(buffer_va);
+                rb1 = BRIDGE_MEM32(buffer_va + 4);
+            }
+            fprintf(stderr, "[READ] h=%p off=%lld cur=%lld len=%u st=0x%08X "
+                    "info=%u buf=%08X %08X ic=%llu fnrva=%zX\n",
+                    handle, poff ? (long long)off.QuadPart : -1LL,
+                    (long long)cur.QuadPart, length, (uint32_t)ios.Status,
+                    (uint32_t)ios.Information, rb0, rb1,
+                    (unsigned long long)g_icall_count,
+                    (size_t)g_penter_last_rva);
+            s_read_log++;
+        }
+    }
 }
 
 /* ── NtWriteFile (ordinal 236, 8 args = 32 bytes) ─────── */
@@ -1586,13 +1632,24 @@ static void bridge_NtQueryInformationFile(void)
         static int s_q_log = 0;
         if (s_q_log < 20) {
             uint64_t eof = 0;
+            DWORD qgle = GetLastError();
+            uint32_t qb[4] = {0, 0, 0, 0};
             if (info_va < 0x04000000u)
+            {
                 eof = (uint64_t)BRIDGE_MEM32(info_va + 8) |
                       ((uint64_t)BRIDGE_MEM32(info_va + 0xC) << 32);
+                qb[0] = BRIDGE_MEM32(info_va);
+                qb[1] = BRIDGE_MEM32(info_va + 4);
+                qb[2] = BRIDGE_MEM32(info_va + 8);
+                qb[3] = BRIDGE_MEM32(info_va + 0xC);
+            }
             fprintf(stderr, "[QFILE] tok=0x%08X h=%p class=%u len=%u "
-                    "st=0x%08X eof64=%llu\n",
+                    "st=0x%08X eof64=%llu gle=%u buf=%08X %08X %08X %08X "
+                    "ic=%llu\n",
                     STACK_ARG(0), handle, infoclass, length,
-                    (uint32_t)ios.Status, (unsigned long long)eof);
+                    (uint32_t)ios.Status, (unsigned long long)eof, qgle,
+                    qb[0], qb[1], qb[2], qb[3],
+                    (unsigned long long)g_icall_count);
             s_q_log++;
         }
     }
@@ -1613,6 +1670,26 @@ static void bridge_NtSetInformationFile(void)
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
+    {
+        /* MM3 run-1048 (read-only): file-seek trace for the loader window.
+         * Logs FilePositionInformation targets so a stream rewind is visible
+         * as an explicit guest seek. Env-gated via MM3_TRACE_READS. */
+        static int s_seek_log = 0;
+        if (getenv("MM3_TRACE_READS") && g_icall_count >= 400000ULL &&
+            infoclass == XboxFilePositionInformation && s_seek_log < 500) {
+            LONGLONG target =
+                ((LONGLONG)(LONG)BRIDGE_MEM32(info_va + 4) << 32) |
+                (LONGLONG)BRIDGE_MEM32(info_va);
+            fprintf(stderr, "[SEEK] h=%p off=%lld ic=%llu fnrva=%zX "
+                    "ra=%08X esp=%08X\n",
+                    handle, (long long)target,
+                    (unsigned long long)g_icall_count,
+                    (size_t)g_penter_last_rva,
+                    (unsigned)BRIDGE_MEM32((uint32_t)g_esp),
+                    (uint32_t)g_esp);
+            s_seek_log++;
+        }
+    }
 }
 
 /* ── NtQueryVolumeInformationFile (ordinal 218, 5 args = 20 bytes) */
@@ -1958,6 +2035,17 @@ static void bridge_MmMapIoSpace(void)
     g_eax = xbox_va;
 }
 
+/* ── MmClaimGpuInstanceMemory (ordinal 168) ─────────────── */
+static void bridge_MmClaimGpuInstanceMemory(void)
+{
+    uint32_t size = STACK_ARG(0);
+    uint32_t padding_ptr = STACK_ARG(1);
+    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    if (padding_ptr)
+        BRIDGE_MEM32(padding_ptr) = 0;
+    g_eax = xbox_va;
+}
+
 /* ── MmPersistContiguousMemory (ordinal 178) ─────────────
  * VOID MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)
  *
@@ -2194,6 +2282,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 258: return bridge_PsTerminateSystemThread;
     case  99: return bridge_KeDelayExecutionThread;
     case 256: return bridge_KeDelayExecutionThread;
+    case 151: return bridge_KeStallExecutionProcessor;
 
     /* File/Handle */
     case 187: return bridge_NtClose;
@@ -2270,6 +2359,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* Hardware */
     case  47: return bridge_HalReadSMCTrayState;
     case  49: return bridge_HalRequestSoftwareInterrupt;
+    case  44: return bridge_HalGetInterruptVector;
 
     /* Display */
     case   1: return bridge_AvGetSavedDataAddress;
@@ -2285,6 +2375,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 246: return bridge_ObReferenceObjectByHandle;
 
     case 175: return bridge_MmLockUnlockBufferPages;
+    case 168: return bridge_MmClaimGpuInstanceMemory;
     /* Memory - I/O mapping */
     case 177: return bridge_MmMapIoSpace;
     case 178: return bridge_MmPersistContiguousMemory;
@@ -2456,7 +2547,8 @@ static void kernel_thunk_dispatch(void)
         fflush(stderr);
     }
 
-    if (slot == 75 || ordinal == 95 || ordinal == 302 || ordinal == 312 || ordinal == 354) {
+    if (slot == 75 || slot == 94 || ordinal == 95 || ordinal == 226 ||
+        ordinal == 302 || ordinal == 312 || ordinal == 354) {
         uintptr_t ra = (uintptr_t)_ReturnAddress();
         fprintf(stderr, "[KERNEL-SPECIAL] ordinal=%u slot=%d ic=%llu guest_esp=%08X "
             "dispatch_caller_rva=%zX penter_rva=%zX eax=%08X ecx=%08X edx=%08X\n",
