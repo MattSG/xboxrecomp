@@ -6,7 +6,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from map_names import check_entry, parse_map, port_names, va_to_off
+from tools.symbols.map_names import check_entry, parse_map, port_names, va_to_off
 
 # A title with .text at 0x11000 and an XDK section at 0x50000, mirroring the
 # real layout: MAP section 0001 -> XBE section 0.
