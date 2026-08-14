@@ -724,6 +724,17 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
     const DWORD *rs;
     HRESULT hr;
     UINT tex_count;
+    static int s_ffp_dbg = 0;
+    int dbg = 0;
+    float dbg_sw = 0.0f, dbg_sh = 0.0f;
+    DWORD dbg_flags = 0;
+
+    if (getenv("MM3_CAPTURE") && s_ffp_dbg < 8) {
+        dbg = 1;
+        s_ffp_dbg++;
+        fprintf(stderr, "[FFP] call %d: g_vs=%p g_ps=%p fvf=0x%lX\n",
+                s_ffp_dbg, (void *)g_vs, (void *)g_ps, (unsigned long)fvf);
+    }
 
     if (!ctx || !g_vs || !g_ps) return;
 
@@ -753,6 +764,7 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
             cb->screen_w = (float)d3d8_GetBackbufferWidth();
             cb->screen_h = (float)d3d8_GetBackbufferHeight();
             cb->flags = 0x01; /* pre-transformed */
+            dbg_sw = cb->screen_w; dbg_sh = cb->screen_h; dbg_flags = cb->flags;
         } else {
             float wv[16], wvp[16], wvp_t[16], world_t[16];
             float world_inv[16], world_inv_t[16];
@@ -777,6 +789,7 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
             cb->screen_w = (float)d3d8_GetBackbufferWidth();
             cb->screen_h = (float)d3d8_GetBackbufferHeight();
             cb->flags = 0;
+            dbg_sw = cb->screen_w; dbg_sh = cb->screen_h; dbg_flags = cb->flags;
 
             /* Compute eye position from inverse view matrix */
             {
@@ -808,6 +821,9 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
 
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vs_cb, 0);
     }
+    if (dbg)
+        fprintf(stderr, "[FFP]  vs_cb map hr=0x%08lX screen=(%g,%g) flags=0x%lX\n",
+                (unsigned long)hr, dbg_sw, dbg_sh, (unsigned long)dbg_flags);
 
     /* ---- VS Lighting CB (b1) ---- */
     hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vs_light_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);

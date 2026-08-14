@@ -62,6 +62,8 @@ struct PGRAPHState {
     uint32_t pending_interrupts;
     uint32_t enabled_interrupts;
     uint32_t regs[0x2000];
+    uint32_t object_context[8];
+    uint32_t object_handle[8];
     /* Phase 3-4: Full PGRAPH state will go here */
 };
 
@@ -234,5 +236,13 @@ void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size)
 
 /* Get the global NV2A state instance */
 NV2AState *nv2a_get_state(void);
+void nv2a_register_dma_object(uint32_t handle, uint32_t dma_class,
+                              uint32_t instance, uint32_t channel_id);
+void nv2a_trace_ramht_lookup(uint32_t handle, uint32_t channel_id,
+                             uint32_t subchannel);
+int nv2a_bind_ramht_object(uint32_t handle, uint32_t channel_id,
+                           uint32_t subchannel, uint32_t *context);
+void nv2a_register_ramht_entry(uint32_t handle, uint32_t hash,
+                               uint32_t context);
 
 #endif /* BURNOUT3_NV2A_STATE_H */

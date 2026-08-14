@@ -17,6 +17,7 @@
 #include "kernel.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <intrin.h>
 
 extern ptrdiff_t g_xbox_mem_offset;
 extern volatile uint64_t g_icall_count;
@@ -134,19 +135,33 @@ NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState)
 LONG __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait)
 {
     uint32_t guest = xbox_guest_dispatcher_va(Event);
+    static unsigned trace_frontier_count;
 
     (void)Increment;
     (void)Wait;
 
     /* We can't easily query previous state, so just set and return 0 */
     if (guest) {
+        uint32_t before = *(volatile uint32_t *)(uintptr_t)(guest + 4u + g_xbox_mem_offset);
+        int trace_frontier = 0;
         if (guest == 0x0035186Cu || guest == 0x0035185Cu)
-            fprintf(stderr, "[FRONTIER-SET] ic=%llu guest=%08X before=%08X caller_rva=%p\n",
+            trace_frontier = before == 0 && trace_frontier_count++ < 256;
+        if (guest == 0x0035185Cu && getenv("MM3_TRACE_185C_SET")) {
+            static unsigned s_185c_set_n;
+            if (s_185c_set_n++ < 256)
+                fprintf(stderr, "[185C-SET] ic=%llu before=%08X ret_rva=%p penter=%p esp=%08X\n",
+                        (unsigned long long)g_icall_count, before,
+                        (void *)((uintptr_t)_ReturnAddress() - (uintptr_t)GetModuleHandle(NULL)),
+                        (void *)g_penter_last_rva, g_esp);
+        }
+        if (trace_frontier)
+            fprintf(stderr, "[FRONTIER-SET] ic=%llu guest=%08X before=%08X ret_rva=%p penter=%p\n",
                     (unsigned long long)g_icall_count, guest,
-                    *(volatile uint32_t *)(uintptr_t)(guest + 4u + g_xbox_mem_offset),
+                    before,
+                    (void *)((uintptr_t)_ReturnAddress() - (uintptr_t)GetModuleHandle(NULL)),
                     (void *)g_penter_last_rva);
         *(volatile LONG *)(uintptr_t)(guest + 4u + g_xbox_mem_offset) = 1;
-        if (guest == 0x0035186Cu || guest == 0x0035185Cu)
+        if (trace_frontier)
             fprintf(stderr, "[FRONTIER-SET-AFTER] guest=%08X host=%p state=%08X type=%08X\n",
                     guest, (void *)(uintptr_t)(guest + 4u + g_xbox_mem_offset),
                     *(volatile uint32_t *)(uintptr_t)(guest + 4u + g_xbox_mem_offset),
@@ -294,8 +309,8 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
     int trace_wait = 0;
     static unsigned trace_wait_count;
     if ((guest == 0x0035185Cu || guest == 0x0035186Cu) &&
-        getenv("MM3_TRACE_WAIT") && g_icall_count >= 300000ULL) {
-        trace_wait = trace_wait_count++ < 80;
+        getenv("MM3_TRACE_WAIT")) {
+        trace_wait = trace_wait_count++ < 400;
         if (trace_wait)
             fprintf(stderr, "[WAIT-TRACE] enter ic=%llu guest=%08X ms=%lu "
                 "state=%08X type=%08X esp=%08X\n", (unsigned long long)g_icall_count,
@@ -392,6 +407,7 @@ static volatile LONG g_guest_dpc_head;
 static volatile LONG g_guest_dpc_tail;
 static CRITICAL_SECTION g_guest_dpc_cs;
 static volatile LONG g_guest_dpc_cs_ready;
+static LONG g_guest_dpc_trace_count;
 
 static void xbox_guest_dpc_lock_init(void)
 {
@@ -418,6 +434,10 @@ static void xbox_queue_guest_dpc(PXBOX_KDPC dpc, PVOID arg1, PVOID arg2)
     g_guest_dpc_queue[tail].arg1 = arg1;
     g_guest_dpc_queue[tail].arg2 = arg2;
     InterlockedExchange(&g_guest_dpc_tail, next);
+    if (InterlockedIncrement(&g_guest_dpc_trace_count) <= 8)
+        fprintf(stderr, "[DPC-QUEUE] enqueue dpc=%p head=%ld tail=%ld depth=%ld\n",
+                (void *)dpc, (long)g_guest_dpc_head, (long)next,
+                (long)((next - g_guest_dpc_head + GUEST_DPC_QUEUE_SIZE) % GUEST_DPC_QUEUE_SIZE));
     LeaveCriticalSection(&g_guest_dpc_cs);
 }
 
@@ -435,6 +455,11 @@ BOOLEAN xbox_kernel_take_guest_dpc(PXBOX_KDPC *Dpc, PVOID *Arg1, PVOID *Arg2)
     if (Arg2) *Arg2 = g_guest_dpc_queue[head].arg2;
     InterlockedExchange(&g_guest_dpc_head,
                         (head + 1) % GUEST_DPC_QUEUE_SIZE);
+    if (InterlockedIncrement(&g_guest_dpc_trace_count) <= 8)
+        fprintf(stderr, "[DPC-QUEUE] take dpc=%p head=%ld tail=%ld depth=%ld\n",
+                (void *)g_guest_dpc_queue[head].dpc, (long)(head + 1) % GUEST_DPC_QUEUE_SIZE,
+                (long)g_guest_dpc_tail,
+                (long)((g_guest_dpc_tail - ((head + 1) % GUEST_DPC_QUEUE_SIZE) + GUEST_DPC_QUEUE_SIZE) % GUEST_DPC_QUEUE_SIZE));
     LeaveCriticalSection(&g_guest_dpc_cs);
     return TRUE;
 }
@@ -645,16 +670,23 @@ BOOLEAN __stdcall xbox_KeInsertQueueDpc(
     PVOID SystemArgument1,
     PVOID SystemArgument2)
 {
+    static int trace_irq_dpc = -1;
+
     if (!Dpc)
         return FALSE;
+
+    if (trace_irq_dpc < 0)
+        trace_irq_dpc = getenv("MM3_TRACE_IRQ_DPC") ? 1 : 0;
 
     Dpc->SystemArgument1 = SystemArgument1;
     Dpc->SystemArgument2 = SystemArgument2;
 
     xbox_queue_guest_dpc(Dpc, SystemArgument1, SystemArgument2);
-    fprintf(stderr, "[DPC] enqueue dpc=%p routine=%08X\n", (void *)Dpc,
-            (unsigned)*(uint32_t *)((uint8_t *)Dpc + 12));
-    fflush(stderr);
+    if (trace_irq_dpc) {
+        fprintf(stderr, "[DPC] enqueue dpc=%p routine=%08X\n", (void *)Dpc,
+                (unsigned)*(uint32_t *)((uint8_t *)Dpc + 12));
+        fflush(stderr);
+    }
 
     return TRUE;
 }

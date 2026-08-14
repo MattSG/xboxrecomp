@@ -2402,6 +2402,8 @@ void xbox_kernel_pump_guest_work(void)
 {
     static int trace_frontier = -1;
     if (trace_frontier < 0) trace_frontier = getenv("MM3_TRACE_PUMP") ? 1 : 0;
+    static int trace_irq_dpc = -1;
+    if (trace_irq_dpc < 0) trace_irq_dpc = getenv("MM3_TRACE_IRQ_DPC") ? 1 : 0;
     int trace_here = trace_frontier && g_icall_count >= 11800ULL && g_icall_count <= 12200ULL;
     if (trace_here) fprintf(stderr, "[PUMP] enter ic=%llu depth=%d esp=%08X\n",
         (unsigned long long)g_icall_count, g_guest_work_depth, g_esp);
@@ -2423,8 +2425,9 @@ void xbox_kernel_pump_guest_work(void)
         uint32_t routine_va = (uint32_t)(uintptr_t)interrupt->ServiceRoutine;
         recomp_func_t isr = recomp_lookup(routine_va);
         if (!isr) isr = recomp_lookup_manual(routine_va);
-        fprintf(stderr, "[IRQ] accept routine=%08X context=%p esp=%08X\n",
-                routine_va, interrupt->ServiceContext, saved_esp);
+        if (trace_irq_dpc)
+            fprintf(stderr, "[IRQ] accept routine=%08X context=%p esp=%08X\n",
+                    routine_va, interrupt->ServiceContext, saved_esp);
         if (isr) {
             if (trace_here) fprintf(stderr, "[PUMP] isr-enter ic=%llu routine=%08X\n",
                 (unsigned long long)g_icall_count, routine_va);
@@ -2441,9 +2444,11 @@ void xbox_kernel_pump_guest_work(void)
             if (trace_here) fprintf(stderr, "[PUMP] isr-exit ic=%llu routine=%08X\n",
                 (unsigned long long)g_icall_count, routine_va);
             g_esp = saved_esp;
-            fprintf(stderr, "[IRQ] return routine=%08X esp=%08X\n", routine_va, g_esp);
+            if (trace_irq_dpc)
+                fprintf(stderr, "[IRQ] return routine=%08X esp=%08X\n", routine_va, g_esp);
         } else {
-            fprintf(stderr, "[IRQ] unresolved routine=%08X\n", routine_va);
+            if (trace_irq_dpc)
+                fprintf(stderr, "[IRQ] unresolved routine=%08X\n", routine_va);
         }
         g_eax = saved_eax; g_ecx = saved_ecx; g_edx = saved_edx;
         g_ebx = saved_ebx; g_esi = saved_esi; g_edi = saved_edi;
@@ -2462,8 +2467,9 @@ void xbox_kernel_pump_guest_work(void)
         uint32_t routine_va = BRIDGE_MEM32(dpc_va + 12);
         recomp_func_t fn = recomp_lookup(routine_va);
         if (!fn) fn = recomp_lookup_manual(routine_va);
-        fprintf(stderr, "[DPC] dispatch routine=%08X esp=%08X\n",
-                routine_va, g_esp);
+        if (trace_irq_dpc)
+            fprintf(stderr, "[DPC] dispatch routine=%08X esp=%08X\n",
+                    routine_va, g_esp);
         if (fn) {
             uint32_t saved_eax = g_eax, saved_ecx = g_ecx, saved_edx = g_edx;
             uint32_t saved_ebx = g_ebx, saved_esi = g_esi, saved_edi = g_edi;
@@ -2512,7 +2518,8 @@ void xbox_kernel_pump_guest_work(void)
             g_seh_ebp = saved_seh;
             g_esp = saved_esp;
         } else {
-            fprintf(stderr, "[DPC] unresolved routine=%08X\n", routine_va);
+            if (trace_irq_dpc)
+                fprintf(stderr, "[DPC] unresolved routine=%08X\n", routine_va);
         }
     }
     if (trace_here) fprintf(stderr, "[PUMP] exit ic=%llu\n",

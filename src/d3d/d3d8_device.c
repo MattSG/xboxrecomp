@@ -157,6 +157,12 @@ static void d3d8_capture_frame(D3D8DeviceState *state, int idx)
  * ================================================================ */
 void d3d8_PresentFrame(void)
 {
+    if (getenv("MM3_TRACE_PRESENT")) {
+        static unsigned trace_frame_pump_count;
+        if (trace_frame_pump_count++ < 16)
+            fprintf(stderr, "[PRESENT-FRAME-PUMP] count=%u\n",
+                    trace_frame_pump_count);
+    }
     /* Pump Windows messages */
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -307,6 +313,12 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
                                               (ID3D11Resource *)state->default_depth,
                                               NULL, &state->default_dsv);
     if (FAILED(hr)) return hr;
+
+    /* The game never emits NV097_CLEAR_SURFACE before its first draws, so the
+     * depth buffer would otherwise be uninitialized and depth-tested geometry
+     * would vanish. Initialize depth like real hardware on first use. */
+    ID3D11DeviceContext_ClearDepthStencilView(state->d3d11_context,
+        state->default_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
     /* Bind default render targets */
     ID3D11DeviceContext_OMSetRenderTargets(state->d3d11_context, 1,
@@ -459,6 +471,13 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
     (void)self; (void)src; (void)dst; (void)hWnd; (void)pDirty;
 
     frame_count++;
+    if (getenv("MM3_TRACE_PRESENT")) {
+        static unsigned trace_present_count;
+        if (trace_present_count++ < 32)
+            fprintf(stderr, "[PRESENT-COM] count=%u begin=%u end=%u draw=%u\n",
+                    trace_present_count, g_d3d_begin_count,
+                    g_d3d_end_count, g_d3d_draw_count);
+    }
     DWORD now = GetTickCount();
     if (last_tick == 0) last_tick = now;
     if (now - last_tick >= 2000) {
@@ -506,6 +525,11 @@ static HRESULT __stdcall dev_BeginScene(IDirect3DDevice8 *self)
     (void)self;
     g_device_state.in_scene = TRUE;
     g_d3d_begin_count++;
+    /* Frame-boundary depth clear (game's boot path emits no clear). */
+    if (g_device_state.default_dsv)
+        ID3D11DeviceContext_ClearDepthStencilView(g_device_state.d3d11_context,
+            g_device_state.default_dsv,
+            D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
     return S_OK;
 }
 
@@ -765,12 +789,22 @@ static UINT          g_up_ring_offset = 0;
 static HRESULT up_ring_init(void)
 {
     D3D11_BUFFER_DESC bd;
+    D3D11_MAPPED_SUBRESOURCE mapped;
     memset(&bd, 0, sizeof(bd));
     bd.ByteWidth = UP_RING_BUFFER_SIZE;
     bd.Usage = D3D11_USAGE_DYNAMIC;
     bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    return ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &g_up_ring_buffer);
+    HRESULT hr = ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &g_up_ring_buffer);
+    if (FAILED(hr)) return hr;
+    /* Pre-warm the first WRITE_DISCARD map so the initial real upload is not
+     * the first map on a fresh dynamic buffer (first-use draws were black). */
+    hr = ID3D11DeviceContext_Map(g_device_state.d3d11_context,
+        (ID3D11Resource *)g_up_ring_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr))
+        ID3D11DeviceContext_Unmap(g_device_state.d3d11_context,
+            (ID3D11Resource *)g_up_ring_buffer, 0);
+    return S_OK;
 }
 
 static void up_ring_shutdown(void)
@@ -786,9 +820,9 @@ static void up_ring_shutdown(void)
 static UINT up_ring_upload(const void *data, UINT size)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
-    D3D11_MAP map_type;
     HRESULT hr;
     UINT offset;
+    static int s_upload_dbg = 0;
 
     if (!g_up_ring_buffer) {
         if (FAILED(up_ring_init())) return (UINT)-1;
@@ -796,16 +830,20 @@ static UINT up_ring_upload(const void *data, UINT size)
 
     if (size > UP_RING_BUFFER_SIZE) return (UINT)-1;
 
-    /* Wrap around if not enough space */
-    if (g_up_ring_offset + size > UP_RING_BUFFER_SIZE) {
+    /* WRITE_DISCARD is safe for the whole ring: prior GPU references to the
+     * old contents have been consumed by the draws that issued them, and
+     * WRITE_NO_OVERWRITE on freshly allocated (never-written) GPU memory can
+     * leave the buffer reading back as zeros -> degenerate vertices. */
+    if (g_up_ring_offset + size > UP_RING_BUFFER_SIZE)
         g_up_ring_offset = 0;
-        map_type = D3D11_MAP_WRITE_DISCARD;
-    } else {
-        map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
-    }
 
     hr = ID3D11DeviceContext_Map(g_device_state.d3d11_context,
-        (ID3D11Resource *)g_up_ring_buffer, 0, map_type, 0, &mapped);
+        (ID3D11Resource *)g_up_ring_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (getenv("MM3_CAPTURE") && s_upload_dbg < 4) {
+        s_upload_dbg++;
+        fprintf(stderr, "[RING] upload %d size=%u map_hr=0x%08lX\n",
+                s_upload_dbg, size, (unsigned long)hr);
+    }
     if (FAILED(hr)) return (UINT)-1;
 
     offset = g_up_ring_offset;
@@ -830,8 +868,8 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
 
     /* Prepare pipeline: shaders, input layout, constant buffers, render states */
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader); /* FFP VS+PS fallback */
+    d3d8_vsh_prepare_draw(g_device_state.vertex_shader);     /* programmable VS overrides */
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -851,8 +889,8 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     if (index_count == 0) return E_INVALIDARG;
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader); /* FFP VS+PS fallback */
+    d3d8_vsh_prepare_draw(g_device_state.vertex_shader);     /* programmable VS overrides */
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -896,13 +934,234 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
         0, 1, &g_up_ring_buffer, &VertexStreamZeroStride, &ring_offset);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader); /* FFP VS+PS fallback */
+    d3d8_vsh_prepare_draw(g_device_state.vertex_shader);     /* programmable VS overrides */
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
     ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, 0);
+
+    /* Diagnostic (MM3): capture backbuffer right after the first 3 real
+     * draws to prove game vertices reach the D3D11 render target. */
+    if (getenv("MM3_CAPTURE") && g_d3d_draw_count <= 3) {
+        if (g_d3d_draw_count == 1) {
+            const DWORD *rsi = d3d8_GetRenderStates();
+            const float *pf = (const float *)pVertexData;
+            fprintf(stderr, "[DRAW] pt=%d count=%u stride=%u vsh=%08X\n",
+                    (int)PrimitiveType, PrimitiveCount, VertexStreamZeroStride,
+                    g_device_state.vertex_shader);
+            for (UINT vi = 0; vi < vertex_count && vi < 4; vi++) {
+                const float *vp = pf + vi * (VertexStreamZeroStride / 4);
+                fprintf(stderr, "[DRAW]  v%u xyzrhw=(%g,%g,%g,%g) c=%08X uv=(%g,%g)\n",
+                        vi, vp[0], vp[1], vp[2], vp[3],
+                        *(const uint32_t *)(vp + 4), vp[5], vp[6]);
+            }
+            fprintf(stderr, "[DRAW] rs ZEN=%u ZFUNC=%u CULL=%u ZW=%u AT=%u AB=%u CWE168=%X SF=%u DF=%u\n",
+                    rsi[7], rsi[23], rsi[22], rsi[14], rsi[15], rsi[27],
+                    rsi[168], rsi[19], rsi[20]);
+        }
+        d3d8_capture_frame(&g_device_state, 900 + (int)g_d3d_draw_count);
+        {
+            ID3D11VertexShader *dvs = NULL;
+            ID3D11PixelShader  *dps = NULL;
+            ID3D11InputLayout *dil = NULL;
+            ID3D11DeviceContext_VSGetShader(g_device_state.d3d11_context, &dvs, NULL, NULL);
+            ID3D11DeviceContext_PSGetShader(g_device_state.d3d11_context, &dps, NULL, NULL);
+            ID3D11DeviceContext_IAGetInputLayout(g_device_state.d3d11_context, &dil);
+            fprintf(stderr, "[STATE] after draw %u: VS=%p PS=%p IL=%p\n",
+                    g_d3d_draw_count, (void *)dvs, (void *)dps, (void *)dil);
+            if (dvs) ID3D11VertexShader_Release(dvs);
+            if (dps) ID3D11PixelShader_Release(dps);
+            if (dil) ID3D11InputLayout_Release(dil);
+        }
+        if (g_d3d_draw_count == 1 && getenv("MM3_PROBES")) {
+            /* Isolated D3D11 diagnostics (env MM3_CAPTURE, draw #1 only).
+             * Does NOT modify the game draw path. Probes:
+             *   991 FFP pretransform + game coords (2560x1920)
+             *   992 trivial VS/PS + NDC half-screen triangle
+             *   993 trivial VS/PS + game triangle in NDC (-1,1),(7,1),(-1,-7)
+             *   994 FFP pretransform + 2x coords (1280x960) */
+            ID3D11RenderTargetView *prtv = NULL;
+            ID3D11DepthStencilView *pdsv = NULL;
+            ID3D11DeviceContext_OMGetRenderTargets(g_device_state.d3d11_context,
+                1, &prtv, &pdsv);
+            ID3D11Resource *pres = NULL;
+            if (prtv) {
+                D3D11_TEXTURE2D_DESC ptd;
+                ID3D11RenderTargetView_GetResource(prtv, &pres);
+                if (pres) {
+                    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)pres, &ptd);
+                    fprintf(stderr, "[PROBE] RTV res=%ux%u fmt=%d\n",
+                            ptd.Width, ptd.Height, (int)ptd.Format);
+                    ID3D11Resource_Release(pres);
+                }
+                ID3D11RenderTargetView_Release(prtv);
+            }
+            fprintf(stderr, "[PROBE] DSV %s\n", pdsv ? "bound" : "NONE");
+            if (pdsv) ID3D11DepthStencilView_Release(pdsv);
+            {
+                D3D11_VIEWPORT pvp[4]; UINT pn = 4;
+                ID3D11DeviceContext_RSGetViewports(g_device_state.d3d11_context, &pn, pvp);
+                fprintf(stderr, "[PROBE] viewports=%u vp0=(%g,%g %gx%g)\n", pn,
+                        pvp[0].TopLeftX, pvp[0].TopLeftY, pvp[0].Width, pvp[0].Height);
+                D3D11_RECT psr[4]; UINT psn = 4;
+                ID3D11DeviceContext_RSGetScissorRects(g_device_state.d3d11_context, &psn, psr);
+                fprintf(stderr, "[PROBE] scissors=%u", psn);
+                for (UINT si = 0; si < psn; si++)
+                    fprintf(stderr, " [%ld,%ld %ldx%ld]",
+                            psr[si].left, psr[si].top,
+                            psr[si].right - psr[si].left, psr[si].bottom - psr[si].top);
+                fprintf(stderr, "\n");
+            }
+
+            static const char pvs_src[] =
+                "void main(float4 p : POSITION, out float4 o : SV_POSITION) { o = p; }";
+            static const char pps_src[] =
+                "void main(out float4 c : SV_TARGET) { c = float4(1,1,1,1); }";
+            ID3DBlob *pvsb = NULL, *ppsbb = NULL, *perrs = NULL;
+            ID3D11VertexShader *ppvs = NULL;
+            ID3D11PixelShader *ppps = NULL;
+            ID3D11InputLayout *ppil = NULL;
+            if (SUCCEEDED(D3DCompile(pvs_src, sizeof(pvs_src)-1, "pv", NULL, NULL,
+                    "main", "vs_5_0", 0, 0, &pvsb, &perrs)) &&
+                SUCCEEDED(D3DCompile(pps_src, sizeof(pps_src)-1, "pp", NULL, NULL,
+                    "main", "ps_5_0", 0, 0, &ppsbb, &perrs))) {
+                D3D11_INPUT_ELEMENT_DESC pied[1] = {
+                    { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+                      D3D11_INPUT_PER_VERTEX_DATA, 0 } };
+                if (SUCCEEDED(ID3D11Device_CreateVertexShader(g_device_state.d3d11_device,
+                        ID3D10Blob_GetBufferPointer(pvsb), ID3D10Blob_GetBufferSize(pvsb), NULL, &ppvs)) &&
+                    SUCCEEDED(ID3D11Device_CreatePixelShader(g_device_state.d3d11_device,
+                        ID3D10Blob_GetBufferPointer(ppsbb), ID3D10Blob_GetBufferSize(ppsbb), NULL, &ppps)) &&
+                    SUCCEEDED(ID3D11Device_CreateInputLayout(g_device_state.d3d11_device,
+                        pied, 1, ID3D10Blob_GetBufferPointer(pvsb), ID3D10Blob_GetBufferSize(pvsb), &ppil))) {
+
+                    float ndc_a[12] = { -1,-1,0,1, 1,-1,0,1, -1,1,0,1 };
+                    float ndc_b[12] = { -1,1,0,1, 7,1,0,1, -1,-7,0,1 };
+
+                    /* draw_ndc(idx, data): bind trivial pipeline and draw */
+                    /* (inlined below via helper lambda-free block) */
+                    ID3D11Buffer *pvb = NULL;
+                    D3D11_BUFFER_DESC pbd;
+                    D3D11_SUBRESOURCE_DATA psd;
+                    memset(&pbd, 0, sizeof(pbd));
+                    pbd.ByteWidth = sizeof(ndc_a);
+                    pbd.Usage = D3D11_USAGE_IMMUTABLE;
+                    pbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                    psd.pSysMem = ndc_a;
+                    if (SUCCEEDED(ID3D11Device_CreateBuffer(g_device_state.d3d11_device,
+                            &pbd, &psd, &pvb))) {
+                        UINT po = 0, ps = 16;
+                        ID3D11DeviceContext_IASetInputLayout(g_device_state.d3d11_context, ppil);
+                        ID3D11DeviceContext_VSSetShader(g_device_state.d3d11_context, ppvs, NULL, 0);
+                        ID3D11DeviceContext_PSSetShader(g_device_state.d3d11_context, ppps, NULL, 0);
+                        ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
+                            0, 1, &pvb, &ps, &po);
+                        ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context,
+                            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        ID3D11DeviceContext_Draw(g_device_state.d3d11_context, 3, 0);
+                        d3d8_capture_frame(&g_device_state, 992);
+                        ID3D11Buffer_Release(pvb);
+                    }
+
+                    memset(&pbd, 0, sizeof(pbd));
+                    pbd.ByteWidth = sizeof(ndc_b);
+                    pbd.Usage = D3D11_USAGE_IMMUTABLE;
+                    pbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                    psd.pSysMem = ndc_b;
+                    if (SUCCEEDED(ID3D11Device_CreateBuffer(g_device_state.d3d11_device,
+                            &pbd, &psd, &pvb))) {
+                        UINT po = 0, ps = 16;
+                        ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
+                            0, 1, &pvb, &ps, &po);
+                        ID3D11DeviceContext_Draw(g_device_state.d3d11_context, 3, 0);
+                        d3d8_capture_frame(&g_device_state, 993);
+                        ID3D11Buffer_Release(pvb);
+                    }
+
+                    /* 994: FFP pretransform + 2x coords (1280x960) */
+                    struct { float x, y, z, rhw; uint32_t color; float u, v; } tv2[3] = {
+                        { 0.0f, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                        { 1280.0f, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                        { 0.0f, 960.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                    };
+                    UINT t2stride = (UINT)sizeof(tv2[0]);
+                    UINT t2off = up_ring_upload(tv2, (UINT)sizeof(tv2));
+                    if (t2off != (UINT)-1) {
+                        d3d8_shaders_prepare_draw(0x144);
+                        d3d8_vsh_prepare_draw(0);
+                        d3d8_combiners_prepare_draw();
+                        d3d8_states_apply();
+                        ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
+                            0, 1, &g_up_ring_buffer, &t2stride, &t2off);
+                        ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context,
+                            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        ID3D11DeviceContext_Draw(g_device_state.d3d11_context, 3, 0);
+                        d3d8_capture_frame(&g_device_state, 994);
+                    }
+
+                    /* 991: FFP pretransform + game coords (2560x1920) control */
+                    struct { float x, y, z, rhw; uint32_t color; float u, v; } tv3[3] = {
+                        { 0.0f, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                        { 2560.0f, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                        { 0.0f, 1920.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                    };
+                    UINT t3stride = (UINT)sizeof(tv3[0]);
+                    UINT t3off = up_ring_upload(tv3, (UINT)sizeof(tv3));
+                    if (t3off != (UINT)-1) {
+                        d3d8_shaders_prepare_draw(0x144);
+                        d3d8_vsh_prepare_draw(0);
+                        d3d8_combiners_prepare_draw();
+                        d3d8_states_apply();
+                        ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
+                            0, 1, &g_up_ring_buffer, &t3stride, &t3off);
+                        ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context,
+                            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        ID3D11DeviceContext_Draw(g_device_state.d3d11_context, 3, 0);
+                        d3d8_capture_frame(&g_device_state, 991);
+                    }
+                }
+            }
+            /* 995/996: drive dev_DrawPrimitiveUP through the real vtbl with
+             * the game's coords (995) and 640x480 coords (996). */
+            {
+                IDirect3DDevice8 *pdev = d3d8_GetDevice();
+                struct { float x, y, z, rhw; uint32_t color; float u, v; } tv5[3] = {
+                    { 0.0f, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                    { 2560.0f, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                    { 0.0f, 1920.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                };
+                struct { float x, y, z, rhw; uint32_t color; float u, v; } tv6[3] = {
+                    { 0.0f, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                    { 640.0f, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                    { 0.0f, 480.0f, 0.0f, 1.0f, 0xFFFFFFFFu, 0.0f, 0.0f },
+                };
+                HRESULT phr = pdev->lpVtbl->DrawPrimitiveUP(pdev, D3DPT_TRIANGLELIST, 1, tv5, (UINT)sizeof(tv5[0]));
+                fprintf(stderr, "[PROBE] vtbl DrawPrimitiveUP(2560x1920) hr=0x%08lX\n", phr);
+                d3d8_capture_frame(&g_device_state, 995);
+                phr = pdev->lpVtbl->DrawPrimitiveUP(pdev, D3DPT_TRIANGLELIST, 1, tv6, (UINT)sizeof(tv6[0]));
+                fprintf(stderr, "[PROBE] vtbl DrawPrimitiveUP(640x480) hr=0x%08lX\n", phr);
+                d3d8_capture_frame(&g_device_state, 996);
+            }
+            if (perrs) { fprintf(stderr, "[PROBE] compile errors: %s\n", (char *)ID3D10Blob_GetBufferPointer(perrs)); ID3D10Blob_Release(perrs); }
+            if (ppil) ID3D11InputLayout_Release(ppil);
+            if (ppps) ID3D11PixelShader_Release(ppps);
+            if (ppvs) ID3D11VertexShader_Release(ppvs);
+            if (pvsb) ID3D10Blob_Release(pvsb);
+            if (ppsbb) ID3D10Blob_Release(ppsbb);        }
+    }
+
+    /* Sample later real draws so the first recognizable game frame is not
+     * limited to the initial clear/triangle draws. */
+    if (getenv("MM3_CAPTURE") && g_d3d_draw_count > 3) {
+        static const UINT sample_counts[] = { 10, 50, 100, 250, 500, 1000, 2000, 5000, 10000 };
+        int i;
+        for (i = 0; i < (int)(sizeof(sample_counts) / sizeof(sample_counts[0])); i++) {
+            if (g_d3d_draw_count == sample_counts[i])
+                d3d8_capture_frame(&g_device_state, 1000 + (int)g_d3d_draw_count);
+        }
+    }
 
     /* Restore previous VB binding if any */
     if (g_cur_vb) {
@@ -961,8 +1220,8 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
         tmp_ib, ib_fmt, 0);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
-        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader); /* FFP VS+PS fallback */
+    d3d8_vsh_prepare_draw(g_device_state.vertex_shader);     /* programmable VS overrides */
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 

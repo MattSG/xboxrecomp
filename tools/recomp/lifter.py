@@ -180,7 +180,11 @@ def _fmt_mem_write(op, value_expr):
     """Format writing to a memory operand."""
     accessor = _mem_accessor(op.mem_size)
     if op.mem_segment == "fs":
-        return f"FS{op.mem_size * 8}({_fmt_mem(op)}) = {value_expr};"
+        addr = _fmt_mem(op)
+        write = f"FS{op.mem_size * 8}({addr}) = {value_expr};"
+        if addr == "0" and op.mem_size == 4:
+            return write[:-1] + f" /* fs:[0] */; recomp_trace_fs0_write({value_expr});"
+        return write
     addr = _fmt_mem(op)
     return f"{accessor}({addr}) = {value_expr};"
 
@@ -766,6 +770,9 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
     cond_expr, desc = result
     target = second.jump_target
     stmt = _emit_cond_goto(cond_expr, second.mnemonic, desc, target, lifter)
+    if lifter is not None and lifter.func_start == 0x00086097:
+        stmt = ("recomp_trace_sched_callback(0, MEM32(0x00362014), "
+                "MEM8(ebp - 29), g_esp); " + stmt)
     return (stmt, 2)
 
 
@@ -1140,6 +1147,33 @@ class Lifter:
             return [f"/* mov: bad operands */"]
         src = _fmt_operand_read(ops[1])
         lines = [_fmt_operand_write(ops[0], src)]
+        if (ops[0].type == "mem" and
+                0x00340000 <= self.func_start < 0x00358000 and
+                not ops[0].mem_index and ops[0].mem_disp == 8):
+            lines.append(
+                f"recomp_trace_watch_write(0x{insn.address:08X}, "
+                f"{_fmt_mem(ops[0])}, (uint32_t)({src}));")
+        if (ops[0].type == "mem" and ops[0].mem_base is None and
+                not ops[0].mem_index and ops[0].mem_disp == 0x003C5CDC):
+            lines.append(
+                f"recomp_trace_gate_write(0x{insn.address:08X}, (uint32_t)({src}));")
+        if (ops[0].type == "mem" and self.func_start in
+                (0x00344410, 0x003444C0, 0x00344640) and
+                ops[0].mem_base == "esi" and not ops[0].mem_index and
+                ops[0].mem_disp in (0x2C, 0x30, 0x17C0)):
+            lines.append(
+                f"recomp_trace_ring_write(0x{insn.address:08X}, "
+                f"{_fmt_mem(ops[0])});")
+        if (ops[0].type == "mem" and self.func_start == 0x00344640 and
+                ops[0].mem_base == "esi" and not ops[0].mem_index and
+                ops[0].mem_disp == 0x1970):
+            lines.append(f"recomp_trace_display_arm(0x{insn.address:08X}, {_fmt_mem(ops[0])});")
+        if (ops[0].type == "mem" and self.func_start == 0x00344410 and
+                ops[0].mem_base == "eax" and not ops[0].mem_index and
+                ops[0].mem_disp in (0, 4, 8, 0xC, 0x10, 0x14)):
+            lines.append(
+                f"recomp_trace_ring_record_write(0x{insn.address:08X}, "
+                f"{_fmt_mem(ops[0])});")
         # "mov ebp, esp" establishes this function's frame pointer. Mirror it
         # into g_seh_ebp so a leaf callee that inherits the caller frame via
         # "ebp = g_seh_ebp" sees the current frame instead of a stale frame
@@ -1492,11 +1526,42 @@ class Lifter:
                 lines.insert(0, f"recomp_trace_pump_call(0x{insn.address:08X}, (uint32_t)eax);")
             if insn.call_target == 0x001EC7F7:
                 lines.insert(0, f"recomp_trace_frame_call(0x{insn.address:08X});")
-            if insn.call_target in (0x001E73AF, 0x001E7627):
+            if self.func_start in (0x00170ED1, 0x00170EE2):
+                lines.insert(0, f"recomp_trace_callback_helper(0x{self.func_start:08X}, 0x{insn.address:08X});")
+            if (insn.call_target in (0x001E73AF, 0x001E7627, 0x00344640, 0x00344A20,
+                                     0x00344360, 0x00345740, 0x00346450,
+                                     0x00348C99) or
+                    (self.func_start == 0x001EC708 and insn.call_target == 0x001EC6EE) or
+                    (self.func_start == 0x001E7627 and insn.call_target in (
+                        0x001EC8CE, 0x0020F7EB, 0x001F33A2)) or
+                    (self.func_start == 0x001E7627 and insn.call_target in (
+                        0x001C032D, 0x001C01B5, 0x001ECD56,
+                        0x001E7E29, 0x001E839C)) or
+                    (self.func_start == 0x001E839C and insn.call_target in (
+                        0x001E7D65, 0x001E82DB, 0x0017013D, 0x00025384,
+                        0x00025339, 0x001EC708, 0x0016FF04, 0x0002539A,
+                        0x001E7F1B, 0x001E7B41, 0x00170EC0, 0x001E7AF4,
+                        0x00083B04)) or
+                    (self.func_start == 0x001E7F1B and insn.call_target in (
+                        0x00340460, 0x0033FD10, 0x00342AE0, 0x000F5050,
+                        0x000F5027, 0x000F4FEF, 0x00342B00, 0x00342860)) or
+                    (self.func_start == 0x00342B00 and
+                        insn.call_target == 0x00347170) or
+                         (self.func_start == 0x00347170 and
+                          insn.call_target in (0x00344A20, 0x00346F40)) or
+                         (self.func_start == 0x00344A20 and
+                          insn.call_target == 0x00344640) or
+                         (self.func_start == 0x00344640 and
+                          insn.call_target in (0x00344410, 0x00344520,
+                                               0x003444C0, 0x003444AB0))):
                 lines.insert(0, f"recomp_trace_sched_call(0x{insn.call_target:08X}, 0x{insn.address:08X});")
                 lines.append(
                     f"recomp_trace_sched_result(0x{insn.call_target:08X}, "
                     f"0x{insn.address:08X}, (uint32_t)eax, (uint32_t)esp);")
+                if insn.call_target in (0x001E7F1B, 0x001E7B41):
+                    lines.append(
+                        f"recomp_trace_sched_loop_result(0x{insn.call_target:08X}, "
+                        f"0x{insn.address:08X}, (uint32_t)eax, (uint32_t)esp);")
             # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
             # Also after the alternate prolog variants (fs:[0] write + lea
             # ebp,[esp+N]) that establish ebp but are not the detected helper.
@@ -1512,6 +1577,13 @@ class Lifter:
             bias = 4 if (ops[0].type == "mem" and ops[0].mem_base == "esp") else 0
             target = _fmt_operand_read(ops[0], disp_bias=bias)
             lines = [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
+            if self.func_start == 0x00086097:
+                lines.insert(0, "recomp_trace_sched_callback(0, MEM32(0x00362014), MEM32(esp), g_esp);")
+                lines.append("recomp_trace_sched_callback(1, MEM32(0x00362014), eax, g_esp);")
+            if self.func_start == 0x00344640 and not insn.call_target:
+                lines = ["PUSH32(esp, 0);", "recomp_trace_sched_callback(0, edi, esi, g_esp);",
+                         f"RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
+                lines.append(f"recomp_trace_sched_callback(1, {target}, eax, g_esp);")
             for slot in (0x00361F50, 0x003620A8, 0x003620A4):
                 if f"0x{slot:X}" in target:
                     lines.insert(0, f"recomp_trace_init_icall(0x{slot:08X}, {target}, 0x{insn.address:08X});")
@@ -1587,7 +1659,11 @@ class Lifter:
                 # Tail call - no return address push (reuses current frame's)
                 # Bridge ebp so the target function can inherit our frame pointer.
                 name = self._call_target_name(insn.jump_target)
-                return [f"g_seh_ebp = ebp; {name}(); return; /* tail jmp 0x{insn.jump_target:08X} */"]
+                lines = []
+                if insn.jump_target == 0x00343E60:
+                    lines.append(f"recomp_trace_pump_call(0x{insn.address:08X}, (uint32_t)eax);")
+                lines.append(f"g_seh_ebp = ebp; {name}(); return; /* tail jmp 0x{insn.jump_target:08X} */")
+                return lines
             return [f"goto loc_{insn.jump_target:08X};"]
         elif len(ops) >= 1:
             # Detect intra-function switch tables (computed gotos)
