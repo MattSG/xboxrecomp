@@ -479,7 +479,7 @@ static void submit_draw(void)
     g_pg.stats.draw_calls++;
     g_pg.stats.vertices_submitted += num_verts;
 
-    if (g_pg.stats.draw_calls <= 5 || (g_pg.stats.draw_calls % 1000) == 0) {
+    if (g_pg.stats.draw_calls <= 40 || (g_pg.stats.draw_calls % 1000) == 0) {
         fprintf(stderr, "[PGRAPH-D3D11] Draw #%u: %u verts, prim=%d, prims=%u\n",
                 g_pg.stats.draw_calls, num_verts, g_pg.d3d_prim_type, prim_count);
     }

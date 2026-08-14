@@ -692,8 +692,16 @@ static int g_pgraph_in_begin = 0;
 void pgraph_method(NV2AState *d, uint32_t subchannel,
                    uint32_t method, uint32_t param)
 {
+    static int s_trace_unhandled = -1;
+    static int s_trace_methods = -1;
+    if (s_trace_unhandled < 0) s_trace_unhandled = getenv("MM3_TRACE_UNHANDLED") ? 1 : 0;
+    if (s_trace_methods < 0) s_trace_methods = getenv("MM3_TRACE_METHODS") ? 1 : 0;
+
     g_pgraph_method_count++;
 
+    if (s_trace_methods && g_pgraph_method_count <= 20000)
+        fprintf(stderr, "[PGRAPH-METHOD] #%u sub=%u 0x%04X = 0x%08X\n",
+                g_pgraph_method_count, subchannel, method, param);
 
     /* Route through D3D11 translator first */
     if (pgraph_d3d11_method(subchannel, method, param)) {
@@ -704,8 +712,9 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
         return;
     }
 
-    /* Log unhandled methods (first 20 + periodic) */
-    if (g_pgraph_method_count <= 20 || (g_pgraph_method_count % 5000) == 0) {
+    /* Log unhandled methods (first 20 + periodic, or every one when traced) */
+    if (s_trace_unhandled ||
+        g_pgraph_method_count <= 20 || (g_pgraph_method_count % 5000) == 0) {
         fprintf(stderr, "[PGRAPH] #%u UNHANDLED sub=%u 0x%04X = 0x%08X\n",
                 g_pgraph_method_count, subchannel, method, param);
     }

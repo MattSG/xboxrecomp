@@ -175,7 +175,7 @@ void d3d8_PresentFrame(void)
     if (getenv("MM3_CAPTURE") && g_device_state.swap_chain) {
         static int s_cap_n = 0;
         int idx = s_cap_n++;
-        if (idx < 6 || (idx >= 100 && idx < 106))
+        if (idx < 20 || (idx >= 100 && idx < 106))
             d3d8_capture_frame(&g_device_state, idx);
     }
 
