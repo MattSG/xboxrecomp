@@ -923,13 +923,12 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
             if (colorop == 0) colorop = (stage == 0) ? D3DTOP_MODULATE : D3DTOP_DISABLE;
 
             pc->stage_color[stage][0] = colorop;
-            pc->stage_color[stage][1] = tss[D3DTSS_COLORARG1] ? tss[D3DTSS_COLORARG1] : D3DTA_TEXTURE;
-            pc->stage_color[stage][2] = tss[D3DTSS_COLORARG2] ? tss[D3DTSS_COLORARG2] : D3DTA_CURRENT;
-            pc->stage_color[stage][3] = tss[D3DTSS_ALPHAOP] ? tss[D3DTSS_ALPHAOP] :
-                                         (stage == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE);
+            pc->stage_color[stage][1] = tss[D3DTSS_COLORARG1];
+            pc->stage_color[stage][2] = tss[D3DTSS_COLORARG2];
+            pc->stage_color[stage][3] = tss[D3DTSS_ALPHAOP];
 
-            pc->stage_alpha[stage][0] = tss[D3DTSS_ALPHAARG1] ? tss[D3DTSS_ALPHAARG1] : D3DTA_TEXTURE;
-            pc->stage_alpha[stage][1] = tss[D3DTSS_ALPHAARG2] ? tss[D3DTSS_ALPHAARG2] : D3DTA_CURRENT;
+            pc->stage_alpha[stage][0] = tss[D3DTSS_ALPHAARG1];
+            pc->stage_alpha[stage][1] = tss[D3DTSS_ALPHAARG2];
         }
 
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_ps_cb, 0);

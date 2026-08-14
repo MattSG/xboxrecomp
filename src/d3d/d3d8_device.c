@@ -336,6 +336,18 @@ static void d3d8_init_default_states(D3D8DeviceState *state)
     state->render_states[D3DRS_STENCILENABLE]     = FALSE;
     state->render_states[D3DRS_COLORWRITEENABLE]  = 0x0F;
 
+    /* Default texture-stage state.  The shader translator reads these
+     * directly, so leave valid D3D8 values here rather than relying on a
+     * zero-value sentinel that collides with D3DTA_DIFFUSE. */
+    for (int stage = 0; stage < MAX_TEXTURE_STAGES; stage++) {
+        state->tss[stage][D3DTSS_COLOROP]   = (stage == 0) ? D3DTOP_MODULATE : D3DTOP_DISABLE;
+        state->tss[stage][D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+        state->tss[stage][D3DTSS_COLORARG2] = D3DTA_CURRENT;
+        state->tss[stage][D3DTSS_ALPHAOP]   = (stage == 0) ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE;
+        state->tss[stage][D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+        state->tss[stage][D3DTSS_ALPHAARG2] = D3DTA_CURRENT;
+    }
+
     /* Default viewport */
     state->viewport.X = 0;
     state->viewport.Y = 0;
