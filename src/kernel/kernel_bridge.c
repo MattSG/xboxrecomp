@@ -2576,7 +2576,7 @@ static void kernel_thunk_dispatch(void)
 
     if (getenv("MM3_TRACE_LOCK_STACK") && (ordinal == 277 || ordinal == 294)) {
         static int s_lock_stack_n;
-        if (s_lock_stack_n++ < 24) {
+        if (g_kernel_call_count > 500000 && s_lock_stack_n++ < 24) {
             uintptr_t ra = (uintptr_t)_ReturnAddress();
             fprintf(stderr, "[LOCK-STACK] #%u ordinal=%u ic=%llu ra=%zX esp=%08X eax=%08X ecx=%08X edx=%08X\n",
                     s_lock_stack_n, ordinal, (unsigned long long)g_icall_count,
