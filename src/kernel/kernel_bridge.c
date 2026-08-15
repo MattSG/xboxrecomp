@@ -2558,11 +2558,13 @@ static void kernel_thunk_dispatch(void)
         ordinal == 302 || ordinal == 312 || ordinal == 354) {
         uintptr_t ra = (uintptr_t)_ReturnAddress();
         fprintf(stderr, "[KERNEL-SPECIAL] ordinal=%u slot=%d ic=%llu guest_esp=%08X "
-            "dispatch_caller_rva=%zX penter_rva=%zX eax=%08X ecx=%08X edx=%08X\n",
+            "dispatch_caller_rva=%zX penter_rva=%zX eax=%08X ecx=%08X edx=%08X "
+            "a0=%08X a1=%08X a2=%08X a3=%08X a4=%08X\n",
             ordinal, slot,
             (unsigned long long)g_icall_count, g_esp,
             (size_t)(ra - (uintptr_t)GetModuleHandleW(NULL)),
-            (size_t)g_penter_last_rva, g_eax, g_ecx, g_edx);
+            (size_t)g_penter_last_rva, g_eax, g_ecx, g_edx,
+            STACK_ARG(0), STACK_ARG(1), STACK_ARG(2), STACK_ARG(3), STACK_ARG(4));
         {
             void *frames[6];
             USHORT n = CaptureStackBackTrace(0, 6, frames, NULL);
