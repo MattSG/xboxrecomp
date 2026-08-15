@@ -110,7 +110,8 @@ def _fixup_icall_esp_save(lines):
     return result
 
 
-def _fixup_unbalanced_saves(lines, func_addr=None, seh_epilog=None):
+def _fixup_unbalanced_saves(lines, func_addr=None, seh_epilog=None,
+                            skip_rebalance=False):
     """
     Balance callee-saved register save/restore in intra-function
     shared-epilogue functions.
@@ -138,6 +139,8 @@ def _fixup_unbalanced_saves(lines, func_addr=None, seh_epilog=None):
     pool base 0x02780000 into the vector grow, corrupting the copy args and
     causing a runaway copy loop).
     """
+    if skip_rebalance:
+        return lines
     if seh_epilog is not None and func_addr == seh_epilog:
         return lines
     import re
@@ -622,8 +625,13 @@ class FunctionTranslator:
         # register-push scan sees the final prologue layout. The SEH epilog is
         # excluded: its pops consume the SEH prolog's pushes (a different
         # function), so rebalancing it would rotate callee-saved registers.
+        # A jump_target seed is a mid-function continuation (e.g. a longjmp
+        # resume point). Its parent prologue owns the callee-saved pushes, so
+        # injecting a fresh push block here shifts the inherited stack frame
+        # and corrupts the restore slots.
         lines = _fixup_unbalanced_saves(
-            lines, func_addr=start, seh_epilog=self.lifter.SEH_EPILOG)
+            lines, func_addr=start, seh_epilog=self.lifter.SEH_EPILOG,
+            skip_rebalance=(func_info.get("detection_method") == "jump_target"))
 
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)

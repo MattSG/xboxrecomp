@@ -109,6 +109,34 @@ def test_preserves_function_entry_label():
     print("ok  preserves_function_entry_label")
 
 
+def _sample_jump_target():
+    """A longjmp continuation: the parent already saved edi/esi/ebp, so the
+    recovered jump_target fragment must not inject its own save block."""
+    return [
+        "void sub_000886E0(void)",
+        "{",
+        "loc_000886E0: ;",
+        "    _cf = 0;",
+        "    esi = MEM32(ebp + -4);",
+        "    POP32(esp, ecx);",
+        "    POP32(esp, ecx);",
+        "loc_00088720: ;",
+        "    POP32(esp, edi);",
+        "    POP32(esp, esi);",
+        "    esp = ebp;",
+        "    POP32(esp, ebp);",
+        "    esp += 8; return;",
+        "}",
+    ]
+
+
+def test_jump_target_skip_rebalance_is_untouched():
+    sample = _sample_jump_target()
+    out = _fixup_unbalanced_saves(list(sample), skip_rebalance=True)
+    assert out == sample, "jump_target continuation must keep parent pushes"
+    print("ok  jump_target_skip_rebalance_is_untouched")
+
+
 def _sample_seh_epilog():
     """The MSVC __SEH_epilog: pops edi/esi/ebx that the __SEH_prolog (a
     different function) pushed. Within this one function the pops outnumber
@@ -258,4 +286,5 @@ if __name__ == "__main__":
     test_arg_cleanup_epilog_is_not_rebalanced()
     test_leave_ebp_balanced_is_not_rebalanced()
     test_exclusive_exit_pops_are_not_rebalanced()
+    test_jump_target_skip_rebalance_is_untouched()
     print("\nall passed")
