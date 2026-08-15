@@ -2574,6 +2574,24 @@ static void kernel_thunk_dispatch(void)
         fflush(stderr);
     }
 
+    if (getenv("MM3_TRACE_LOCK_STACK") && (ordinal == 277 || ordinal == 294)) {
+        static int s_lock_stack_n;
+        if (s_lock_stack_n++ < 24) {
+            uintptr_t ra = (uintptr_t)_ReturnAddress();
+            fprintf(stderr, "[LOCK-STACK] #%u ordinal=%u ic=%llu ra=%zX esp=%08X eax=%08X ecx=%08X edx=%08X\n",
+                    s_lock_stack_n, ordinal, (unsigned long long)g_icall_count,
+                    (size_t)(ra - (uintptr_t)GetModuleHandleW(NULL)), g_esp, g_eax, g_ecx, g_edx);
+            void *frames[12];
+            USHORT n = CaptureStackBackTrace(0, 12, frames, NULL);
+            HMODULE mod = GetModuleHandleW(NULL);
+            for (USHORT i = 0; i < n; ++i)
+                fprintf(stderr, "[LOCK-STACK-FRAME] %u rva=%zX\n", i,
+                    (size_t)((uintptr_t)frames[i] - (uintptr_t)mod));
+            fflush(stderr);
+        }
+    }
+
+
     /* Guest thread owns register globals here; host producers only queue. */
     xbox_kernel_pump_guest_work();
 
