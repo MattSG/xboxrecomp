@@ -1867,7 +1867,7 @@ static void bridge_RtlInitAnsiString(void)
     const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(src);
     while (p[len]) len++;
     if (len > 0xFFFF) len = 0xFFFF;
-    {
+    if (getenv("MM3_TRACE_ANSI")) {
         static int s_ansi = 0;
         if (dst < 0x04000000u) {
             const uint8_t *dp = (const uint8_t *)XBOX_TO_NATIVE(dst);
