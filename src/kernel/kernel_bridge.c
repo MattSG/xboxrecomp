@@ -2631,8 +2631,8 @@ static void kernel_thunk_dispatch(void)
         static DWORD last_summary_tick = 0;
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
-                    g_kernel_call_count, ordinal, slot, g_esp);
+            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X penter=%zX\n",
+                    g_kernel_call_count, ordinal, slot, g_esp, (size_t)g_penter_last_rva);
             fflush(stderr);
             last_summary_tick = now;
         }
