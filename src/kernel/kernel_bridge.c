@@ -43,6 +43,7 @@ extern uint32_t g_seh_ebp;
 extern volatile uint64_t g_icall_count;
 extern volatile uintptr_t g_penter_last_rva;
 extern ptrdiff_t g_xbox_mem_offset;
+extern void d3d8_PresentFrame(void);
 
 /* Xbox file I/O bridge (src/xbox_file_bridge.c) */
 extern int xbox_file_register(FILE *fp);
@@ -1018,6 +1019,8 @@ static void bridge_AvSetDisplayMode(void)
                 pitch, fb, g_esp);
 
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
+    if (step == 0)
+        d3d8_PresentFrame();
     g_eax = 0;
 }
 
