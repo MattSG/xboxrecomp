@@ -459,6 +459,8 @@ def _make_condition(jcc, flag_setter, flag_ops):
             mask = flag_ops[0].imm & 0xFF
         if mask == 0x41:
             ge, le = "_fpu_cmp > 0", "_fpu_cmp <= 0"
+        elif mask == 0x01:
+            ge, le = "_fpu_cmp >= 0", "_fpu_cmp < 0"
         elif mask == 0x05:
             # C0|C2: jp taken iff C0 == C2 (ST >= operand / unordered)
             ge, le = "_fpu_cmp >= 0", "_fpu_cmp < 0"
@@ -703,7 +705,7 @@ def _make_cmovcc_cond(cmov_mnemonic, flag_setter, flag_ops):
 # x87 status bits visible in AH after fnstsw ax: C0=0x01, C1=0x02, C2=0x04,
 # C3=0x40. These are the masks MM3 uses with the test-ah idiom; _fpu_cmp can
 # only resolve C3/C2, so masks pulling in C0/C1 keep the old behaviour.
-_FPU_STATUS_TEST_MASKS = (0x40, 0x41, 0x44, 0x05)
+_FPU_STATUS_TEST_MASKS = (0x40, 0x41, 0x44, 0x05, 0x01)
 
 
 def _is_fpu_status_test(insn):
@@ -865,6 +867,19 @@ def detect_seh_helpers(func_db, xbe_data, verbose=False):
 # simulated stack. Observed: sub_00093860 (a CRT memcpy whose byte-copy
 # tails at 0x939BC+ are not in the CFG).
 DISPATCH_DIRECT = {0x00093860, 0x000858F3}
+
+# Direct calls to these functions must push the real guest return
+# address instead of the dummy zero because the callee reads [esp].
+# Observed: sub_00095B8C stores [esp] into a D3DX jump context (+0x14)
+# and sub_00095EB4 later tail-jumps through that slot.
+RETURN_ADDRESS_READERS = {0x00095B8C}
+
+# Direct calls to these functions never return under the original CFG: the
+# callee ends in an unconditional indirect tail jump (`jmp [reg+off]`), so the
+# pushed return address is discarded and control returns to *our* caller.
+# `RECOMP_ITAIL` still returns to the C caller, so call sites must be emitted
+# as tail calls too, otherwise they fall through with clobbered registers.
+TAIL_ONLY_CALL_TARGETS = {0x00095EB4}
 
 
 class Lifter:
@@ -1504,6 +1519,8 @@ class Lifter:
         # The callee's 'ret' will pop it back off.
         if insn.call_target:
             name = self._call_target_name(insn.call_target)
+            if insn.call_target in TAIL_ONLY_CALL_TARGETS:
+                return [f"{name}(); return; /* call 0x{insn.call_target:08X} (tail-only callee) */"]
             if insn.call_target in DISPATCH_DIRECT:
                 # Route through the manual dispatch so recomp_manual.c can
                 # override functions the lifter cannot generate correctly.
@@ -1511,7 +1528,10 @@ class Lifter:
             else:
                 cleanup = self._callee_cleanup(insn.call_target)
                 ret_note = "" if cleanup is None else f" ret {cleanup}"
-                lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X}{ret_note} */"]
+                return_slot = "0"
+                if insn.call_target in RETURN_ADDRESS_READERS:
+                    return_slot = f"0x{insn.address + insn.size:08X}"
+                lines = [f"PUSH32(esp, {return_slot}); {name}(); /* call 0x{insn.call_target:08X}{ret_note} */"]
             if insn.call_target == 0x0008872F:
                 lines.insert(0, f"recomp_trace_guest_call(0x0008872F, 0x{insn.address:08X});")
             if insn.call_target == 0x001F3163:
@@ -1972,6 +1992,11 @@ class Lifter:
 
         if m == "fld":
             if len(ops) >= 1:
+                if ops[0].type == "reg" and ops[0].reg.startswith("st("):
+                    idx = int(ops[0].reg[3:-1])
+                    src = (f"_fp_stack[_fp_top & 7]" if idx == 0
+                           else f"_fp_stack[(_fp_top + {idx}) & 7]")
+                    return [f"{{ double _fld_tmp = {src}; fp_push(_fld_tmp); }} /* fld {insn.op_str} */"]
                 if ops[0].type == "mem":
                     if ops[0].mem_size == 4:
                         return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld float */"]
@@ -1981,12 +2006,22 @@ class Lifter:
             return [f"/* fld {insn.op_str} */"]
 
         if m in ("fst", "fstp"):
-            pop = "p" if m == "fstp" else ""
             if len(ops) >= 1 and ops[0].type == "mem":
+                pop_code = " fp_popp();" if m == "fstp" else ""
                 if ops[0].mem_size == 4:
-                    return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top(); fp_pop{pop}(); /* {m} */"]
+                    return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{pop_code} /* {m} */"]
                 elif ops[0].mem_size == 8:
-                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top(); fp_pop{pop}(); /* {m} */"]
+                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{pop_code} /* {m} */"]
+            if len(ops) >= 1 and ops[0].type == "reg" and ops[0].reg.startswith("st("):
+                idx = int(ops[0].reg[3:-1])
+                slot = (f"_fp_stack[_fp_top & 7]" if idx == 0
+                        else f"_fp_stack[(_fp_top + {idx}) & 7]")
+                if m == "fstp":
+                    if idx == 0:
+                        return ["fp_popp(); /* fstp st(0) */"]
+                    return [f"{slot} = fp_top(); fp_popp(); /* fstp {insn.op_str} */"]
+                if idx != 0:
+                    return [f"{slot} = fp_top(); /* fst {insn.op_str} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m == "fild":
@@ -2033,8 +2068,14 @@ class Lifter:
                 rhs = f"{acc}({_fmt_mem(ops[0])})"
             else:
                 rhs = "fp_st1()"
+            if m in ("fcomp", "fucomp"):
+                pop_code = " fp_popp();"
+            elif m in ("fcompp", "fucompp"):
+                pop_code = " fp_popp(); fp_popp();"
+            else:
+                pop_code = ""
             return [f"_fpu_cmp = (fp_top() < {rhs}) ? -1 : (fp_top() > {rhs}) ? 1 : 0;"
-                    f" /* {m} {insn.op_str} */"]
+                    f"{pop_code} /* {m} {insn.op_str} */"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
             # These set EFLAGS directly (CF, ZF, PF) from FPU comparison
             # fcompi/fucompi pop st(0) after comparing; fcomi/fucomi do not
@@ -2211,6 +2252,16 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None,
                     + f" /* {curr.mnemonic} */")
                 i += 1
                 continue
+
+        # Xbox DbgPrint idiom: `int 0x2d; int3` is one debugger command.
+        # The kernel service consumes both and returns normally. Translating
+        # the trailing int3 to __debugbreak() traps on a valid debug print.
+        if (curr.mnemonic == "int3" and i > 0 and
+                insns[i - 1].mnemonic == "int" and
+                getattr(insns[i - 1], "op_str", "") == "0x2d"):
+            stmts.append("/* int3 after int 0x2d: consumed by debug service */")
+            i += 1
+            continue
 
         # Lift the instruction normally
         results = lifter.lift_instruction(insns[i])

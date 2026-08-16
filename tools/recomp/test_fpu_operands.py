@@ -68,6 +68,39 @@ def test_test_ah_5_jp_is_conditional():
     out = _lift(bytes.fromhex("d9442408 d8542404 dfe0 f6c405 7a03 90 c3"))
     assert "_fpu_cmp >= 0" in out, "jp after test ah,0x05 must be conditional"
     assert "if (1 " not in out, "no unconditional parity branches allowed"
+
+
+def test_fst_mem_does_not_pop():
+    out = _lift(bytes.fromhex("d913"))
+    assert "= (float)fp_top(); /* fst" in out, "fst [mem] stores without popping"
+    assert "fp_pop" not in out, "fst [mem] must not pop the FPU stack"
+
+
+def test_fstp_mem_pops():
+    out = _lift(bytes.fromhex("d91b"))
+    assert "fp_popp();" in out, "fstp [mem] must pop the FPU stack"
+
+
+def test_fcomp_mem_pops():
+    out = _lift(bytes.fromhex("d81b"))
+    assert "_fpu_cmp = (fp_top() < MEMF(ebx))" in out
+    assert "fp_popp();" in out, "fcomp [mem] must pop ST0 after comparing"
+
+
+def test_fcom_mem_does_not_pop():
+    out = _lift(bytes.fromhex("d813"))
+    assert "fp_popp();" not in out, "fcom [mem] must compare without popping"
+
+
+def test_fld_st0_duplicates_top():
+    out = _lift(bytes.fromhex("d9c0"))
+    assert "double _fld_tmp = _fp_stack[_fp_top & 7]; fp_push(_fld_tmp);" in out, (
+        "fld st(0) must duplicate ST0 through a sequenced temporary")
+
+
+def test_fstp_st0_pops():
+    out = _lift(bytes.fromhex("ddd8"))
+    assert "fp_popp();" in out, "fstp st(0) must pop ST0"
 if __name__ == "__main__":
     failed = []
     for name, fn in [
@@ -76,6 +109,12 @@ if __name__ == "__main__":
         ("fcom_mem_operand_compared", test_fcom_mem_operand_is_compared),
         ("fdivr_mem_operand_computes", test_fdivr_mem_operand_computes),
         ("test_ah_5_jp_conditional", test_test_ah_5_jp_is_conditional),
+        ("fst_mem_no_pop", test_fst_mem_does_not_pop),
+        ("fstp_mem_pops", test_fstp_mem_pops),
+        ("fcomp_mem_pops", test_fcomp_mem_pops),
+        ("fcom_mem_no_pop", test_fcom_mem_does_not_pop),
+        ("fld_st0_duplicates_top", test_fld_st0_duplicates_top),
+        ("fstp_st0_pops", test_fstp_st0_pops),
     ]:
         try:
             fn()

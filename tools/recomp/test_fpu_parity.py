@@ -92,6 +92,16 @@ def test_jne_after_fcomp_0x41_is_less_equal():
         "branch must not read the stale C register for the FPU status")
 
 
+def test_jne_after_fcomp_0x01_is_less():
+    out = _lift(bytes.fromhex("d81d40613800 dfe0 f6c401 7503 90 c3"))
+    # fcomp [0x386140]; fnstsw ax; test ah, 0x01; jne +3; nop; ret
+    # C0 alone: jne is taken iff ST < operand (unordered collapsed to equal).
+    assert "if (_fpu_cmp < 0)" in out, (
+        "jne after fcomp/fnstsw/test ah,0x01 must resolve via _fpu_cmp < 0")
+    assert "if (HI8(eax)" not in out, (
+        "branch must not read the stale C register for the FPU status")
+
+
 if __name__ == "__main__":
     failed = []
     for name, fn in [
@@ -100,6 +110,7 @@ if __name__ == "__main__":
         ("jp_after_fcomp_0x41", test_jp_after_fcomp_0x41_is_greater),
         ("jnp_after_fcomp_0x41", test_jnp_after_fcomp_0x41_is_less_equal),
         ("jne_after_fcomp_0x41", test_jne_after_fcomp_0x41_is_less_equal),
+        ("jne_after_fcomp_0x01", test_jne_after_fcomp_0x01_is_less),
     ]:
         try:
             fn()
