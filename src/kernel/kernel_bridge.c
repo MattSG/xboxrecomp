@@ -299,6 +299,18 @@ static void worker_switch_to_worker(void)
     SwitchToFiber(g_worker.fiber);
 }
 
+static void worker_resume_if_due(void)
+{
+    if (g_worker_active && g_worker.fiber && g_worker.parked && !g_worker.done &&
+        (int)(GetTickCount() - g_worker.wake_tick) >= 0) {
+        worker_switch_to_worker();
+        if (g_worker.done) {
+            DeleteFiber(g_worker.fiber);
+            g_worker.fiber = NULL;
+        }
+    }
+}
+
 static void WINAPI worker_fiber_main(LPVOID param)
 {
     (void)param;
@@ -2403,6 +2415,7 @@ static XBOX_THREAD_LOCAL int g_guest_work_depth;
 
 void xbox_kernel_pump_guest_work(void)
 {
+    worker_resume_if_due();
     static int trace_frontier = -1;
     if (trace_frontier < 0) trace_frontier = getenv("MM3_TRACE_PUMP") ? 1 : 0;
     static int trace_irq_dpc = -1;
@@ -2673,14 +2686,7 @@ static void kernel_thunk_dispatch(void)
     /* Resume a parked worker whose delay has elapsed before servicing this
      * thunk: the pump calls kernel thunks regularly, which is what paces the
      * render worker on the same host thread. */
-    if (g_worker_active && g_worker.fiber && g_worker.parked && !g_worker.done &&
-        (int)(GetTickCount() - g_worker.wake_tick) >= 0) {
-        worker_switch_to_worker();
-        if (g_worker.done) {
-            DeleteFiber(g_worker.fiber);
-            g_worker.fiber = NULL;
-        }
-    }
+    worker_resume_if_due();
 
     if (bridge) {
         uint32_t dev_before = 0;
