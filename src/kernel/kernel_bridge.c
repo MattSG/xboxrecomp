@@ -370,20 +370,14 @@ static void bridge_PsCreateSystemThreadEx(void)
         if (!fn) fn = recomp_lookup_manual(start_routine);
         if (fn) {
             if (is_first_call) {
-                /* Main game thread: run directly, inheriting register state */
+                /* The first routine is the game entry and inherits the
+                 * current guest register state. */
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
                 fn();
                 g_esp += 12;
-                fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
-                fflush(stderr);
             } else {
-                /* Worker thread: run it as a fiber on the same host thread.
-                 * The worker runs until its first KeDelayExecutionThread
-                 * parks it, then the main fiber resumes here and the pump
-                 * continues (real Xbox concurrency: the pump keeps kicking
-                 * while the render worker blends). */
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawning worker 0x%08X (ctx=0x%08X)\n",
                         start_routine, start_context1);
                 fflush(stderr);
