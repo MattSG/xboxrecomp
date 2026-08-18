@@ -868,19 +868,21 @@ def detect_seh_helpers(func_db, xbe_data, verbose=False):
 # tails at 0x939BC+ are not in the CFG).
 DISPATCH_DIRECT = {0x00093860, 0x000858F3}
 
+# sub_00095B8C is the guest setjmp half of the D3DX unwind pair.  Calls to it
+# must be wrapped in host setjmp/longjmp so sub_00095EB4 can unwind the native
+# C call frames back to the saved continuation instead of returning into the
+# wrong generated caller.
+SETJMP_DIRECT = {0x00095B8C}
+
+# Functions whose final indirect jmp is a guest longjmp (context restore),
+# not a normal computed tail call.
+LONGJMP_FUNCS = {0x00095EB4}
+
 # Direct calls to these functions must push the real guest return
 # address instead of the dummy zero because the callee reads [esp].
 # Observed: sub_00095B8C stores [esp] into a D3DX jump context (+0x14)
 # and sub_00095EB4 later tail-jumps through that slot.
 RETURN_ADDRESS_READERS = {0x00095B8C}
-
-# Direct calls to these functions never return under the original CFG: the
-# callee ends in an unconditional indirect tail jump (`jmp [reg+off]`), so the
-# pushed return address is discarded and control returns to *our* caller.
-# `RECOMP_ITAIL` still returns to the C caller, so call sites must be emitted
-# as tail calls too, otherwise they fall through with clobbered registers.
-TAIL_ONLY_CALL_TARGETS = {0x00095EB4}
-
 
 class Lifter:
     """Translates x86 instructions to C statements."""
@@ -909,6 +911,7 @@ class Lifter:
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
         self.referenced_calls = {}
+        self.uses_ebp = False
 
         # Detect if either is missing, so overriding one does not silently
         # leave the other unset -- that is the bug this whole path fixes.
@@ -1519,8 +1522,19 @@ class Lifter:
         # The callee's 'ret' will pop it back off.
         if insn.call_target:
             name = self._call_target_name(insn.call_target)
-            if insn.call_target in TAIL_ONLY_CALL_TARGETS:
-                return [f"{name}(); return; /* call 0x{insn.call_target:08X} (tail-only callee) */"]
+            if insn.call_target in SETJMP_DIRECT:
+                return_slot = f"0x{insn.address + insn.size:08X}"
+                jb = f"_mm3_jb_{insn.address:08X}"
+                lines = ["{",
+                         f"    jmp_buf {jb};",
+                         f"    if (setjmp({jb}) == 0) {{",
+                         f"        PUSH32(esp, {return_slot}); {name}(); /* call 0x{insn.call_target:08X} (guest setjmp) */",
+                         f"        recomp_setjmp_register(MEM32(esp), &{jb});",
+                         "    } else {"]
+                if self.uses_ebp:
+                    lines.append("        ebp = g_seh_ebp; /* longjmp restored caller frame */")
+                lines += ["    }", "}"]
+                return lines
             if insn.call_target in DISPATCH_DIRECT:
                 # Route through the manual dispatch so recomp_manual.c can
                 # override functions the lifter cannot generate correctly.
@@ -1532,6 +1546,47 @@ class Lifter:
                 if insn.call_target in RETURN_ADDRESS_READERS:
                     return_slot = f"0x{insn.address + insn.size:08X}"
                 lines = [f"PUSH32(esp, {return_slot}); {name}(); /* call 0x{insn.call_target:08X}{ret_note} */"]
+                if insn.call_target == 0x0008B22E:
+                    lines.insert(0, f"recomp_trace_b22e(0, 0x{insn.address:08X});")
+                    lines.append(f"recomp_trace_b22e(1, 0x{insn.address:08X});")
+                if insn.call_target == 0x000854CF:
+                    lines.insert(0, f"recomp_trace_854cf(0, 0x{insn.address:08X}, esp);")
+                    lines.append(f"recomp_trace_854cf(1, 0x{insn.address:08X}, esp);")
+            if self.func_start == 0x001BCBC0 and insn.address in (
+                    0x001BCC8C, 0x001BCC84, 0x001BCC96,
+                    0x001BCDDE, 0x001BCDE8, 0x001BCE11):
+                lines.insert(0, f"recomp_trace_bcbcc0_direct(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_bcbcc0_direct(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+            if insn.call_target == 0x001E73AF:
+                lines.insert(0, f"recomp_trace_73af(0, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_73af(1, 0x{insn.address:08X});")
+            if insn.call_target == 0x00170ED1:
+                lines.insert(0, f"recomp_trace_170ed1_edge(0, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_170ed1_edge(1, 0x{insn.address:08X});")
+            if self.func_start == 0x001E6EAD:
+                lines.insert(0, f"recomp_trace_6ead_edge(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_6ead_edge(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+            if self.func_start == 0x001BF86A:
+                lines.insert(0, f"recomp_trace_bf86a_edge(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_bf86a_edge(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+            if self.func_start == 0x001BF1D4:
+                lines.insert(0, f"recomp_trace_bf1d4_edge(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_bf1d4_edge(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+            if self.func_start == 0x001BE953:
+                lines.insert(0, f"recomp_trace_be953_edge(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_be953_edge(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+            if self.func_start == 0x000127A9:
+                lines.insert(0, f"recomp_trace_127a9_edge(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_127a9_edge(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+            if self.func_start == 0x001BCE30:
+                lines.insert(0, f"recomp_trace_bce30_edge(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_bce30_edge(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+            if self.func_start == 0x0002E735:
+                lines.insert(0, f"recomp_trace_2e735_edge(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_2e735_edge(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+            if self.func_start == 0x001E73AF:
+                lines.insert(0, f"recomp_trace_73af_inner(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_73af_inner(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
             if insn.call_target == 0x0008872F:
                 lines.insert(0, f"recomp_trace_guest_call(0x0008872F, 0x{insn.address:08X});")
             if insn.call_target == 0x001F3163:
@@ -1597,6 +1652,18 @@ class Lifter:
             bias = 4 if (ops[0].type == "mem" and ops[0].mem_base == "esp") else 0
             target = _fmt_operand_read(ops[0], disp_bias=bias)
             lines = [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
+            if self.func_start == 0x001BE953:
+                lines.insert(0, f"recomp_trace_be953_icall(0, {target}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_be953_icall(1, {target}, 0x{insn.address:08X});")
+            if self.func_start == 0x001BCBC0 and insn.address == 0x001BCC84:
+                lines.insert(0, f"recomp_trace_bcbcc0_icall(0, {target}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_bcbcc0_icall(1, {target}, 0x{insn.address:08X});")
+            if self.func_start == 0x001B9FB0:
+                lines.insert(0, f"recomp_trace_b9fb0_icall(0, {target}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_b9fb0_icall(1, {target}, 0x{insn.address:08X});")
+            if self.func_start == 0x001B98E1:
+                lines.insert(0, f"recomp_trace_b98e1_icall(0, {target}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_b98e1_icall(1, {target}, 0x{insn.address:08X});")
             if self.func_start == 0x00086097:
                 lines.insert(0, "recomp_trace_sched_callback(0, MEM32(0x00362014), MEM32(esp), g_esp);")
                 lines.append("recomp_trace_sched_callback(1, MEM32(0x00362014), eax, g_esp);")
@@ -1696,6 +1763,8 @@ class Lifter:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
                 lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
                 return lines
+            if self.func_start in LONGJMP_FUNCS:
+                return [f"g_seh_ebp = ebp; recomp_guest_longjmp(edx); return; /* guest longjmp */"]
             target = _fmt_operand_read(ops[0])
             return [f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return; /* indirect tail jmp */"]
         return ["/* jmp: no target */"]
@@ -2199,6 +2268,12 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None,
             flag_insn = insns[i]
             last_flag_ops = _snapshot_flag_operands(
                 stmts, flag_insn, snap_counter)
+            if (lifter.func_start == 0x001BCBC0
+                    and insns[i + 1].address in (0x001BCCA5, 0x001BCE20)):
+                stmts.append(
+                    "recomp_trace_bcbcc0_loop((uint32_t)ZX16(MEM16(ebp + 0x2A)), "
+                    "(uint32_t)MEM32(ebp + 0x68), "
+                    "CMP_B(MEM32(ebp + 0x68), ZX16(MEM16(ebp + 0x2A))));")
             stmts.append(stmt)
             last_flag_setter = flag_insn.mnemonic
             i += consumed
