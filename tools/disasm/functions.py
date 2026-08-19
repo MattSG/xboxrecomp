@@ -138,6 +138,14 @@ class FunctionDetector:
         # executable sections and register them as function starts.
         self._pass_data_pointer_targets(sections)
 
+        # Pass 4e: Code-immediate function pointers.
+        # Function pointers are also stored from code as immediates, e.g.
+        # D3DX vtable constructors (`mov [eax+0x28], 0x2680ED`). Those
+        # targets have no prologue and no call/jump/data-table xref, so no
+        # earlier pass sees them; the runtime falls through to the D3DX safe
+        # stub and returns a fake pointer.
+        self._pass_code_immediate_targets(sections)
+
         # Pass 5: Build functions from candidates
         self._build_functions(sections)
 
@@ -558,6 +566,35 @@ class FunctionDetector:
                     "data_pointer"
                 )
 
+    def _pass_code_immediate_targets(self, sections: List[SectionInfo]) -> None:
+        """Pass 4e: seed function starts from code-loaded function pointers.
+
+        Some functions are reachable only through pointer tables built at
+        runtime by `mov [reg+disp], imm32` instructions. Scan every decoded
+        code instruction's ``imm_ref`` for values that land on decoded
+        instruction boundaries inside code sections and register them as
+        function-start candidates.
+        """
+        code_sections = [s for s in sections if s.executable]
+        if not code_sections:
+            return
+        code_sec_names = {s.name for s in code_sections}
+        code_addrs = set(self.engine.instructions.keys())
+        for insn in self.engine.instructions.values():
+            target = insn.imm_ref
+            if target is None or target in self._candidates:
+                continue
+            if target not in code_addrs:
+                continue
+            target_sec = self.image.get_section_at_va(target)
+            if target_sec is None or target_sec.name not in code_sec_names:
+                continue
+            self._add_candidate(
+                target,
+                config.CONFIDENCE_CALL_TARGET * 0.7,
+                "code_imm"
+            )
+
     def _build_functions(self, sections: List[SectionInfo]) -> None:
         """
         Pass 5: Build Function objects from candidates.
@@ -573,7 +610,7 @@ class FunctionDetector:
         (overlapping ranges are intentional — trap #38: each entry point
         produces its own translation starting at the right offset).
         """
-        INTRA_METHODS = {"jump_target", "data_pointer", "jump_table"}
+        INTRA_METHODS = {"jump_target", "data_pointer", "jump_table", "code_imm"}
 
         sorted_starts = sorted(self._candidates.keys())
         if not sorted_starts:

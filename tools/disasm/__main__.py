@@ -117,9 +117,10 @@ def _load_seed_functions(path):
     addrs = []
     for entry in data:
         if isinstance(entry, dict) and "start" in entry:
-            addrs.append(int(entry["start"], 16))
+            method = entry.get("method", "seed_vtable_thunk")
+            addrs.append((int(entry["start"], 16), method))
         elif isinstance(entry, int):
-            addrs.append(entry)
+            addrs.append((entry, "seed_vtable_thunk"))
     return addrs
 
 
