@@ -1,10 +1,10 @@
-"""Self-check: direct calls to tail-only callees are lowered as tail calls.
+"""Self-check: indirect-tail callees still get a normal return slot.
 
-sub_00095EB4 ends in an unconditional `jmp [edx+0x14]`, so the original
-`call 0x95eb4` never returns to the call site.  In C, RECOMP_ITAIL returns to
-the C caller, so the call site must immediately return instead of falling
-through into the branch that original execution could only reach when the
-call was skipped.
+sub_00095EB4 ends in `jmp [edx+0x14]`, but the return address pushed by the
+original `call` is still on the simulated stack and the tail target returns
+through it. Lowering the call without the dummy return slot shifts every
+[esp+N] argument by 4 bytes (observed as sub_00095EB4 reading arg=1 instead
+of the D3DX unwind table).
 
 Run: py -3 tools/recomp/test_tail_only_call.py
 """
@@ -25,18 +25,18 @@ class _Insn:
         self.operands = []
 
 
-def test_tail_only_call_emits_return():
+def test_indirect_tail_callee_pushes_return_slot():
     lifter = Lifter(func_db={
         0x00095EB4: {"name": "sub_00095EB4", "size": 0x79, "end": 0x00095F2D},
     })
     insn = _Insn(target=0x00095EB4, address=0x00088B3C, size=5)
     lines = lifter._lift_call(insn, insn.operands)
     text = "\n".join(lines)
-    assert "sub_00095EB4(); return;" in text, text
-    assert "PUSH32(esp, 0); sub_00095EB4();" not in text, text
-    print("ok  tail_only_call_emits_return")
+    assert "PUSH32(esp, 0); sub_00095EB4();" in text, text
+    assert "sub_00095EB4(); return;" not in text, text
+    print("ok  indirect_tail_callee_pushes_return_slot")
 
 
 if __name__ == "__main__":
-    test_tail_only_call_emits_return()
+    test_indirect_tail_callee_pushes_return_slot()
     print("\nall passed")

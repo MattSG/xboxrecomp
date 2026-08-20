@@ -1575,6 +1575,11 @@ class Lifter:
             if self.func_start == 0x001BE953:
                 lines.insert(0, f"recomp_trace_be953_edge(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
                 lines.append(f"recomp_trace_be953_edge(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                if insn.address == 0x001BECC3:
+                    lines.append("recomp_trace_be953_loop(0x001BECC3, MEM32(ebp + 0x24), MEM32(ebp + 0x28), MEM32(ebp + 0x2C), MEM32(ebp + 0x38), MEM32(ebp + 0x3C));")
+            if self.func_start == 0x0003F1B0:
+                lines.insert(0, f"recomp_trace_3f1b0_edge(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_3f1b0_edge(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
             if self.func_start == 0x000127A9:
                 lines.insert(0, f"recomp_trace_127a9_edge(0, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
                 lines.append(f"recomp_trace_127a9_edge(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
@@ -1589,6 +1594,8 @@ class Lifter:
                 lines.append(f"recomp_trace_73af_inner(1, 0x{insn.call_target:08X}, 0x{insn.address:08X});")
             if insn.call_target == 0x0008872F:
                 lines.insert(0, f"recomp_trace_guest_call(0x0008872F, 0x{insn.address:08X});")
+            if insn.call_target == 0x00089CAB:
+                lines.insert(0, f"recomp_trace_guest_call(0x00089CAB, 0x{insn.address:08X});")
             if insn.call_target == 0x001F3163:
                 lines.insert(0, f"recomp_snapshot_f3163_call(0x{insn.address:08X});")
             if insn.call_target == 0x00042921:
@@ -1691,6 +1698,12 @@ class Lifter:
                                0x001E7627, 0x001E77F3):
             prefix += (f"recomp_trace_render_return(0x{self.func_start:08X}, "
                        "(uint32_t)eax, (uint32_t)esp); ")
+        if self.func_start == 0x001BF1D4:
+            prefix += "recomp_trace_1bf1d4(1); "
+        if self.func_start == 0x001BCE30:
+            prefix += "recomp_trace_bce30(1); "
+        if self.func_start == 0x001BCBC0:
+            prefix += "recomp_trace_bcbcc0(1); "
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
             return [f"{prefix}esp += {4 + n}; return; /* ret {n} */"]
@@ -2227,6 +2240,10 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None,
     stmts = []
     insns = bb.instructions
     i = 0
+
+    if (lifter.func_start == 0x00344410 and insns and
+            insns[0].address == lifter.func_start):
+        stmts.append("recomp_trace_ring_source((uint32_t)edi);")
 
     # Track the last instruction that set flags
     if snap_counter is None:

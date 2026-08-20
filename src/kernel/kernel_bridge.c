@@ -42,6 +42,8 @@ extern uint32_t g_ebx, g_esi, g_edi;
 extern uint32_t g_seh_ebp;
 extern volatile uint64_t g_icall_count;
 extern volatile uintptr_t g_penter_last_rva;
+extern volatile uintptr_t g_penter_caller_rva;
+extern const char *recomp_probe_fn_name(uintptr_t rva);
 extern ptrdiff_t g_xbox_mem_offset;
 extern void d3d8_PresentFrame(void);
 
@@ -2024,6 +2026,22 @@ static void bridge_RtlRaiseException(void)
     g_eax = 0;
 }
 
+/* -- RtlUnwind (ordinal 312) ---------------------------------
+ * VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
+ *                PVOID ExceptionRecord, PVOID ReturnValue)
+ *
+ * MM3 uses this through sub_000BBB60 as a stdcall "pop args and resume at
+ * TargetIp" helper. In the generated model, kernel_thunk_dispatch already
+ * pops the dummy return address and the four stdcall args, and the caller
+ * continues at the label immediately after its RECOMP_ITAIL, which is the
+ * original TargetIp. Therefore the guest-visible effect is simply a normal
+ * return; do not delegate to host RtlUnwind (it would unwind the native
+ * stack, not the simulated Xbox stack). */
+static void bridge_RtlUnwind(void)
+{
+    g_eax = 0;
+}
+
 /* ── MmMapIoSpace (ordinal 177) ──────────────────────────
  * PVOID MmMapIoSpace(ULONG_PTR PhysicalAddress, ULONG NumberOfBytes, ULONG Protect)
  *
@@ -2393,6 +2411,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 289: return bridge_RtlInitAnsiString;
     case 301: return bridge_RtlNtStatusToDosError;
     case 302: return bridge_RtlRaiseException;
+    case 312: return bridge_RtlUnwind;
 
     default:  return NULL;
     }
@@ -2554,6 +2573,7 @@ static void kernel_thunk_dispatch(void)
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
 
+
     if (getenv("MM3_TRACE_KERNEL_WINDOW") &&
         ((g_icall_count >= 12055ULL && g_icall_count <= 12062ULL) ||
          (g_icall_count >= 12080ULL && g_icall_count <= 12092ULL))) {
@@ -2601,6 +2621,23 @@ static void kernel_thunk_dispatch(void)
             for (USHORT i = 0; i < n; ++i)
                 fprintf(stderr, "[LOCK-STACK-FRAME] %u rva=%zX\n", i,
                     (size_t)((uintptr_t)frames[i] - (uintptr_t)mod));
+            fflush(stderr);
+        }
+    }
+
+
+    if (getenv("MM3_TRACE_LOCK_CALLER") && (ordinal == 277 || ordinal == 294)) {
+        static int s_lock_caller_n;
+        int late = g_kernel_call_count > 500000;
+        if ((!late && s_lock_caller_n < 12) || (late && s_lock_caller_n < 36)) {
+            s_lock_caller_n++;
+            fprintf(stderr, "[LOCK-CALLER] #%d ordinal=%u ic=%llu caller=%zX fn=%s "
+                    "esp=%08X eax=%08X ecx=%08X edx=%08X\n",
+                    s_lock_caller_n, ordinal,
+                    (unsigned long long)g_icall_count,
+                    (size_t)g_penter_caller_rva,
+                    recomp_probe_fn_name(g_penter_caller_rva),
+                    g_esp, g_eax, g_ecx, g_edx);
             fflush(stderr);
         }
     }

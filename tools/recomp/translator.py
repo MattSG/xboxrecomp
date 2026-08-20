@@ -366,6 +366,9 @@ class FunctionTranslator:
         # Determine which registers are used
         used_regs = self._find_used_registers(instructions)
         used_xmm = self._find_used_xmm(instructions)
+        # The lifter needs this when lowering setjmp calls: the longjmp
+        # return path must re-load the caller's local ebp from g_seh_ebp.
+        self.lifter.uses_ebp = "ebp" in used_regs
         has_prologue = self._func_has_prologue(instructions)
         has_fpu = any(insn.mnemonic.startswith("f") for insn in instructions)
 
@@ -547,9 +550,19 @@ class FunctionTranslator:
         lines.append("    recomp_guest_boundary();")
         lines.append(f"")
         if start in (0x001EC6EE, 0x001EC7F7, 0x001E73AF, 0x001E7627, 0x001E77F3,
+                     0x001BF1D4, 0x001BCE30,
                      0x00344A20,
                      0x00083BE1, 0x00083B04, 0x00083C55):
             lines.append(f"    recomp_trace_sched_entry(0x{start:08X});")
+            lines.append(f"")
+        if start == 0x001BF1D4:
+            lines.append("    recomp_trace_1bf1d4(0);")
+            lines.append(f"")
+        if start == 0x001BCE30:
+            lines.append("    recomp_trace_bce30(0);")
+            lines.append(f"")
+        if start == 0x001BCBC0:
+            lines.append("    recomp_trace_bcbcc0(0);")
             lines.append(f"")
         if start in (0x0027B8C0, 0x0027B742):
             lines.append(f"    recomp_trace_sched_entry(0x{start:08X});")
@@ -676,6 +689,14 @@ class FunctionTranslator:
         # recovered entry has no terminal block in the generated CFG.
         if start == 0x00348120 and not any("return;" in line for line in lines):
             lines.append("    esp += 20; return; /* recovered ret 0x10 */")
+
+        # Narrow, opt-in evidence for the simple asset-table accessor. Keep
+        # this generator-owned so generated output is never hand-edited.
+        if start == 0x001A3E8F:
+            for _i, _line in enumerate(lines):
+                if "esp += 8; return;" in _line:
+                    lines.insert(_i, "    recomp_trace_asset_result(0x001A3E8F, (uint32_t)eax, (uint32_t)esp);")
+                    break
 
         # Undefine FPU macros
         if has_fpu:
