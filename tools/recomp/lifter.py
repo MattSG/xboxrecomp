@@ -1192,6 +1192,11 @@ class Lifter:
             lines.append(
                 f"recomp_trace_ring_record_write(0x{insn.address:08X}, "
                 f"{_fmt_mem(ops[0])});")
+        if (ops[0].type == "mem" and ops[0].mem_base == "edi" and
+                not ops[0].mem_index and ops[0].mem_disp in (0x72, 0x73)):
+            lines.append(
+                f"recomp_trace_callback_flag_write(0x{insn.address:08X}, "
+                f"{_fmt_mem(ops[0])}, (uint32_t)({src}));")
         # "mov ebp, esp" establishes this function's frame pointer. Mirror it
         # into g_seh_ebp so a leaf callee that inherits the caller frame via
         # "ebp = g_seh_ebp" sees the current frame instead of a stale frame
