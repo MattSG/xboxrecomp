@@ -551,7 +551,7 @@ class FunctionTranslator:
         lines.append(f"")
         if start in (0x001EC520, 0x001EC6EE, 0x001EC7F7, 0x001E73AF, 0x001E7627, 0x001E77F3,
                      0x001BF1D4, 0x001BCE30,
-                     0x00344A20, 0x00342B00, 0x001EC8E6,
+                     0x00344A20, 0x00342B00, 0x001EC8E6, 0x001F373E,
                      0x00083BE1, 0x00083B04, 0x00083C55):
             lines.append(f"    recomp_trace_sched_entry(0x{start:08X});")
             lines.append(f"")
