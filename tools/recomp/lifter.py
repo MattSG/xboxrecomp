@@ -1675,6 +1675,9 @@ class Lifter:
             if self.func_start == 0x001B9FB0:
                 lines.insert(0, f"recomp_trace_b9fb0_icall(0, {target}, 0x{insn.address:08X});")
                 lines.append(f"recomp_trace_b9fb0_icall(1, {target}, 0x{insn.address:08X});")
+            if self.func_start == 0x001EC520:
+                lines.insert(0, f"recomp_trace_1ec520_icall(0, {target}, 0x{insn.address:08X});")
+                lines.append(f"recomp_trace_1ec520_icall(1, {target}, 0x{insn.address:08X});")
             if self.func_start == 0x001B98E1:
                 lines.insert(0, f"recomp_trace_b98e1_icall(0, {target}, 0x{insn.address:08X});")
                 lines.append(f"recomp_trace_b98e1_icall(1, {target}, 0x{insn.address:08X});")
