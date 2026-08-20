@@ -1657,6 +1657,8 @@ class Lifter:
             if (insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG)
                     or insn.call_target in (0x00097AA4, 0x0009504E)):
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
+            if self.func_start == 0x001EC520 and insn.call_target == 0x0024C82C:
+                lines.append("recomp_trace_1ec520_object((uint32_t)eax, 0x003B07DC);")
             return lines
         elif len(ops) >= 1:
             # The dummy-return PUSH32(esp, 0) executes before the ICALL
