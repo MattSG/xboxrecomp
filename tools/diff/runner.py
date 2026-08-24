@@ -17,17 +17,33 @@ def run_unicorn(case, *, trace=True):
     state = case.data["state"]
     uc = Uc(UC_ARCH_X86, UC_MODE_32)
     pages = {}
+    mapped_pages = set()
     for page in case.data["memory"]:
         address = int(page["address"], 0) if isinstance(page["address"], str) else page["address"]
         blob = bytes.fromhex(page["data"])
         size = (len(blob) + 0xFFF) & ~0xFFF
         uc.mem_map(address & ~0xFFF, max(size, 0x1000))
+        mapped_pages.add(address & ~0xFFF)
         uc.mem_write(address, blob)
         pages[address] = len(blob)
     code = bytes.fromhex(case.data["code"])
     entry = int(case.data["entry_eip"], 0) if isinstance(case.data["entry_eip"], str) else case.data["entry_eip"]
     uc.mem_map(entry & ~0xFFF, max(0x1000, (len(code) + (entry & 0xFFF) + 0xFFF) & ~0xFFF))
+    mapped_pages.add(entry & ~0xFFF)
     uc.mem_write(entry, code)
+    uc.reg_write(UC_X86_REG_EIP, entry)
+    transcripts = {}
+    for item in case.data.get("calls", []):
+        target = item.get("target")
+        if target is None:
+            continue
+        target = int(target, 0) if isinstance(target, str) else target
+        transcripts.setdefault(target, []).append(item)
+        page = target & ~0xFFF
+        if page not in mapped_pages:
+            uc.mem_map(page, 0x1000)
+            mapped_pages.add(page)
+        uc.mem_write(target, b"\xC3")
     try:
         from capstone import Cs, CS_ARCH_X86, CS_MODE_32
         decoder = Cs(CS_ARCH_X86, CS_MODE_32)
@@ -54,6 +70,9 @@ def run_unicorn(case, *, trace=True):
         uc.reg_write(UC_X86_REG_MXCSR, state["mxcsr"])
     checkpoints = []
     writes = []
+    calls = []
+    stub_called = False
+    transcript_index = {target: 0 for target in transcripts}
     def snapshot():
         eip = uc.reg_read(UC_X86_REG_EIP)
         result = {"eip": eip, "instruction": instruction_text.get(eip),
@@ -68,6 +87,27 @@ def run_unicorn(case, *, trace=True):
     if isinstance(stop_eip, str):
         stop_eip = int(stop_eip, 0)
     def hook(_, address, size, __):
+        nonlocal stub_called
+        if address in transcripts:
+            index = transcript_index[address]
+            record = transcripts[address][min(index, len(transcripts[address]) - 1)]
+            transcript_index[address] = index + 1
+            calls.append({"target": address, "sequence": len(calls)})
+            for name in ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "eflags"):
+                if name in record:
+                    uc.reg_write(regs[name], int(record[name], 0) if isinstance(record[name], str) else record[name])
+            for write in record.get("writes", []):
+                write_address = int(write["address"], 0) if isinstance(write["address"], str) else write["address"]
+                raw_value = write.get("value", 0)
+                value = int(raw_value, 0) if isinstance(raw_value, str) else raw_value
+                width = int(write.get("size", 4))
+                uc.mem_write(write_address, value.to_bytes(width, "little"))
+            return_address = int.from_bytes(bytes(uc.mem_read(uc.reg_read(UC_X86_REG_ESP), 4)), "little")
+            uc.reg_write(UC_X86_REG_ESP, uc.reg_read(UC_X86_REG_ESP) + 4)
+            uc.reg_write(UC_X86_REG_EIP, return_address)
+            stub_called = True
+            uc.emu_stop()
+            return
         if trace:
             checkpoints.append(snapshot())
         if stop_eip is not None and address == stop_eip:
@@ -79,7 +119,15 @@ def run_unicorn(case, *, trace=True):
     from unicorn import UC_HOOK_MEM_WRITE
     uc.hook_add(UC_HOOK_MEM_WRITE, lambda _, __, address, size, value, ___: writes.append({"address": address, "size": size, "value": value}))
     try:
-        uc.emu_start(entry, 0, count=limit)
+        remaining = limit
+        while remaining > 0:
+            stub_called = False
+            before = len(checkpoints)
+            uc.emu_start(uc.reg_read(UC_X86_REG_EIP), 0, count=remaining)
+            consumed = max(1, len(checkpoints) - before)
+            remaining -= consumed
+            if not stub_called:
+                break
     except Exception as error:
         failed = snapshot()
         failed["exception"] = {"type": type(error).__name__, "message": str(error)}
@@ -96,6 +144,7 @@ def run_unicorn(case, *, trace=True):
             item["writes"] = list(writes)
             item["dirty_memory"] = dirty
             item["calls"] = list(case.data.get("calls", []))
+            item["call_events"] = list(calls)
     return checkpoints
 
 def save_trace(path, trace):
