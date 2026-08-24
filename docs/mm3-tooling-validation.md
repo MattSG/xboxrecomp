@@ -18,3 +18,16 @@ The report recovered direct calls from `0x001E77F3`, including
 available static state could not prove their target. This is the intended
 conservative answer and gives the next debugging target without committing
 MM3 XBE bytes or state.
+
+The generator was also exercised read-only against the same MM3 inputs using
+an output file under `%TEMP%`:
+
+```powershell
+python -m tools.recomp F:\repos\midtown-madness-3-recomp\game_files\default.xbe `
+  --analysis-json F:\repos\midtown-madness-3-recomp\game_files\mm3_analysis.json `
+  --functions F:\repos\midtown-madness-3-recomp\m4tmp\disasm2437\functions.json `
+  --function 0x001E77F3
+```
+
+It produced a 24,044-byte C function with instruction, memory, call, and
+shared-flag hooks; no MM3 input or generated output was written to this repo.
