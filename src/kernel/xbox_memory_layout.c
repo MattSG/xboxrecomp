@@ -69,6 +69,7 @@ uint32_t g_ebp = 0;
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
+uint32_t g_eflags = 0x202u;
 volatile uint64_t g_icall_count = 0;
 volatile struct recomp_trace_record g_recomp_trace[4096] = {0};
 volatile uint32_t g_recomp_trace_write = 0;

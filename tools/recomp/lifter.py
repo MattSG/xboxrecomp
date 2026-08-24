@@ -84,6 +84,15 @@ def _fmt_imm(val):
         return f"0x{val:08X}u"
     return f"0x{val:X}"
 
+def _operand_width(op):
+    if op.type == "mem" and op.mem_size:
+        return op.mem_size
+    if op.type == "reg" and op.reg in ("al", "ah", "bl", "bh", "cl", "ch", "dl", "dh"):
+        return 1
+    if op.type == "reg" and op.reg in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
+        return 2
+    return 4
+
 
 def _mem_accessor(size):
     """Return the MEM macro name for a given operand size."""
@@ -917,23 +926,27 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         # XOR reg, reg → zero (clears CF like any xor)
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-            return [_fmt_operand_write(ops[0], "0") + " /* xor self */", "_cf = 0; /* xor clears CF */"]
+            return [_fmt_operand_write(ops[0], "0") + " /* xor self */",
+                    "_cf = 0; g_eflags &= ~(X86_CF|X86_OF|X86_AF|X86_ZF|X86_SF|X86_PF);"
+                    " g_eflags |= X86_ZF | X86_PF; /* xor clears CF/OF */"]
         expr = f"{dst} {c_op} {src}"
+        width = _operand_width(ops[0])
         # Store the carry flag for sbb/adc consumers. add/sub set it; and/or/xor clear it.
         if m == "sub":
             # CF = borrow = (dst < src) unsigned; must read dst before the write
-            return [
-                f"_cf = ((uint32_t)({dst}) < (uint32_t)({src})); /* sub: CF = borrow */",
-                _fmt_operand_write(ops[0], expr)
-            ]
+            return [f"{{ uint32_t _lhs = {dst}, _rhs = {src}, _result = _lhs - _rhs;",
+                    _fmt_operand_write(ops[0], "_result"),
+                    f"_cf = ((uint32_t)_lhs < (uint32_t)_rhs); recomp_set_sub_flags(_lhs, _rhs, 0, _result, {width}); }}"]
         if m == "add":
             # CF = carry out = (sum < src) unsigned; dst now holds the sum
-            return [
-                _fmt_operand_write(ops[0], expr),
-                f"_cf = ((uint32_t)({dst}) < (uint32_t)({src})); /* add: CF = carry out */"
-            ]
+            return [f"{{ uint32_t _lhs = {dst}, _rhs = {src}, _result = _lhs + _rhs;",
+                    _fmt_operand_write(ops[0], "_result"),
+                    f"_cf = ((uint32_t)_result < (uint32_t)_lhs); recomp_set_add_flags(_lhs, _rhs, 0, _result, {width}); }}"]
         if m in ("and", "or", "xor"):
-            return [_fmt_operand_write(ops[0], expr), "_cf = 0; /* and/or/xor clear CF */"]
+            return [f"{{ uint32_t _lhs = {dst}, _rhs = {src}, _result = _lhs {c_op} _rhs;",
+                    _fmt_operand_write(ops[0], "_result"),
+                    "_cf = 0; g_eflags &= ~(X86_CF|X86_OF|X86_AF|X86_ZF|X86_SF|X86_PF);"
+                    " g_eflags |= (_result == 0 ? X86_ZF : 0) | (_result & 0x80000000u ? X86_SF : 0) | recomp_parity(_result); }"]
         return [_fmt_operand_write(ops[0], expr)]
 
     def _lift_inc_dec(self, insn, ops, m):
@@ -943,18 +956,23 @@ class Lifter:
         delta = "1"
         op_char = "+" if m == "inc" else "-"
         # For sub-registers (al, cl, etc.), use the SET macro instead of ++
+        width = _operand_width(ops[0])
         if ops[0].type == "reg" and ops[0].reg in (
                 "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"):
-            return [f"{val}{'++' if m == 'inc' else '--'};"]
-        else:
-            return [_fmt_operand_write(ops[0], f"{val} {op_char} {delta}")]
+            return [f"{{ uint32_t _lhs = {val}, _result = _lhs {op_char} 1; { _fmt_operand_write(ops[0], '_result') }"
+                    f" recomp_set_{'add' if m == 'inc' else 'sub'}_flags(_lhs, 1, 0, _result, {width}); }}"]
+        return [f"{{ uint32_t _lhs = {val}, _result = _lhs {op_char} 1;"
+                f" {_fmt_operand_write(ops[0], '_result')}"
+                f" recomp_set_{'add' if m == 'inc' else 'sub'}_flags(_lhs, 1, 0, _result, {width}); }}"]
 
     def _lift_neg(self, insn, ops):
         if len(ops) < 1:
             return ["/* neg: no operand */"]
         val = _fmt_operand_read(ops[0])
-        return [f"_cf = ({val} != 0);",
-                _fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})")]
+        width = _operand_width(ops[0])
+        return [f"{{ uint32_t _src = {val}, _result = (uint32_t)(-_src);",
+                _fmt_operand_write(ops[0], "_result"),
+                f"recomp_set_sub_flags(0, _src, 0, _result, {width}); _cf = (g_eflags & X86_CF) != 0; }}"]
 
     def _lift_not(self, insn, ops):
         if len(ops) < 1:
@@ -971,7 +989,10 @@ class Lifter:
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0") + " /* sbb self (CF extend) */"]
-        return [_fmt_operand_write(ops[0], f"{dst} - {src} - _cf") + " /* sbb */"]
+        width = _operand_width(ops[0])
+        return [f"{{ uint32_t _lhs = {dst}, _rhs = {src}, _borrow = (uint32_t)_cf, _result = _lhs - _rhs - _borrow;",
+                _fmt_operand_write(ops[0], "_result"),
+                f"recomp_set_sub_flags(_lhs, _rhs, _borrow, _result, {width}); _cf = (g_eflags & X86_CF) != 0; }} /* sbb */"]
 
     def _lift_adc(self, insn, ops):
         """ADC: add with carry."""
@@ -979,7 +1000,10 @@ class Lifter:
             return ["/* adc: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
-        return [_fmt_operand_write(ops[0], f"{dst} + {src} + _cf") + " /* adc */"]
+        width = _operand_width(ops[0])
+        return [f"{{ uint32_t _lhs = {dst}, _rhs = {src}, _carry = (uint32_t)_cf, _result = _lhs + _rhs + _carry;",
+                _fmt_operand_write(ops[0], "_result"),
+                f"recomp_set_add_flags(_lhs, _rhs, _carry, _result, {width}); _cf = (g_eflags & X86_CF) != 0; }} /* adc */"]
 
     def _lift_shld(self, insn, ops):
         """SHLD: double-precision shift left."""
@@ -1091,8 +1115,9 @@ class Lifter:
         rhs = _fmt_operand_read(ops[1])
         # Store CF for sbb/adc consumers. The following jcc re-evaluates the
         # operands itself, so this is purely for carry-dependent instructions.
+        width = _operand_width(ops[0])
         return [
-            f"_cf = ((uint32_t)({lhs}) < (uint32_t)({rhs})); /* cmp: CF = (lhs < rhs) unsigned */",
+            f"{{ uint32_t _lhs = {lhs}, _rhs = {rhs}, _result = _lhs - _rhs; _cf = ((uint32_t)_lhs < (uint32_t)_rhs); recomp_set_sub_flags(_lhs, _rhs, 0, _result, {width}); }} /* cmp */",
             f"(void)0; /* cmp {lhs}, {rhs} - flags set for next jcc */"
         ]
 
@@ -1102,7 +1127,7 @@ class Lifter:
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
         return [
-            "_cf = 0; /* test clears CF */",
+            f"{{ uint32_t _result = ({lhs}) & ({rhs}); _cf = 0; g_eflags &= ~(X86_CF|X86_OF|X86_AF|X86_ZF|X86_SF|X86_PF); g_eflags |= (_result == 0 ? X86_ZF : 0) | (_result & 0x80000000u ? X86_SF : 0) | recomp_parity(_result); }} /* test */",
             f"(void)0; /* test {lhs}, {rhs} - flags set for next jcc */"
         ]
 

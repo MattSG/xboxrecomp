@@ -90,6 +90,49 @@ extern ptrdiff_t g_xbox_mem_offset;
  */
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern uint32_t g_ebx, g_esi, g_edi;
+extern uint32_t g_eflags;
+
+#define X86_CF 0x00000001u
+#define X86_PF 0x00000004u
+#define X86_AF 0x00000010u
+#define X86_ZF 0x00000040u
+#define X86_SF 0x00000080u
+#define X86_OF 0x00000800u
+
+static inline uint32_t recomp_mask_for_width(unsigned width) {
+    return width == 1 ? 0xFFu : width == 2 ? 0xFFFFu : 0xFFFFFFFFu;
+}
+static inline uint32_t recomp_parity(uint32_t value) {
+    value &= 0xFFu;
+    value ^= value >> 4;
+    return ((0x6996u >> (value & 0xFu)) & 1u) ? 0u : X86_PF;
+}
+static inline void recomp_set_add_flags(uint32_t lhs, uint32_t rhs,
+                                         uint32_t carry, uint32_t result,
+                                         unsigned width) {
+    uint32_t mask = recomp_mask_for_width(width), sign = (mask + 1u) >> 1;
+    uint64_t wide = (uint64_t)(lhs & mask) + (rhs & mask) + carry;
+    uint32_t value = result & mask;
+    g_eflags = (g_eflags & ~(X86_CF|X86_PF|X86_AF|X86_ZF|X86_SF|X86_OF))
+        | ((wide & ~((uint64_t)mask)) ? X86_CF : 0u)
+        | ((lhs ^ rhs ^ value) & 0x10u ? X86_AF : 0u)
+        | recomp_parity(value) | (value == 0 ? X86_ZF : 0u)
+        | (value & sign ? X86_SF : 0u)
+        | ((~(lhs ^ rhs) & (lhs ^ value) & sign) ? X86_OF : 0u);
+}
+static inline void recomp_set_sub_flags(uint32_t lhs, uint32_t rhs,
+                                         uint32_t borrow, uint32_t result,
+                                         unsigned width) {
+    uint32_t mask = recomp_mask_for_width(width), sign = (mask + 1u) >> 1;
+    uint64_t right = (uint64_t)(rhs & mask) + borrow;
+    uint32_t value = result & mask;
+    g_eflags = (g_eflags & ~(X86_CF|X86_PF|X86_AF|X86_ZF|X86_SF|X86_OF))
+        | (((uint64_t)(lhs & mask) < right) ? X86_CF : 0u)
+        | ((lhs ^ rhs ^ value) & 0x10u ? X86_AF : 0u)
+        | recomp_parity(value) | (value == 0 ? X86_ZF : 0u)
+        | (value & sign ? X86_SF : 0u)
+        | (((lhs ^ rhs) & (lhs ^ value) & sign) ? X86_OF : 0u);
+}
 
 /* x87 stack. Global for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */

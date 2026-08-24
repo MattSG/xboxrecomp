@@ -451,7 +451,7 @@ class FunctionTranslator:
                 "rol", "ror", "rcl", "rcr")
                         for insn in instructions)
         if has_carry:
-            lines.append(f"    int _cf = 0; /* carry flag */")
+            lines.append(f"    int _cf = (g_eflags & X86_CF) != 0; /* carry flag */")
 
         # Add _fpu_cmp for FPU compare instructions (both old and new style)
         has_fpu_cmp = any(insn.mnemonic in ("fcompi", "fcomip", "fucomi",
