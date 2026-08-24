@@ -47,8 +47,11 @@ def analyze(instructions, initial=None):
         elif mnemonic in ("push", "pop"):
             events.append({"address": insn["address"], "kind": mnemonic, "value": str(read(op[0])) if op else UNKNOWN})
         elif mnemonic in ("call", "jmp") and op:
-            target = read(op[0])
-            events.append({"address": insn["address"], "kind": "indirect-control", "target": str(target)})
+            target = Value("CONST", (hex(op[0]),)) if isinstance(op[0], int) else read(op[0])
+            kind = "direct-control" if isinstance(op[0], int) else "indirect-control"
+            events.append({"address": insn["address"], "kind": kind, "target": str(target)})
+            if mnemonic == "call" and isinstance(op[0], int):
+                state["eax"] = Value("RETURN_FROM", (hex(op[0]),))
         elif op and isinstance(op[0], str):
             state[op[0]] = Value(UNKNOWN)
     return state, events
