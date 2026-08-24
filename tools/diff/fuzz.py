@@ -7,7 +7,7 @@ from .case import Case
 from .runner import run_unicorn, RunnerUnavailable
 
 OPS = ("01d8", "11d8", "29d8", "19d8", "39d8", "85d8", "40", "48",
-       "d1e0", "d1e8", "d1f8", "b001", "b401", "0fb6c0", "0fbec0",
+       "d1e0", "d1e8", "d1f8", "d1d0", "d1d8", "b001", "b401", "0fb6c0", "0fbec0",
        "0fb7c0", "0fbfc0", "f7e3", "0fafc3", "f7f3", "f7fb", "50", "58")
 REGS = ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eflags")
 

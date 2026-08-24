@@ -736,7 +736,7 @@ class Lifter:
             return self._lift_shift(insn, ops, ">>")
         if m == "sar":
             return self._lift_sar(insn, ops)
-        if m in ("rol", "ror"):
+        if m in ("rol", "ror", "rcl", "rcr"):
             return self._lift_rotate(insn, ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
@@ -776,10 +776,16 @@ class Lifter:
             return [f"{r} = BSWAP32({r}); /* bswap */"]
         if m == "int3":
             return ["__debugbreak(); /* int3 */"]
+        if m == "enter":
+            alloc = _fmt_operand_read(ops[0]) if ops else "0"
+            level = _fmt_operand_read(ops[1]) if len(ops) > 1 else "0"
+            return [f"{{ PUSH32(esp, ebp); ebp = esp; uint32_t _level = ({level}) & 31;"
+                    f" for (uint32_t _i = 1; _i < _level; ++_i) {{ ebp -= 4; PUSH32(esp, MEM32(ebp)); }}"
+                    f" esp = ebp - ({alloc}); }} /* enter */"]
         if m in ("leave",):
             return ["esp = ebp;", "POP32(esp, ebp); /* leave */"]
         if m in ("cld", "std"):
-            return [f"/* {m} - direction flag */"]
+            return [f"g_eflags = (g_eflags & ~0x400u) | ({'0' if m == 'cld' else '0x400u'}); /* {m} */"]
         if m == "lahf":
             return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
         if m == "sahf":
@@ -1106,6 +1112,18 @@ class Lifter:
             return [f"/* {m}: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
+        if m in ("rcl", "rcr"):
+            width = _operand_width(ops[0]); bits = width * 8
+            mask = {1: '0xFFu', 2: '0xFFFFu', 4: '0xFFFFFFFFu'}[width]
+            right = m == "rcr"
+            if right:
+                step = f"uint32_t _next = _result & 1u; _result = (_result >> 1) | (_cf << {bits - 1});"
+            else:
+                step = f"uint32_t _next = (_result >> {bits - 1}) & 1u; _result = ((_result << 1) & {mask}) | _cf;"
+            return [f"{{ uint32_t _d = {dst} & {mask}, _c = ({cnt}) & 31, _result = _d;"
+                    f" _c %= {bits + 1}; for (uint32_t _i = 0; _i < _c; ++_i) {{ {step} _cf = _next; }}"
+                    f" {_fmt_operand_write(ops[0], '_result')}"
+                    f" g_eflags = (g_eflags & ~X86_CF) | (_cf ? X86_CF : 0); }}"]
         func = "ROL32" if m == "rol" else "ROR32"
         # CF = the bit that rotates out the top (rol) / bottom (ror)
         bit = f"((_d >> (32 - _c)) & 1)" if m == "rol" else f"((_d >> (_c - 1)) & 1)"
@@ -1299,32 +1317,29 @@ class Lifter:
     # ── String operations ──
 
     def _lift_rep_string(self, insn, m):
-        if "movsb" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx);",
-                    "esi += ecx; edi += ecx; ecx = 0; /* rep movsb */"]
-        if "movsd" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 4);",
-                    "esi += ecx * 4; edi += ecx * 4; ecx = 0; /* rep movsd */"]
-        if "movsw" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 2);",
-                    "esi += ecx * 2; edi += ecx * 2; ecx = 0; /* rep movsw */"]
-        if "stosb" in m:
-            return ["memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx);",
-                    "edi += ecx; ecx = 0; /* rep stosb */"]
-        if "stosd" in m:
-            return [
-                "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*4) = eax; }",
-                "edi += ecx * 4; ecx = 0; /* rep stosd */"
-            ]
-        if "stosw" in m:
-            return [
-                "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*2) = LO16(eax); }",
-                "edi += ecx * 2; ecx = 0; /* rep stosw */"
-            ]
-        if "cmpsb" in m or "cmpsw" in m or "cmpsd" in m:
-            return [f"/* {m} - string compare, ecx iterations */"]
-        if "scasb" in m or "scasw" in m or "scasd" in m:
-            return [f"/* {m} - string scan, ecx iterations */"]
+        names = ("movsb", "movsw", "movsd", "stosb", "stosw", "stosd")
+        if any(name in m for name in names):
+            name = next(name for name in names if name in m)
+            size = {"movsb": 1, "movsw": 2, "movsd": 4, "stosb": 1, "stosw": 2, "stosd": 4}[name]
+            access = {1: "MEM8", 2: "MEM16", 4: "MEM32"}[size]
+            source = "eax" if name.startswith("stos") else f"{access}(esi)"
+            source_move = "" if name.startswith("stos") else f"esi += _step;"
+            return [f"{{ uint32_t _step = (g_eflags & 0x400u) ? (uint32_t)-{size} : {size}u;"
+                    f" while (ecx) {{ {access}(edi) = {source}; {source_move} edi += _step; --ecx; }} /* {m} */ }}"]
+        names = ("cmpsb", "cmpsw", "cmpsd", "scasb", "scasw", "scasd")
+        if any(name in m for name in names):
+            name = next(name for name in names if name in m)
+            size = {"cmpsb": 1, "cmpsw": 2, "cmpsd": 4, "scasb": 1, "scasw": 2, "scasd": 4}[name]
+            access = {1: "MEM8", 2: "MEM16", 4: "MEM32"}[size]
+            scan = name.startswith("scas")
+            repeat = "repe" in m or "repz" in m
+            left = ("LO8(eax)" if size == 1 else "LO16(eax)" if size == 2 else "eax") if scan else f"{access}(esi)"
+            rhs = f"{access}(edi)"
+            advance = "edi += _step;" if scan else "esi += _step; edi += _step;"
+            return [f"{{ uint32_t _step = (g_eflags & 0x400u) ? (uint32_t)-{size} : {size}u;"
+                    f" while (ecx) {{ uint32_t _lhs = {left}, _rhs = {rhs}, _result = _lhs - _rhs;"
+                    f" recomp_set_sub_flags(_lhs, _rhs, 0, _result, {size}); {advance} --ecx;"
+                    f" if (!(ecx && (((g_eflags & X86_ZF) != 0) == {str(repeat)}))) break; }} /* {m} */ }}"]
         return [f"/* {m} */"]
 
     def _lift_string_op(self, insn, m):
