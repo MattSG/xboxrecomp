@@ -13,6 +13,10 @@ available, memory pages, and an external-call transcript. The runner adapter
 may use Unicorn or another trusted x86 engine; the case format does not depend
 on that choice.
 
+For a disposable Unicorn environment on Windows, use
+`uv run --with unicorn --with capstone --project . python -m tools.diff.fuzz`;
+the dependency is optional and is not vendored.
+
 `python -m tools.diff.fuzz --seed 1234 --cases 100` creates bounded,
 replayable arithmetic/flag cases. With `RECOMP_TRACE_ENABLED=1`, consumers
 keep 4096 fixed-size runtime records; decode a raw dump with
