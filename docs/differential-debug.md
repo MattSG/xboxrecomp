@@ -22,6 +22,9 @@ replayable arithmetic/flag cases. With `RECOMP_TRACE_ENABLED=1`, consumers
 keep 4096 fixed-size runtime records; decode a raw dump with
 `python -m tools.diff.trace_decode trace.bin`. The default build emits no
 trace calls.
+Generated functions also emit an instruction event for every guest instruction
+when tracing is enabled, allowing a consumer to refine a function/basic-block
+failure to the exact guest EIP without editing generated C.
 Pass `--recomp-command` to run a generated-runtime adapter for every case;
 `--stop-on-failure` leaves the failing case, oracle, and recomp trace in the
 output directory and prints the first divergent checkpoint.

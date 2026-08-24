@@ -230,7 +230,8 @@ enum recomp_trace_event_type {
     RECOMP_TRACE_TAIL = 4,
     RECOMP_TRACE_READ = 5,
     RECOMP_TRACE_WRITE = 6,
-    RECOMP_TRACE_FAULT = 7
+    RECOMP_TRACE_FAULT = 7,
+    RECOMP_TRACE_INSTRUCTION = 8
 };
 void recomp_trace_event(uint32_t type, uint32_t eip,
                         uint32_t arg0, uint32_t arg1, uint32_t arg2);

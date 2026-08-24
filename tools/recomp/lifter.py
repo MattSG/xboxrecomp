@@ -1650,11 +1650,14 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
     while i < len(insns):
         curr = insns[i]
+        stmts.append(f"RECOMP_TRACE_EVENT(RECOMP_TRACE_INSTRUCTION, 0x{curr.address:08X}u, 0, 0, 0);")
 
         # Try cmp/test + jcc pattern first (2-instruction match)
         match = try_match_cmp_jcc(insns, i, lifter=lifter)
         if match:
             stmt, consumed = match
+            if consumed > 1:
+                stmts.append(f"RECOMP_TRACE_EVENT(RECOMP_TRACE_INSTRUCTION, 0x{insns[i + 1].address:08X}u, 0, 0, 0);")
             stmts.append(stmt)
             # Preserve the flag-setter from the cmp/test since jcc
             # doesn't modify flags - subsequent jcc can reuse them
