@@ -177,6 +177,20 @@ void xbox_HeapFree(uint32_t xbox_va);
  */
 HANDLE xbox_GetMappingHandle(void);
 
+struct recomp_trace_record {
+    uint32_t sequence;
+    uint32_t thread;
+    uint32_t eip;
+    uint32_t type;
+    uint32_t arg0;
+    uint32_t arg1;
+    uint32_t arg2;
+};
+extern volatile struct recomp_trace_record g_recomp_trace[4096];
+extern volatile uint32_t g_recomp_trace_write;
+void recomp_trace_event(uint32_t type, uint32_t eip,
+                        uint32_t arg0, uint32_t arg1, uint32_t arg2);
+
 #ifdef __cplusplus
 }
 #endif

@@ -11,3 +11,9 @@ entry/stop boundary, all general registers and EFLAGS, x87/SSE state when
 available, memory pages, and an external-call transcript. The runner adapter
 may use Unicorn or another trusted x86 engine; the case format does not depend
 on that choice.
+
+`python -m tools.diff.fuzz --seed 1234 --cases 100` creates bounded,
+replayable arithmetic/flag cases. With `RECOMP_TRACE_ENABLED=1`, consumers
+keep 4096 fixed-size runtime records; decode a raw dump with
+`python -m tools.diff.trace_decode trace.bin`. The default build emits no
+trace calls.
