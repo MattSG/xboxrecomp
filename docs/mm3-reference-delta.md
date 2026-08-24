@@ -27,3 +27,6 @@ changes remain pending isolated generic tests; no bulk copy was performed.
   state. Halo-specific kernel ordinals, EEPROM, NV2A, heap, file, and address
   diagnostics were excluded. Flag-snapshot and function-boundary commits
   conflicted with newer fork code and were retained as superseded.
+- The clean generated-source glob update from PR #5 (`794bd7f`) was also
+  imported; it makes newly split function chunks visible to CMake without a
+  hand-edited source list.
