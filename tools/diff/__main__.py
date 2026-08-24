@@ -11,6 +11,7 @@ def main():
     parser.add_argument("--oracle", required=True)
     parser.add_argument("--recomp", required=True)
     parser.add_argument("--run-oracle", action="store_true", help="run optional Unicorn oracle")
+    parser.add_argument("--oracle-command", help="command that writes oracle checkpoints to --oracle")
     parser.add_argument("--recomp-command", help="command that writes recomp checkpoints to --recomp")
     args = parser.parse_args()
     path = args.case if args.case.endswith(".json") else args.case + "/case.json"
@@ -19,6 +20,13 @@ def main():
         from .runner import run_unicorn, save_trace
         oracle = run_unicorn(Case.load(path).validate())
         save_trace(args.oracle, oracle)
+    elif args.oracle_command:
+        environment = os.environ.copy()
+        environment["XBOXRECOMP_DIFF_CASE"] = path
+        environment["XBOXRECOMP_DIFF_OUT"] = args.oracle
+        subprocess.run(args.oracle_command, shell=True, check=True, env=environment)
+        with open(args.oracle, encoding="utf-8") as stream:
+            oracle = json.load(stream)
     else:
         with open(args.oracle, encoding="utf-8") as stream:
             oracle = json.load(stream)

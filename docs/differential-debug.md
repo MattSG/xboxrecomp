@@ -1,7 +1,8 @@
 # Differential debug cases
 
 Run `python -m tools.diff cases/foo --oracle oracle.json --recomp recomp.json`.
-Add `--run-oracle` for the optional Unicorn oracle, and
+Add `--run-oracle` for the optional Unicorn oracle, or `--oracle-command` for a
+trusted x86 engine adapter. Add
 `--recomp-command '...'` for a generated-runtime adapter. The adapter receives
 `XBOXRECOMP_DIFF_CASE` and `XBOXRECOMP_DIFF_OUT`; this keeps generated game
 projects independent of the toolkit's Python process.
