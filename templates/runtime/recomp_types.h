@@ -133,6 +133,46 @@ static inline void recomp_set_sub_flags(uint32_t lhs, uint32_t rhs,
         | (value & sign ? X86_SF : 0u)
         | (((lhs ^ rhs) & (lhs ^ value) & sign) ? X86_OF : 0u);
 }
+static inline void recomp_set_incdec_flags(uint32_t lhs, uint32_t result,
+                                           unsigned width, int decrement) {
+    uint32_t carry = g_eflags & X86_CF;
+    if (decrement) recomp_set_sub_flags(lhs, 1, 0, result, width);
+    else recomp_set_add_flags(lhs, 1, 0, result, width);
+    g_eflags = (g_eflags & ~X86_CF) | carry;
+}
+static inline void recomp_set_shift_flags(uint32_t before, uint32_t result,
+                                          unsigned count, unsigned width,
+                                          int right, int arithmetic) {
+    uint32_t mask = recomp_mask_for_width(width), value = result & mask;
+    if (!count) return;
+    uint32_t cf = right ? ((before >> (count - 1)) & 1u)
+                        : ((before >> ((width * 8u) - count)) & 1u);
+    g_eflags &= ~(X86_CF|X86_PF|X86_AF|X86_ZF|X86_SF|X86_OF);
+    g_eflags |= cf ? X86_CF : 0u;
+    g_eflags |= recomp_parity(value) | (value == 0 ? X86_ZF : 0u);
+    g_eflags |= (value & ((mask + 1u) >> 1)) ? X86_SF : 0u;
+    if (count == 1) {
+        uint32_t sign = (mask + 1u) >> 1;
+        g_eflags |= right ? ((before & sign) ? X86_OF : 0u)
+                          : (((value & sign) != (before & sign)) ? X86_OF : 0u);
+    }
+    (void)arithmetic;
+}
+static inline void recomp_set_rotate_flags(uint32_t before, uint32_t result,
+                                           unsigned count, unsigned width,
+                                           int right) {
+    uint32_t bits = width * 8u, mask = recomp_mask_for_width(width);
+    if (!count) return;
+    uint32_t cf = right ? ((result >> (bits - 1)) & 1u) : (result & 1u);
+    g_eflags = (g_eflags & ~(X86_CF|X86_OF)) | (cf ? X86_CF : 0u);
+    if (count == 1) {
+        uint32_t sign = (mask + 1u) >> 1;
+        uint32_t of = right ? (((result & sign) != 0) ^ ((result >> (bits - 2)) & 1u))
+                            : (((result & sign) != 0) ^ cf);
+        g_eflags |= of ? X86_OF : 0u;
+    }
+    (void)before;
+}
 
 /* x87 stack. Global for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */

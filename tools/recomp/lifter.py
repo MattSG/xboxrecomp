@@ -960,10 +960,10 @@ class Lifter:
         if ops[0].type == "reg" and ops[0].reg in (
                 "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"):
             return [f"{{ uint32_t _lhs = {val}, _result = _lhs {op_char} 1; { _fmt_operand_write(ops[0], '_result') }"
-                    f" recomp_set_{'add' if m == 'inc' else 'sub'}_flags(_lhs, 1, 0, _result, {width}); }}"]
+                    f" recomp_set_incdec_flags(_lhs, _result, {width}, {1 if m == 'dec' else 0}); }}"]
         return [f"{{ uint32_t _lhs = {val}, _result = _lhs {op_char} 1;"
                 f" {_fmt_operand_write(ops[0], '_result')}"
-                f" recomp_set_{'add' if m == 'inc' else 'sub'}_flags(_lhs, 1, 0, _result, {width}); }}"]
+                f" recomp_set_incdec_flags(_lhs, _result, {width}, {1 if m == 'dec' else 0}); }}"]
 
     def _lift_neg(self, insn, ops):
         if len(ops) < 1:
@@ -988,7 +988,10 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-            return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0") + " /* sbb self (CF extend) */"]
+            width = _operand_width(ops[0])
+            return [f"{{ uint32_t _lhs = {_fmt_operand_read(ops[0])}, _borrow = (uint32_t)_cf, _result = _lhs - _lhs - _borrow;",
+                    _fmt_operand_write(ops[0], "_result"),
+                    f"recomp_set_sub_flags(_lhs, _lhs, _borrow, _result, {width}); _cf = (g_eflags & X86_CF) != 0; }} /* sbb self */"]
         width = _operand_width(ops[0])
         return [f"{{ uint32_t _lhs = {dst}, _rhs = {src}, _borrow = (uint32_t)_cf, _result = _lhs - _rhs - _borrow;",
                 _fmt_operand_write(ops[0], "_result"),
@@ -1077,22 +1080,26 @@ class Lifter:
         # Store CF = the last bit shifted out (x86 masks the count to 5 bits,
         # which also keeps the C shift well-defined). _cf is unchanged for a
         # count of 0, matching x86.
-        if c_op == "<<":
-            return [f"{{ uint32_t _d = {dst}; uint32_t _c = ({cnt}) & 31;"
-                    f" if (_c) _cf = ((_d >> (32 - _c)) & 1);"
-                    f" {_fmt_operand_write(ops[0], '_d << _c')} }}"]
-        return [f"{{ uint32_t _d = {dst}; uint32_t _c = ({cnt}) & 31;"
-                f" if (_c) _cf = ((_d >> (_c - 1)) & 1);"
-                f" {_fmt_operand_write(ops[0], '_d >> _c')} }}"]
+        width = _operand_width(ops[0]); bits = width * 8
+        mask = {1: '0xFFu', 2: '0xFFFFu', 4: '0xFFFFFFFFu'}[width]
+        operator = '<<' if c_op == '<<' else '>>'
+        return [f"{{ uint32_t _d = {dst} & {mask}, _c = ({cnt}) & 31;"
+                f" uint32_t _result = _c < {bits} ? (_d {operator} _c) : 0;"
+                f" {_fmt_operand_write(ops[0], '_result')}"
+                f" recomp_set_shift_flags(_d, _result, _c, {width}, {0 if c_op == '<<' else 1}, 0);"
+                f" _cf = (g_eflags & X86_CF) != 0; }}"]
 
     def _lift_sar(self, insn, ops):
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        return [f"{{ uint32_t _d = {dst}; uint32_t _c = ({cnt}) & 31;"
-                f" if (_c) _cf = ((_d >> (_c - 1)) & 1);"
-                f" {_fmt_operand_write(ops[0], '(uint32_t)((int32_t)_d >> _c)')} }}"]
+        width = _operand_width(ops[0]); bits = width * 8
+        mask = {1: '0xFFu', 2: '0xFFFFu', 4: '0xFFFFFFFFu'}[width]
+        return [f"{{ uint32_t _d = {dst} & {mask}, _c = ({cnt}) & 31;"
+                f" uint32_t _result = _c < {bits} ? (uint32_t)(((int32_t)(_d << (32 - {bits})) >> (32 - {bits})) >> _c) : (uint32_t)(((int32_t)(_d << (32 - {bits})) >> (32 - {bits})));"
+                f" {_fmt_operand_write(ops[0], '_result')} recomp_set_shift_flags(_d, _result, _c, {width}, 1, 1);"
+                f" _cf = (g_eflags & X86_CF) != 0; }}"]
 
     def _lift_rotate(self, insn, ops, m):
         if len(ops) < 2:
@@ -1102,9 +1109,12 @@ class Lifter:
         func = "ROL32" if m == "rol" else "ROR32"
         # CF = the bit that rotates out the top (rol) / bottom (ror)
         bit = f"((_d >> (32 - _c)) & 1)" if m == "rol" else f"((_d >> (_c - 1)) & 1)"
-        return [f"{{ uint32_t _d = {dst}; uint32_t _c = ({cnt}) & 31;"
-                f" if (_c) _cf = {bit};"
-                f" {_fmt_operand_write(ops[0], f'{func}(_d, _c)')} }}"]
+        width = _operand_width(ops[0]); bits = width * 8
+        mask = {1: '0xFFu', 2: '0xFFFFu', 4: '0xFFFFFFFFu'}[width]
+        return [f"{{ uint32_t _d = {dst} & {mask}, _c = ({cnt}) % {bits};"
+                f" uint32_t _result = {func}(_d, _c) & {mask};"
+                f" {_fmt_operand_write(ops[0], '_result')} recomp_set_rotate_flags(_d, _result, _c, {width}, {1 if m == 'ror' else 0});"
+                f" _cf = (g_eflags & X86_CF) != 0; }}"]
 
     # ── Compare / Test (standalone) ──
 
