@@ -22,6 +22,9 @@ replayable arithmetic/flag cases. With `RECOMP_TRACE_ENABLED=1`, consumers
 keep 4096 fixed-size runtime records; decode a raw dump with
 `python -m tools.diff.trace_decode trace.bin`. The default build emits no
 trace calls.
+The built-in corpus covers partial registers, MOVSX/MOVZX, ADC/SBB, shifts and
+rotates, MUL/IMUL/DIV/IDIV, SETcc/CMOVcc, stack operations, REP string forms,
+ENTER/LEAVE, x87 basics, and SSE basics. Runs remain bounded and seed-driven.
 Generated functions also emit an instruction event for every guest instruction
 when tracing is enabled, allowing a consumer to refine a function/basic-block
 failure to the exact guest EIP without editing generated C.
