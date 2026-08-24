@@ -1133,7 +1133,7 @@ class Lifter:
         # The callee's 'ret' will pop it back off.
         if insn.call_target:
             name = self._call_target_name(insn.call_target)
-            lines = [f"g_seh_ebp = ebp; PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
+            lines = [f"RECOMP_TRACE_EVENT(RECOMP_TRACE_CALL, 0x{insn.address:08X}u, 0x{insn.call_target:08X}u, 0, 0); g_seh_ebp = ebp; PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
             # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
             if insn.call_target in self.SEH_PROLOGS | self.SEH_EPILOGS:
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
@@ -1141,7 +1141,7 @@ class Lifter:
         elif len(ops) >= 1:
             target = _fmt_operand_read(ops[0])
             # Mark indirect calls for post-processing by _fixup_icall_esp_save
-            return [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
+            return [f"{{ uint32_t _trace_target = (uint32_t)({target}); RECOMP_TRACE_EVENT(RECOMP_TRACE_CALL, 0x{insn.address:08X}u, _trace_target, 0, 0); PUSH32(esp, 0); RECOMP_ICALL_SAFE(_trace_target, _icall_esp); }} /* indirect call */"]
         return ["/* call: no target */"]
 
     def _lift_ret(self, insn, ops):
@@ -1154,8 +1154,8 @@ class Lifter:
             prefix = "g_seh_ebp = ebp; "
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
-            return [f"{prefix}esp += {4 + n}; return; /* ret {n} */"]
-        return [f"{prefix}esp += 4; return; /* ret */"]
+            return [f"{prefix}RECOMP_TRACE_RETURN(0x{self.func_start:08X}u); esp += {4 + n}; return; /* ret {n} */"]
+        return [f"{prefix}RECOMP_TRACE_RETURN(0x{self.func_start:08X}u); esp += 4; return; /* ret */"]
 
     def _is_external_target(self, addr):
         """Check if a jump target is outside the current function."""
@@ -1207,7 +1207,7 @@ class Lifter:
                 # Tail call - no return address push (reuses current frame's)
                 # Bridge ebp so the target function can inherit our frame pointer.
                 name = self._call_target_name(insn.jump_target)
-                return [f"g_seh_ebp = ebp; {name}(); return; /* tail jmp 0x{insn.jump_target:08X} */"]
+                return [f"RECOMP_TRACE_EVENT(RECOMP_TRACE_TAIL, 0x{insn.address:08X}u, 0x{insn.jump_target:08X}u, 0, 0); g_seh_ebp = ebp; {name}(); return; /* tail jmp 0x{insn.jump_target:08X} */"]
             return [f"goto loc_{insn.jump_target:08X};"]
         elif len(ops) >= 1:
             # Detect intra-function switch tables (computed gotos)
@@ -1218,10 +1218,10 @@ class Lifter:
                 lines = [f"{{ uint32_t _jt = {target_expr}; /* switch: {len(switch_targets)} entries, {len(unique_targets)} targets */"]
                 for t in unique_targets:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
-                lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
+                lines.append(f"RECOMP_TRACE_EVENT(RECOMP_TRACE_TAIL, 0x{insn.address:08X}u, _jt, 0, 0); g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
                 return lines
             target = _fmt_operand_read(ops[0])
-            return [f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return; /* indirect tail jmp */"]
+            return [f"{{ uint32_t _trace_target = (uint32_t)({target}); RECOMP_TRACE_EVENT(RECOMP_TRACE_TAIL, 0x{insn.address:08X}u, _trace_target, 0, 0); g_seh_ebp = ebp; RECOMP_ITAIL(_trace_target); return; }} /* indirect tail jmp */"]
         return ["/* jmp: no target */"]
 
     def _lift_jcc(self, insn):
