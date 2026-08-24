@@ -6,14 +6,18 @@ from pathlib import Path
 from .case import Case
 from .runner import run_unicorn, RunnerUnavailable
 
-OPS = ("01d8", "11d8", "29d8", "19d8", "39d8", "85d8", "40", "48", "d1e0", "d1e8", "d1f8")
+OPS = ("01d8", "11d8", "29d8", "19d8", "39d8", "85d8", "40", "48",
+       "d1e0", "d1e8", "d1f8", "b001", "b401", "0fb6c0", "0fbec0",
+       "0fb7c0", "0fbfc0", "f7e3", "0fafc3", "f7f3", "f7fb", "50", "58")
 REGS = ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eflags")
 
 def make_case(seed, count):
     rng = random.Random(seed)
     code = "".join(rng.choice(OPS) for _ in range(count))
+    state = {name: rng.getrandbits(32) for name in REGS}
+    state.update({"esp": 0x8FF0, "esi": 0x8100, "edi": 0x8200, "ecx": 4, "ebx": 3})
     return Case({"name": f"x86-semantics-{seed}", "code": code, "entry_eip": 0x1000,
-        "stop": {"instructions": count}, "state": {name: rng.getrandbits(32) for name in REGS},
+        "stop": {"instructions": count}, "state": state,
         "memory": [{"address": 0x8000, "data": "00" * 4096}], "calls": [], "seed": seed}).validate()
 
 def main():
