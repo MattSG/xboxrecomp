@@ -135,6 +135,31 @@ void recomp_trace_enter(uint32_t va);
 void recomp_trace_leave(void);
 void recomp_trace_dump(void);
 
+/* Optional bounded generator-native event stream. Disabled at compile time by
+ * default, so generated code pays no call or branch cost in normal builds. */
+#ifndef RECOMP_TRACE_ENABLED
+#define RECOMP_TRACE_ENABLED 0
+#endif
+enum recomp_trace_event_type {
+    RECOMP_TRACE_ENTRY = 1,
+    RECOMP_TRACE_RETURN = 2,
+    RECOMP_TRACE_CALL = 3,
+    RECOMP_TRACE_TAIL = 4,
+    RECOMP_TRACE_READ = 5,
+    RECOMP_TRACE_WRITE = 6,
+    RECOMP_TRACE_FAULT = 7
+};
+void recomp_trace_event(uint32_t type, uint32_t eip,
+                        uint32_t arg0, uint32_t arg1, uint32_t arg2);
+#if RECOMP_TRACE_ENABLED
+#define RECOMP_TRACE_EVENT(type,eip,arg0,arg1,arg2) \
+    recomp_trace_event((type),(eip),(arg0),(arg1),(arg2))
+#else
+#define RECOMP_TRACE_EVENT(type,eip,arg0,arg1,arg2) do { } while (0)
+#endif
+#define RECOMP_TRACE_ENTRY(va) RECOMP_TRACE_EVENT(RECOMP_TRACE_ENTRY, (va), 0, 0, 0)
+#define RECOMP_TRACE_RETURN(va) RECOMP_TRACE_EVENT(RECOMP_TRACE_RETURN, (va), 0, 0, 0)
+
 /* ================================================================
  * Memory access helpers
  * ================================================================ */

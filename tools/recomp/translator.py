@@ -400,6 +400,7 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+        lines.append(f"    RECOMP_TRACE_ENTRY(0x{start:08X}u);")
 
         # ebp is the only callee-saved register declared as a local.
         # ebx, esi, edi are global via #define macros (g_ebx, g_esi, g_edi)
