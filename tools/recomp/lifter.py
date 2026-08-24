@@ -1650,7 +1650,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
     while i < len(insns):
         curr = insns[i]
-        stmts.append(f"RECOMP_TRACE_EVENT(RECOMP_TRACE_INSTRUCTION, 0x{curr.address:08X}u, 0, 0, 0);")
+        stmts.append(f"RECOMP_TRACE_EVENT(RECOMP_TRACE_INSTRUCTION, 0x{curr.address:08X}u, 0, 0, 0); RECOMP_TRACE_INSTRUCTION(0x{curr.address:08X}u);")
         for operand_index, operand in enumerate(curr.operands):
             if operand.type == "mem":
                 access = "RECOMP_TRACE_WRITE" if operand_index == 0 and curr.mnemonic not in (
@@ -1662,7 +1662,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if match:
             stmt, consumed = match
             if consumed > 1:
-                stmts.append(f"RECOMP_TRACE_EVENT(RECOMP_TRACE_INSTRUCTION, 0x{insns[i + 1].address:08X}u, 0, 0, 0);")
+                stmts.append(f"RECOMP_TRACE_EVENT(RECOMP_TRACE_INSTRUCTION, 0x{insns[i + 1].address:08X}u, 0, 0, 0); RECOMP_TRACE_INSTRUCTION(0x{insns[i + 1].address:08X}u);")
             stmts.append(stmt)
             # Preserve the flag-setter from the cmp/test since jcc
             # doesn't modify flags - subsequent jcc can reuse them

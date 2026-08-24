@@ -191,6 +191,12 @@ extern volatile uint32_t g_recomp_trace_write;
 void recomp_trace_event(uint32_t type, uint32_t eip,
                         uint32_t arg0, uint32_t arg1, uint32_t arg2);
 void recomp_trace_set_memory_filter(uint32_t begin, uint32_t end);
+struct recomp_diff_checkpoint_record {
+    uint32_t sequence, eip, eax, ebx, ecx, edx, esi, edi, esp, eflags;
+};
+extern volatile struct recomp_diff_checkpoint_record g_recomp_diff_checkpoints[4096];
+extern volatile uint32_t g_recomp_diff_checkpoint_write;
+void recomp_diff_checkpoint(uint32_t eip);
 extern uint32_t g_eflags;
 
 #ifdef __cplusplus

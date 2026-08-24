@@ -75,6 +75,8 @@ volatile struct recomp_trace_record g_recomp_trace[4096] = {0};
 volatile uint32_t g_recomp_trace_write = 0;
 volatile uint32_t g_recomp_trace_mem_begin = 0;
 volatile uint32_t g_recomp_trace_mem_end = 0;
+volatile struct recomp_diff_checkpoint_record g_recomp_diff_checkpoints[4096] = {0};
+volatile uint32_t g_recomp_diff_checkpoint_write = 0;
 
 void recomp_trace_event(uint32_t type, uint32_t eip,
                         uint32_t arg0, uint32_t arg1, uint32_t arg2)
@@ -99,6 +101,18 @@ void recomp_trace_set_memory_filter(uint32_t begin, uint32_t end)
 {
     g_recomp_trace_mem_begin = begin;
     g_recomp_trace_mem_end = end;
+}
+
+void recomp_diff_checkpoint(uint32_t eip)
+{
+    uint32_t slot = g_recomp_diff_checkpoint_write++ & 4095u;
+    struct recomp_diff_checkpoint_record *record =
+        (struct recomp_diff_checkpoint_record *)&g_recomp_diff_checkpoints[slot];
+    record->sequence = g_recomp_diff_checkpoint_write;
+    record->eip = eip;
+    record->eax = g_eax; record->ebx = g_ebx; record->ecx = g_ecx;
+    record->edx = g_edx; record->esi = g_esi; record->edi = g_edi;
+    record->esp = g_esp; record->eflags = g_eflags;
 }
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)

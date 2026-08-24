@@ -236,6 +236,15 @@ enum recomp_trace_event_type {
 void recomp_trace_event(uint32_t type, uint32_t eip,
                         uint32_t arg0, uint32_t arg1, uint32_t arg2);
 void recomp_trace_set_memory_filter(uint32_t begin, uint32_t end);
+#ifndef RECOMP_DIFF_CHECKPOINT_ENABLED
+#define RECOMP_DIFF_CHECKPOINT_ENABLED 0
+#endif
+void recomp_diff_checkpoint(uint32_t eip);
+#if RECOMP_DIFF_CHECKPOINT_ENABLED
+#define RECOMP_TRACE_INSTRUCTION(eip) recomp_diff_checkpoint((eip))
+#else
+#define RECOMP_TRACE_INSTRUCTION(eip) do { } while (0)
+#endif
 #if RECOMP_TRACE_ENABLED
 #define RECOMP_TRACE_EVENT(type,eip,arg0,arg1,arg2) \
     recomp_trace_event((type),(eip),(arg0),(arg1),(arg2))

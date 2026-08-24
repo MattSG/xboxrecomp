@@ -28,6 +28,12 @@ failure to the exact guest EIP without editing generated C.
 Call `recomp_trace_set_memory_filter(begin, end)` to retain only generated
 memory-read/write events whose guest address is in the selected half-open
 range; the same bounded ring stores those events.
+Define `RECOMP_DIFF_CHECKPOINT_ENABLED=1` in the generated consumer to fill a
+second bounded ring with EIP, EAX/EBX/ECX/EDX/ESI/EDI, ESP, and EFLAGS at each
+instruction event. This is the generated-side state stream an adapter can
+serialize to the same checkpoint JSON shape as the oracle.
+Raw records copied from that ring can be decoded with
+`python -m tools.diff.checkpoint_decode checkpoints.bin`.
 Pass `--recomp-command` to run a generated-runtime adapter for every case;
 `--stop-on-failure` leaves the failing case, oracle, and recomp trace in the
 output directory and prints the first divergent checkpoint.
