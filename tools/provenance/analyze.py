@@ -19,7 +19,9 @@ def analyze(instructions, initial=None):
     instructions invalidate their destination; ambiguous joins must be merged
     by the caller with ``join``.
     """
-    state = {name: Value(UNKNOWN) for name in (initial or ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"))}
+    names = initial.keys() if isinstance(initial, dict) else (initial or ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"))
+    state = {name: Value(UNKNOWN) for name in names}
+    stack = {}
     events = []
     def read(operand):
         if isinstance(operand, str):
@@ -27,6 +29,8 @@ def analyze(instructions, initial=None):
         if isinstance(operand, dict) and operand.get("kind") == "global":
             return Value("GLOBAL", (hex(operand["address"]),))
         if isinstance(operand, dict) and operand.get("kind") == "mem":
+            if operand.get("base") == "esp" and not operand.get("index") and operand.get("disp", 0) >= 4:
+                return Value("STACK_ARG", (f"+0x{operand['disp']:X}",))
             base = state.get(operand.get("base"), Value(UNKNOWN))
             return Value("LOAD", (str(base), operand.get("disp", 0)))
         return Value(UNKNOWN)
@@ -46,6 +50,10 @@ def analyze(instructions, initial=None):
                 state[op[0]] = Value(UNKNOWN)
         elif mnemonic in ("push", "pop"):
             events.append({"address": insn["address"], "kind": mnemonic, "value": str(read(op[0])) if op else UNKNOWN})
+            if mnemonic == "push" and op:
+                stack[len(stack)] = read(op[0])
+            elif mnemonic == "pop" and op and isinstance(op[0], str) and stack:
+                state[op[0]] = stack.pop(max(stack))
         elif mnemonic in ("call", "jmp") and op:
             target = Value("CONST", (hex(op[0]),)) if isinstance(op[0], int) else read(op[0])
             kind = "direct-control" if isinstance(op[0], int) else "indirect-control"
