@@ -8,14 +8,17 @@ Compared read-only on 2026-08-25:
 Generic candidates identified from the fork-derived copy include carry/borrow
 and `NEG` flags, REP CMPS, sub-register immediate masking, flag snapshots,
 ESP-relative indirect-call addressing, and continuation/jump-table handling.
-The current XboxRecomp branch already contains newer versions of several of
-these changes; the carry-flag fix was retained as commit `d55e994` and its
-focused regression test.
+Imported from that generic delta: the carry/borrow fix and focused regression
+test (`d55e994`), then the branch's newer shared implementation was extended
+to full arithmetic EFLAGS state, width-aware shifts/rotates, and REP string
+semantics. These remain title-independent and are covered by the lifter and
+bounded fuzz checks.
 
 Not imported: MM3 scheduler/fiber timing, NV2A/D3D device behavior, MM3 address
 probes, hard-coded callback traces, MM3 seed files, and generated `m4tmp`
-material. These are title-specific or local artifacts. Large kernel/runtime
-changes remain pending isolated generic tests; no bulk copy was performed.
+material. These are title-specific or local artifacts. No bulk copy was
+performed; remaining MM3-only runtime, timing, graphics, address probes, and
+generated artifacts were excluded rather than generalized by assumption.
 
 ## Upstream PR review
 
