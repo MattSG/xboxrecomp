@@ -11,9 +11,12 @@ def load(path):
     return entries
 
 def resolve(entries, address):
-    exact = [item for item in entries if item["guest_start"] <= address < item["guest_end"]]
+    def value(item, key):
+        raw = item[key]
+        return int(raw, 0) if isinstance(raw, str) else raw
+    exact = [item for item in entries if value(item, "guest_start") <= address < value(item, "guest_end")]
     if exact:
         item = exact[0]
         return {"entry": item, "secondary": address != item["guest_start"], "classification": item.get("classification", "unknown")}
-    nearest = min(entries, key=lambda item: min(abs(address-item["guest_start"]), abs(address-item["guest_end"])), default=None)
+    nearest = min(entries, key=lambda item: min(abs(address-value(item, "guest_start")), abs(address-value(item, "guest_end"))), default=None)
     return {"entry": None, "nearest": nearest, "classification": "unknown"}
