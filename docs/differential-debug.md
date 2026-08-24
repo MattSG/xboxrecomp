@@ -25,6 +25,9 @@ trace calls.
 Generated functions also emit an instruction event for every guest instruction
 when tracing is enabled, allowing a consumer to refine a function/basic-block
 failure to the exact guest EIP without editing generated C.
+Call `recomp_trace_set_memory_filter(begin, end)` to retain only generated
+memory-read/write events whose guest address is in the selected half-open
+range; the same bounded ring stores those events.
 Pass `--recomp-command` to run a generated-runtime adapter for every case;
 `--stop-on-failure` leaves the failing case, oracle, and recomp trace in the
 output directory and prints the first divergent checkpoint.

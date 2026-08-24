@@ -1651,6 +1651,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
     while i < len(insns):
         curr = insns[i]
         stmts.append(f"RECOMP_TRACE_EVENT(RECOMP_TRACE_INSTRUCTION, 0x{curr.address:08X}u, 0, 0, 0);")
+        for operand_index, operand in enumerate(curr.operands):
+            if operand.type == "mem":
+                access = "RECOMP_TRACE_WRITE" if operand_index == 0 and curr.mnemonic not in (
+                    "cmp", "test", "push", "call", "jmp", "lea") else "RECOMP_TRACE_READ"
+                stmts.append(f"RECOMP_TRACE_EVENT({access}, 0x{curr.address:08X}u, (uint32_t)({_fmt_mem(operand)}), {max(1, operand.mem_size)}u, 0);")
 
         # Try cmp/test + jcc pattern first (2-instruction match)
         match = try_match_cmp_jcc(insns, i, lifter=lifter)

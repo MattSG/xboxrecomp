@@ -190,6 +190,7 @@ extern volatile struct recomp_trace_record g_recomp_trace[4096];
 extern volatile uint32_t g_recomp_trace_write;
 void recomp_trace_event(uint32_t type, uint32_t eip,
                         uint32_t arg0, uint32_t arg1, uint32_t arg2);
+void recomp_trace_set_memory_filter(uint32_t begin, uint32_t end);
 extern uint32_t g_eflags;
 
 #ifdef __cplusplus

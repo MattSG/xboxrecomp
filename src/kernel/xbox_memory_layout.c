@@ -73,10 +73,16 @@ uint32_t g_eflags = 0x202u;
 volatile uint64_t g_icall_count = 0;
 volatile struct recomp_trace_record g_recomp_trace[4096] = {0};
 volatile uint32_t g_recomp_trace_write = 0;
+volatile uint32_t g_recomp_trace_mem_begin = 0;
+volatile uint32_t g_recomp_trace_mem_end = 0;
 
 void recomp_trace_event(uint32_t type, uint32_t eip,
                         uint32_t arg0, uint32_t arg1, uint32_t arg2)
 {
+    if ((type == 5u || type == 6u) &&
+        g_recomp_trace_mem_begin < g_recomp_trace_mem_end &&
+        (arg0 < g_recomp_trace_mem_begin || arg0 >= g_recomp_trace_mem_end))
+        return;
     /* ponytail: single-writer-per-thread is the normal case; use an
      * interlocked cursor if cross-thread total ordering is required. */
     uint32_t slot = g_recomp_trace_write++ & 4095u;
@@ -87,6 +93,12 @@ void recomp_trace_event(uint32_t type, uint32_t eip,
     g_recomp_trace[slot].arg0 = arg0;
     g_recomp_trace[slot].arg1 = arg1;
     g_recomp_trace[slot].arg2 = arg2;
+}
+
+void recomp_trace_set_memory_filter(uint32_t begin, uint32_t end)
+{
+    g_recomp_trace_mem_begin = begin;
+    g_recomp_trace_mem_end = end;
 }
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)

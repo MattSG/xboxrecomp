@@ -235,6 +235,7 @@ enum recomp_trace_event_type {
 };
 void recomp_trace_event(uint32_t type, uint32_t eip,
                         uint32_t arg0, uint32_t arg1, uint32_t arg2);
+void recomp_trace_set_memory_filter(uint32_t begin, uint32_t end);
 #if RECOMP_TRACE_ENABLED
 #define RECOMP_TRACE_EVENT(type,eip,arg0,arg1,arg2) \
     recomp_trace_event((type),(eip),(arg0),(arg1),(arg2))
