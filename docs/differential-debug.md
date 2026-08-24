@@ -31,3 +31,13 @@ function starts, so secondary entries can be reported explicitly.
 Bulk indirect-call diagnostics use `python -m tools.resolve.report resolver.json
 callsites.json --resolve-all-calls`; unresolved targets retain their nearest
 range and conservative provenance classification.
+
+Capture a local replay case from a real XBE and JSON runtime snapshot:
+
+```powershell
+python -m tools.capture --xbe default.xbe --func 0x001E77F3 --state state.json --out cases/local/001E77F3
+```
+
+The snapshot contains `state`, `end_eip`, and optional `stop`, `memory`, and
+`calls`. Captured XBE bytes are marked local-only and must remain ignored; the
+manifest records only the XBE hash for repository diagnostics.

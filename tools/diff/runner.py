@@ -28,6 +28,18 @@ def run_unicorn(case, *, trace=True):
     entry = int(case.data["entry_eip"], 0) if isinstance(case.data["entry_eip"], str) else case.data["entry_eip"]
     uc.mem_map(entry & ~0xFFF, max(0x1000, (len(code) + (entry & 0xFFF) + 0xFFF) & ~0xFFF))
     uc.mem_write(entry, code)
+    try:
+        from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+        decoder = Cs(CS_ARCH_X86, CS_MODE_32)
+        instruction_text = {item.address: f"{item.mnemonic} {item.op_str}".rstrip()
+                            for item in decoder.disasm(code, entry)}
+    except ImportError:
+        instruction_text = {}
+    initial_memory = []
+    for page in case.data["memory"]:
+        address = int(page["address"], 0) if isinstance(page["address"], str) else page["address"]
+        blob = bytes.fromhex(page["data"])
+        initial_memory.append((address, blob))
     regs = {"eax": UC_X86_REG_EAX, "ebx": UC_X86_REG_EBX, "ecx": UC_X86_REG_ECX,
             "edx": UC_X86_REG_EDX, "esi": UC_X86_REG_ESI, "edi": UC_X86_REG_EDI,
             "ebp": UC_X86_REG_EBP, "esp": UC_X86_REG_ESP, "eflags": UC_X86_REG_EFLAGS}
@@ -43,7 +55,9 @@ def run_unicorn(case, *, trace=True):
     checkpoints = []
     writes = []
     def snapshot():
-        result = {"eip": uc.reg_read(UC_X86_REG_EIP), **{name: uc.reg_read(reg) for name, reg in regs.items()}}
+        eip = uc.reg_read(UC_X86_REG_EIP)
+        result = {"eip": eip, "instruction": instruction_text.get(eip),
+                  **{name: uc.reg_read(reg) for name, reg in regs.items()}}
         result["sse"] = {f"xmm{i}": uc.reg_read(UC_X86_REG_XMM0 + i) for i in range(8)}
         result["mxcsr"] = uc.reg_read(UC_X86_REG_MXCSR)
         result["x87"] = [uc.reg_read(UC_X86_REG_ST0 + i) for i in range(8)]
@@ -71,8 +85,17 @@ def run_unicorn(case, *, trace=True):
         failed["exception"] = {"type": type(error).__name__, "message": str(error)}
         checkpoints.append(failed)
     if checkpoints:
+        dirty = []
+        for address, before in initial_memory:
+            after = bytes(uc.mem_read(address, len(before)))
+            if after != before:
+                for offset, (old, new) in enumerate(zip(before, after)):
+                    if old != new:
+                        dirty.append({"address": address + offset, "old": old, "new": new})
         for item in checkpoints:
             item["writes"] = list(writes)
+            item["dirty_memory"] = dirty
+            item["calls"] = list(case.data.get("calls", []))
     return checkpoints
 
 def save_trace(path, trace):
