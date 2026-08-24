@@ -63,6 +63,10 @@ def main():
     parser.add_argument("xbe_path", help="Path to default.xbe")
     parser.add_argument("--analysis-json", required=True,
                         help="xbe_parser analysis JSON for the target XBE")
+    parser.add_argument("--functions", help="function database JSON (overrides repository default)")
+    parser.add_argument("--labels", help="label database JSON")
+    parser.add_argument("--identified", help="function classification JSON")
+    parser.add_argument("--abi", help="ABI analysis JSON")
     parser.add_argument("-o", "--output-dir",
                         help="Output directory")
     parser.add_argument("-f", "--function",
@@ -96,6 +100,10 @@ def main():
 
     # Find data files
     data_files = find_data_files()
+    for key, value in (("functions", args.functions), ("labels", args.labels),
+                       ("identified", args.identified), ("abi", args.abi)):
+        if value:
+            data_files[key] = value
     if not data_files["functions"]:
         print("ERROR: functions.json not found. Run the disassembler first.",
               file=sys.stderr)

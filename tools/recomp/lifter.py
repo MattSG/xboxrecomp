@@ -649,10 +649,42 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
 
 # ── Single instruction lifting ───────────────────────────────
 
+_SEH_PROLOG_MARKERS = (b"\x64\xa1\x00\x00\x00\x00", b"\x8d\x6c\x24\x10")
+_SEH_EPILOG_MARKERS = (b"\x64\x89\x0d\x00\x00\x00\x00", b"\xc9\x51\xc3")
+
+def detect_seh_helpers(func_db, xbe_data, verbose=False):
+    """Conservatively locate compiler SEH prolog/epilog helpers."""
+    from .config import va_to_file_offset
+    prolog = epilog = None
+    for address in sorted(func_db):
+        info = func_db[address]
+        end = info.get("end", 0)
+        if isinstance(end, str):
+            end = int(end, 0)
+        size = int(info.get("size") or (end - address if end else 0))
+        if not xbe_data or size <= 0 or size > 128:
+            continue
+        offset = va_to_file_offset(address)
+        if offset is None or offset + size > len(xbe_data):
+            continue
+        body = xbe_data[offset:offset + size]
+        if prolog is None and all(marker in body for marker in _SEH_PROLOG_MARKERS):
+            prolog = address
+        if epilog is None and size <= 64 and all(marker in body for marker in _SEH_EPILOG_MARKERS):
+            epilog = address
+        if prolog is not None and epilog is not None:
+            break
+    if verbose:
+        import sys
+        fmt = lambda value: f"0x{value:08X}" if value is not None else "not found"
+        print(f"  SEH helpers: __SEH_prolog {fmt(prolog)}, __SEH_epilog {fmt(epilog)}", file=sys.stderr)
+    return prolog, epilog
+
 class Lifter:
     """Translates x86 instructions to C statements."""
 
-    def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None):
+    def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
+                 seh_prolog=None, seh_epilog=None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
@@ -666,6 +698,18 @@ class Lifter:
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
+        if seh_prolog is None or seh_epilog is None:
+            found_prolog, found_epilog = detect_seh_helpers(self.func_db, xbe_data)
+            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
+            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
+        self.SEH_PROLOG = seh_prolog
+        self.SEH_EPILOG = seh_epilog
+        self.SEH_PROLOGS = set(self.__class__.SEH_PROLOGS)
+        self.SEH_EPILOGS = set(self.__class__.SEH_EPILOGS)
+        if seh_prolog is not None:
+            self.SEH_PROLOGS.add(seh_prolog)
+        if seh_epilog is not None:
+            self.SEH_EPILOGS.add(seh_epilog)
 
     def _call_target_name(self, addr):
         """Get the name for a call target address."""
