@@ -22,6 +22,9 @@ replayable arithmetic/flag cases. With `RECOMP_TRACE_ENABLED=1`, consumers
 keep 4096 fixed-size runtime records; decode a raw dump with
 `python -m tools.diff.trace_decode trace.bin`. The default build emits no
 trace calls.
+Pass `--recomp-command` to run a generated-runtime adapter for every case;
+`--stop-on-failure` leaves the failing case, oracle, and recomp trace in the
+output directory and prints the first divergent checkpoint.
 
 Build resolver metadata from a consumer's function database with
 `python -m tools.resolve.build --xbe default.xbe --functions functions.json
