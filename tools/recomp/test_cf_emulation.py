@@ -61,6 +61,13 @@ def test_neg_sets_cf():
     assert "_result = _lhs - _lhs - _borrow" in out, out
     print("ok  neg_sets_cf:", out.strip())
 
+def test_rotate_and_rep_are_not_placeholders():
+    out = _lift(bytes.fromhex("d1 d0 d1 d8 f3 a4 f3 a6"))
+    assert "_cf = _next" in out, out
+    assert "while (ecx)" in out, out
+    assert "recomp_set_sub_flags" in out, out
+    print("ok  rotate_and_rep:", out.strip())
+
 
 if __name__ == "__main__":
     test_cmp_sets_cf_before_sbb()
@@ -68,4 +75,5 @@ if __name__ == "__main__":
     test_add_sets_cf_carry_into_adc()
     test_xor_clears_cf()
     test_neg_sets_cf()
+    test_rotate_and_rep_are_not_placeholders()
     print("\nall cf-emulation checks passed")
