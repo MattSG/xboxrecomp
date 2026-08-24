@@ -28,3 +28,6 @@ Build resolver metadata from a consumer's function database with
 --out resolver.json`, then inspect a target using
 `python -m tools.resolve resolver.json 0x001E77F3`. Ranges are checked before
 function starts, so secondary entries can be reported explicitly.
+Bulk indirect-call diagnostics use `python -m tools.resolve.report resolver.json
+callsites.json --resolve-all-calls`; unresolved targets retain their nearest
+range and conservative provenance classification.
