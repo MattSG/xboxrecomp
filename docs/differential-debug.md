@@ -18,3 +18,9 @@ replayable arithmetic/flag cases. With `RECOMP_TRACE_ENABLED=1`, consumers
 keep 4096 fixed-size runtime records; decode a raw dump with
 `python -m tools.diff.trace_decode trace.bin`. The default build emits no
 trace calls.
+
+Build resolver metadata from a consumer's function database with
+`python -m tools.resolve.build --xbe default.xbe --functions functions.json
+--out resolver.json`, then inspect a target using
+`python -m tools.resolve resolver.json 0x001E77F3`. Ranges are checked before
+function starts, so secondary entries can be reported explicitly.
