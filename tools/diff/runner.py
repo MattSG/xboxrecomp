@@ -33,10 +33,18 @@ def run_unicorn(case, *, trace=True):
     for name, reg in regs.items():
         uc.reg_write(reg, int(state[name], 0) if isinstance(state[name], str) else state[name])
     checkpoints = []
-    limit = int(case.data["stop"].get("instructions", 1))
+    stop = case.data["stop"]
+    limit = int(stop.get("instructions", 1000000))
+    stop_eip = stop.get("eip")
+    if isinstance(stop_eip, str):
+        stop_eip = int(stop_eip, 0)
     def hook(_, address, size, __):
         if trace:
             checkpoints.append({"eip": address, **{name: uc.reg_read(reg) for name, reg in regs.items()}})
+        if stop_eip is not None and address == stop_eip:
+            uc.emu_stop()
+        if stop.get("ret") and 0 <= address - entry < len(code) and code[address - entry] in (0xC2, 0xC3):
+            uc.emu_stop()
     from unicorn import UC_HOOK_CODE
     uc.hook_add(UC_HOOK_CODE, hook)
     try:
