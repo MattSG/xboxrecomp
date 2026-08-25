@@ -11,7 +11,7 @@ from tools.recomp.lifter import Lifter  # noqa: E402
 
 def test_bcbcc0_trace_reuses_target_after_callback():
     """The END trace must not re-read EAX after the callback clobbers it."""
-    for address, disp in ((0x001BCC84, "0c"), (0x001BCD15, "04")):
+    for address, disp in ((0x001BCC84, "0c"), (0x001BCD18, "04")):
         insn = Disassembler().disassemble_function(
             bytes.fromhex(f"ff 50 {disp} c3"), address, address + 4)[0]
         lifter = Lifter()
