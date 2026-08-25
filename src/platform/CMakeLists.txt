@@ -14,7 +14,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 if(WIN32)
     add_library(platform INTERFACE)
-    target_include_directories(platform INTERFACE ${CMAKE_SOURCE_DIR}/src)
+    # This project is embedded by title repositories; CMAKE_SOURCE_DIR then
+    # belongs to the outer project, not this fork.
+    target_include_directories(platform INTERFACE ${CMAKE_CURRENT_LIST_DIR}/..)
 else()
     add_library(platform STATIC win32_compat.c)
     target_include_directories(platform PUBLIC
