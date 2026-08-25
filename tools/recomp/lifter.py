@@ -660,7 +660,10 @@ def detect_seh_helpers(func_db, xbe_data, verbose=False):
         info = func_db[address]
         end = info.get("end", 0)
         if isinstance(end, str):
-            end = int(end, 0)
+            try:
+                end = int(end, 0)
+            except ValueError:
+                end = int(end, 16)
         size = int(info.get("size") or (end - address if end else 0))
         if not xbe_data or size <= 0 or size > 128:
             continue
