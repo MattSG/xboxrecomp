@@ -11,16 +11,17 @@ from tools.recomp.lifter import Lifter  # noqa: E402
 
 def test_bcbcc0_trace_reuses_target_after_callback():
     """The END trace must not re-read EAX after the callback clobbers it."""
-    insn = Disassembler().disassemble_function(
-        bytes.fromhex("ff 50 0c c3"), 0x001BCC84, 0x001BCC88)[0]
-    lifter = Lifter()
-    lifter.func_start = 0x001BCBC0
-    out = "\n".join(lifter._lift_call(insn, insn.operands))
-
-    assert "_bcbcc0_target_001BCC84" in out, out
-    assert "RECOMP_ICALL_SAFE(_bcbcc0_target_001BCC84" in out, out
-    assert "recomp_trace_bcbcc0_icall(1, _bcbcc0_target_001BCC84" in out, out
-    assert "recomp_trace_bcbcc0_icall(1, MEM32(eax + 0xC)" not in out, out
+    for address, disp in ((0x001BCC84, "0c"), (0x001BCD15, "04")):
+        insn = Disassembler().disassemble_function(
+            bytes.fromhex(f"ff 50 {disp} c3"), address, address + 4)[0]
+        lifter = Lifter()
+        lifter.func_start = 0x001BCBC0
+        out = "\n".join(lifter._lift_call(insn, insn.operands))
+        target = f"_bcbcc0_target_{address:08X}"
+        assert target in out, out
+        assert f"RECOMP_ICALL_SAFE({target}" in out, out
+        assert f"recomp_trace_bcbcc0_icall(1, {target}" in out, out
+        assert "recomp_trace_bcbcc0_icall(1, MEM32(eax + 0xC)" not in out, out
 
 
 if __name__ == "__main__":

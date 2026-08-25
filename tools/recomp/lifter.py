@@ -1677,7 +1677,8 @@ class Lifter:
                     f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target_var}, _icall_esp); "
                     f"recomp_trace_be953_icall(1, {target_var}, 0x{insn.address:08X}); /* indirect call */",
                 ]
-            elif self.func_start == 0x001BCBC0 and insn.address == 0x001BCC84:
+            elif (self.func_start == 0x001BCBC0
+                  and insn.address in (0x001BCC84, 0x001BCD15)):
                 # Snapshot the target before the item callback.  The callback
                 # legitimately changes EAX, so re-reading the original
                 # expression for the END trace can report a bogus target
