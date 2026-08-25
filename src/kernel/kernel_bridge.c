@@ -1668,12 +1668,13 @@ static void bridge_NtQueryInformationFile(void)
             uint32_t qb[4] = {0, 0, 0, 0};
             if (info_va < 0x04000000u)
             {
-                eof = (uint64_t)BRIDGE_MEM32(info_va + 8) |
-                      ((uint64_t)BRIDGE_MEM32(info_va + 0xC) << 32);
-                qb[0] = BRIDGE_MEM32(info_va);
-                qb[1] = BRIDGE_MEM32(info_va + 4);
-                qb[2] = BRIDGE_MEM32(info_va + 8);
-                qb[3] = BRIDGE_MEM32(info_va + 0xC);
+                /* FileNetworkOpenInformation.EndOfFile is at +0x28. */
+                eof = (uint64_t)BRIDGE_MEM32(info_va + 0x28) |
+                      ((uint64_t)BRIDGE_MEM32(info_va + 0x2C) << 32);
+                qb[0] = BRIDGE_MEM32(info_va + 0x28);
+                qb[1] = BRIDGE_MEM32(info_va + 0x2C);
+                qb[2] = BRIDGE_MEM32(info_va + 0x30);
+                qb[3] = BRIDGE_MEM32(info_va + 0x34);
             }
             fprintf(stderr, "[QFILE] tok=0x%08X h=%p class=%u len=%u "
                     "st=0x%08X eof64=%llu gle=%u buf=%08X %08X %08X %08X "
