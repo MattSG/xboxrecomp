@@ -920,6 +920,7 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t wait_mode   = STACK_ARG(0);
     uint32_t alertable   = STACK_ARG(1);
     uint32_t interval_va = STACK_ARG(2);
+    static unsigned trace_delay;
 
     if (g_worker_active) {
         /* Worker context: the whole recomp runs on one host thread, so a
@@ -932,11 +933,31 @@ static void bridge_KeDelayExecutionThread(void)
             ms = (DWORD)(rel / 10000);
             if (ms == 0 && rel > 0) ms = 1;
         }
+        if (getenv("MM3_TRACE_DELAY") && g_icall_count >= 300000ULL &&
+            trace_delay++ < 128) {
+            fprintf(stderr, "[DELAY] ic=%llu tid=%lu interval_va=%08X "
+                    "quad=%lld ms=%lu parked=%d active=%d esp=%08X\n",
+                    (unsigned long long)g_icall_count,
+                    (unsigned long)GetCurrentThreadId(), interval_va,
+                    iv ? (long long)iv->QuadPart : 0LL,
+                    (unsigned long)ms, g_worker.parked, g_worker_active,
+                    g_esp);
+            fflush(stderr);
+        }
         if (ms > 0) {
             g_worker.wake_tick = GetTickCount() + ms;
             g_worker.parked = 1;
             worker_switch_to_main();   /* resumes when the delay is due */
             g_worker.parked = 0;
+            if (getenv("MM3_TRACE_DELAY") && g_icall_count >= 300000ULL &&
+                trace_delay++ < 128) {
+                fprintf(stderr, "[DELAY-RESUME] ic=%llu tid=%lu parked=%d "
+                        "done=%d eax=%08X esp=%08X\n",
+                        (unsigned long long)g_icall_count,
+                        (unsigned long)GetCurrentThreadId(),
+                        g_worker.parked, g_worker.done, g_eax, g_esp);
+                fflush(stderr);
+            }
         }
         g_eax = 0;  /* STATUS_SUCCESS */
         return;
