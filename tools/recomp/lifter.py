@@ -2301,6 +2301,13 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None,
                     "recomp_trace_bcbcc0_loop((uint32_t)ZX16(MEM16(ebp + 0x2A)), "
                     "(uint32_t)MEM32(ebp + 0x68), "
                     "CMP_B(MEM32(ebp + 0x68), ZX16(MEM16(ebp + 0x2A))));")
+            if (lifter.func_start == 0x001BE953
+                    and flag_insn.address == 0x001BF13C
+                    and insns[i + 1].address == 0x001BF13F):
+                stmts.append(
+                    "recomp_trace_be953_predicate(0x001BF13C, "
+                    "MEM32(ebp + 0x74), esi, MEM32(ebp + 0x28), "
+                    "CMP_NE(MEM32(ebp + 0x74), esi));")
             stmts.append(stmt)
             last_flag_setter = flag_insn.mnemonic
             i += consumed
