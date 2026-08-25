@@ -1665,10 +1665,20 @@ class Lifter:
             # to hit the slot the original instruction addressed.
             bias = 4 if (ops[0].type == "mem" and ops[0].mem_base == "esp") else 0
             target = _fmt_operand_read(ops[0], disp_bias=bias)
-            lines = [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
             if self.func_start == 0x001BE953:
-                lines.insert(0, f"recomp_trace_be953_icall(0, {target}, 0x{insn.address:08X});")
-                lines.append(f"recomp_trace_be953_icall(1, {target}, 0x{insn.address:08X});")
+                # Snapshot the address expression before the callee can clobber
+                # EAX/other source registers. Re-reading it in the END trace
+                # reports a different slot and can falsely call a valid target
+                # zero/invalid.
+                target_var = f"_be953_target_{insn.address:08X}"
+                lines = [
+                    f"uint32_t {target_var} = {target};",
+                    f"recomp_trace_be953_icall(0, {target_var}, 0x{insn.address:08X});",
+                    f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target_var}, _icall_esp); /* indirect call */",
+                    f"recomp_trace_be953_icall(1, {target_var}, 0x{insn.address:08X});",
+                ]
+            else:
+                lines = [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
             if self.func_start == 0x001BCBC0 and insn.address == 0x001BCC84:
                 lines.insert(0, f"recomp_trace_bcbcc0_icall(0, {target}, 0x{insn.address:08X});")
                 lines.append(f"recomp_trace_bcbcc0_icall(1, {target}, 0x{insn.address:08X});")
