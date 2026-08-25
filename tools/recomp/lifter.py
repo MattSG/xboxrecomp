@@ -1674,8 +1674,8 @@ class Lifter:
                 lines = [
                     f"uint32_t {target_var} = {target};",
                     f"recomp_trace_be953_icall(0, {target_var}, 0x{insn.address:08X});",
-                    f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target_var}, _icall_esp); /* indirect call */",
-                    f"recomp_trace_be953_icall(1, {target_var}, 0x{insn.address:08X});",
+                    f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target_var}, _icall_esp); "
+                    f"recomp_trace_be953_icall(1, {target_var}, 0x{insn.address:08X}); /* indirect call */",
                 ]
             else:
                 lines = [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
