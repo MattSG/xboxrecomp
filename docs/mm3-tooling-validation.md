@@ -30,4 +30,6 @@ python -m tools.recomp F:\repos\midtown-madness-3-recomp\game_files\default.xbe 
 ```
 
 It produced a 24,044-byte C function with instruction, memory, call, and
-shared-flag hooks; no MM3 input or generated output was written to this repo.
+shared-flag hooks; the generated unit also compiled to a 11,278-byte MSVC
+object with `RECOMP_GENERATED_CODE` defined. No MM3 input or generated output
+was written to this repo.
