@@ -94,7 +94,7 @@ def test_fcom_mem_does_not_pop():
 
 def test_fld_st0_duplicates_top():
     out = _lift(bytes.fromhex("d9c0"))
-    assert "double _fld_tmp = _fp_stack[_fp_top & 7]; fp_push(_fld_tmp);" in out, (
+    assert "double _fld_tmp = g_fp_stack[g_fp_top & 7]; fp_push(_fld_tmp);" in out, (
         "fld st(0) must duplicate ST0 through a sequenced temporary")
 
 

@@ -43,6 +43,7 @@ extern uint32_t g_seh_ebp;
 extern volatile uint64_t g_icall_count;
 extern volatile uintptr_t g_penter_last_rva;
 extern volatile uintptr_t g_penter_caller_rva;
+extern uintptr_t g_fake_kpcr_native;
 extern const char *recomp_probe_fn_name(uintptr_t rva);
 extern ptrdiff_t g_xbox_mem_offset;
 extern void d3d8_PresentFrame(void);
@@ -52,7 +53,6 @@ extern int xbox_file_register(FILE *fp);
 extern FILE *xbox_file_lookup(int handle);
 extern void xbox_file_close(int handle);
 extern size_t xbox_file_read(int handle, void *buf, size_t size);
-extern FILE *xbox_file_open(const char *path, const char *mode);
 extern void xbox_handle_register_file(HANDLE xbox_handle, FILE *fp);
 extern FILE *xbox_handle_lookup_file(int xbox_handle);
 
@@ -252,6 +252,14 @@ static worker_state_t g_worker;
 static worker_state_t g_main_state;
 static LPVOID g_main_fiber = NULL;
 
+static void worker_load_tib(const worker_state_t *w)
+{
+    if (g_fake_kpcr_native)
+        *(uint32_t *)(g_fake_kpcr_native + 0x04) =
+            (w == &g_worker) ? XBOX_WORKER_STACK_TOP : 0x00F7FFF0u;
+}
+
+
 /* Diagnostic: prove whether fiber resume restores the exact guest regset
  * saved at the switch (run-360 register-provenance question). Bounded. */
 static uint32_t s_fsw_log = 0;
@@ -281,6 +289,7 @@ static void worker_load_regs(const worker_state_t *w)
     g_eax = w->eax; g_ecx = w->ecx; g_edx = w->edx;
     g_ebx = w->ebx; g_esi = w->esi; g_edi = w->edi;
     g_esp = w->esp; g_seh_ebp = w->seh_ebp;
+    worker_load_tib(w);
     fsw_log("load", w);
 }
 
@@ -317,8 +326,14 @@ static void WINAPI worker_fiber_main(LPVOID param)
 {
     (void)param;
     g_worker_active = 1;
-    g_esp = XBOX_WORKER_STACK_TOP;
+    /* Reserve the TIB/stack-base metadata immediately below the stack top;
+     * the worker's first pushes must not overwrite FS:[4]-0x14. */
+    g_esp = XBOX_WORKER_STACK_TOP - 0x20u;
     g_seh_ebp = g_esp;
+
+    BRIDGE_MEM32(XBOX_WORKER_STACK_TOP - 0x14u) =
+        XBOX_WORKER_STACK_TOP - 0x10u;
+
 
     /* Xbox thread start routines receive (StartContext1, StartContext2). */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = g_worker.ctx2;
@@ -1389,8 +1404,6 @@ static NTSTATUS bridge_create_file_impl(
     XBOX_IO_STATUS_BLOCK   ios;
     HANDLE   h  = NULL;
     NTSTATUS st;
-    FILE    *win_fp = NULL;  /* Windows FILE* from xbox_file_open */
-    int      win_slot = 0;   /* slot index in file table */
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
     if (!name.Buffer) {
@@ -1398,54 +1411,6 @@ static NTSTATUS bridge_create_file_impl(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
     memset(&ios, 0, sizeof(ios));
-
-    /* ── Xbox file I/O bridge: also open a real Windows file ── */
-    {
-        static int s_file_log = 0;
-        const char *xbox_path = name.Buffer ? name.Buffer : "(null)";
-        if (s_file_log < 10) {
-            fprintf(stderr, "[FILE] NtCreateFile: path='%s' access=0x%X disp=%d\n",
-                xbox_path, access, disposition);
-            s_file_log++;
-        }
-        /* Try to map Xbox path to game_files/Data/ */
-        /* Xbox paths look like \\Device\\Harddisk0\\Partition1\\... */
-        /* Strip the device prefix to get the game-relative path */
-        const char *rel = xbox_path;
-        /* Skip common Xbox device prefixes */
-        if (strncmp(rel, "\\Device\\", 8) == 0) {
-            rel = strchr(rel + 8, '\\');
-            if (rel) rel++; /* skip partition prefix */
-            if (rel && strncmp(rel, "Harddisk", 8) == 0) {
-                rel = strchr(rel, '\\');
-                if (rel) rel++;
-            }
-        }
-        if (rel && *rel) {
-            /* Skip trailing partition name if it's just "partition1\\" */
-            if (strncmp(rel, "partition", 9) == 0 || strncmp(rel, "Partition", 9) == 0) {
-                rel = strchr(rel, '\\');
-                if (rel) rel++;
-            }
-        }
-        {
-            char win_path[1024];
-            if (!rel || !*rel) {
-                /* Root directory */snprintf(win_path, sizeof(win_path), "game_files\\Data");
-            } else {
-            snprintf(win_path, sizeof(win_path), "game_files\\Data\\%s", rel);
-            FILE *fp = xbox_file_open(win_path, "rb");
-            if (fp) {
-                int slot = xbox_file_register(fp);
-                win_fp = fp;   /* save for later HANDLE mapping */
-                win_slot = slot; /* save slot index */
-                fprintf(stderr, "[FILE] opened '%s' -> slot %d\n", win_path, slot);
-            } else if (s_file_log < 10) {
-                fprintf(stderr, "[FILE] not found: '%s'\n", win_path);
-            }
-            }
-        }
-    }
 
     DWORD gle = 0;
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
@@ -1945,6 +1910,21 @@ static void bridge_RtlInitAnsiString(void)
     g_eax = 0;
 }
 /* ── IoCreateSymbolicLink (ordinal 63) ───────────────────── */
+/* IoAllocateIrp (ordinal 59, 2 args = 8 bytes).
+ * Drivers in the XPP/resource path require a real guest-resident IRP;
+ * returning the generic null stub makes their request path immediately fail.
+ * Keep the allocation opaque here: callers own the Xbox-layout fields and
+ * the existing IoInitializeIrp bridge handles explicit initialization. */
+static void bridge_IoAllocateIrp(void)
+{
+    uint32_t stack_size = STACK_ARG(0);
+    uint32_t bytes = 0x100u + (stack_size > 0x40u ? 0x40u : stack_size) * 0x24u;
+    uint32_t irp = xbox_HeapAlloc(bytes, 16);
+    if (irp)
+        memset(XBOX_TO_NATIVE(irp), 0, bytes);
+    g_eax = irp;
+}
+
 static void bridge_IoCreateSymbolicLink(void)
 {
     g_eax = 0;  /* STATUS_SUCCESS */
@@ -2169,6 +2149,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 358: return  0;  /* HalIsResetOrShutdownPending(void) */
 
     /* ── I/O Manager ── */
+    case  59: return  8;  /* IoAllocateIrp(2) */
     case  62: return 36;  /* IoBuildDeviceIoControlRequest(9) */
     case  65: return 24;  /* IoCreateDevice(6) */
     /* case  65: DATA export - IoCompletionObjectType */
@@ -2417,6 +2398,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case   4: return bridge_AvSetSavedDataAddress;
 
     /* I/O */
+    case  59: return bridge_IoAllocateIrp;
     case  63: return bridge_IoCreateSymbolicLink;
     case  65: return bridge_IoCreateDevice;
     case  67: return bridge_IoCreateFile;
@@ -2598,11 +2580,14 @@ static void kernel_thunk_dispatch(void)
 
     if (getenv("MM3_TRACE_KERNEL_WINDOW") &&
         ((g_icall_count >= 12055ULL && g_icall_count <= 12062ULL) ||
-         (g_icall_count >= 12080ULL && g_icall_count <= 12092ULL))) {
+         (g_icall_count >= 12080ULL && g_icall_count <= 12092ULL) ||
+         (g_icall_count >= 325900ULL && g_icall_count <= 326120ULL))) {
         fprintf(stderr, "[KERNEL-WINDOW] ic=%llu slot=%d ordinal=%u bridge=%p "
-            "esp=%08X a0=%08X a1=%08X a2=%08X a3=%08X\n",
+            "esp=%08X a0=%08X a1=%08X a2=%08X a3=%08X "
+            "penter=%p caller=%p\n",
             (unsigned long long)g_icall_count, slot, ordinal, (void *)bridge,
-            g_esp, STACK_ARG(0), STACK_ARG(1), STACK_ARG(2), STACK_ARG(3));
+            g_esp, STACK_ARG(0), STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
+            (void *)g_penter_last_rva, (void *)g_penter_caller_rva);
         fflush(stderr);
     }
 
@@ -2748,7 +2733,8 @@ static void kernel_thunk_dispatch(void)
         bridge();
         if (getenv("MM3_TRACE_KERNEL_WINDOW")) {
             uint32_t dev_after = BRIDGE_MEM32(0x00351F48u);
-            if (dev_before != dev_after || ordinal == 100 || ordinal == 166)
+            if (dev_before != dev_after || ordinal == 100 || ordinal == 166 ||
+                (g_icall_count >= 325900ULL && g_icall_count <= 326120ULL))
                 fprintf(stderr, "[KERNEL-WINDOW-RET] ic=%llu ordinal=%u "
                     "dev=%08X->%08X eax=%08X esp=%08X\n",
                     (unsigned long long)g_icall_count, ordinal, dev_before,

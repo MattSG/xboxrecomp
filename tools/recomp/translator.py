@@ -451,6 +451,8 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+        if start in (0x001EC708, 0x001E7F1B):
+            lines.append("    uint32_t _saved_ebx = ebx;")
         if start == 0x0003B493:
             lines.append("    recomp_snapshot_3b493_entry();")
         if start == 0x0003B4B4:
@@ -514,15 +516,15 @@ class FunctionTranslator:
             if mmx_regs:
                 lines.append(f"    uint64_t {', '.join(mmx_regs)};")
 
-        # FPU stack (simplified)
+        # FPU stack is shared across translated calls. x87 ST0 survives a
+        # normal CALL, so a fresh local stack per C function loses the
+        # caller's operand (notably the MM3 float-to-int helper).
         if has_fpu:
-            lines.append(f"    double _fp_stack[8];")
-            lines.append(f"    int _fp_top = 0;")
-            lines.append(f"    #define fp_push(v) (_fp_stack[--_fp_top & 7] = (v))")
-            lines.append(f"    #define fp_pop() (_fp_top++)")
+            lines.append(f"    #define fp_push(v) (g_fp_stack[--g_fp_top & 7] = (v))")
+            lines.append(f"    #define fp_pop() (g_fp_top++)")
             lines.append(f"    #define fp_popp() (fp_pop())")
-            lines.append(f"    #define fp_top() _fp_stack[_fp_top & 7]")
-            lines.append(f"    #define fp_st1() _fp_stack[(_fp_top + 1) & 7]")
+            lines.append(f"    #define fp_top() g_fp_stack[g_fp_top & 7]")
+            lines.append(f"    #define fp_st1() g_fp_stack[(g_fp_top + 1) & 7]")
 
         # For fpo_leaf functions that use ebp: initialize from g_seh_ebp.
         # In x86, these functions inherit EBP from their caller (typically
@@ -552,8 +554,24 @@ class FunctionTranslator:
         if start in (0x001EC520, 0x001EC6EE, 0x001EC7F7, 0x001E73AF, 0x001E7627, 0x001E77F3,
                      0x001BF1D4, 0x001BCE30,
                      0x00344A20, 0x00342B00, 0x001EC8E6, 0x001F373E,
-                     0x00083BE1, 0x00083B04, 0x00083C55):
+                     0x00083BE1, 0x00083B04, 0x00083C55,
+                     0x00093B9D, 0x00093C45, 0x00093C7D, 0x00097AFC):
             lines.append(f"    recomp_trace_sched_entry(0x{start:08X});")
+            lines.append(f"")
+        if start == 0x00083D32:
+            lines.append("    recomp_trace_83d32_entry(MEM32(esp + 0x0C), (uint32_t)esp);")
+            lines.append(f"")
+        if start == 0x00083D49:
+            lines.append("    recomp_trace_83d49_read(MEM32(0x0046A154u));")
+            lines.append(f"")
+        if start == 0x000871C8:
+            lines.append("    recomp_trace_871c8_write(MEM32(0x0046A154u));")
+            lines.append(f"")
+        if start in (0x00096738, 0x00096825, 0x00096874, 0x0016FEF0, 0x00170EC0, 0x00170ED1):
+            lines.append(f"    recomp_trace_83d32_caller(0x{start:08X}, (uint32_t)esp);")
+            lines.append(f"")
+        if start == 0x00096825:
+            lines.append("    recomp_trace_96825_entry((uint32_t)esp);")
             lines.append(f"")
         if start == 0x001BF1D4:
             lines.append("    recomp_trace_1bf1d4(0);")
@@ -563,6 +581,9 @@ class FunctionTranslator:
             lines.append(f"")
         if start == 0x001BCBC0:
             lines.append("    recomp_trace_bcbcc0(0);")
+            lines.append(f"")
+        if start == 0x001BA085:
+            lines.append("    recomp_trace_ba085(ebp);")
             lines.append(f"")
         if start in (0x0027B8C0, 0x0027B742):
             lines.append(f"    recomp_trace_sched_entry(0x{start:08X});")
@@ -625,8 +646,29 @@ class FunctionTranslator:
                 snap_counter=snap_counter, fpu_cmp_available=has_fpu_cmp)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
+                if (start == 0x001BCBC0 and
+                        stmt.strip() == "ebp = esp + -112;"):
+                    lines.append("    recomp_trace_bcbcc0_state(ebp);")
+                # MM3-only diagnostic: expose the two intermediate values in
+                # the conversion loop without editing generated C by hand.
+                if (start == 0x001E793E and
+                        stmt.strip() == "ebx = MEM32(edi + 8);"):
+                    lines.append("    recomp_trace_1e793e_load(edi, ebx, eax, ecx, edx);")
+                if (start == 0x001E793E and
+                        stmt.strip().startswith("ebx = ebx + edx * 4;")):
+                    lines.append("    recomp_trace_1e793e_scaled(edi, ebx, eax, ecx, edx);")
+                if (start == 0x001E7AF4 and
+                        stmt.strip() == "MEM32(ebp + -4) = eax;"):
+                    lines.append("    recomp_trace_1e7af4_tile(edi, esi, ebp);")
+                if (start == 0x00093B9D and
+                        "sub_00097AFC();" in stmt):
+                    lines.append("    recomp_trace_97afc_result((uint32_t)eax, (uint32_t)esp);")
 
             lines.append(f"")
+
+        if start in (0x001EC708, 0x001E7F1B):
+            lines = [line.replace("return;", "ebx = _saved_ebx; return;")
+                     for line in lines]
 
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
         # The pattern is: optional PUSH32 args, then PUSH32(esp, 0); RECOMP_ICALL_SAFE(...).
@@ -958,7 +1000,8 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False):
+                              prefix="recomp", verbose=False,
+                              max_chunk_bytes=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -1065,8 +1108,21 @@ class BatchTranslator:
         # Split translations into chunks and write .c files
         import glob
         generated_files = [header_path]
-        chunks = [translations[i:i+chunk_size]
-                  for i in range(0, len(translations), chunk_size)]
+        chunks = []
+        chunk = []
+        chunk_bytes = 0
+        for item in translations:
+            item_bytes = len(item[2].encode("utf-8"))
+            if chunk and (len(chunk) >= chunk_size or
+                          (max_chunk_bytes and
+                           chunk_bytes + item_bytes > max_chunk_bytes)):
+                chunks.append(chunk)
+                chunk = []
+                chunk_bytes = 0
+            chunk.append(item)
+            chunk_bytes += item_bytes
+        if chunk:
+            chunks.append(chunk)
 
         for ci, chunk in enumerate(chunks):
             c_path = os.path.join(output_dir, f"{prefix}_{ci:04d}.c")

@@ -89,6 +89,8 @@ extern ptrdiff_t g_xbox_mem_offset;
  * functions use it as scratch. For SEH, g_seh_ebp bridges the gap.
  */
 extern uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern double g_fp_stack[8];
+extern int g_fp_top;
 extern uint32_t g_ebx, g_esi, g_edi;
 
 /**

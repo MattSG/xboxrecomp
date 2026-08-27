@@ -52,6 +52,8 @@ ptrdiff_t g_xbox_mem_offset = 0;
 
 /* Global registers for recompiled code (via recomp_types.h) */
 uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
+double g_fp_stack[8];
+int g_fp_top = 0;
 uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */

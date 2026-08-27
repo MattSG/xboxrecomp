@@ -127,6 +127,8 @@ def main():
                         help="Generate C header file")
     parser.add_argument("--split", type=int, metavar="N",
                         help="Split output into files of N functions each")
+    parser.add_argument("--max-chunk-bytes", type=int, metavar="N",
+                        help="Also split before a generated C file exceeds N bytes")
     parser.add_argument("--gen-dir",
                         help="Output dir for split generated files "
                              "(default: src/game/recomp/gen)")
@@ -285,6 +287,7 @@ def main():
             output_dir=gen_dir,
             chunk_size=args.split,
             verbose=args.verbose,
+            max_chunk_bytes=args.max_chunk_bytes,
         )
 
         t_translate = time.time() - t0

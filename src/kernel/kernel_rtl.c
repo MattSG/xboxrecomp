@@ -158,7 +158,9 @@ ULONG __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pat
  * ============================================================================ */
 
 /*
- * Critical section operations are no-ops for now.
+ * Xbox critical sections live in guest memory and cannot be passed directly
+ * to the host implementation. Keep the host mutexes in a separate table,
+ * keyed by the translated guest address.
  *
  * The Xbox CRITICAL_SECTION is a 20-byte 32-bit structure that's
  * incompatible with the Windows 64-bit CRITICAL_SECTION (40 bytes).
@@ -167,25 +169,60 @@ ULONG __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pat
  * (all Xbox threads are called synchronously), there's no contention
  * and no-ops are correct.
  *
- * TODO: If multithreading is needed, implement a shadow CS mapping
- * (Xbox VA → native Windows CRITICAL_SECTION).
  */
+#define XBOX_CS_SHADOW_COUNT 128
+typedef struct xbox_cs_shadow {
+    void *guest_key;
+    HANDLE mutex;
+} xbox_cs_shadow;
+
+static xbox_cs_shadow g_xbox_cs_shadow[XBOX_CS_SHADOW_COUNT];
+
+static HANDLE xbox_cs_shadow_get(void *guest_key, BOOL create)
+{
+    xbox_cs_shadow *free_slot = NULL;
+    HANDLE mutex;
+
+    if (!guest_key)
+        return NULL;
+    for (int i = 0; i < XBOX_CS_SHADOW_COUNT; ++i) {
+        if (g_xbox_cs_shadow[i].guest_key == guest_key)
+            return g_xbox_cs_shadow[i].mutex;
+        if (!g_xbox_cs_shadow[i].guest_key && !free_slot)
+            free_slot = &g_xbox_cs_shadow[i];
+    }
+    if (!create || !free_slot)
+        return NULL;
+
+    mutex = CreateMutexW(NULL, FALSE, NULL);
+    if (!mutex)
+        return NULL;
+    if (InterlockedCompareExchangePointer(
+            (PVOID volatile *)&free_slot->guest_key, guest_key, NULL) != NULL) {
+        CloseHandle(mutex);
+        return xbox_cs_shadow_get(guest_key, FALSE);
+    }
+    free_slot->mutex = mutex;
+    return mutex;
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution, no contention */
+    HANDLE mutex = xbox_cs_shadow_get(CriticalSection, TRUE);
+    if (mutex)
+        WaitForSingleObject(mutex, INFINITE);
 }
 
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution */
+    HANDLE mutex = xbox_cs_shadow_get(CriticalSection, FALSE);
+    if (mutex)
+        ReleaseMutex(mutex);
 }
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution */
+    (void)xbox_cs_shadow_get(CriticalSection, TRUE);
 }
 
 /* ============================================================================

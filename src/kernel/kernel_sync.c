@@ -657,6 +657,7 @@ static VOID CALLBACK xbox_dpc_work_callback(PTP_CALLBACK_INSTANCE Instance,
 {
     PXBOX_KDPC dpc = (PXBOX_KDPC)Context;
 
+
     (void)Instance;
 
     if (dpc && dpc->DeferredRoutine) {

@@ -1557,6 +1557,14 @@ class Lifter:
                 if insn.call_target == 0x000854CF:
                     lines.insert(0, f"recomp_trace_854cf(0, 0x{insn.address:08X}, esp);")
                     lines.append(f"recomp_trace_854cf(1, 0x{insn.address:08X}, esp);")
+                if insn.call_target == 0x00096738:
+                    lines.insert(0, f"recomp_trace_83d32_precall(0x{insn.address:08X}, (uint32_t)esp);")
+                if insn.call_target == 0x000860AA:
+                    lines.insert(0, f"recomp_trace_860aa_call(0x{insn.address:08X}, (uint32_t)eax, (uint32_t)ecx, (uint32_t)edx, (uint32_t)ebx, (uint32_t)esi, (uint32_t)edi, (uint32_t)esp);")
+                if self.func_start == 0x00096825 and insn.call_target == 0x00083D49:
+                    lines.append("recomp_trace_96825_after_83d49((uint32_t)eax, (uint32_t)esp, MEM32(ebp + 8));")
+                if self.func_start == 0x001EC708 and insn.address == 0x001EC773:
+                    lines.append("recomp_trace_sched_result(0x00342B20, 0x001EC773, (uint32_t)eax, (uint32_t)esp);")
             if self.func_start == 0x001BCBC0 and insn.address in (
                     0x001BCC8C, 0x001BCC84, 0x001BCC96,
                     0x001BCDDE, 0x001BCDE8, 0x001BCE11):
@@ -1733,6 +1741,8 @@ class Lifter:
                                0x001E7627, 0x001E77F3):
             prefix += (f"recomp_trace_render_return(0x{self.func_start:08X}, "
                        "(uint32_t)eax, (uint32_t)esp); ")
+        if self.func_start in (0x00084709, 0x000860AA):
+            prefix += f"recomp_trace_cleanup_return(0x{self.func_start:08X}, (uint32_t)eax, (uint32_t)esp); "
         if self.func_start == 0x001BF1D4:
             prefix += "recomp_trace_1bf1d4(1); "
         if self.func_start == 0x001BCE30:
@@ -2111,8 +2121,8 @@ class Lifter:
             if len(ops) >= 1:
                 if ops[0].type == "reg" and ops[0].reg.startswith("st("):
                     idx = int(ops[0].reg[3:-1])
-                    src = (f"_fp_stack[_fp_top & 7]" if idx == 0
-                           else f"_fp_stack[(_fp_top + {idx}) & 7]")
+                    src = (f"g_fp_stack[g_fp_top & 7]" if idx == 0
+                           else f"g_fp_stack[(g_fp_top + {idx}) & 7]")
                     return [f"{{ double _fld_tmp = {src}; fp_push(_fld_tmp); }} /* fld {insn.op_str} */"]
                 if ops[0].type == "mem":
                     if ops[0].mem_size == 4:
@@ -2131,8 +2141,8 @@ class Lifter:
                     return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{pop_code} /* {m} */"]
             if len(ops) >= 1 and ops[0].type == "reg" and ops[0].reg.startswith("st("):
                 idx = int(ops[0].reg[3:-1])
-                slot = (f"_fp_stack[_fp_top & 7]" if idx == 0
-                        else f"_fp_stack[(_fp_top + {idx}) & 7]")
+                slot = (f"g_fp_stack[g_fp_top & 7]" if idx == 0
+                        else f"g_fp_stack[(g_fp_top + {idx}) & 7]")
                 if m == "fstp":
                     if idx == 0:
                         return ["fp_popp(); /* fstp st(0) */"]
@@ -2279,6 +2289,10 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None,
     if (lifter.func_start == 0x00344410 and insns and
             insns[0].address == lifter.func_start):
         stmts.append("recomp_trace_ring_source((uint32_t)edi);")
+    if lifter.func_start == 0x000F388B and insns and insns[0].address == lifter.func_start:
+        stmts.append("recomp_trace_0f388b_call((uint32_t)eax, (uint32_t)ecx, (uint32_t)edx, (uint32_t)ebx, (uint32_t)esi, (uint32_t)edi, (uint32_t)esp);")
+    if lifter.func_start in (0x00084709, 0x000860AA) and insns and insns[0].address == lifter.func_start:
+        stmts.append("recomp_trace_cleanup_entry((uint32_t)esp, MEM32(esp), MEM32(esp + 4u), MEM32(esp + 8u), MEM32(esp + 0xCu));")
 
     # Track the last instruction that set flags
     if snap_counter is None:
@@ -2400,7 +2414,6 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None,
         # Lift the instruction normally
         results = lifter.lift_instruction(insns[i])
         stmts.extend(results)
-
         # Track flag-setting instructions
         if fpu_test:
             # test ah, imm on the x87 status word: no operand snapshot (the
