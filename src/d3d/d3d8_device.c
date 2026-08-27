@@ -180,8 +180,14 @@ void d3d8_PresentFrame(void)
     }
 
     /* Present the backbuffer (VSync = 1) */
-    if (g_device_state.swap_chain)
+    if (g_device_state.swap_chain) {
+        if (getenv("MM3_TRACE_PRESENT")) {
+            static unsigned present_count;
+            if (present_count++ < 16)
+                fprintf(stderr, "[PRESENT-COM] count=%u\\n", present_count);
+        }
         IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    }
 }
 
 /* ================================================================
