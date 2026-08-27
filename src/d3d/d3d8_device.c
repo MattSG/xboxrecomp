@@ -111,7 +111,7 @@ static void d3d8_capture_frame(D3D8DeviceState *state, int idx)
         int w = (int)d.Width, h = (int)d.Height;
         int row = w * 3; row = (row + 3) & ~3;
         char name[64];
-        snprintf(name, sizeof(name), "frame_%03d.bmp", idx);
+        snprintf(name, sizeof(name), "m4tmp/runs/captures/frame_%03d.bmp", idx);
         FILE *f = fopen(name, "wb");
         if (f) {
             unsigned char hdr[54];
