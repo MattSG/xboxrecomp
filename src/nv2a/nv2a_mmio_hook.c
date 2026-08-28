@@ -100,6 +100,27 @@ static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
             fprintf(stderr, " %08X",
                     *(uint32_t *)(uintptr_t)(get + i * 4u + g_mem_offset));
         fprintf(stderr, "\n");
+
+        /* Occupancy of the submitted span. The guest advances PUT by far
+         * more than the number of method packets the parser finds, so
+         * report how much of GET..PUT is actually non-zero and where those
+         * words sit. A dense span means the decode is wrong; a sparse one
+         * means the writes are not landing in the span PUT describes. */
+        uint32_t total = (put - get) / 4u, nonzero = 0;
+        uint32_t first_nz = 0, last_nz = 0;
+        for (uint32_t i = 0; i < total; ++i) {
+            uint32_t w = *(uint32_t *)(uintptr_t)(get + i * 4u + g_mem_offset);
+            if (w) {
+                if (!nonzero) first_nz = i;
+                last_nz = i;
+                nonzero++;
+            }
+        }
+        fprintf(stderr, "[NV2A-PB-OCC] dwords=%u nonzero=%u (%u%%) "
+                "first_nz=%u last_nz=%u\n",
+                total, nonzero, total ? (nonzero * 100u / total) : 0u,
+                first_nz, last_nz);
+        fflush(stderr);
     }
 
     while (cursor < put && packets++ < 0x100000u) {
