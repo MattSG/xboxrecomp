@@ -1165,6 +1165,12 @@ class Lifter:
             return [f"/* mov: bad operands */"]
         src = _fmt_operand_read(ops[1])
         lines = [_fmt_operand_write(ops[0], src)]
+        if (self.func_start == 0x0034D8EE and
+                ops[0].type == "mem"):
+            lines.append(
+                f"recomp_trace_ramht_write(0x{insn.address:08X}, "
+                f"(uint32_t)({_fmt_mem(ops[0])}), "
+                f"(uint32_t)({src}));")
         if (ops[0].type == "mem" and
                 0x00340000 <= self.func_start < 0x00358000 and
                 not ops[0].mem_index and ops[0].mem_disp == 8):
