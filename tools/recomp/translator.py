@@ -657,6 +657,10 @@ class FunctionTranslator:
                 if (start == 0x001E793E and
                         stmt.strip().startswith("ebx = ebx + edx * 4;")):
                     lines.append("    recomp_trace_1e793e_scaled(edi, ebx, eax, ecx, edx);")
+                if (start == 0x001E793E and
+                        "RECOMP_ICALL_SAFE(MEM32(edi + 0x18)" in stmt):
+                    lines.insert(len(lines) - 1,
+                                 "    recomp_trace_1e793e_callback(MEM32(edi + 0x18), edx, MEM32(ebp + -4));")
                 if (start == 0x001E7AF4 and
                         stmt.strip() == "MEM32(ebp + -4) = eax;"):
                     lines.append("    recomp_trace_1e7af4_tile(edi, esi, ebp);")
