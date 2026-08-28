@@ -1177,6 +1177,11 @@ class Lifter:
             lines.append(
                 f"recomp_trace_watch_write(0x{insn.address:08X}, "
                 f"{_fmt_mem(ops[0])}, (uint32_t)({src}));")
+        if (self.func_start == 0x00345740 and ops[0].type == "mem" and
+                not ops[0].mem_index and ops[0].mem_disp == 0x2030):
+            lines.append(
+                f"recomp_trace_watch_write(0x{insn.address:08X}, "
+                f"{_fmt_mem(ops[0])}, (uint32_t)({src}));")
         if (ops[0].type == "mem" and ops[0].mem_base is None and
                 not ops[0].mem_index and ops[0].mem_disp == 0x003C5CDC):
             lines.append(
