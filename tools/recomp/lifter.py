@@ -1038,6 +1038,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
         if m in ("bsf", "bsr"):
             return self._lift_bsf_bsr(insn, ops, m)
 
@@ -1061,7 +1063,8 @@ class Lifter:
         if m.startswith("rep ") or m.startswith("repe ") or m.startswith("repne "):
             return self._lift_rep_string(insn, m)
         if m in ("movsb", "movsd", "movsw", "stosb", "stosd", "stosw",
-                 "lodsb", "lodsd", "lodsw"):
+                 "lodsb", "lodsd", "lodsw",
+                 "cmpsb", "cmpsw", "scasb", "scasw", "scasd"):
             return self._lift_string_op(insn, m)
         if m == "wait":
             return ["/* wait - FPU sync */"]
@@ -1463,6 +1466,27 @@ class Lifter:
         return [f"{{ uint32_t _d = {dst}; uint32_t _c = ({cnt}) & 31;"
                 f" if (_c) _cf = {bit};"
                 f" {_fmt_operand_write(ops[0], f'{func}(_d, _c)')} }}"]
+
+    def _lift_rotate_carry(self, insn, ops, m):
+        """rcl/rcr - rotate through carry.
+
+        These were listed as flag setters but had no emitter, so every site
+        became a comment and the operand kept its old value - 1,945 sites in
+        MM3's .text alone.
+
+        CF participates as a 33rd bit, so the result depends on the incoming
+        carry, and the outgoing carry must be published for a following adc,
+        sbb or jc. Width handling matches _lift_rotate: the 32-bit form.
+        """
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        dst = _fmt_operand_read(ops[0])
+        cnt = _fmt_operand_read(ops[1])
+        func = "RCL32" if m == "rcl" else "RCR32"
+        write = _fmt_operand_write(ops[0], "_r")
+        return [f"{{ int _co = _cf; uint32_t _r = {func}({dst}, "
+                f"(int)({cnt}) & 31, _cf, &_co);"
+                f" {write} _cf = _co; }}"]
 
     def _lift_bsf_bsr(self, insn, ops, m):
         """bsf r, src / bsr r, src — bit scan, ZF set if src is zero."""
@@ -1938,6 +1962,31 @@ class Lifter:
             return ["MEM16(edi) = LO16(eax); edi += 2; /* stosw */"]
         if m == "lodsw":
             return ["SET_LO16(eax, MEM16(esi)); esi += 2; /* lodsw */"]
+        # Bare (unprefixed) compare/scan. The repe/repne forms are handled by
+        # _lift_rep_string; these single-step forms had no emitter, so 183
+        # sites in MM3 silently compared nothing and left flags stale.
+        # Flags are set as for SUB, and the pointers advance assuming DF=0,
+        # matching the direction assumption the rep forms already make.
+        if m == "cmpsb":
+            return ["{ uint32_t _a = MEM8(esi), _b = MEM8(edi);"
+                    " _cf = (_a < _b); _flags = (int)(_a - _b);"
+                    " esi++; edi++; } /* cmpsb */"]
+        if m == "cmpsw":
+            return ["{ uint32_t _a = MEM16(esi), _b = MEM16(edi);"
+                    " _cf = (_a < _b); _flags = (int)(_a - _b);"
+                    " esi += 2; edi += 2; } /* cmpsw */"]
+        if m == "scasb":
+            return ["{ uint32_t _a = LO8(eax), _b = MEM8(edi);"
+                    " _cf = (_a < _b); _flags = (int)(_a - _b);"
+                    " edi++; } /* scasb */"]
+        if m == "scasw":
+            return ["{ uint32_t _a = LO16(eax), _b = MEM16(edi);"
+                    " _cf = (_a < _b); _flags = (int)(_a - _b);"
+                    " edi += 2; } /* scasw */"]
+        if m == "scasd":
+            return ["{ uint32_t _a = eax, _b = MEM32(edi);"
+                    " _cf = (_a < _b); _flags = (int)(_a - _b);"
+                    " edi += 4; } /* scasd */"]
         return [f"/* {m} */"]
 
     # ── FPU (x87) ──

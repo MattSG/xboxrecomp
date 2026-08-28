@@ -1201,7 +1201,11 @@ class BatchTranslator:
             ]
             for addr in sorted(unresolved):
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ /* 0x{addr:08X}: not detected */ }}"
+                    f"void {unresolved[addr]}(void) {{ "
+                    f"/* 0x{addr:08X}: not detected. Pop the return address so "
+                    f"an unresolved call does not leak guest stack; the callee's "
+                    f"own argument bytes are unknown and still leak. */ "
+                    f"esp += 4; }}"
                 )
             stub_lines.append("")
 
