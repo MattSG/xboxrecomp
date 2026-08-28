@@ -152,10 +152,54 @@ static void d3d8_capture_frame(D3D8DeviceState *state, int idx)
     ID3D11Texture2D_Release(bb);
 }
 
+/* Draw/state counters.  These are monotonic: the periodic [D3D] stats line
+ * reports deltas against a saved baseline rather than zeroing them, so the
+ * [FRAME] marker below can always report true cumulative totals. */
+static DWORD g_d3d_begin_count = 0;
+static DWORD g_d3d_end_count = 0;
+static DWORD g_d3d_clear_count = 0;
+static DWORD g_d3d_draw_count = 0;
+static DWORD g_d3d_settransform_count = 0;
+static DWORD g_d3d_setrs_count = 0;
+static DWORD g_d3d_settexture_count = 0;
+
+/* ================================================================
+ * Genuine frame presentation
+ *
+ * M4 acceptance keys on [FRAME].  Every real swapchain present in this
+ * translation unit routes through here so the marker has exactly one
+ * emitter, is never env-gated, and always carries the cumulative geometry
+ * state a detector needs to reject an empty or stub-produced frame.
+ * `src` names the caller path so a frame presented by the NV2A phase-1
+ * stub can be told apart from one presented by the guest render path.
+ * ================================================================ */
+HRESULT d3d8_present_swapchain(const char *src)
+{
+    static unsigned frame_seq;
+
+    if (!g_device_state.swap_chain) return E_FAIL;
+
+    frame_seq++;
+    /* Unconditional, but bounded: every one of the first 8 frames, then
+     * every 100th.  A detector only needs presence, not a full log. */
+    if (frame_seq <= 8 || (frame_seq % 100) == 0) {
+        fprintf(stderr,
+                "[FRAME] n=%u src=%s draw=%lu begin=%lu clear=%lu tex=%lu\n",
+                frame_seq, src ? src : "unknown",
+                (unsigned long)g_d3d_draw_count,
+                (unsigned long)g_d3d_begin_count,
+                (unsigned long)g_d3d_clear_count,
+                (unsigned long)g_d3d_settexture_count);
+        fflush(stderr);
+    }
+
+    return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+}
+
 /* ================================================================
  * Public frame pump (called from recompiled game code)
  * ================================================================ */
-void d3d8_PresentFrame(void)
+void d3d8_PresentFrameFrom(const char *src)
 {
     if (getenv("MM3_TRACE_PRESENT")) {
         static unsigned trace_frame_pump_count;
@@ -180,14 +224,12 @@ void d3d8_PresentFrame(void)
     }
 
     /* Present the backbuffer (VSync = 1) */
-    if (g_device_state.swap_chain) {
-        if (getenv("MM3_TRACE_PRESENT")) {
-            static unsigned present_count;
-            if (present_count++ < 16)
-                fprintf(stderr, "[PRESENT-COM] count=%u\\n", present_count);
-        }
-        IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
-    }
+    d3d8_present_swapchain(src);
+}
+
+void d3d8_PresentFrame(void)
+{
+    d3d8_PresentFrameFrom("pump");
 }
 
 /* ================================================================
@@ -462,14 +504,6 @@ static HRESULT __stdcall dev_Reset(IDirect3DDevice8 *self, D3DPRESENT_PARAMETERS
     return S_OK;
 }
 
-static DWORD g_d3d_begin_count = 0;
-static DWORD g_d3d_end_count = 0;
-static DWORD g_d3d_clear_count = 0;
-static DWORD g_d3d_draw_count = 0;
-static DWORD g_d3d_settransform_count = 0;
-static DWORD g_d3d_setrs_count = 0;
-static DWORD g_d3d_settexture_count = 0;
-
 static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, const RECT *dst, HWND hWnd, void *pDirty)
 {
     static DWORD frame_count = 0;
@@ -487,20 +521,24 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
     DWORD now = GetTickCount();
     if (last_tick == 0) last_tick = now;
     if (now - last_tick >= 2000) {
+        /* Counters are monotonic; report the delta since the last line. */
+        static DWORD base_begin, base_end, base_clear, base_draw;
+        static DWORD base_xform, base_rs, base_tex;
         fprintf(stderr, "  [D3D] %.1fs: %u present (%.1f fps), %u begin, %u end, "
                 "%u clear, %u draw, %u xform, %u rs, %u tex\n",
                 (now - last_tick) / 1000.0, frame_count,
                 frame_count * 1000.0 / (now - last_tick),
-                g_d3d_begin_count, g_d3d_end_count,
-                g_d3d_clear_count, g_d3d_draw_count,
-                g_d3d_settransform_count, g_d3d_setrs_count,
-                g_d3d_settexture_count);
+                g_d3d_begin_count - base_begin, g_d3d_end_count - base_end,
+                g_d3d_clear_count - base_clear, g_d3d_draw_count - base_draw,
+                g_d3d_settransform_count - base_xform,
+                g_d3d_setrs_count - base_rs,
+                g_d3d_settexture_count - base_tex);
         fflush(stderr);
         frame_count = 0;
-        g_d3d_begin_count = g_d3d_end_count = 0;
-        g_d3d_clear_count = g_d3d_draw_count = 0;
-        g_d3d_settransform_count = g_d3d_setrs_count = 0;
-        g_d3d_settexture_count = 0;
+        base_begin = g_d3d_begin_count; base_end = g_d3d_end_count;
+        base_clear = g_d3d_clear_count; base_draw = g_d3d_draw_count;
+        base_xform = g_d3d_settransform_count; base_rs = g_d3d_setrs_count;
+        base_tex = g_d3d_settexture_count;
         last_tick = now;
     }
 
@@ -516,7 +554,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
         DispatchMessageA(&msg);
     }
 
-    return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    return d3d8_present_swapchain("d3d8-present");
 }
 
 static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuffer, DWORD Type, IDirect3DSurface8 **ppSurface)
@@ -1464,7 +1502,7 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
         DispatchMessageA(&msg);
     }
 
-    return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    return d3d8_present_swapchain("d3d8-swap");
 }
 
 /* ================================================================
@@ -1565,6 +1603,7 @@ static ULONG __stdcall d3d8_Release(IDirect3D8 *self)
 }
 
 void d3d8_PresentFrame(void);
+void d3d8_PresentFrameFrom(const char *src);
 
 /* ── Auto window creation (when game provides no HWND) ────── */
 

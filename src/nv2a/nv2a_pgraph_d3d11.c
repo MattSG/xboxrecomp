@@ -806,7 +806,9 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         if (getenv("MM3_TRACE_FLIP_METHODS"))
             fprintf(stderr, "[NV2A-FLIP] method=STALL read=%u write=%u modulo=%u\n",
                     g_pg.flip_read, g_pg.flip_write, g_pg.flip_modulo);
-        d3d8_PresentFrame();
+        /* Presented by the NV2A phase-1 stub, not the guest render path;
+         * tag it so [FRAME] cannot be mistaken for a real game frame. */
+        d3d8_PresentFrameFrom("pgraph-stub");
         return 1;
 
     default:

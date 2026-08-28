@@ -780,6 +780,20 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
  */
 void d3d8_PresentFrame(void);
 
+/**
+ * As d3d8_PresentFrame, but tags which path drove the frame.  The tag is
+ * reported in the [FRAME] marker so a frame presented by the NV2A phase-1
+ * stub can be distinguished from one presented by the guest render path.
+ */
+void d3d8_PresentFrameFrom(const char *src);
+
+/**
+ * The single genuine swapchain present.  Emits the [FRAME] marker that M4
+ * acceptance keys on; never env-gated.  Returns E_FAIL with no marker when
+ * no swapchain exists.
+ */
+HRESULT d3d8_present_swapchain(const char *src);
+
 #ifdef __cplusplus
 }
 #endif

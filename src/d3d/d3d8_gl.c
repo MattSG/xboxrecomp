@@ -1044,9 +1044,30 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void)
     return &g_device;
 }
 
+/* POSIX/GL backend. This backend does not yet track per-frame geometry
+ * counts, so its [FRAME] marker omits draw=/begin=/clear=/tex= and can
+ * therefore reach M4c but never satisfy M4. Add the counters here before
+ * treating a GL-backend run as M4 evidence. */
+HRESULT d3d8_present_swapchain(const char *src)
+{
+    static unsigned frame_seq;
+    frame_seq++;
+    if (frame_seq <= 8 || (frame_seq % 100) == 0) {
+        fprintf(stderr, "[FRAME] n=%u src=%s\n",
+                frame_seq, src ? src : "unknown");
+        fflush(stderr);
+    }
+    return dev_Present(&g_device, NULL, NULL, NULL, NULL);
+}
+
+void d3d8_PresentFrameFrom(const char *src)
+{
+    d3d8_present_swapchain(src);
+}
+
 void d3d8_PresentFrame(void)
 {
-    dev_Present(&g_device, NULL, NULL, NULL, NULL);
+    d3d8_PresentFrameFrom("pump");
 }
 
 /* Alias used by recomp_manual.c via d3d8_internal.h on both backends. */

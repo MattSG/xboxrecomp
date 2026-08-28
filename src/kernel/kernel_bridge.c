@@ -47,6 +47,7 @@ extern uintptr_t g_fake_kpcr_native;
 extern const char *recomp_probe_fn_name(uintptr_t rva);
 extern ptrdiff_t g_xbox_mem_offset;
 extern void d3d8_PresentFrame(void);
+extern void d3d8_PresentFrameFrom(const char *src);
 
 /* Xbox file I/O bridge (src/xbox_file_bridge.c) */
 extern int xbox_file_register(FILE *fp);
@@ -1064,7 +1065,7 @@ static void bridge_AvSetDisplayMode(void)
 
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
     if (step == 0)
-        d3d8_PresentFrame();
+        d3d8_PresentFrameFrom("av-setmode");
     g_eax = 0;
 }
 
