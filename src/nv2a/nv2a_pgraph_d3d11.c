@@ -22,6 +22,9 @@
 /* D3D8 device — we include the full header for COM vtable access */
 #include "../d3d/d3d8_xbox.h"
 #include "../d3d/d3d8_vsh.h"
+
+/* Defined in nv2a_core.c; avoids including nv2a_state.h here. */
+uint8_t *nv2a_get_vram(uint32_t *size_out);
 extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
 /* Global.txd texture lookup */
@@ -66,6 +69,120 @@ static IDirect3DTexture8 *create_dxt5_texture(IDirect3DDevice8 *dev,
     } else {
         fprintf(stderr, "[PGRAPH-D3D11] Failed to lock font atlas: hr=0x%08X\n", hr);
     }
+    return tex;
+}
+
+/* ----------------------------------------------------------------------
+ * Generic NV2A texture upload
+ *
+ * The previous texture path was Burnout 3 specific: a switch over nine
+ * hardcoded VRAM addresses, wrapped in #ifdef GAME_HAS_FONT_ATLAS, a symbol
+ * defined nowhere in this build. So no title other than Burnout 3 ever bound
+ * a texture, and MM3's full-screen blits drew solid white.
+ *
+ * This reads the texture the guest actually pointed at. Decoding is
+ * deliberately conservative: anything that does not decode to a plausible
+ * 32bpp surface inside VRAM is refused and logged rather than uploaded as
+ * noise. MM3_TRACE_TEX prints every decode, including the refusals, so a
+ * wrong format guess reports itself instead of painting garbage.
+ * ---------------------------------------------------------------------- */
+
+#define TEXFMT_COLOR(f)  (((f) >> 8)  & 0xFF)
+#define TEXFMT_LOG_W(f)  (((f) >> 20) & 0x0F)
+#define TEXFMT_LOG_H(f)  (((f) >> 24) & 0x0F)
+#define TEXFMT_DIM(f)    (((f) >> 4)  & 0x0F)
+
+#define NVFMT_A8R8G8B8_SW   0x06
+#define NVFMT_X8R8G8B8_SW   0x07
+#define NVFMT_X8R8G8B8_LIN  0x11
+#define NVFMT_A8R8G8B8_LIN  0x12
+
+static int pgraph_fmt_is_32bpp(uint32_t cf)
+{
+    return cf == NVFMT_A8R8G8B8_SW  || cf == NVFMT_X8R8G8B8_SW ||
+           cf == NVFMT_A8R8G8B8_LIN || cf == NVFMT_X8R8G8B8_LIN;
+}
+
+static int pgraph_fmt_is_swizzled(uint32_t cf)
+{
+    return cf == NVFMT_A8R8G8B8_SW || cf == NVFMT_X8R8G8B8_SW;
+}
+
+/* Morton / Z-order de-swizzle for a 32bpp surface. */
+static void pgraph_untwiddle32(uint32_t *dst, const uint32_t *src,
+                               uint32_t w, uint32_t h)
+{
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t m = 0, bit = 0, xx = x, yy = y;
+            while (xx || yy) {
+                m |= (xx & 1u) << bit; bit++; xx >>= 1;
+                m |= (yy & 1u) << bit; bit++; yy >>= 1;
+            }
+            dst[y * w + x] = src[m];
+        }
+    }
+}
+
+static IDirect3DTexture8 *pgraph_upload_vram_texture(IDirect3DDevice8 *dev,
+                                                     uint32_t vram_off,
+                                                     uint32_t fmt)
+{
+    uint32_t vram_size = 0;
+    uint8_t *vram = nv2a_get_vram(&vram_size);
+    int trace = getenv("MM3_TRACE_TEX") != NULL;
+
+    if (!vram || !vram_size || !vram_off)
+        return NULL;
+
+    uint32_t cf = TEXFMT_COLOR(fmt);
+    uint32_t w  = 1u << TEXFMT_LOG_W(fmt);
+    uint32_t h  = 1u << TEXFMT_LOG_H(fmt);
+
+    if (trace)
+        fprintf(stderr, "[TEX] off=%08X fmt=%08X colour=%02X dim=%u %ux%u\n",
+                vram_off, fmt, cf, TEXFMT_DIM(fmt), w, h);
+
+    if (!pgraph_fmt_is_32bpp(cf) || w < 4 || h < 4 || w > 2048 || h > 2048) {
+        if (trace)
+            fprintf(stderr, "[TEX] refused: colour %02X size %ux%u\n", cf, w, h);
+        return NULL;
+    }
+
+    uint64_t bytes = (uint64_t)w * (uint64_t)h * 4u;
+    if ((uint64_t)vram_off + bytes > (uint64_t)vram_size) {
+        if (trace)
+            fprintf(stderr, "[TEX] refused: %llu bytes at %08X exceeds VRAM\n",
+                    (unsigned long long)bytes, vram_off);
+        return NULL;
+    }
+
+    IDirect3DTexture8 *tex = NULL;
+    HRESULT hr = dev->lpVtbl->CreateTexture(dev, w, h, 1, 0, 0x06, 0, &tex);
+    if (hr != 0 || !tex) {
+        if (trace) fprintf(stderr, "[TEX] CreateTexture failed hr=%08X\n", hr);
+        return NULL;
+    }
+
+    D3DLOCKED_RECT lr;
+    memset(&lr, 0, sizeof(lr));
+    hr = tex->lpVtbl->LockRect(tex, 0, &lr, NULL, 0);
+    if (hr != 0 || !lr.pBits) {
+        if (trace) fprintf(stderr, "[TEX] LockRect failed hr=%08X\n", hr);
+        tex->lpVtbl->Release(tex);
+        return NULL;
+    }
+
+    const uint32_t *src = (const uint32_t *)(vram + vram_off);
+    if (pgraph_fmt_is_swizzled(cf))
+        pgraph_untwiddle32((uint32_t *)lr.pBits, src, w, h);
+    else
+        memcpy(lr.pBits, src, (size_t)bytes);
+    tex->lpVtbl->UnlockRect(tex, 0);
+
+    if (trace)
+        fprintf(stderr, "[TEX] uploaded %ux%u from %08X (%s)\n", w, h, vram_off,
+                pgraph_fmt_is_swizzled(cf) ? "swizzled" : "linear");
     return tex;
 }
 
@@ -500,13 +617,51 @@ static void submit_draw(void)
         dev->lpVtbl->SetTexture(dev, 0, NULL);
     }
 #else
-    /* Generic path: no game-specific texture lookup, use vertex color only */
+    /* Generic path: bind whatever texture the guest actually pointed at.
+     * This replaces an unconditional SetTexture(NULL), which made every draw
+     * vertex-colour only and rendered MM3's full-screen blits solid white. */
     {
-        dev->lpVtbl->SetTexture(dev, 0, NULL);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 1, 2 /*SELECTARG1*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 2, 0 /*DIFFUSE*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 4, 2 /*SELECTARG1*/);
-        dev->lpVtbl->SetTextureStageState(dev, 0, 5, 0 /*DIFFUSE*/);
+        static uint32_t s_cached_off, s_cached_fmt;
+        static IDirect3DTexture8 *s_cached_tex;
+
+        uint32_t off = g_pg.tex[0].offset;
+        uint32_t fmt = g_pg.tex[0].format;
+        IDirect3DTexture8 *tex = NULL;
+
+        if (off) {
+            /* One-entry cache: a full-screen blit re-binds the same surface
+             * every frame, and re-uploading it per draw would be pointless
+             * work. Re-upload when the guest points somewhere else. */
+            if (s_cached_tex && off == s_cached_off && fmt == s_cached_fmt) {
+                tex = s_cached_tex;
+            } else {
+                tex = pgraph_upload_vram_texture(dev, off, fmt);
+                if (tex) {
+                    if (s_cached_tex) s_cached_tex->lpVtbl->Release(s_cached_tex);
+                    s_cached_tex = tex;
+                    s_cached_off = off;
+                    s_cached_fmt = fmt;
+                }
+            }
+        }
+
+        if (tex) {
+            dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)tex);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 1, 4 /*MODULATE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 2, 2 /*TEXTURE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 3, 0 /*DIFFUSE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 4, 4 /*MODULATE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 5, 2 /*TEXTURE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 6, 0 /*DIFFUSE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 13, 3 /*CLAMP*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 14, 3 /*CLAMP*/);
+        } else {
+            dev->lpVtbl->SetTexture(dev, 0, NULL);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 1, 2 /*SELECTARG1*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 2, 0 /*DIFFUSE*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 4, 2 /*SELECTARG1*/);
+            dev->lpVtbl->SetTextureStageState(dev, 0, 5, 0 /*DIFFUSE*/);
+        }
     }
 #endif
 

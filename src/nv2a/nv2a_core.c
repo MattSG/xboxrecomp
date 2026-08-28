@@ -1043,3 +1043,20 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
 
     return d;
 }
+
+/* Narrow VRAM accessor for the D3D11 translator.
+ *
+ * nv2a_pgraph_d3d11.c deliberately does not include nv2a_state.h, which would
+ * drag in the QEMU shim, so it cannot reach NV2AState directly. It needs the
+ * VRAM base and size to upload the texture the guest points at. Expose just
+ * that rather than coupling the headers. */
+uint8_t *nv2a_get_vram(uint32_t *size_out)
+{
+    NV2AState *d = nv2a_get_state();
+    if (!d || !d->vram_ptr) {
+        if (size_out) *size_out = 0;
+        return NULL;
+    }
+    if (size_out) *size_out = (uint32_t)memory_region_size(&d->vram);
+    return d->vram_ptr;
+}
