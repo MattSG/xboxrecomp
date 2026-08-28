@@ -24,6 +24,16 @@ def test_bcbcc0_trace_reuses_target_after_callback():
         assert "recomp_trace_bcbcc0_icall(1, MEM32(eax + 0xC)" not in out, out
 
 
+def test_be953_predicate_hook_uses_real_fallthrough():
+    """The predicate hook follows cmp's decoded fallthrough at 001BF145."""
+    source = open(os.path.join(os.path.dirname(__file__), "lifter.py"),
+                  encoding="utf-8").read()
+    assert "flag_insn.address == 0x001BF13C" in source
+    assert "insns[i + 1].address == 0x001BF145" in source
+    assert "insns[i + 1].address == 0x001BF13F" not in source
+
+
 if __name__ == "__main__":
     test_bcbcc0_trace_reuses_target_after_callback()
+    test_be953_predicate_hook_uses_real_fallthrough()
     print("ok bcbcc0_trace_reuses_target_after_callback")
