@@ -189,6 +189,13 @@ def _fmt_mem_write(op, value_expr):
     return f"{accessor}({addr}) = {value_expr};"
 
 
+def _base_mnemonic(m):
+    """Strip a LOCK prefix. Capstone folds it into the mnemonic string, so
+    "lock inc" never matched any dispatch entry and the instruction was
+    dropped. Atomicity is not modelled; the underlying operation is."""
+    return m[5:] if m.startswith("lock ") else m
+
+
 def _fmt_operand_read(op, disp_bias=0):
     """Format reading any operand type."""
     if op.type == "reg":
@@ -259,7 +266,6 @@ _EFLAGS_SETTERS = frozenset({
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
-    "lock xadd",           # Lock prefix - complex flag behavior
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
@@ -652,17 +658,25 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── cmpxchg: compares accumulator with dest, sets ZF on match ──
     if flag_setter == "cmpxchg":
         if jcc in ("je", "jz"):
-            return f"({lhs} == eax)", desc
+            return "_cmpx_zf", desc
         if jcc in ("jne", "jnz"):
-            return f"({lhs} != eax)", desc
+            return "!_cmpx_zf", desc
+        if jcc in ("jb", "jc", "jnae"):
+            return "_cf", desc
+        if jcc in ("jae", "jnc", "jnb"):
+            return "!_cf", desc
         return None
 
     # ── xadd: exchange and add, flags from addition ──
     if flag_setter == "xadd":
         if jcc in ("je", "jz"):
-            return f"({lhs} == 0)", desc
+            return "_cmpx_zf", desc
         if jcc in ("jne", "jnz"):
-            return f"({lhs} != 0)", desc
+            return "!_cmpx_zf", desc
+        if jcc in ("jb", "jc", "jnae"):
+            return "_cf", desc
+        if jcc in ("jae", "jnc", "jnb"):
+            return "!_cf", desc
         return None
 
     # ── repe cmpsb / repne scasb: string comparison ──
@@ -983,10 +997,11 @@ class Lifter:
         ops = insn.operands
         nops = len(ops)
 
-        # LOCK prefix is meaningless in recompiled code (not atomic context).
-        # Underlying instruction is lifted normally.
-        if hasattr(insn, 'prefix') and 0xF0 in insn.prefix:
-            pass  # strip LOCK, continue to normal lift
+        # LOCK is folded into the mnemonic by the disassembler, so the guard
+        # this replaced (insn.prefix, always None) never fired and every
+        # locked instruction fell through to the TODO comment. Strip it and
+        # lift the underlying operation; atomicity is not modelled.
+        m = _base_mnemonic(m)
 
         # ── NOP ──
         if m == "nop" or (m == "lea" and nops == 2 and
@@ -1006,6 +1021,10 @@ class Lifter:
             return self._lift_lea(insn, ops)
         if m == "xchg":
             return self._lift_xchg(insn, ops)
+        if m == "cmpxchg":
+            return self._lift_cmpxchg(insn, ops)
+        if m == "xadd":
+            return self._lift_xadd(insn, ops)
 
         # ── Stack ──
         if m == "push":
@@ -1261,6 +1280,57 @@ class Lifter:
             f"{{ uint32_t _tmp = {a};",
             _fmt_operand_write(ops[0], b),
             _fmt_operand_write(ops[1], "_tmp") + " }",
+        ]
+
+    # ── Atomics (lock-stripped; sequential semantics) ──
+
+    @staticmethod
+    def _op_width(op):
+        """Operand width in bytes, for picking the accumulator sub-register."""
+        if op.type == "mem":
+            return getattr(op, "mem_size", 4) or 4
+        if op.type == "reg":
+            r = op.reg
+            if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
+                return 1
+            if r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
+                return 2
+        return 4
+
+    _ACC_READ = {1: "LO8(eax)", 2: "LO16(eax)", 4: "eax"}
+    _ACC_WRITE = {1: "SET_LO8(eax, {0});", 2: "SET_LO16(eax, {0});",
+                  4: "eax = {0};"}
+    _WIDTH_MASK = {1: "0xFFu", 2: "0xFFFFu", 4: "0xFFFFFFFFu"}
+
+    def _lift_cmpxchg(self, insn, ops):
+        """CMPXCHG dst, src: compare the accumulator with dst; on equal store
+        src into dst, otherwise load dst into the accumulator. ZF says which
+        branch was taken, so it is published explicitly - reading it back off
+        the operands afterwards cannot tell the two cases apart, because the
+        failure path makes the accumulator equal to dst."""
+        if len(ops) < 2:
+            return ["/* cmpxchg: bad operands */"]
+        w = self._op_width(ops[0])
+        acc = self._ACC_READ.get(w, "eax")
+        return [
+            "{ uint32_t _t = " + _fmt_operand_read(ops[0]) + ", _a = " + acc + ";",
+            "  _cf = (_a < _t); _cmpx_zf = (_a == _t);",
+            "  if (_cmpx_zf) { " + _fmt_operand_write(ops[0], _fmt_operand_read(ops[1])) + " }",
+            "  else { " + self._ACC_WRITE.get(w, "eax = {0};").format("_t") + " } } /* cmpxchg */",
+        ]
+
+    def _lift_xadd(self, insn, ops):
+        """XADD dst, src: src receives the old dst, dst receives the sum.
+        Flags come from the addition, the same way ADD sets them."""
+        if len(ops) < 2:
+            return ["/* xadd: bad operands */"]
+        mask = self._WIDTH_MASK.get(self._op_width(ops[0]), "0xFFFFFFFFu")
+        return [
+            "{ uint32_t _o = " + _fmt_operand_read(ops[0]) + ", _s = " + _fmt_operand_read(ops[1]) + ";",
+            "  uint32_t _r = (_o + _s) & " + mask + ";",
+            "  " + _fmt_operand_write(ops[1], "_o"),
+            "  " + _fmt_operand_write(ops[0], "_r"),
+            "  _cf = (_r < _s); _cmpx_zf = (_r == 0); } /* xadd */",
         ]
 
     # ── Stack ──
@@ -1969,23 +2039,23 @@ class Lifter:
         # matching the direction assumption the rep forms already make.
         if m == "cmpsb":
             return ["{ uint32_t _a = MEM8(esi), _b = MEM8(edi);"
-                    " _cf = (_a < _b); _flags = (int)(_a - _b);"
+                    " _cf = (_a < _b); _cmps_zf = (_a == _b);"
                     " esi++; edi++; } /* cmpsb */"]
         if m == "cmpsw":
             return ["{ uint32_t _a = MEM16(esi), _b = MEM16(edi);"
-                    " _cf = (_a < _b); _flags = (int)(_a - _b);"
+                    " _cf = (_a < _b); _cmps_zf = (_a == _b);"
                     " esi += 2; edi += 2; } /* cmpsw */"]
         if m == "scasb":
             return ["{ uint32_t _a = LO8(eax), _b = MEM8(edi);"
-                    " _cf = (_a < _b); _flags = (int)(_a - _b);"
+                    " _cf = (_a < _b); _cmps_zf = (_a == _b);"
                     " edi++; } /* scasb */"]
         if m == "scasw":
             return ["{ uint32_t _a = LO16(eax), _b = MEM16(edi);"
-                    " _cf = (_a < _b); _flags = (int)(_a - _b);"
+                    " _cf = (_a < _b); _cmps_zf = (_a == _b);"
                     " edi += 2; } /* scasw */"]
         if m == "scasd":
             return ["{ uint32_t _a = eax, _b = MEM32(edi);"
-                    " _cf = (_a < _b); _flags = (int)(_a - _b);"
+                    " _cf = (_a < _b); _cmps_zf = (_a == _b);"
                     " edi += 4; } /* scasd */"]
         return [f"/* {m} */"]
 
@@ -2470,23 +2540,31 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None,
             # C register AH is stale; _fpu_cmp holds the compare result).
             last_flag_setter = "fpu_test"
             last_flag_ops = [curr.operands[1]]
-        elif curr.mnemonic in FLAG_SETTERS:
+        elif _base_mnemonic(curr.mnemonic) in FLAG_SETTERS:
             if curr.mnemonic in _SNAPSHOT_SETTERS:
                 last_flag_ops = _snapshot_flag_operands(
                     stmts, curr, snap_counter)
             else:
                 last_flag_ops = list(curr.operands)
-            last_flag_setter = curr.mnemonic
-        elif curr.mnemonic in _FLAGS_UNDEFINED:
+            last_flag_setter = _base_mnemonic(curr.mnemonic)
+        elif _base_mnemonic(curr.mnemonic) in _FLAGS_UNDEFINED:
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
             last_flag_ops = []
-        elif curr.mnemonic in _EFLAGS_SETTERS:
+        elif _base_mnemonic(curr.mnemonic) in _EFLAGS_SETTERS:
             # Additional flag-setting instructions
-            last_flag_ops = _snapshot_flag_operands(
-                stmts, curr, snap_counter)
-            last_flag_setter = curr.mnemonic
-        elif curr.mnemonic in _EFLAGS_PRESERVE:
+            base = _base_mnemonic(curr.mnemonic)
+            if base in ("cmpxchg", "xadd"):
+                # These publish _cmpx_zf themselves, so the condition never
+                # reads the operands; snapshotting them would emit dead reads
+                # of guest memory the emitter has just overwritten. Keep the
+                # operand list, which _condition_for requires to be non-empty.
+                last_flag_ops = list(curr.operands)
+            else:
+                last_flag_ops = _snapshot_flag_operands(
+                    stmts, curr, snap_counter)
+            last_flag_setter = base
+        elif _base_mnemonic(curr.mnemonic) in _EFLAGS_PRESERVE:
             pass  # These don't affect EFLAGS
         elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
                                 "fucomip", "fcomi"):
@@ -2517,6 +2595,12 @@ def lift_basic_block(lifter, bb, flag_state=None, snap_counter=None,
                 last_flag_ops = list(curr.operands)
             else:
                 pass  # rep movs/stos = data movement, flags preserved
+        elif "cmps" in curr.mnemonic or "scas" in curr.mnemonic:
+            # Bare (unprefixed) cmpsb/scasb and friends. Without this they
+            # reached the clear-state arm below and the following jcc was
+            # emitted as a standalone jump against a stale flag variable.
+            last_flag_setter = curr.mnemonic
+            last_flag_ops = list(curr.operands)
         else:
             # Unknown instruction - conservatively clear flag state
             last_flag_setter = None

@@ -19,6 +19,7 @@ import os
 from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
 from .lifter import Lifter, lift_basic_block, detect_seh_helpers
+from .lifter import _base_mnemonic
 
 # XBE section "D3D": Microsoft's statically linked D3D8LTCG library.
 # Functions in this range get the host D3D8 HLE dispatch seam at entry.
@@ -487,10 +488,10 @@ class FunctionTranslator:
         # add/sub, and/or/xor, neg, shifts, rotates). Consumers must read a
         # value that producers store; declaring it whenever either appears
         # keeps the generated C valid for both cases.
-        has_carry = any(insn.mnemonic in (
+        has_carry = any(_base_mnemonic(insn.mnemonic) in (
                 "sbb", "adc", "neg", "cmp", "test", "add", "sub",
                 "and", "or", "xor", "shl", "sal", "shr", "sar",
-                "rol", "ror", "rcl", "rcr")
+                "rol", "ror", "rcl", "rcr", "cmpxchg", "xadd")
                 or ("cmps" in insn.mnemonic) or ("scas" in insn.mnemonic)
                         for insn in instructions)
         if has_carry:
@@ -501,6 +502,14 @@ class FunctionTranslator:
                        for insn in instructions)
         if has_cmps:
             lines.append(f"    int _cmps_zf = 0; /* string-compare ZF */")
+
+        # cmpxchg/xadd publish ZF explicitly: for cmpxchg the failure path
+        # makes the accumulator equal the destination, so the flag cannot be
+        # recovered from the operands after the fact.
+        has_cmpx = any(_base_mnemonic(insn.mnemonic) in ("cmpxchg", "xadd")
+                       for insn in instructions)
+        if has_cmpx:
+            lines.append(f"    int _cmpx_zf = 0; /* cmpxchg/xadd ZF */")
 
         # Add _fpu_cmp for FPU compare instructions (both old and new style)
         has_fpu_cmp = any(insn.mnemonic in ("fcompi", "fcomip", "fucomi",
