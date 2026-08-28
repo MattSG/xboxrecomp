@@ -132,7 +132,7 @@ def _fmt_imm(val):
 
 def _mem_accessor(size):
     """Return the MEM macro name for a given operand size."""
-    return {1: "MEM8", 2: "MEM16", 4: "MEM32"}.get(size, "MEM32")
+    return {1: "MEM8", 2: "MEM16", 4: "MEM32", 8: "MEM64"}.get(size, "MEM32")
 
 
 def _smem_accessor(size):
@@ -187,6 +187,12 @@ def _fmt_mem_write(op, value_expr):
         return write
     addr = _fmt_mem(op)
     return f"{accessor}({addr}) = {value_expr};"
+
+
+def _is_mmx_reg(op):
+    """True for the MMX register file (mm0-mm7), which the translator
+    declares as uint64_t locals."""
+    return op.type == "reg" and bool(op.reg) and op.reg.startswith("mm")
 
 
 def _base_mnemonic(m):
@@ -1139,7 +1145,7 @@ class Lifter:
                  "cvtsi2sd", "cvtsd2si", "cvttsd2si",
                  "cvtss2sd", "cvtsd2ss",
                  "xorps", "xorpd", "andps", "orps",
-                 "movd", "movq",
+                 "movd", "movq", "movntq",
                  "shufps", "unpcklps", "unpckhps",
                  "addps", "subps", "mulps", "divps",
                  "minps", "maxps", "rsqrtss", "rcpss",
@@ -2064,6 +2070,18 @@ class Lifter:
     # ── SSE (scalar/packed float) ──
 
     def _lift_sse(self, insn, m, ops):
+        # MOVQ/MOVNTQ on the MMX registers. These fell through to the
+        # comment-only fallback at the bottom of this method, which meant an
+        # MMX block copy lifted to its loop counter and pointer arithmetic
+        # with every load and store missing: the loop ran the right number of
+        # times and moved nothing. sub_000120B6 is one such copy and has 77
+        # callers. The mm registers are already declared as uint64_t by the
+        # translator, so only the memory side was missing.
+        if m in ("movq", "movntq") and len(ops) >= 2 and (
+                _is_mmx_reg(ops[0]) or _is_mmx_reg(ops[1])):
+            return [_fmt_operand_write(ops[0], _fmt_operand_read(ops[1]))
+                    + f" /* {m} */"]
+
         """Translate SSE instructions to C float operations."""
         nops = len(ops)
         if nops < 1:
@@ -2281,7 +2299,13 @@ class Lifter:
         if m in ("fist", "fistp"):
             if len(ops) >= 1 and ops[0].type == "mem":
                 mem_acc = _mem_accessor(ops[0].mem_size)
-                return [f"{mem_acc}({_fmt_mem(ops[0])}) = (int32_t)fp_top(); /* {m} */"]
+                # The cast must match the store width. fistp with a qword
+                # operand stores a 64-bit integer; truncating to int32_t
+                # first would silently clamp every value that needs the
+                # extra range. (Before MEM64 existed the store itself was
+                # only four bytes wide, which hid this.)
+                cast = {2: "int16_t", 8: "int64_t"}.get(ops[0].mem_size, "int32_t")
+                return [f"{mem_acc}({_fmt_mem(ops[0])}) = ({cast})fp_top(); /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m in ("fadd", "faddp", "fsub", "fsubp", "fmul", "fmulp", "fdiv", "fdivp"):
