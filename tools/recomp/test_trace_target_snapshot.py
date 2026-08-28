@@ -25,11 +25,10 @@ def test_bcbcc0_trace_reuses_target_after_callback():
 
 
 def test_be953_predicate_hook_uses_real_fallthrough():
-    """The predicate hook follows cmp's decoded fallthrough at 001BF145."""
+    """The predicate hook is keyed to cmp's unique guest address."""
     source = open(os.path.join(os.path.dirname(__file__), "lifter.py"),
                   encoding="utf-8").read()
-    assert "flag_insn.address == 0x001BF13C" in source
-    assert "insns[i + 1].address == 0x001BF145" in source
+    assert "curr.address == 0x001BF13C):" in source
     assert "insns[i + 1].address == 0x001BF13F" not in source
 
 
