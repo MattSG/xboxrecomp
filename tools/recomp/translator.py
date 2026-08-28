@@ -20,6 +20,11 @@ from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
 from .lifter import Lifter, lift_basic_block, detect_seh_helpers
 
+# XBE section "D3D": Microsoft's statically linked D3D8LTCG library.
+# Functions in this range get the host D3D8 HLE dispatch seam at entry.
+D3D8_HLE_LO = 0x0033F960
+D3D8_HLE_HI = 0x00353128
+
 
 def _fixup_icall_esp_save(lines):
     """
@@ -551,6 +556,24 @@ class FunctionTranslator:
         # thread may accept an IRQ or dispatch a queued DPC.
         lines.append("    recomp_guest_boundary();")
         lines.append(f"")
+
+        # D3D8LTCG high-level-emulation seam.
+        #
+        # The XBE section "D3D" holds Microsoft's statically linked
+        # D3D8LTCG library, not game code. Functions there can be served by
+        # the host D3D8 layer instead of executed as translated x86. Emit a
+        # dispatch check at entry for every function in that range: when the
+        # host handles the call it has already applied the guest-visible
+        # effects (registers, stack cleanup), so the translated body is
+        # skipped; when it declines, execution falls through unchanged. This
+        # is inert until the runtime opts a specific function in.
+        #
+        # The global is tested inline first, so a run with HLE off pays only
+        # a load and a not-taken branch per call.
+        if D3D8_HLE_LO <= start < D3D8_HLE_HI:
+            lines.append(
+                f"    if (g_recomp_hle_on && recomp_hle_dispatch(0x{start:08X})) return;")
+            lines.append(f"")
         if start in (0x001EC520, 0x001EC6EE, 0x001EC7F7, 0x001E73AF, 0x001E7627, 0x001E77F3,
                      0x001BF1D4, 0x001BCE30,
                      0x00344A20, 0x00342B00, 0x001EC8E6, 0x001F373E,

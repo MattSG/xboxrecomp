@@ -1165,23 +1165,14 @@ class Lifter:
             return [f"/* mov: bad operands */"]
         src = _fmt_operand_read(ops[1])
         lines = [_fmt_operand_write(ops[0], src)]
-        if (self.func_start == 0x0034D8EE and
-                ops[0].type == "mem"):
-            lines.append(
-                f"recomp_trace_ramht_write(0x{insn.address:08X}, "
-                f"(uint32_t)({_fmt_mem(ops[0])}), "
-                f"(uint32_t)({src}));")
-        if (ops[0].type == "mem" and
-                0x00340000 <= self.func_start < 0x00358000 and
-                not ops[0].mem_index and ops[0].mem_disp == 8):
-            lines.append(
-                f"recomp_trace_watch_write(0x{insn.address:08X}, "
-                f"{_fmt_mem(ops[0])}, (uint32_t)({src}));")
-        if (self.func_start == 0x00345740 and ops[0].type == "mem" and
-                not ops[0].mem_index and ops[0].mem_disp == 0x2030):
-            lines.append(
-                f"recomp_trace_watch_write(0x{insn.address:08X}, "
-                f"{_fmt_mem(ops[0])}, (uint32_t)({src}));")
+        # Diagnostic write hooks for the D3D8LTCG internals (0x0034D8EE,
+        # 0x00345740, and the 0x00340000-0x00358000 range) were removed.
+        # They instrumented Microsoft's statically linked D3D8 library, which
+        # is now served at its API boundary by the host D3D8 layer, so its
+        # internals no longer execute. recomp_trace_ramht_write never had a
+        # runtime implementation at all, so emitting it broke the link; the
+        # pair that did was measured collapsing the run frontier from
+        # IC 679,590 to IC ~12,140.
         if (ops[0].type == "mem" and ops[0].mem_base is None and
                 not ops[0].mem_index and ops[0].mem_disp == 0x003C5CDC):
             lines.append(
