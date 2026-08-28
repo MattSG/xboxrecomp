@@ -200,6 +200,13 @@ static struct {
     /* Chyron scroll */
     float chyron_scroll_offset;  /* Pixels to shift X for chyron text */
 
+    /* Fixed-function composite (world*view*projection) matrix, from
+     * NV097_SET_COMPOSITE_MATRIX at 0x0A60..0x0A9C. MM3 drives these draws
+     * through fixed-function T&L rather than a vertex program, so without
+     * this the inline positions are object space and cannot be placed. */
+    float composite[16];
+    int   composite_valid;
+
     /* Init flag */
     int initialized;
 } g_pg;
@@ -241,6 +248,44 @@ void pgraph_d3d11_shutdown(void)
 
 static void prepare_vsh(void);
 
+/* True only for a matrix that can actually transform a point. MM3 writes this
+ * region before it holds anything meaningful - observed all-NaN and all-zero -
+ * and an unchecked NaN would propagate into every vertex and blank the draws
+ * that already work, since a NaN comparison against zero is false. */
+static int pgraph_composite_usable(void)
+{
+    if (!g_pg.composite_valid)
+        return 0;
+    float sum = 0.0f;
+    for (int i = 0; i < 16; i++) {
+        if (!isfinite(g_pg.composite[i]))
+            return 0;
+        sum += fabsf(g_pg.composite[i]);
+    }
+    return sum > 0.0f;
+}
+
+static void pgraph_apply_composite(float *x, float *y, float *z, float *w)
+{
+    if (!pgraph_composite_usable())
+        return;
+    const float *m = g_pg.composite;
+    float ox = *x, oy = *y, oz = *z;
+    float cx = m[0] * ox + m[4] * oy + m[8]  * oz + m[12];
+    float cy = m[1] * ox + m[5] * oy + m[9]  * oz + m[13];
+    float cz = m[2] * ox + m[6] * oy + m[10] * oz + m[14];
+    float cw = m[3] * ox + m[7] * oy + m[11] * oz + m[15];
+    if (!isfinite(cw) || cw == 0.0f)
+        return;
+    float inv = 1.0f / cw;
+    if (!isfinite(inv))
+        return;
+    *x = cx * inv;
+    *y = cy * inv;
+    *z = cz * inv;
+    *w = inv;
+}
+
 static void submit_draw(void)
 {
     if (g_pg.inline_count == 0)
@@ -279,6 +324,13 @@ static void submit_draw(void)
     if (prim_count == 0)
         return;
 
+    /* Fixed-function transform. MM3 drives these draws through
+     * fixed-function T&L, so inline positions are object space and must go
+     * through the composite matrix plus a perspective divide to reach the
+     * screen-space (rhw) form this translator emits. With no composite
+     * matrix the positions are already screen space - 2D menu quads - and
+     * pass through unchanged. */
+
     /* Convert inline vertices to OutputVertex (28 bytes) */
     OutputVertex *out = (OutputVertex *)_alloca(out_vert_count * sizeof(OutputVertex));
 
@@ -292,6 +344,8 @@ static void submit_draw(void)
         out[dst_idx].u     = u2f(g_pg.attr_immediate ? src[_b + 0] : src[_b + 2]); \
         out[dst_idx].v     = u2f(g_pg.attr_immediate ? src[_b + 1] : src[_b + 3]); \
         out[dst_idx].color = g_pg.attr_immediate ? 0xFFFFFFFFu : src[_b + 4]; \
+        pgraph_apply_composite(&out[dst_idx].x, &out[dst_idx].y, \
+                               &out[dst_idx].z, &out[dst_idx].rhw); \
     } while(0)
 
     if (is_quads) {
@@ -573,6 +627,27 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 
     if (method == NV097_SET_TRANSFORM_CONSTANT_LOAD) {
         g_pg.vsh_constant_load = param;
+        return 1;
+    }
+
+    /* NV097_SET_COMPOSITE_MATRIX: the fixed-function world*view*projection
+     * matrix, 16 floats. Row-major as the guest writes it. */
+    if (method >= 0x0A60u && method < 0x0A60u + 0x40u) {
+        uint32_t slot = (method - 0x0A60u) / 4u;
+        ((uint32_t *)g_pg.composite)[slot] = param;
+        if (slot == 15) {
+            g_pg.composite_valid = 1;
+            if (getenv("MM3_TRACE_MATRIX"))
+                fprintf(stderr, "[PGRAPH-MTX] composite set: "
+                        "[%.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / "
+                        "%.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f]\n",
+                        g_pg.composite[0], g_pg.composite[1], g_pg.composite[2],
+                        g_pg.composite[3], g_pg.composite[4], g_pg.composite[5],
+                        g_pg.composite[6], g_pg.composite[7], g_pg.composite[8],
+                        g_pg.composite[9], g_pg.composite[10], g_pg.composite[11],
+                        g_pg.composite[12], g_pg.composite[13], g_pg.composite[14],
+                        g_pg.composite[15]);
+        }
         return 1;
     }
 
