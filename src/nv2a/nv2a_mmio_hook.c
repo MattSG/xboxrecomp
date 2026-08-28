@@ -521,14 +521,10 @@ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
     /* The guest VRAM aperture (0xF0000000-0xF3FFFFFF) is pre-committed
      * PAGE_READWRITE by main.c. Point the standalone GPU's VRAM at that
      * same backing so CPU texture/geometry writes land where PGRAPH samples
-     * them (real Xbox: the aperture IS VRAM). */
+     * them (real Xbox: the aperture IS VRAM). RAMIN follows at +64MB. */
     g_nv2a_vram = (uint8_t *)(uintptr_t)(NV2A_VRAM_BASE + (uintptr_t)g_mem_offset);
 
-    /* PRAMIN is CPU-visible at guest VA 0x00700000.  Generated guest code
-     * writes DMA objects there directly; keeping a second host-only RAMIN
-     * buffer makes PFIFO lookups miss those authentic writes. */
-    uint8_t *ramin_ptr = (uint8_t *)(uintptr_t)(0x00700000u +
-                                                 (uintptr_t)g_mem_offset);
+    uint8_t *ramin_ptr = g_nv2a_vram + NV2A_VRAM_SIZE;
 
     /* Initialize NV2A state machine */
     nv2a_init_standalone(g_nv2a_vram, NV2A_VRAM_SIZE,
