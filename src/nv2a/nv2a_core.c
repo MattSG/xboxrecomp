@@ -86,6 +86,20 @@ void nv2a_trace_ramht_lookup(uint32_t handle, uint32_t channel_id,
     fprintf(stderr, "[RAMHT-LOOKUP] handle=%08X channel=%u sub=%u hash=%03X "
             "slot=%05llX entry=%08X context=%08X\n", handle, channel_id,
             subchannel, hash, (unsigned long long)off, entry_handle, context);
+    if (getenv("MM3_TRACE_RAMHT")) {
+        uint32_t probe[4][2] = {{0}};
+        for (unsigned int i = 0; i < 4; ++i) {
+            hwaddr poff = 0x1F0000u + (hwaddr)((hash + i) & 0x7FFu) * 8u;
+            if (poff + 8u <= memory_region_size(&d->ramin)) {
+                memcpy(&probe[i][0], d->ramin_ptr + poff, 4);
+                memcpy(&probe[i][1], d->ramin_ptr + poff + 4, 4);
+            }
+        }
+        fprintf(stderr, "[RAMHT-PROBE-SLOTS] h=%03X "
+            "%08X/%08X %08X/%08X %08X/%08X %08X/%08X\n", hash,
+            probe[0][0], probe[0][1], probe[1][0], probe[1][1],
+            probe[2][0], probe[2][1], probe[3][0], probe[3][1]);
+    }
 }
 
 int nv2a_bind_ramht_object(uint32_t handle, uint32_t channel_id,
