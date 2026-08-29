@@ -31,6 +31,8 @@ static int g_dma_get_log = 0;
 static uint32_t g_semaphore_offset;
 static int g_semaphore_log;
 static int g_release_complete_log;
+static int g_semaphore_offset_log;
+static int g_sema_scan_log;
 /* One authentic GPU completion per consumed semaphore release.  The guest
  * arms the completion event (dev+0x1970 clear in sub_00344640) before each
  * fence wait, so deliver one pending release completion per arm instead of
@@ -152,6 +154,11 @@ static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
             }
             if (actual_method == 0x1D6Cu) {
                 g_semaphore_offset = param;
+                /* The write-back below never fired in a whole run, so record
+                 * that the guest does set an offset and what it is. */
+                if (g_semaphore_offset_log++ < 8)
+                    fprintf(stderr, "[NV2A-SEMA-OFF] offset=%08X\n",
+                            param);
             } else if (actual_method == 0x1D70u) {
                 uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
                 uint32_t dev = *g351f48;
@@ -165,6 +172,21 @@ static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
                 if (dev < 0x04000000u) {
                     uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
                     uint32_t ring = devp[0x30 / 4];
+                    /* [NV2A-SEMA] fires zero times across a full run, so the
+                     * scan below never matches and the fence value is never
+                     * written where the guest can poll it. Report what the
+                     * scan is actually looking at. */
+                    if (g_sema_scan_log++ < 6) {
+                        unsigned matches = 0, nonzero = 0;
+                        for (uint32_t o = 0; o < 0x400u; o += 0x10u) {
+                            uint32_t *ob = (uint32_t *)(gpu->ramin_ptr + o);
+                            if (ob[0] | ob[1] | ob[2]) nonzero++;
+                            if ((ob[0] & NV_DMA_CLASS) == 0x3Du) matches++;
+                        }
+                        fprintf(stderr, "[NV2A-SEMA-SCAN] ring=%08X off=%08X "
+                                "ramin_nonzero=%u class3D=%u\n",
+                                ring, g_semaphore_offset, nonzero, matches);
+                    }
                     for (uint32_t off = 0; off < 0x400u; off += 0x10u) {
                         uint32_t *obj = (uint32_t *)(gpu->ramin_ptr + off);
                         uint32_t address = (obj[2] & NV_DMA_ADDRESS) |
