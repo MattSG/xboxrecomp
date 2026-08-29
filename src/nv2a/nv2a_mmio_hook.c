@@ -730,6 +730,23 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
              * somewhere the guest is not reading. The divergence is upstream
              * of this field, and forcing the field only hides it. */
 
+            /* Not writing dev+0x30 here, and the reason is worth keeping.
+             *
+             * The burnout3 reference records a "GPU read pointer trick:
+             * device+0x30 -> device+0x2C (eliminates PB spin loops)", which
+             * matches the symptom exactly - the guest counts requested ring
+             * slots in dev+0x2C and stops submitting when nothing reports
+             * completion. But that title's device sits at 0x0035D6A0 with its
+             * own layout. In MM3 the device is at 0x0034FF00 and dev+0x30
+             * holds a pointer, 0x01085000, which the flush path above reads
+             * as the ring header. Overwriting it with a slot count destroyed
+             * that pointer: ic fell from 402,275 to 12,385 with no frame and
+             * no draw at all.
+             *
+             * Field offsets from another title do not transfer. If this
+             * completion counter is to be published, the field that carries
+             * it in MM3 has to be identified first. */
+
             /* NV_USER_DMA_GET (0xFD800044) is served from d->puser.regs by
              * the VEH, so the guest poll at sub_00345740 loc_345EE0 sees it. */
             if (sub >= NV2A_MMIO_BASE && sub < NV2A_MMIO_BASE + NV2A_MMIO_SIZE) {
