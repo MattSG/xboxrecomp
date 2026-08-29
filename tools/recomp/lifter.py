@@ -2437,7 +2437,9 @@ class Lifter:
                 acc = "MEMD" if ops[0].mem_size == 8 else "MEMF"
                 op = "-" if m == "fsubr" else "/"
                 return [f"fp_push({acc}({_fmt_mem(ops[0])})); fp_top() = fp_top() {op} fp_st1(); fp_pop(); /* {m} [mem] */"]
-            return [f"/* FPU: {m} {insn.op_str} */"]
+            # Not a memory operand: fall through to the stack-register forms
+            # below, which handle the DC/DE encodings. Returning a comment
+            # here is what left them unlifted.
         if m == "fchs":
             return [f"fp_top() = -fp_top(); /* fchs */"]
         if m == "fabs":
@@ -2478,6 +2480,76 @@ class Lifter:
             return [f"fp_push(0.0); /* fldz */"]
         if m == "fld1":
             return [f"fp_push(1.0); /* fld1 */"]
+
+        # ── Transcendentals ──
+        # These had no emitter, so every one of them left ST0 untouched and
+        # the caller read whatever was already there. fsin/fcos alone account
+        # for 294 sites in .text; angle maths cannot work without them.
+        if m in ("fsin", "fcos", "fsqrt", "frndint", "f2xm1"):
+            fn = {"fsin": "sin(fp_top())", "fcos": "cos(fp_top())",
+                  "fsqrt": "sqrt(fp_top())", "frndint": "rint(fp_top())",
+                  "f2xm1": "pow(2.0, fp_top()) - 1.0"}[m]
+            return [f"fp_top() = {fn}; /* {m} */"]
+        if m == "fptan":
+            # Computes the tangent, then pushes the 1.0 the ratio needs.
+            return ["fp_top() = tan(fp_top()); fp_push(1.0); /* fptan */"]
+        if m == "fsincos":
+            return ["{ double _a = fp_top(); fp_top() = sin(_a);"
+                    " fp_push(cos(_a)); } /* fsincos */"]
+        if m == "fpatan":
+            # ST1 = atan2(ST1, ST0), then pop, so the result ends up in ST0.
+            return ["fp_st1() = atan2(fp_st1(), fp_top()); fp_pop();"
+                    " /* fpatan */"]
+        if m in ("fyl2x", "fyl2xp1"):
+            arg = "fp_top()" if m == "fyl2x" else "(fp_top() + 1.0)"
+            return [f"fp_st1() = fp_st1() * log2({arg}); fp_pop(); /* {m} */"]
+        if m == "fscale":
+            return ["fp_top() = fp_top() * pow(2.0, trunc(fp_st1()));"
+                    " /* fscale */"]
+
+        # ── Integer-operand arithmetic ──
+        # fiadd and friends take a 16- or 32-bit integer from memory. They had
+        # no emitter either, so the operand was simply never applied.
+        if m in ("fiadd", "fisub", "fisubr", "fimul", "fidiv", "fidivr"):
+            if len(ops) >= 1 and ops[0].type == "mem":
+                if ops[0].mem_size == 2:
+                    val = f"(double)(int16_t)MEM16({_fmt_mem(ops[0])})"
+                else:
+                    val = f"(double)(int32_t)MEM32({_fmt_mem(ops[0])})"
+                if m in ("fisubr", "fidivr"):
+                    # Reverse forms: the memory operand is the left side.
+                    op = "-" if m == "fisubr" else "/"
+                    return [f"fp_top() = {val} {op} fp_top(); /* {m} */"]
+                op = {"fiadd": "+", "fisub": "-",
+                      "fimul": "*", "fidiv": "/"}[m]
+                return [f"fp_top() = fp_top() {op} {val}; /* {m} */"]
+            return [f"/* {m} {insn.op_str} - operand is not memory */"]
+
+        # ── Truncating store and pop ──
+        if m == "fisttp":
+            if len(ops) >= 1 and ops[0].type == "mem":
+                acc = _mem_accessor(ops[0].mem_size)
+                cast = {2: "int16_t", 8: "int64_t"}.get(ops[0].mem_size,
+                                                        "int32_t")
+                return [f"{acc}({_fmt_mem(ops[0])}) = ({cast})trunc(fp_top());"
+                        f" fp_pop(); /* fisttp */"]
+            return [f"/* fisttp {insn.op_str} - operand is not memory */"]
+
+        # ── Reverse subtract/divide against a stack register ──
+        # The DC and DE encodings put the destination at ST(i), not ST(0), and
+        # reverse the operand order relative to the D8 forms. Getting this
+        # backwards is silent, so the direction is spelled out: the memory
+        # forms above already handle "ST0 = mem OP ST0".
+        if m in ("fsubr", "fsubrp", "fdivr", "fdivrp"):
+            if len(ops) >= 1 and ops[0].type == "reg" and ops[0].reg and                     ops[0].reg.startswith("st("):
+                idx = int(ops[0].reg[3:-1])
+                dst = ("fp_top()" if idx == 0 else
+                       "fp_st1()" if idx == 1 else
+                       f"g_fp_stack[(g_fp_top + {idx}) & 7]")
+                op = "-" if m.startswith("fsub") else "/"
+                pop = " fp_pop();" if m.endswith("p") else ""
+                return [f"{dst} = fp_top() {op} {dst};{pop} /* {m} */"]
+            return [f"/* FPU: {m} {insn.op_str} */"]
 
         return [f"/* FPU: {m} {insn.op_str} */"]
 
