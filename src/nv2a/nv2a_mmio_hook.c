@@ -713,6 +713,23 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                         dev, get, put, consumed, dev + 0x196Cu);
                 nv2a_defer_completion_signal(dev);
             }
+            /* Not advancing the ring-header completion counter here, and
+             * that is deliberate.
+             *
+             * The guest requests ring slots in dev+0x2C and real hardware
+             * reports completion in the first dword of *(dev+0x30), trailing
+             * the request count by two: xemu shows 09/07, 11/0F, 15/11,
+             * 19/15, 21/1F, 27/25. Here it sits at 3 all run. Publishing the
+             * count made things worse, not better - equal cost seven of the
+             * nine flushes, trailing by two cost five.
+             *
+             * The reason is in the rest of the struct. On real hardware the
+             * counter is followed by real data (FF000000, FF292929, FF888888
+             * - colours); here everything after the counter is zero. The
+             * structure this points at was never populated, so writes land
+             * somewhere the guest is not reading. The divergence is upstream
+             * of this field, and forcing the field only hides it. */
+
             /* NV_USER_DMA_GET (0xFD800044) is served from d->puser.regs by
              * the VEH, so the guest poll at sub_00345740 loc_345EE0 sees it. */
             if (sub >= NV2A_MMIO_BASE && sub < NV2A_MMIO_BASE + NV2A_MMIO_SIZE) {

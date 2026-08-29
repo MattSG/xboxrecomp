@@ -237,6 +237,10 @@ static int g_thread_call_count = 0;
  * workers would need a slot table). */
 static jmp_buf g_worker_exit_jmp;
 static volatile int g_worker_active = 0;
+/* Which guest fiber is running. Both share a host thread, so a per-thread
+ * probe cannot tell them apart; the profile is all worker and the main fiber
+ * has never been observed. */
+volatile int g_in_worker_fiber = 0;
 
 typedef struct {
     LPVOID fiber;            /* worker fiber handle (NULL until created) */
@@ -299,6 +303,7 @@ static void worker_switch_to_main(void)
 {
     worker_save_regs(&g_worker);
     worker_load_regs(&g_main_state);
+    g_in_worker_fiber = 0;
     SwitchToFiber(g_main_fiber);
 }
 
@@ -308,6 +313,7 @@ static void worker_switch_to_worker(void)
 {
     worker_save_regs(&g_main_state);
     worker_load_regs(&g_worker);
+    g_in_worker_fiber = 1;
     SwitchToFiber(g_worker.fiber);
 }
 
