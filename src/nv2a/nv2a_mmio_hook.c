@@ -43,6 +43,21 @@ static volatile LONG g_pending_release_count = 0;
 static volatile LONG g_completion_thread_started = 0;
 static uint32_t g_completion_dev = 0;
 
+/* dev+0x24 is the ring BASE, not a GET cursor. Ten presents captured from
+ * xemu show it constant at 0x83F5D000 while PUT grows from 0x83F5E344 to
+ * 0x83F644D0, so the three sites that wrote the consumed cursor back into it
+ * were walking the guest's ring base forward on every flush and corrupting
+ * it. The GPU-side cursor belongs here, not in guest memory. */
+static uint32_t g_gpu_get;
+
+static uint32_t nv2a_ring_get(const uint32_t *devp)
+{
+    uint32_t base = devp[0x24 / 4];
+    uint32_t put = devp[0];
+    if (g_gpu_get < base || g_gpu_get > put) g_gpu_get = base;
+    return g_gpu_get;
+}
+
 static DWORD WINAPI nv2a_completion_signal_thread(LPVOID parameter)
 {
     (void)parameter;
@@ -54,22 +69,24 @@ static DWORD WINAPI nv2a_completion_signal_thread(LPVOID parameter)
             Sleep(1);
             continue;
         }
-        /* The original GPU interrupt is asynchronous.  Wait for the guest's
-         * sub_00344640 arm/clear write before delivering the completion. */
+        /* The original GPU interrupt is asynchronous. Wait for the guest's
+         * sub_00344640 arm/clear write before delivering the completion.
+         *
+         * Removing this gate looked justified - xemu shows dev+0x1970 holding
+         * 1 across ten presents - but that sample is taken at Present entry,
+         * not during the fence wait, so it says nothing about the arm
+         * protocol. Delivering without the gate cost 60% of the frontier
+         * (ic 327,000 against 800,000) and the texture upload stopped
+         * happening at all. The guest really does clear this to arm. */
         Sleep(1);
         for (unsigned i = 0; i < 1000 && *state != 0; ++i)
             Sleep(1);
         if (*state != 0) {
-            /* Cannot deliver: the guest has not armed. Report it, bounded,
-             * with the pending count - four completions get through and a
-             * fifth never does, and this says whether the guest simply
-             * stopped arming or something else holds it. */
             static int s_stuck_log;
-            if (s_stuck_log < 12) {
+            if (s_stuck_log < 8) {
                 s_stuck_log++;
-                fprintf(stderr, "[NV2A-STUCK] pending=%ld state=%08X arm=%08X\n",
-                        (long)g_pending_release_count, *state,
-                        (unsigned)(dev + 0x1970u));
+                fprintf(stderr, "[NV2A-STUCK] pending=%ld state=%08X\n",
+                        (long)g_pending_release_count, *state);
                 fflush(stderr);
             }
             continue;
@@ -620,7 +637,7 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
         if (dev < 0x04000000u) {
             uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
             uint32_t put = devp[0];
-            uint32_t get = devp[0x24 / 4];
+            uint32_t get = nv2a_ring_get(devp);
             uint32_t rend = devp[0x28 / 4];
             if (g_dma_get_log++ < 12)
                 fprintf(stderr, "[NV2A-DMA-GET] dev=%08X get=%08X put=%08X rend=%08X\n",
@@ -633,7 +650,7 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
              * in-ring position for the sub_003444C0 free-space math. */
             uint32_t consumed = nv2a_consume_pushbuffer(get, put);
             if (consumed != get) {
-                devp[0x24 / 4] = consumed;
+                g_gpu_get = consumed;
                 /* Original sub_00344640 waits on the device completion
                  * dispatcher object at dev+0x196C after the GPU advances
                  * the ring. Signal that authentic producer transition. */
@@ -683,7 +700,7 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
             uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
             uint32_t sub = devp[0x17C0 / 4];
             uint32_t put = devp[0];              /* submitted PUT */
-            uint32_t get = devp[0x24 / 4];       /* guest-side GET cursor */
+            uint32_t get = nv2a_ring_get(devp);  /* emulator-side cursor */
             uint32_t rend = devp[0x28 / 4];      /* ring end */
             uint32_t ring = devp[0x30 / 4];      /* ring-header struct */
             uint32_t ring_slots = devp[0x2C / 4];/* ring slot count */
@@ -691,7 +708,7 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
              * leaves GET at its last known-good cursor. */
             uint32_t consumed = nv2a_consume_pushbuffer(get, put);
             if (consumed != get) {
-                devp[0x24 / 4] = consumed;
+                g_gpu_get = consumed;
                 fprintf(stderr, "[NV2A-WAKE] dev=%08X get=%08X put=%08X consumed=%08X object=%08X\n",
                         dev, get, put, consumed, dev + 0x196Cu);
                 nv2a_defer_completion_signal(dev);
@@ -727,11 +744,11 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
         uint32_t dev = *g351f48;
         if (dev < 0x04000000u) {
             uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
-            uint32_t get = devp[0x24 / 4];
+            uint32_t get = nv2a_ring_get(devp);
             uint32_t put = devp[0];
             uint32_t consumed = nv2a_consume_pushbuffer(get, put);
             if (consumed != get) {
-                devp[0x24 / 4] = consumed;
+                g_gpu_get = consumed;
                 fprintf(stderr, "[NV2A-WAKE] dev=%08X get=%08X put=%08X consumed=%08X object=%08X\n",
                         dev, get, put, consumed, dev + 0x196Cu);
                 nv2a_defer_completion_signal(dev);
