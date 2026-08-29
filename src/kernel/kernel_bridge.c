@@ -1425,9 +1425,18 @@ static NTSTATUS bridge_create_file_impl(
     gle = GetLastError();
 
     {
+        /* This was capped at 20, and every run reported exactly 20 file
+         * operations as a result - which was then read as "the loader opens
+         * nothing more". It is a log limit, not a measurement. Count every
+         * call and log a useful number of them. */
         static int s_res_log = 0;
-        if (s_res_log < 20) {
-            fprintf(stderr, "[FILE] result path='%s' st=0x%08X h=%p access=0x%X share=0x%X disp=%d opts=0x%X gle=%u seh_ebp=0x%08X\n",
+        static int s_res_total = 0;
+        s_res_total++;
+        if ((s_res_total % 200) == 0)
+            fprintf(stderr, "[FILE-COUNT] total=%d\n", s_res_total);
+        if (s_res_log < 400) {
+            fprintf(stderr, "[FILE] #%d ra=%08X path='%s' st=0x%08X h=%p access=0x%X share=0x%X disp=%d opts=0x%X gle=%u seh_ebp=0x%08X\n",
+                    s_res_total, BRIDGE_MEM32(g_esp),
                     name.Buffer ? name.Buffer : "(null)", (uint32_t)st, h,
                     access, share, disposition, options, gle, g_seh_ebp);
             s_res_log++;
