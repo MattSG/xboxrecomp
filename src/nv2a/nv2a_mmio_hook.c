@@ -59,8 +59,21 @@ static DWORD WINAPI nv2a_completion_signal_thread(LPVOID parameter)
         Sleep(1);
         for (unsigned i = 0; i < 1000 && *state != 0; ++i)
             Sleep(1);
-        if (*state != 0)
+        if (*state != 0) {
+            /* Cannot deliver: the guest has not armed. Report it, bounded,
+             * with the pending count - four completions get through and a
+             * fifth never does, and this says whether the guest simply
+             * stopped arming or something else holds it. */
+            static int s_stuck_log;
+            if (s_stuck_log < 12) {
+                s_stuck_log++;
+                fprintf(stderr, "[NV2A-STUCK] pending=%ld state=%08X arm=%08X\n",
+                        (long)g_pending_release_count, *state,
+                        (unsigned)(dev + 0x1970u));
+                fflush(stderr);
+            }
             continue;
+        }
         if (InterlockedDecrement(&g_pending_release_count) < 0)
             continue;
         uint32_t event = dev + 0x196Cu;
@@ -162,39 +175,6 @@ static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
             } else if (actual_method == 0x1D70u) {
                 uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
                 uint32_t dev = *g351f48;
-                /* RAMHT is not at RAMIN 0x1F0000 nor at the top of VRAM -
-                 * every lookup reads 0xFFFFFFFF. Find the table instead of
-                 * guessing a third address. Matching a single handle hits
-                 * ordinary code (0x5B5E5F00 is pop ebx/esi/edi), so require a
-                 * real table: one 4 KiB page holding at least two distinct
-                 * bound handles at 8-byte slots, searched above the image. */
-                {
-                    static int s_scanned;
-                    if (!s_scanned) {
-                        s_scanned = 1;
-                        unsigned pages = 0;
-                        for (uint32_t page = 0x00500000u;
-                             page < 0x04000000u && pages < 6; page += 0x1000u) {
-                            unsigned mask = 0;
-                            for (uint32_t o = 0; o < 0x1000u; o += 8u) {
-                                uint32_t *q = (uint32_t *)(uintptr_t)
-                                    (page + o + g_mem_offset);
-                                if (!q[1] || q[1] == 0xFFFFFFFFu) continue;
-                                if (q[0] == 0x0Du) mask |= 1;
-                                else if (q[0] == 0x0Eu) mask |= 2;
-                                else if (q[0] == 0x10u) mask |= 4;
-                                else if (q[0] == 0x11u) mask |= 8;
-                            }
-                            if (mask && (mask & (mask - 1))) {
-                                pages++;
-                                fprintf(stderr, "[RAMHT-FIND] page=%08X mask=%X\n",
-                                        page, mask);
-                            }
-                        }
-                        fprintf(stderr, "[RAMHT-FIND] pages=%u\n", pages);
-                        fflush(stderr);
-                    }
-                }
                 /* The guest's fence completion is tied to the release packet
                  * itself: count it as consumed work when the GPU retires it,
                  * independent of the RAMIN object bookkeeping below. */
@@ -215,15 +195,6 @@ static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
                             uint32_t *ob = (uint32_t *)(gpu->ramin_ptr + o);
                             if (ob[0] | ob[1] | ob[2]) nonzero++;
                             if ((ob[0] & NV_DMA_CLASS) == 0x3Du) matches++;
-                        }
-                        /* 770 non-zero words but no class 0x3D: dump the
-                         * region the guest actually wrote so the real object
-                         * layout and class are visible instead of guessed. */
-                        for (uint32_t o = 0x1000u; o < 0x1060u; o += 0x10u) {
-                            uint32_t *ob = (uint32_t *)(gpu->ramin_ptr + o);
-                            if (!(ob[0] | ob[1] | ob[2] | ob[3])) continue;
-                            fprintf(stderr, "[NV2A-RAMIN-OBJ] off=%04X %08X %08X %08X %08X\n",
-                                    o, ob[0], ob[1], ob[2], ob[3]);
                         }
                         fprintf(stderr, "[NV2A-SEMA-SCAN] ring=%08X off=%08X "
                                 "ramin_nonzero=%u class3D=%u\n",
@@ -615,12 +586,13 @@ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
      * them (real Xbox: the aperture IS VRAM). RAMIN follows at +64MB. */
     g_nv2a_vram = (uint8_t *)(uintptr_t)(NV2A_VRAM_BASE + (uintptr_t)g_mem_offset);
 
-    /* RAMIN is the top of VRAM, not a region past it. Placing it at
-     * +64MB put it outside the committed aperture, so it read as
-     * uninitialised 0xFF and every RAMHT lookup missed - the title writes
-     * its hash table and DMA objects as ordinary stores through the VRAM
-     * aperture, which is what unified memory means on this hardware. */
-    uint8_t *ramin_ptr = g_nv2a_vram + NV2A_VRAM_SIZE - NV2A_RAMIN_SIZE;
+    /* RAMIN stays past the aperture, not at the top of VRAM. Aliasing it
+     * into the last 2MB of VRAM is what the hardware does, but here the
+     * aperture IS guest memory, so the emulator's own RAMHT writes landed on
+     * guest data: run 224 lost the frame and the draw outright (0 frames, 0
+     * draws, 5 flushes against 9). It also did not help - RAMHT is not there
+     * either, and the title never writes one anywhere. */
+    uint8_t *ramin_ptr = g_nv2a_vram + NV2A_VRAM_SIZE;
 
     /* Initialize NV2A state machine */
     nv2a_init_standalone(g_nv2a_vram, NV2A_VRAM_SIZE,
