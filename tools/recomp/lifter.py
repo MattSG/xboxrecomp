@@ -1087,9 +1087,15 @@ class Lifter:
         # ── String operations ──
         if m.startswith("rep ") or m.startswith("repe ") or m.startswith("repne "):
             return self._lift_rep_string(insn, m)
+        # movsd and cmpsd name two unrelated instructions: the string move
+        # and compare, and the SSE2 scalar-double forms. Only the SSE forms
+        # carry an xmm operand, so that is the discriminator. Without this
+        # test "movsd xmm0, [eax]" lifted as a string move - it clobbered
+        # esi, edi and guest memory, which is worse than not lifting it.
         if m in ("movsb", "movsd", "movsw", "stosb", "stosd", "stosw",
                  "lodsb", "lodsd", "lodsw",
-                 "cmpsb", "cmpsw", "scasb", "scasw", "scasd"):
+                 "cmpsb", "cmpsw", "cmpsd", "scasb", "scasw", "scasd")                 and not any(o.type == "reg" and o.reg
+                            and o.reg.startswith("xmm") for o in ops):
             return self._lift_string_op(insn, m)
         if m == "wait":
             return ["/* wait - FPU sync */"]
@@ -1144,14 +1150,18 @@ class Lifter:
                  "cvtsi2ss", "cvtss2si", "cvttss2si",
                  "cvtsi2sd", "cvtsd2si", "cvttsd2si",
                  "cvtss2sd", "cvtsd2ss",
-                 "xorps", "xorpd", "andps", "orps",
-                 "movd", "movq", "movntq",
-                 "shufps", "unpcklps", "unpckhps",
+                 "xorps", "xorpd", "andps", "andpd", "orps", "orpd",
+                 "andnps", "andnpd",
+                 "movd", "movq", "movntq", "movntps",
+                 "movapd", "movupd",
+                 "shufps", "unpcklps", "unpckhps", "movlhps", "movhlps",
                  "addps", "subps", "mulps", "divps",
-                 "minps", "maxps", "rsqrtss", "rcpss",
+                 "addpd", "subpd", "mulpd", "divpd",
+                 "minps", "maxps", "minpd", "maxpd", "rsqrtss", "rcpss",
                  "sqrtps", "rsqrtps", "rcpps",
                  "cmpneqps", "cmpeqps", "cmpltps", "cmpleps",
-                 "movmskps",
+                 "cmpnltps", "cmpnleps",
+                 "movmskps", "movmskpd",
                  "pand", "pandn", "por", "pxor", "pcmpgtd"):
             return self._lift_sse(insn, m, ops)
 
@@ -2047,6 +2057,10 @@ class Lifter:
             return ["{ uint32_t _a = MEM8(esi), _b = MEM8(edi);"
                     " _cf = (_a < _b); _cmps_zf = (_a == _b);"
                     " esi++; edi++; } /* cmpsb */"]
+        if m == "cmpsd":
+            return ["{ uint32_t _a = MEM32(esi), _b = MEM32(edi);"
+                    " _cf = (_a < _b); _cmps_zf = (_a == _b);"
+                    " esi += 4; edi += 4; } /* cmpsd */"]
         if m == "cmpsw":
             return ["{ uint32_t _a = MEM16(esi), _b = MEM16(edi);"
                     " _cf = (_a < _b); _cmps_zf = (_a == _b);"
@@ -2070,6 +2084,14 @@ class Lifter:
     # ── SSE (scalar/packed float) ──
 
     def _lift_sse(self, insn, m, ops):
+        """Translate SSE instructions to C float operations.
+
+        An xmm register is modelled as float[4]. It used to be a single
+        float, which meant the packed forms had nowhere to put three of
+        their four results and were emitted as comments - they did nothing
+        at all. Scalar forms operate on lane 0, which is what the hardware
+        does.
+        """
         # MOVQ/MOVNTQ on the MMX registers. These fell through to the
         # comment-only fallback at the bottom of this method, which meant an
         # MMX block copy lifted to its loop counter and pointer arithmetic
@@ -2082,7 +2104,6 @@ class Lifter:
             return [_fmt_operand_write(ops[0], _fmt_operand_read(ops[1]))
                     + f" /* {m} */"]
 
-        """Translate SSE instructions to C float operations."""
         nops = len(ops)
         if nops < 1:
             return [f"/* {m}: no operands */"]
@@ -2090,7 +2111,8 @@ class Lifter:
         # SSE register names (xmm0-xmm7) are used as float locals
         def _sse_read(op):
             if op.type == "reg":
-                return op.reg  # xmm0, xmm1, etc.
+                # Scalar forms touch only the low lane.
+                return f"{op.reg}[0]" if op.reg.startswith("xmm") else op.reg
             elif op.type == "mem":
                 if op.mem_size == 8:
                     return f"MEMD({_fmt_mem(op)})"
@@ -2101,6 +2123,8 @@ class Lifter:
 
         def _sse_write(op, val):
             if op.type == "reg":
+                if op.reg.startswith("xmm"):
+                    return f"{op.reg}[0] = {val};"
                 return f"{op.reg} = {val};"
             elif op.type == "mem":
                 if op.mem_size == 8:
@@ -2108,18 +2132,72 @@ class Lifter:
                 return f"MEMF({_fmt_mem(op)}) = {val};"
             return f"/* sse_write? */;"
 
+        def _lane(op, i):
+            """Lane i of an xmm register or of a 16-byte memory operand."""
+            if op.type == "reg":
+                return f"{op.reg}[{i}]" if op.reg.startswith("xmm") else op.reg
+            if op.type == "mem":
+                return f"MEMF({_fmt_mem(op, 4 * i)})"
+            if op.type == "imm":
+                return _fmt_imm(op.imm)
+            return "0.0f"
+
+        def _lane_w(op, i, val):
+            if op.type == "reg":
+                if op.reg.startswith("xmm"):
+                    return f"{op.reg}[{i}] = {val};"
+                return f"{op.reg} = {val};"
+            if op.type == "mem":
+                return f"MEMF({_fmt_mem(op, 4 * i)}) = {val};"
+            return "/* lane write? */;"
+
+        def _packed(dst, make, note, src=None):
+            """Emit four independent lanes. Each lane reads and writes only
+            its own index, so this stays correct when dst aliases src."""
+            body = " ".join(
+                _lane_w(dst, i, make(i)) for i in range(4))
+            return ["{ " + body + f" }} /* {note} */"]
+
+        def _shuffle(dst, lanes, note):
+            """Emit a lane permutation. The sources are read into temporaries
+            first because a shuffle's destination is also one of its
+            sources."""
+            tmp = " ".join(f"float _s{i} = {lanes[i]};" for i in range(4))
+            out = " ".join(_lane_w(dst, i, f"_s{i}") for i in range(4))
+            return ["{ " + tmp + " " + out + f" }} /* {note} */"]
+
         # ── Moves ──
-        if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps"):
+        if m in ("movaps", "movups", "movntps", "movapd", "movupd"):
+            # A full 16-byte move, not the low lane it used to be.
             if nops >= 2:
-                src = _sse_read(ops[1])
-                return [_sse_write(ops[0], src) + f" /* {m} */"]
+                return _packed(ops[0], lambda i: _lane(ops[1], i), m)
+            return [f"/* {m} {insn.op_str} */"]
+        if m in ("movlps", "movhps"):
+            # These move the low or high 64 bits, i.e. two lanes.
+            if nops >= 2:
+                base = 0 if m == "movlps" else 2
+                body = " ".join(
+                    _lane_w(ops[0], base + k,
+                            _lane(ops[1], (base + k) if ops[1].type == "reg" else k))
+                    for k in range(2))
+                return ["{ " + body + f" }} /* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+        if m in ("movss", "movsd"):
+            if nops >= 2:
+                store = _sse_write(ops[0], _sse_read(ops[1]))
+                # Loading from memory into a register zeroes the upper lanes;
+                # a register-to-register move leaves them alone.
+                if ops[0].type == "reg" and ops[0].reg.startswith("xmm")                         and ops[1].type == "mem":
+                    zero = " ".join(_lane_w(ops[0], i, "0.0f") for i in (1, 2, 3))
+                    return ["{ " + store + " " + zero + f" }} /* {m} (zeroes upper lanes) */"]
+                return [store + f" /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m == "movd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1]) if ops[1].type != "reg" or not ops[1].reg.startswith("xmm") else _sse_read(ops[1])
                 if ops[0].type == "reg" and ops[0].reg.startswith("xmm"):
-                    return [f"memcpy(&{ops[0].reg}, &{src}, 4); /* movd to xmm */"]
+                    return [f"memcpy(&{ops[0].reg}[0], &{src}, 4); /* movd to xmm */"]
                 else:
                     return [f"{_fmt_operand_write(ops[0], src)} /* movd */"]
             return [f"/* movd {insn.op_str} */"]
@@ -2150,11 +2228,14 @@ class Lifter:
                 return [_sse_write(ops[0], f"({a} > {b} ? {a} : {b})") + f" /* {m} */"]
 
         # ── Packed arithmetic ──
-        if m in ("addps", "subps", "mulps", "divps"):
+        if m in ("addps", "subps", "mulps", "divps",
+                 "addpd", "subpd", "mulpd", "divpd"):
             if nops >= 2:
-                c_op = {"addps": "+", "subps": "-", "mulps": "*", "divps": "/"}[m]
-                d, s = _sse_read(ops[0]), _sse_read(ops[1])
-                return [f"/* {m}: {d} {c_op}= {s} (packed 4xfloat) */"]
+                c_op = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[m[:3]]
+                return _packed(
+                    ops[0],
+                    lambda i: f"{_lane(ops[0], i)} {c_op} {_lane(ops[1], i)}",
+                    m)
 
         # ── Conversions ──
         if m == "cvtsi2ss":
@@ -2184,19 +2265,29 @@ class Lifter:
                 return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} - sets EFLAGS */"]
 
         # ── Bitwise ──
-        if m in ("xorps", "xorpd"):
-            if nops >= 2 and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-                return [_sse_write(ops[0], "0.0f") + f" /* {m} self = zero */"]
+        if m in ("xorps", "xorpd", "andps", "andpd", "orps", "orpd",
+                 "andnps", "andnpd"):
             if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} */"]
-        if m in ("andps", "orps"):
-            if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} */"]
+                # xor with self clears the whole register, all four lanes.
+                if m.startswith("xor") and ops[0].type == "reg"                         and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
+                    return _packed(ops[0], lambda i: "0.0f", f"{m} self = zero")
+                fn = {"xor": "RECOMP_FXOR", "and": "RECOMP_FAND",
+                      "orp": "RECOMP_FOR", "andn": "RECOMP_FANDN"}[
+                          "andn" if m.startswith("andn") else m[:3]]
+                return _packed(
+                    ops[0],
+                    lambda i: f"{fn}({_lane(ops[0], i)}, {_lane(ops[1], i)})",
+                    m)
 
         # ── Packed min/max ──
-        if m in ("minps", "maxps"):
+        if m in ("minps", "maxps", "minpd", "maxpd"):
             if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} (packed 4xfloat) */"]
+                cmp_op = "<" if m.startswith("min") else ">"
+                return _packed(
+                    ops[0],
+                    lambda i: (f"({_lane(ops[0], i)} {cmp_op} {_lane(ops[1], i)}"
+                               f" ? {_lane(ops[0], i)} : {_lane(ops[1], i)})"),
+                    m)
 
         # ── Reciprocal / rsqrt ──
         if m == "rsqrtss":
@@ -2207,36 +2298,41 @@ class Lifter:
                 return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}") + " /* rcpss */"]
 
         # ── Packed sqrt / reciprocal / rsqrt ──
-        # The SSE model here tracks only the low lane as a single float, so
-        # these compute the low lane like their scalar ...ss forms rather than
-        # all four. That is the same low-lane approximation the packed
-        # arithmetic ops (addps/mulps) already use -- but computing the low lane
-        # is strictly better than the TODO no-op these used to hit, which left
-        # the destination stale and fed garbage into vector normalisation.
-        # rsqrtps/sqrtps are the workhorse of 3D vector normalize; Wreckless
-        # uses them heavily, Burnout 3 did not, which is why this surfaced now.
-        if m == "sqrtps":
+        # These used to compute the low lane only, because the model had no
+        # other lane to write. rsqrtps and sqrtps are the workhorses of 3D
+        # vector normalisation, so three quarters of every normalise was
+        # stale. All four lanes now.
+        if m in ("sqrtps", "rsqrtps", "rcpps"):
             if nops >= 2:
-                return [_sse_write(ops[0], f"sqrtf({_sse_read(ops[1])})")
-                        + " /* sqrtps (low lane; 4-lane model TODO) */"]
-        if m == "rsqrtps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / sqrtf({_sse_read(ops[1])})")
-                        + " /* rsqrtps (low lane; 4-lane model TODO) */"]
-        if m == "rcpps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}")
-                        + " /* rcpps (low lane; 4-lane model TODO) */"]
+                make = {
+                    "sqrtps":  lambda i: f"sqrtf({_lane(ops[1], i)})",
+                    "rsqrtps": lambda i: f"1.0f / sqrtf({_lane(ops[1], i)})",
+                    "rcpps":   lambda i: f"1.0f / {_lane(ops[1], i)}",
+                }[m]
+                return _packed(ops[0], make, m)
 
         # ── Packed comparison ──
-        if m in ("cmpneqps", "cmpeqps", "cmpltps", "cmpleps"):
+        if m in ("cmpneqps", "cmpeqps", "cmpltps", "cmpleps",
+                 "cmpnltps", "cmpnleps"):
             if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} (packed compare) */"]
+                c = {"cmpeqps": "==", "cmpneqps": "!=", "cmpltps": "<",
+                     "cmpleps": "<=", "cmpnltps": ">=", "cmpnleps": ">"}[m]
+                # A packed compare writes a lane mask, all ones or all zeros,
+                # not a 0/1 value; the result is normally fed to andps.
+                return _packed(
+                    ops[0],
+                    lambda i: (f"RECOMP_FMASK({_lane(ops[0], i)} {c} "
+                               f"{_lane(ops[1], i)})"),
+                    m)
 
         # ── Move mask ──
-        if m == "movmskps":
+        if m in ("movmskps", "movmskpd"):
+            # Was hardcoded to 0, so every branch on it took the same path.
+            if nops >= 2 and ops[1].type == "reg" and ops[1].reg.startswith("xmm"):
+                return [_fmt_operand_write(ops[0], f"RECOMP_MOVMSKPS({ops[1].reg})")
+                        + f" /* {m} */"]
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"0 /* movmskps {_sse_read(ops[1])} */")]
+                return [f"/* {m} {insn.op_str} - source is not a register */"]
 
         # ── MMX / integer SIMD ──
         if m in ("pand", "pandn", "por", "pxor", "pcmpgtd"):
@@ -2244,7 +2340,24 @@ class Lifter:
                 return [f"/* {m} {insn.op_str} (MMX/SIMD integer) */"]
 
         # ── Shuffle/unpack ──
-        if m in ("shufps", "unpcklps", "unpckhps"):
+        if m in ("shufps", "unpcklps", "unpckhps", "movlhps", "movhlps"):
+            if nops >= 2:
+                a, b = ops[0], ops[1]
+                if m == "unpcklps":
+                    lanes = [_lane(a, 0), _lane(b, 0), _lane(a, 1), _lane(b, 1)]
+                elif m == "unpckhps":
+                    lanes = [_lane(a, 2), _lane(b, 2), _lane(a, 3), _lane(b, 3)]
+                elif m == "movlhps":
+                    lanes = [_lane(a, 0), _lane(a, 1), _lane(b, 0), _lane(b, 1)]
+                elif m == "movhlps":
+                    lanes = [_lane(b, 2), _lane(b, 3), _lane(a, 2), _lane(a, 3)]
+                else:  # shufps: the immediate picks two lanes from each source
+                    if nops < 3 or ops[2].type != "imm":
+                        return [f"/* shufps {insn.op_str} - no immediate */"]
+                    sel = ops[2].imm & 0xFF
+                    lanes = [_lane(a, sel & 3), _lane(a, (sel >> 2) & 3),
+                             _lane(b, (sel >> 4) & 3), _lane(b, (sel >> 6) & 3)]
+                return _shuffle(a, lanes, f"{m} {insn.op_str}")
             return [f"/* {m} {insn.op_str} */"]
 
         return [f"/* SSE: {m} {insn.op_str} */"]

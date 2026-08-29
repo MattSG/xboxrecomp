@@ -526,7 +526,10 @@ class FunctionTranslator:
             mmx_regs = sorted([r for r in used_xmm if r.startswith("mm")
                                and not r.startswith("xmm")])
             if xmm_regs:
-                lines.append(f"    float {', '.join(xmm_regs)};")
+                # float[4], not a single float: the packed forms need all
+                # four lanes, and with only one they lifted to nothing.
+                decl = ", ".join(f"{r}[4]" for r in xmm_regs)
+                lines.append(f"    float {decl};")
             if mmx_regs:
                 lines.append(f"    uint64_t {', '.join(mmx_regs)};")
 
