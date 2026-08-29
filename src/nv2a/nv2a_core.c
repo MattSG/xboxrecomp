@@ -957,6 +957,29 @@ uint64_t nv2a_mmio_read(NV2AState *d, hwaddr addr, unsigned int size)
 
 void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size)
 {
+    /* RAMHT reads back as 0xFFFFFFFF for every handle, so nothing populates
+     * it. RAMIN is allocated at 2 MB with the Xbox RAMHT at 0x1F0000, but the
+     * PRAMIN aperture below is declared 1 MB, so an aperture write aimed at
+     * RAMHT lands at 0x8F0000 - inside USER. Record which block actually
+     * takes writes above the PRAMIN base before changing anything. */
+    if (addr >= 0x700000u && addr < 0x1000000u) {
+        static int s_log;
+        static hwaddr s_max;
+        static unsigned s_zero, s_nonzero;
+        if (addr > s_max) s_max = addr;
+        if (val) s_nonzero++; else s_zero++;
+        /* The zero-fill of PRAMIN swamps any cap, so report only writes
+         * that carry a value, and carry the highest address seen with
+         * them: an aperture write aimed at RAMHT would exceed 0x7FFFFF. */
+        if (val && s_log < 24) {
+            s_log++;
+            fprintf(stderr, "[NV2A-HIGHWRITE] addr=%06llX val=%08llX size=%u "
+                    "max=%06llX zero=%u nonzero=%u\n",
+                    (unsigned long long)addr, (unsigned long long)val, size,
+                    (unsigned long long)s_max, s_zero, s_nonzero);
+            fflush(stderr);
+        }
+    }
     for (int i = 0; i < NV_NUM_BLOCKS; i++) {
         if (!blocktable[i].name) continue;
         if (addr >= blocktable[i].offset &&

@@ -183,10 +183,25 @@ static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
                             if (ob[0] | ob[1] | ob[2]) nonzero++;
                             if ((ob[0] & NV_DMA_CLASS) == 0x3Du) matches++;
                         }
+                        /* 770 non-zero words but no class 0x3D: dump the
+                         * region the guest actually wrote so the real object
+                         * layout and class are visible instead of guessed. */
+                        for (uint32_t o = 0x1000u; o < 0x1060u; o += 0x10u) {
+                            uint32_t *ob = (uint32_t *)(gpu->ramin_ptr + o);
+                            if (!(ob[0] | ob[1] | ob[2] | ob[3])) continue;
+                            fprintf(stderr, "[NV2A-RAMIN-OBJ] off=%04X %08X %08X %08X %08X\n",
+                                    o, ob[0], ob[1], ob[2], ob[3]);
+                        }
                         fprintf(stderr, "[NV2A-SEMA-SCAN] ring=%08X off=%08X "
                                 "ramin_nonzero=%u class3D=%u\n",
                                 ring, g_semaphore_offset, nonzero, matches);
                     }
+                    /* Bounded at 0x400 deliberately. Widening it to 0x8000
+                     * looked like it found content - ramin_nonzero went 0 to
+                     * 770 - but the guest only zero-fills about 0x5000 of
+                     * RAMIN, so everything past that is unwritten memory and
+                     * the count was garbage. There is no DMA object to find
+                     * here at any width; see below. */
                     for (uint32_t off = 0; off < 0x400u; off += 0x10u) {
                         uint32_t *obj = (uint32_t *)(gpu->ramin_ptr + off);
                         uint32_t address = (obj[2] & NV_DMA_ADDRESS) |
