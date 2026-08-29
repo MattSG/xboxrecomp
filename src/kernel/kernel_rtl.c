@@ -209,8 +209,24 @@ static HANDLE xbox_cs_shadow_get(void *guest_key, BOOL create)
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     HANDLE mutex = xbox_cs_shadow_get(CriticalSection, TRUE);
-    if (mutex)
+    if (!mutex)
+        return;
+    /* An INFINITE wait here is invisible: a thread blocked on a guest
+     * critical section looks identical to one doing nothing, and the profile
+     * shows only the loading-screen thread while the main thread is stalled.
+     * Wait in bounded slices and say so, then keep waiting. Behaviour is
+     * unchanged; only the silence is. */
+    if (WaitForSingleObject(mutex, 4000) == WAIT_TIMEOUT) {
+        static volatile LONG s_log;
+        LONG n = InterlockedIncrement(&s_log);
+        if (n <= 12)
+            fprintf(stderr, "[CS-BLOCK] cs=%p tid=%lu waiting>4s\n",
+                    (void *)CriticalSection, (unsigned long)GetCurrentThreadId());
         WaitForSingleObject(mutex, INFINITE);
+        if (n <= 12)
+            fprintf(stderr, "[CS-BLOCK] cs=%p tid=%lu acquired\n",
+                    (void *)CriticalSection, (unsigned long)GetCurrentThreadId());
+    }
 }
 
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
