@@ -458,6 +458,33 @@ class FunctionDetector:
                 continue
             self._seed_jump_table(insn.table_ref)
 
+    def _read_switch_targets(self, table_va: int) -> List[int]:
+        """Absolute dword targets of a switch table, in order.
+
+        Same walk as _seed_jump_table, factored out so the extent walk can
+        follow a switch dispatch without seeding candidates.
+        """
+        section = self.image.get_section_at_va(table_va)
+        if section is None:
+            return []
+        data = self.image.get_section_data(section)
+        if not data:
+            return []
+        off = table_va - section.virtual_addr
+        if off < 0 or off + 4 > len(data):
+            return []
+        targets = []
+        for i in range(256):
+            o = off + i * 4
+            if o + 4 > len(data):
+                break
+            target = struct.unpack_from('<I', data, o)[0]
+            target_sec = self.image.get_section_at_va(target)
+            if target_sec is None or not target_sec.executable:
+                break
+            targets.append(target)
+        return targets
+
     def _seed_jump_table(self, table_va: int) -> None:
         """Read a switch table's absolute dword targets and seed each leaf."""
         section = self.image.get_section_at_va(table_va)
@@ -733,6 +760,22 @@ class FunctionDetector:
                 end = insn.end_address
                 if end > max_addr:
                     max_addr = end
+
+                # A switch dispatch (jmp [index*scale + table]) has no
+                # jump_target, so the walk used to stop at it and every block
+                # reachable only through the table fell outside the extent.
+                # When those blocks hold the epilogue, the function loses its
+                # register restores: MM3 sub_0008A368 ended at 0x0008AB43 and
+                # dropped "pop ebx" at 0x0008AB7A, so it pushed EBX six times
+                # and popped it never. Its caller sub_000888CF then passed a
+                # stale loop cursor where a container pointer belonged, and
+                # the allocator walked a null bucket table. Same principle as
+                # the conditional-branch case below: a block reachable only
+                # through the dispatch is still part of this function.
+                if insn.table_ref is not None:
+                    for t in self._read_switch_targets(insn.table_ref):
+                        if start <= t < upper and t not in visited:
+                            worklist.append(t)
 
                 if insn.jump_target is not None:
                     target = insn.jump_target
