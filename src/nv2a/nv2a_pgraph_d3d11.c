@@ -192,10 +192,18 @@ static IDirect3DTexture8 *pgraph_upload_vram_texture(IDirect3DDevice8 *dev,
 
 #define NV097_SET_BEGIN_END             0x17FC
 #define NV097_INLINE_ARRAY              0x1818
-#define NV097_CLEAR_SURFACE             0x01D0
-#define NV097_SET_COLOR_CLEAR_VALUE     0x01D4
-#define NV097_SET_CLEAR_RECT_HORIZONTAL 0x01D8
-#define NV097_SET_CLEAR_RECT_VERTICAL   0x01DC
+/* The clear block lives at 0x1D8C-0x1D9C, not 0x01D0-0x01DC. The four
+ * constants below were transcribed a digit short, so none of them ever
+ * matched: CLEAR_SURFACE never ran, clear_color kept its 0xFF000000 default,
+ * and every frame presented an uncleared buffer - the black plane. The guest
+ * emits all five of these methods (measured in run283: 1D8C x13, 1D90 x27,
+ * 1D94 x1, 1D98 x1, 1D9C x1). SET_BEGIN_END and INLINE_ARRAY above use raw
+ * method offsets and are correct; these now match that convention. */
+#define NV097_SET_ZSTENCIL_CLEAR_VALUE  0x1D8C
+#define NV097_SET_COLOR_CLEAR_VALUE     0x1D90
+#define NV097_CLEAR_SURFACE             0x1D94
+#define NV097_SET_CLEAR_RECT_HORIZONTAL 0x1D98
+#define NV097_SET_CLEAR_RECT_VERTICAL   0x1D9C
 
 #define NV097_SET_DEPTH_TEST_ENABLE     0x0354
 #define NV097_SET_BLEND_ENABLE          0x0304
@@ -898,6 +906,9 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             if (param & 0x01) flags |= 2;  /* D3DCLEAR_ZBUFFER */
             if (param & 0x02) flags |= 4;  /* D3DCLEAR_STENCIL */
             dev->lpVtbl->Clear(dev, 0, NULL, flags, g_pg.clear_color, 1.0f, 0);
+            if (g_pg.stats.clears < 8u)
+                fprintf(stderr, "[CLEAR] surface param=%08X flags=%u "
+                        "color=%08X\n", param, flags, g_pg.clear_color);
         }
         g_pg.stats.clears++;
         return 1;
