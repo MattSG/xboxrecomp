@@ -117,6 +117,9 @@ static void nv2a_defer_completion_signal(uint32_t dev)
 
 /* Decode guest push-buffer packets. Return last valid cursor; malformed or
  * incomplete packet stops retirement. */
+static unsigned g_pb_methods;
+static unsigned g_pb_seen[0x800];
+
 static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
 {
     NV2AState *gpu = nv2a_get_state();
@@ -240,14 +243,29 @@ static uint32_t nv2a_consume_pushbuffer(uint32_t get, uint32_t put)
                     }
                 }
             }
+            /* pgraph_method forwards to pgraph_d3d11_method (nv2a_core.c),
+             * so the translator is already wired to the live ring. Record
+             * what the span really contains: the run reports zero draws, and
+             * the question is whether the draw methods are absent from the
+             * pushbuffer or are arriving and being dropped downstream. */
+            g_pb_methods++;
+            if (actual_method < 0x2000u) g_pb_seen[actual_method >> 2]++;
             pgraph_method(gpu, subchannel, actual_method, param);
         }
         cursor += words * 4u;
     }
 
-    if (cursor != get && g_pb_retire_log++ < 8)
-        fprintf(stderr, "[NV2A-PB] retired GET=%08X PUT=%08X -> %08X\n",
-                get, put, cursor);
+    if (cursor != get && g_pb_retire_log++ < 8) {
+        fprintf(stderr, "[NV2A-PB] retired GET=%08X PUT=%08X -> %08X "
+                "dwords=%u methods=%u\n",
+                get, put, cursor, (put - get) / 4u, g_pb_methods);
+        fprintf(stderr, "[NV2A-PB-METHODS]");
+        for (uint32_t m = 0; m < 0x800u; ++m)
+            if (g_pb_seen[m])
+                fprintf(stderr, " %04X:%u", m << 2, g_pb_seen[m]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
     return cursor;
 }
 
@@ -730,22 +748,28 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
              * somewhere the guest is not reading. The divergence is upstream
              * of this field, and forcing the field only hides it. */
 
-            /* Not writing dev+0x30 here, and the reason is worth keeping.
+            /* dev+0x30 is left alone. Tried twice, measured twice.
              *
-             * The burnout3 reference records a "GPU read pointer trick:
-             * device+0x30 -> device+0x2C (eliminates PB spin loops)", which
-             * matches the symptom exactly - the guest counts requested ring
-             * slots in dev+0x2C and stops submitting when nothing reports
-             * completion. But that title's device sits at 0x0035D6A0 with its
-             * own layout. In MM3 the device is at 0x0034FF00 and dev+0x30
-             * holds a pointer, 0x01085000, which the flush path above reads
-             * as the ring header. Overwriting it with a slot count destroyed
-             * that pointer: ic fell from 402,275 to 12,385 with no frame and
-             * no draw at all.
+             * The burnout3 reference documents a self-referencing GPU read
+             * pointer - MEM32(device + 0x30) = device + 0x2C - to break the
+             * D3D8LTCG push-buffer spin, and MM3's symptom matches: dev+0x2C
+             * climbs 5,7,9,D,F and then stops.
              *
-             * Field offsets from another title do not transfer. If this
-             * completion counter is to be published, the field that carries
-             * it in MM3 has to be identified first. */
+             * Writing a slot count there destroyed the pointer outright:
+             * ic 402,275 -> 12,385, no frame, no draw. Writing the correct
+             * self-referencing address instead (run278, dev+30 01085000 ->
+             * 0034FF2C) still regressed everything that matters: flushes
+             * 9 -> 2, PUT 0x01087A7C -> 0x01087A34, ic 678,437 -> 618,827.
+             *
+             * The reason is local, not in the guest: the flush handler just
+             * below reads ring = devp[0x30 / 4] as the ring-header address.
+             * In MM3 that field is load-bearing on the emulator side, so
+             * pointing it at the device breaks our own consumer whatever it
+             * does for the title. Burnout 3's device is at 0x0035D6A0 and
+             * MM3's at 0x0034FF00; the offset does not carry over.
+             *
+             * If the spin needs breaking, find the field MM3 actually polls
+             * first - do not reuse this offset. */
 
             /* NV_USER_DMA_GET (0xFD800044) is served from d->puser.regs by
              * the VEH, so the guest poll at sub_00345740 loc_345EE0 sees it. */

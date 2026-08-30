@@ -181,7 +181,6 @@ NTSTATUS __stdcall xbox_NtReadFile(
     DWORD bytes_read = 0;
     BOOL result;
     OVERLAPPED ov;
-    (void)ApcRoutine; (void)ApcContext;
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
@@ -193,6 +192,28 @@ NTSTATUS __stdcall xbox_NtReadFile(
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, &ov);
     } else {
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
+    }
+
+    /* Reads were only ever logged on failure, so a loader that opens an
+     * archive and stops making progress looked identical to one that never
+     * read it. A flat cap would repeat that mistake at a different number,
+     * so this carries a sequence (#N) and a running byte total: windowed
+     * output, but the true count is always on the last line printed. */
+    {
+        static unsigned rd_n;
+        static unsigned long long rd_bytes;
+        rd_n++;
+        if (result) rd_bytes += bytes_read;
+        if (rd_n <= 8u || (rd_n % 25u) == 0u) {
+            fprintf(stderr, "[READ] #%u h=%p off=%lld len=%lu got=%lu "
+                    "total=%llu ok=%d apc=%p apcctx=%p ev=%p\n",
+                    rd_n, FileHandle,
+                    ByteOffset ? (long long)ByteOffset->QuadPart : -1LL,
+                    (unsigned long)Length, (unsigned long)bytes_read,
+                    rd_bytes, result ? 1 : 0,
+                    (void *)ApcRoutine, (void *)ApcContext, (void *)Event);
+            fflush(stderr);
+        }
     }
 
     if (result || GetLastError() == ERROR_HANDLE_EOF) {
