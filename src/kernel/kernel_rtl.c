@@ -206,11 +206,25 @@ static HANDLE xbox_cs_shadow_get(void *guest_key, BOOL create)
     return mutex;
 }
 
+/* How many guest critical sections are held right now.
+ *
+ * On real hardware a DPC runs at DISPATCH_LEVEL and cannot preempt code that
+ * holds a lock. Here the guest heap takes its lock via
+ * RtlEnterCriticalSection, which is a kernel thunk, which pumps guest work,
+ * which dispatches a DPC - and MM3's D3D8 DPC (sub_00348120) calls the heap.
+ * That re-enters the allocator mid-splice and corrupts the free list: the
+ * crash at sub_0008B46F reading 0xD00001A9. The nested-pump guard does not
+ * catch it because the outer frame is guest code, not a pump. */
+volatile LONG g_guest_cs_depth;
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     HANDLE mutex = xbox_cs_shadow_get(CriticalSection, TRUE);
-    if (!mutex)
+    if (!mutex) {
+        InterlockedIncrement(&g_guest_cs_depth);
         return;
+    }
+    InterlockedIncrement(&g_guest_cs_depth);
     /* An INFINITE wait here is invisible: a thread blocked on a guest
      * critical section looks identical to one doing nothing, and the profile
      * shows only the loading-screen thread while the main thread is stalled.
@@ -232,6 +246,8 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     HANDLE mutex = xbox_cs_shadow_get(CriticalSection, FALSE);
+    if (InterlockedDecrement(&g_guest_cs_depth) < 0)
+        InterlockedExchange(&g_guest_cs_depth, 0);
     if (mutex)
         ReleaseMutex(mutex);
 }

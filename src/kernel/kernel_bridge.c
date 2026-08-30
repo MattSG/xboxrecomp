@@ -249,6 +249,7 @@ typedef struct {
     volatile int parked;     /* 1 while the worker sleeps on KeDelay */
     volatile int done;       /* 1 after the worker routine returned */
     DWORD wake_tick;         /* GetTickCount() when the delay elapses */
+    unsigned long long wake_icall; /* guest-progress deadline (see below) */
     /* Saved guest register set for this guest thread. */
     uint32_t eax, ecx, edx, ebx, esi, edi, esp, seh_ebp;
 } worker_state_t;
@@ -317,10 +318,69 @@ static void worker_switch_to_worker(void)
     SwitchToFiber(g_worker.fiber);
 }
 
+/* The other half of worker_resume_if_due.
+ *
+ * Guest threads are fibers on one host thread, so whoever holds it must give
+ * it back. The only yield point was KeDelayExecutionThread with a non-zero
+ * delay, which assumes every worker sleeps. MM3's worker does not: it spins
+ * calling KeInsertQueueDpc, so once it was resumed it held the host thread
+ * for the rest of the run and the main fiber - the one that presents - never
+ * ran again. Measured in run286: control entered the worker at kc=26730 and
+ * never came back, the title presented exactly one frame in 200 s, and ic
+ * kept climbing because the worker was still executing guest code.
+ *
+ * Real hardware preempts. Here the closest thing to a timer tick is the
+ * kernel thunk boundary, which is already where the reverse switch happens,
+ * so pace the yield off that. The worker is parked as immediately-due, so
+ * the main fiber's next thunk call resumes it: round robin, not a sleep. */
+#define WORKER_YIELD_EVERY_KERNEL_CALLS 256u
+
+/* Kernel calls the main fiber gets to itself after a hog-yield.
+ *
+ * Without this the round robin is degenerate. worker_yield_if_hogging parks
+ * the worker as immediately-due, and worker_resume_if_due runs at the top of
+ * the very same pump, so main took control and handed it straight back in the
+ * same kernel call: run288 shows save-work / load-main / save-main / load-work
+ * all at kc=27977, 3321 switches that let main execute nothing. Main needs a
+ * slice it owns, not just a turn. */
+#define MAIN_SLICE_KERNEL_CALLS 256u
+
+static unsigned g_main_slice_remaining;
+
+static void worker_yield_if_hogging(void)
+{
+    static unsigned calls_since_switch;
+
+    if (!g_in_worker_fiber || !g_worker_active || !g_worker.fiber ||
+        g_worker.done) {
+        calls_since_switch = 0;
+        return;
+    }
+    if (++calls_since_switch < WORKER_YIELD_EVERY_KERNEL_CALLS)
+        return;
+
+    calls_since_switch = 0;
+    g_worker.wake_tick = GetTickCount();   /* due at once; this is not a sleep */
+    g_worker.wake_icall = 0;               /* hog-yield is not a delay */
+    g_main_slice_remaining = MAIN_SLICE_KERNEL_CALLS;
+    g_worker.parked = 1;
+    worker_switch_to_main();
+    g_worker.parked = 0;
+}
+
 static void worker_resume_if_due(void)
 {
+    /* Let the main fiber finish its slice before handing the host thread
+     * back. Only a hog-yield sets this; a worker parked on a real
+     * KeDelayExecutionThread delay is still gated by wake_tick alone. */
+    if (g_main_slice_remaining) {
+        g_main_slice_remaining--;
+        return;
+    }
+
     if (g_worker_active && g_worker.fiber && g_worker.parked && !g_worker.done &&
-        (int)(GetTickCount() - g_worker.wake_tick) >= 0) {
+        ((int)(GetTickCount() - g_worker.wake_tick) >= 0 ||
+         g_icall_count >= g_worker.wake_icall)) {
         worker_switch_to_worker();
         if (g_worker.done) {
             DeleteFiber(g_worker.fiber);
@@ -967,6 +1027,33 @@ static void bridge_KeDelayExecutionThread(void)
             fflush(stderr);
         }
         if (ms > 0) {
+            /* Park on guest progress, not only on wall clock.
+             *
+             * A KeDelayExecutionThread of N ms means "about this much game
+             * time". We execute orders of magnitude slower than a 733 MHz
+             * Xbox, so a wall-clock deadline lets the other fiber run far
+             * more guest code during the delay than the title expects - and
+             * the faster the host build, the worse the skew. That is why
+             * removing the _penter overhead (MM3_PENTER_LIGHT, or
+             * MM3_GENERATED_PENTER=OFF) reproducibly crashes in the asset
+             * parser with a NULL source: main outruns the worker that is
+             * still filling the object at 0x01448070. Gating on icall
+             * progress as well keeps the relative schedule stable no matter
+             * how fast the host runs. This is an EARLY-wake bound, not an
+             * extra requirement: whichever of the two deadlines lands first
+             * ends the park, so the sleeping fiber cannot be left behind by
+             * an arbitrary amount of guest execution. Calibration is a guess
+             * and tunable via MM3_ICALLS_PER_MS. */
+            {
+                static unsigned long long s_icalls_per_ms;
+                if (!s_icalls_per_ms) {
+                    const char *e = getenv("MM3_ICALLS_PER_MS");
+                    s_icalls_per_ms = e ? strtoull(e, NULL, 10) : 500ull;
+                    if (!s_icalls_per_ms) s_icalls_per_ms = 1ull;
+                }
+                g_worker.wake_icall = g_icall_count +
+                    (unsigned long long)ms * s_icalls_per_ms;
+            }
             g_worker.wake_tick = GetTickCount() + ms;
             g_worker.parked = 1;
             worker_switch_to_main();   /* resumes when the delay is due */
@@ -2448,7 +2535,18 @@ static XBOX_THREAD_LOCAL int g_guest_work_depth;
 
 void xbox_kernel_pump_guest_work(void)
 {
+    /* A guest lock is held: this is the emulator's DISPATCH_LEVEL. Running a
+     * DPC or switching fibers here lets that work re-enter whatever the lock
+     * protects - in MM3 the heap, via the D3D8 DPC. Defer; the next pump
+     * after the lock is released will do it. */
+    {
+        extern volatile LONG g_guest_cs_depth;
+        if (g_guest_cs_depth > 0)
+            return;
+    }
+
     worker_resume_if_due();
+    worker_yield_if_hogging();
     static int trace_frontier = -1;
     if (trace_frontier < 0) trace_frontier = getenv("MM3_TRACE_PUMP") ? 1 : 0;
     static int trace_irq_dpc = -1;
@@ -2508,7 +2606,15 @@ void xbox_kernel_pump_guest_work(void)
     PVOID arg1, arg2;
     if (trace_here) fprintf(stderr, "[PUMP] before-dpc-loop ic=%llu\n",
         (unsigned long long)g_icall_count);
+    /* Diagnostic switch, not a fix: MM3_NO_DPC drains the queue without
+     * running anything, to establish whether the D3D8 DPC is what corrupts
+     * the guest heap. The crash chain runs sub_00348120 (the DPC) straight
+     * into the allocator. */
+    static int s_no_dpc = -1;
+    if (s_no_dpc < 0) s_no_dpc = getenv("MM3_NO_DPC") ? 1 : 0;
+
     while (xbox_kernel_take_guest_dpc(&dpc, &arg1, &arg2)) {
+        if (s_no_dpc) continue;
         if (trace_here) fprintf(stderr, "[PUMP] dpc-take ic=%llu dpc=%p\n",
             (unsigned long long)g_icall_count, (void *)dpc);
         if (!dpc) continue;
@@ -2741,6 +2847,7 @@ static void kernel_thunk_dispatch(void)
      * thunk: the pump calls kernel thunks regularly, which is what paces the
      * render worker on the same host thread. */
     worker_resume_if_due();
+    worker_yield_if_hogging();
 
     if (bridge) {
         uint32_t dev_before = 0;
