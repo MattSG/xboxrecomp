@@ -2541,8 +2541,16 @@ void xbox_kernel_pump_guest_work(void)
      * after the lock is released will do it. */
     {
         extern volatile LONG g_guest_cs_depth;
-        if (g_guest_cs_depth > 0)
+        static int s_cs_guard = -1;
+        if (s_cs_guard < 0)
+            s_cs_guard = getenv("MM3_CS_DEFER") ? 1 : 0;
+        if (s_cs_guard && g_guest_cs_depth > 0) {
+            static unsigned n_defer;
+            if (n_defer++ < 8)
+                fprintf(stderr, "[PUMP-DEFER] guest cs depth=%ld\n",
+                        (long)g_guest_cs_depth);
             return;
+        }
     }
 
     worker_resume_if_due();
