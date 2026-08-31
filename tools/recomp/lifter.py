@@ -1817,15 +1817,40 @@ class Lifter:
                 ]
             else:
                 lines = [f"PUSH32(esp, 0); RECOMP_ICALL_SAFE({target}, _icall_esp); /* indirect call */"]
-            if self.func_start == 0x001B9FB0:
-                lines.insert(0, f"recomp_trace_b9fb0_icall(0, {target}, 0x{insn.address:08X});")
-                lines.append(f"recomp_trace_b9fb0_icall(1, {target}, 0x{insn.address:08X});")
-            if self.func_start == 0x001EC520:
-                lines.insert(0, f"recomp_trace_1ec520_icall(0, {target}, 0x{insn.address:08X});")
-                lines.append(f"recomp_trace_1ec520_icall(1, {target}, 0x{insn.address:08X});")
-            if self.func_start == 0x001B98E1:
-                lines.insert(0, f"recomp_trace_b98e1_icall(0, {target}, 0x{insn.address:08X});")
-                lines.append(f"recomp_trace_b98e1_icall(1, {target}, 0x{insn.address:08X});")
+            # These per-function icall traces bracket the call. The target is
+            # an expression like MEM32(eax + 0x14), so re-evaluating it in the
+            # AFTER trace reads it through whatever the callee left in eax -
+            # its return value, not the vtable pointer. That dereference is a
+            # function argument, so C evaluates it even though the tracer is
+            # env-gated inside, and it faults.
+            #
+            # MM3 sub_001EC520: eax comes back as 0xD000018D, the after-trace
+            # reads [eax+0x14] = 0xD00001A1 and takes an access violation.
+            # That crash was mistaken for a title bug more than once.
+            #
+            # Hoist the target once, like the bcbcc0 case above already does,
+            # and use the value in both traces.
+            for _fs, _name in ((0x001B9FB0, "b9fb0"),
+                               (0x001EC520, "1ec520"),
+                               (0x001B98E1, "b98e1")):
+                if self.func_start != _fs:
+                    continue
+                _tv = f"_itrace_tgt_{insn.address:08X}"
+                # The AFTER trace must sit inside the same block as the call:
+                # the caller may wrap these lines in "{ uint32_t _icall_esp
+                # ... }", and a trailing line lands outside it where the
+                # hoisted variable is out of scope. Appending it to the call
+                # line keeps both in one statement, as the bcbcc0 case above
+                # already does.
+                _after = f"recomp_trace_{_name}_icall(1, {_tv}, 0x{insn.address:08X});"
+                _new = [f"uint32_t {_tv} = {target};",
+                        f"recomp_trace_{_name}_icall(0, {_tv}, 0x{insn.address:08X});"]
+                for _l in lines:
+                    _l = _l.replace(target, _tv)
+                    if "RECOMP_ICALL_SAFE" in _l:
+                        _l = _l + " " + _after
+                    _new.append(_l)
+                lines = _new
             if self.func_start == 0x00086097:
                 lines.insert(0, "recomp_trace_sched_callback(0, MEM32(0x00362014), MEM32(esp), g_esp);")
                 lines.append("recomp_trace_sched_callback(1, MEM32(0x00362014), eax, g_esp);")
