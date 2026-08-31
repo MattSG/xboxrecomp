@@ -347,6 +347,39 @@ static void worker_switch_to_worker(void)
 
 static unsigned g_main_slice_remaining;
 
+/* Guest-execution-paced yield.
+ *
+ * worker_yield_if_hogging is paced on kernel thunk calls, which is useless
+ * when a fiber's hot loop is pure guest code. MM3's worker blend loop is
+ * exactly that: sub_000F5391 called through a function pointer, writing
+ * VRAM, with essentially no kernel calls - 99,000 profile samples against 12
+ * for everything else. So the yield never fired and the worker held the host
+ * thread indefinitely, starving the main fiber that does the loading.
+ *
+ * recomp_guest_boundary runs at the top of every generated function, so it
+ * paces on actual guest progress. Same park-and-hand-back as the kernel-call
+ * path; only the trigger differs. */
+#define WORKER_YIELD_EVERY_GUEST_CALLS 20000u
+
+void xbox_kernel_worker_yield_tick(void)
+{
+    static unsigned guest_calls;
+    if (!g_in_worker_fiber || !g_worker_active || !g_worker.fiber ||
+        g_worker.done) {
+        guest_calls = 0;
+        return;
+    }
+    if (++guest_calls < WORKER_YIELD_EVERY_GUEST_CALLS)
+        return;
+    guest_calls = 0;
+    g_worker.wake_tick = GetTickCount();
+    g_worker.wake_icall = 0;
+    g_main_slice_remaining = MAIN_SLICE_KERNEL_CALLS;
+    g_worker.parked = 1;
+    worker_switch_to_main();
+    g_worker.parked = 0;
+}
+
 static void worker_yield_if_hogging(void)
 {
     static unsigned calls_since_switch;
@@ -379,8 +412,8 @@ static void worker_resume_if_due(void)
     }
 
     if (g_worker_active && g_worker.fiber && g_worker.parked && !g_worker.done &&
-        ((int)(GetTickCount() - g_worker.wake_tick) >= 0 ||
-         g_icall_count >= g_worker.wake_icall)) {
+        (int)(GetTickCount() - g_worker.wake_tick) >= 0 &&
+        g_icall_count >= g_worker.wake_icall) {
         worker_switch_to_worker();
         if (g_worker.done) {
             DeleteFiber(g_worker.fiber);
@@ -1039,16 +1072,29 @@ static void bridge_KeDelayExecutionThread(void)
              * parser with a NULL source: main outruns the worker that is
              * still filling the object at 0x01448070. Gating on icall
              * progress as well keeps the relative schedule stable no matter
-             * how fast the host runs. This is an EARLY-wake bound, not an
-             * extra requirement: whichever of the two deadlines lands first
-             * ends the park, so the sleeping fiber cannot be left behind by
-             * an arbitrary amount of guest execution. Calibration is a guess
-             * and tunable via MM3_ICALLS_PER_MS. */
+             * how fast the host runs.
+             *
+             * BOTH deadlines must pass, and the guest-progress one dominates.
+             * A KeDelay of 1 ms is ~700,000 instructions on a 733 MHz Xbox,
+             * but ic advances only ~4,400/sec here - so a wall-clock-only
+             * wake gives the other fiber about 4 guest calls per park. That
+             * is what starves the main fiber: MM3's worker blends a screen
+             * (tens of thousands of guest calls, almost no kernel calls) and
+             * then delays 1 ms, so main was getting a rounding error's worth
+             * of execution per blend. Measured: the worker's blend loop holds
+             * 99,000 profile samples against 12 for everything else.
+             *
+             * An earlier version of this used ||, which made the bound inert
+             * because the tick is due almost immediately. Calibration is
+             * tunable via MM3_ICALLS_PER_MS. */
             {
                 static unsigned long long s_icalls_per_ms;
                 if (!s_icalls_per_ms) {
                     const char *e = getenv("MM3_ICALLS_PER_MS");
-                    s_icalls_per_ms = e ? strtoull(e, NULL, 10) : 500ull;
+                    /* ~700k instructions per guest ms; indirect calls are a
+                     * fraction of that. 7,000 keeps the worker's duty cycle
+                     * near its intent instead of ~4 calls per park. */
+                    s_icalls_per_ms = e ? strtoull(e, NULL, 10) : 7000ull;
                     if (!s_icalls_per_ms) s_icalls_per_ms = 1ull;
                 }
                 g_worker.wake_icall = g_icall_count +
@@ -2837,9 +2883,10 @@ static void kernel_thunk_dispatch(void)
         static DWORD last_summary_tick = 0;
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X ra=%zX\n",
+            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X ra=%zX fn=%s\n",
                     g_kernel_call_count, ordinal, slot, g_esp,
-                    (size_t)((uintptr_t)_ReturnAddress() - (uintptr_t)GetModuleHandleW(NULL)));
+                    (size_t)((uintptr_t)_ReturnAddress() - (uintptr_t)GetModuleHandleW(NULL)),
+                    recomp_probe_fn_name((uintptr_t)_ReturnAddress() - (uintptr_t)GetModuleHandleW(NULL)));
             fflush(stderr);
             last_summary_tick = now;
         }
