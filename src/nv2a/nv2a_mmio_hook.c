@@ -611,6 +611,38 @@ static bool decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
  * Public API
  * ============================================================ */
 
+/* Consume everything the guest has submitted, up to PUT.
+ *
+ * A flip synchronises with the GPU: it does not present while submitted work
+ * is still unconsumed. Our consumption is driven by the PUT doorbell, so
+ * geometry written just before a present was being consumed by the NEXT
+ * flush - after the present had already gone out. The frame therefore showed
+ * the state before the title's last draws:
+ *
+ *     [FRAME] n=1 src=d3d8-present draw=0
+ *     [PGRAPH-D3D11] Draw #1: 3 verts     <- consumed after the present
+ *     [NV2A] WBC flush                    <- by this flush
+ *
+ * Draining here puts the draws before the present, which is the order real
+ * hardware produces. */
+void nv2a_drain_pushbuffer(void)
+{
+    uint32_t *g351f48 = (uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
+    uint32_t dev = *g351f48;
+    if (!dev || dev >= 0x04000000u)
+        return;
+    uint32_t *devp = (uint32_t *)(uintptr_t)(dev + g_mem_offset);
+    uint32_t get = nv2a_ring_get(devp);
+    uint32_t put = devp[0];
+    if (put == get)
+        return;
+    uint32_t consumed = nv2a_consume_pushbuffer(get, put);
+    if (consumed != get) {
+        g_gpu_get = consumed;
+        nv2a_mmio_write(nv2a_get_state(), 0x800000u + 0x44u, consumed, 4);
+    }
+}
+
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 {
     g_mem_offset = xbox_mem_offset;

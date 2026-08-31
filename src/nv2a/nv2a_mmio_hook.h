@@ -25,6 +25,11 @@
  */
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset);
 
+/* Consume submitted push-buffer work up to PUT. A flip synchronises with
+ * the GPU; call this before presenting so draws land in the frame that
+ * requested them rather than the next one. */
+void nv2a_drain_pushbuffer(void);
+
 /*
  * Handle an NV2A MMIO access fault.
  *
