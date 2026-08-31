@@ -79,9 +79,16 @@ static DWORD WINAPI nv2a_completion_signal_thread(LPVOID parameter)
          * (ic 327,000 against 800,000) and the texture upload stopped
          * happening at all. The guest really does clear this to arm. */
         Sleep(1);
-        for (unsigned i = 0; i < 1000 && *state != 0; ++i)
+        /* MM3_NV2A_NOARM re-tests the gate above. The 60% frontier loss that
+         * justified it was measured with the ordinal-46 stack corruption in
+         * place, which sent the guest down a different fence path entirely.
+         * Under MM3_PCI46=1 the guest reaches sub_00344640 and then deadlocks
+         * against this wait, so the old measurement does not settle it. */
+        static int s_noarm = -1;
+        if (s_noarm < 0) s_noarm = getenv("MM3_NV2A_NOARM") ? 1 : 0;
+        for (unsigned i = 0; !s_noarm && i < 1000 && *state != 0; ++i)
             Sleep(1);
-        if (*state != 0) {
+        if (!s_noarm && *state != 0) {
             static int s_stuck_log;
             if (s_stuck_log < 8) {
                 s_stuck_log++;
@@ -801,7 +808,23 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
              * MM3's at 0x0034FF00; the offset does not carry over.
              *
              * If the spin needs breaking, find the field MM3 actually polls
-             * first - do not reuse this offset. */
+             * first - do not reuse this offset.
+             *
+             * ANSWERED (run 421, MM3_PCI46=1). The spin is sub_003444C0, the
+             * ring-space calculator, and it has two sources:
+             *
+             *   mov eax,[ecx+0x17C0] / mov eax,[eax+0x44] / or eax,80000000
+             *   mov edx,[ecx+0x4F8]  / mov eax,[edx+0x324C] / and ~1 / or 80000000
+             *
+             * The second is NV_PFIFO_CACHE1_DMA_SUBROUTINE (0x324C) and the
+             * first is NV_USER_DMA_GET (+0x44); both already have handlers
+             * here. But no MMIO read of either is logged during the spin, so
+             * the guest is reading a SHADOW of DMA_GET in guest RAM at
+             * [ecx+0x17C0]+0x44, which the driver's ISR is expected to
+             * refresh. The ISR (sub_00348000) does run - six accepted
+             * interrupts with MM3_PCI46=1 - so what is missing is the
+             * shadow update, not the interrupt. That is the thing to fix,
+             * and it is NV2A DMA emulation rather than another offset poke. */
 
             /* NV_USER_DMA_GET (0xFD800044) is served from d->puser.regs by
              * the VEH, so the guest poll at sub_00345740 loc_345EE0 sees it. */
