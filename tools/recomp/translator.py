@@ -567,6 +567,9 @@ class FunctionTranslator:
         # Host producers only publish work; this call is where the owning guest
         # thread may accept an IRQ or dispatch a queued DPC.
         lines.append("    recomp_guest_boundary();")
+        # Records the frame's callee-saved registers; recomp_guest_exit
+        # compares them at every return. No-op unless MM3_CHECK_CALLEE_SAVED.
+        lines.append(f"    recomp_guest_enter(0x{func_addr:08X});")
         lines.append(f"")
 
         # D3D8LTCG high-level-emulation seam.

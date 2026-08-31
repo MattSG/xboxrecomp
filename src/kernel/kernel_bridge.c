@@ -2300,7 +2300,23 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
      * compiler's late ESI save, which pairs with the "pop esi" at 0x0034760B.
      * Do not retry without new evidence. */
     case  44: return  8;  /* HalGetInterruptVector(2) */
-    case  46: return 12;  /* MM3 ISR IAT alias for KeInsertQueueDpc(3) */
+    /* Ordinal 46 stays at 12 bytes, and the slot is ALIASED - do not "fix" it.
+     *
+     * Both "call esi" sites in sub_003474B0 dispatch to slot 114 = ordinal 46
+     * with six arguments (24 bytes): a read-modify-write of PCI config
+     * register 0x4C, HalReadWritePCISpace(bus, 0, 0x4C, buf, 4, write).
+     * MM3_CHECK_ICALL_ESP measures exactly delta=-12 on each, and popping 12
+     * strands twelve bytes, which shifts sub_003474B0's epilogue pops so EBX
+     * returns a local (1) instead of the caller's object pointer.
+     *
+     * Setting it to 24 does fix that corruption - run 416 shows zero CS-LOST
+     * and no crash - but regresses every sound metric hard: frontier 779,565
+     * -> 12,331, file ops 34 -> 3, frames 2 -> 0, boundary 61 -> 58. So the
+     * other callers of this slot really do pass three arguments, and a
+     * per-slot constant cannot serve both arities. The fix is per-call-site
+     * cleanup driven by what the caller pushed, not a table entry, plus a
+     * bridge for ordinal 46 (there is none today; it returns 0). */
+    case  46: return 12;  /* aliased slot: 3-arg callers; see note above */
     /* Ordinal 47 takes TWO arguments in this title, not six.
      *
      * Every one of its ten call sites in the XBE pushes 8 bytes; the one at
@@ -2963,6 +2979,28 @@ static void kernel_thunk_dispatch(void)
      * and N bytes of arguments. We already popped the dummy return address
      * above; now pop the args. */
     g_esp += g_slot_arg_bytes[slot];
+
+    /* Did the bridge leave ESP where the guest expects it?
+     *
+     * esp_before points at the dummy return address, so after popping that
+     * and the declared argument bytes ESP must be esp_before + 4 + argbytes.
+     * Anything else silently shifts the CALLER's epilogue pops, which is
+     * invisible at the call and only surfaces as a wrong callee-saved
+     * register much later. A bridge that touches g_esp itself lands here too.
+     */
+    if (getenv("MM3_TRACE_KERNEL_ESP")) {
+        uint32_t want = esp_before + 4u + (uint32_t)g_slot_arg_bytes[slot];
+        if (g_esp != want) {
+            static unsigned n_ke;
+            if (n_ke++ < 64)
+                fprintf(stderr, "[KERNEL-ESP] ic=%llu ordinal=%u slot=%d "
+                        "before=%08X after=%08X want=%08X argbytes=%d delta=%d\n",
+                        (unsigned long long)g_icall_count, (unsigned)ordinal,
+                        slot, esp_before, (uint32_t)g_esp, want,
+                        g_slot_arg_bytes[slot], (int)(g_esp - want));
+            fflush(stderr);
+        }
+    }
 
     /* Detect ESP corruption: after the thunk, ESP should be near esp_before
      * (the dummy return + args were popped). Large deviations indicate a bug. */

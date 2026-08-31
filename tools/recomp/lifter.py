@@ -1886,6 +1886,12 @@ class Lifter:
             prefix += "recomp_trace_bce30(1); "
         if self.func_start == 0x001BCBC0:
             prefix += "recomp_trace_bcbcc0(1); "
+        # Callee-saved audit: pair with recomp_guest_enter at the top of the
+        # function. recomp_guest_boundary only runs at entry, so without an
+        # exit hook a register a function fails to restore is invisible - the
+        # caller resumes with the frame already gone. No-op unless
+        # MM3_CHECK_CALLEE_SAVED is set.
+        prefix += f"recomp_guest_exit(0x{self.func_start:08X}); "
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
             return [f"{prefix}esp += {4 + n}; return; /* ret {n} */"]
