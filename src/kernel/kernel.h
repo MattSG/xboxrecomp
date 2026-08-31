@@ -745,6 +745,11 @@ PXBOX_KINTERRUPT xbox_kernel_take_interrupt(void);
 BOOLEAN xbox_kernel_take_guest_dpc(PXBOX_KDPC *Dpc, PVOID *Arg1, PVOID *Arg2);
 void xbox_kernel_pump_guest_work(void);
 
+/* Hand the host thread back if the worker fiber has run a long stretch of
+ * pure guest code. Called from recomp_guest_boundary; the kernel-call
+ * paced yield cannot see loops that never enter the kernel. */
+void xbox_kernel_worker_yield_tick(void);
+
 /* KeTickCount - exported as a data pointer, not a function */
 extern volatile ULONG xbox_KeTickCount;
 

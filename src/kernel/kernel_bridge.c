@@ -2293,9 +2293,32 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     /* ── HAL ── */
     case  40: return  4;  /* HalClearSoftwareInterrupt(1) */
     case  41: return  8;  /* HalDisableSystemInterrupt(2) */
+    /* Ordinal 44 stays at 8 bytes. Run 410 tried 12, on the reading that the
+     * call site at 0x00347538 pushes three arguments back to back
+     * ("push esi; lea eax,[ebp-0x10]; push eax; push 3"). EBX was still
+     * clobbered to 1 at the caller's depth, so the third push is the
+     * compiler's late ESI save, which pairs with the "pop esi" at 0x0034760B.
+     * Do not retry without new evidence. */
     case  44: return  8;  /* HalGetInterruptVector(2) */
     case  46: return 12;  /* MM3 ISR IAT alias for KeInsertQueueDpc(3) */
-    case  47: return 24;  /* HalReadWritePCISpace(6) */
+    /* Ordinal 47 takes TWO arguments in this title, not six.
+     *
+     * Every one of its ten call sites in the XBE pushes 8 bytes; the one at
+     * 0x0034757C stores a routine pointer (0x00348A70) into a local and then
+     * does "push ebx; push eax". This table was the only place claiming six
+     * arguments - the bridge dispatch below already maps ordinal 47 to
+     * HalReadSMCTrayState, which takes two. Whichever of the two-argument Hal
+     * routines it really is, the cleanup is 8 bytes, not 24.
+     *
+     * Popping 24 bytes for an 8-byte call left ESP 16 bytes high on return.
+     * Nothing faults: the caller's epilogue simply pops shifted slots, and a
+     * frame-pointer epilogue (esp = ebp) hides the drift. In sub_003474B0 it
+     * meant "pop ebx" read the local at [ebp-4] - value 1 - so the object
+     * pointer EBX carried for sub_001ECB4A was replaced by 1, and
+     * MEM32(ebx+0x4C) = eax wrote to address 0x4D instead of the object.
+     * The title then dereferenced the never-written field ~770,000 icalls
+     * later and died. See M4_PLAN.md. */
+    case  47: return  8;  /* two args; matches the HalReadSMCTrayState mapping */
     case  49: return  4;  /* HalRequestSoftwareInterrupt(1) */
     case 358: return  0;  /* HalIsResetOrShutdownPending(void) */
 

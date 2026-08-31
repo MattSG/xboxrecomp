@@ -825,6 +825,36 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
         }
     }
 
+    /* Which register is the guest polling?
+     *
+     * At the stall the title redraws its loading screen into VRAM ~35 times
+     * without ever flipping, and PUT is frozen - so it is waiting on
+     * something it reads through MMIO. Histogram the offsets rather than
+     * guessing which one. Reads only; writes are progress, reads are polls. */
+    {
+        static int s_pw = -1;
+        if (s_pw < 0) s_pw = getenv("MM3_WATCH_POLL") ? 1 : 0;
+        if (s_pw && !is_write) {
+            enum { POLL_MAX = 24 };
+            static uint32_t off[POLL_MAX];
+            static unsigned long long cnt[POLL_MAX];
+            static unsigned n_off;
+            static unsigned long long total;
+            unsigned i;
+            for (i = 0; i < n_off; i++)
+                if (off[i] == mmio_offset) break;
+            if (i == n_off && n_off < POLL_MAX) { off[n_off] = mmio_offset; n_off++; }
+            if (i < POLL_MAX) cnt[i]++;
+            if ((++total % 200000ull) == 0ull) {
+                fprintf(stderr, "[POLL] total=%llu:", total);
+                for (i = 0; i < n_off; i++)
+                    fprintf(stderr, " %05X=%llu", off[i], cnt[i]);
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+        }
+    }
+
     bool handled = decode_and_handle(ctx, mmio_offset, is_write);
 
     /* DMA PUT is the submission doorbell. Retire newly submitted complete
