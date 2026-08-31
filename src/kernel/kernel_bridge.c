@@ -887,6 +887,56 @@ static void bridge_HalGetInterruptVector(void)
         BRIDGE_MEM8(irql_ptr) = irql;
 }
 
+/* ── HalReadWritePCISpace (ordinal 46) ────────────────────
+ *
+ * VOID HalReadWritePCISpace(ULONG BusNumber, ULONG SlotNumber,
+ *     ULONG RegisterNumber, PVOID Buffer, ULONG Length, BOOLEAN WritePCISpace)
+ *
+ * MM3 calls this exactly twice, both from sub_003474B0, as a read-modify-write
+ * of config register 0x4C: read four bytes, OR 0x1F into the top one, write it
+ * back. There was no bridge at all before, so the call returned 0 and left the
+ * caller's buffer untouched, which stalls the title once the stack is right.
+ *
+ * A flat per-(bus,slot) config store is enough for that: reads return what was
+ * written, writes are retained. No real PCI topology is emulated, and nothing
+ * here should be mistaken for one - if a caller ever needs true device or
+ * vendor IDs, they have to be filled in deliberately.
+ */
+#define PCI_CFG_SLOTS 8u
+#define PCI_CFG_BYTES 256u
+static uint8_t g_pci_cfg[PCI_CFG_SLOTS][PCI_CFG_BYTES];
+
+static void bridge_HalReadWritePCISpace(void)
+{
+    uint32_t bus    = STACK_ARG(0);
+    uint32_t slot   = STACK_ARG(1);
+    uint32_t reg    = STACK_ARG(2);
+    uint32_t buffer = STACK_ARG(3);
+    uint32_t length = STACK_ARG(4);
+    uint32_t write  = STACK_ARG(5);
+    uint32_t key    = ((bus * 32u) + (slot & 31u)) % PCI_CFG_SLOTS;
+    uint32_t i;
+
+    g_eax = 0;
+    if (!buffer || reg >= PCI_CFG_BYTES)
+        return;
+    if (length > PCI_CFG_BYTES - reg)
+        length = PCI_CFG_BYTES - reg;
+
+    for (i = 0; i < length; i++) {
+        if (write)
+            g_pci_cfg[key][reg + i] = BRIDGE_MEM8(buffer + i);
+        else
+            BRIDGE_MEM8(buffer + i) = g_pci_cfg[key][reg + i];
+    }
+    if (getenv("MM3_TRACE_PCI")) {
+        fprintf(stderr, "  [KERNEL] HalReadWritePCISpace %s bus=%u slot=%u "
+                "reg=0x%02X len=%u\n", write ? "write" : "read",
+                bus, slot, reg, length);
+        fflush(stderr);
+    }
+}
+
 /* ── RtlInitializeCriticalSection / Enter / Leave (ordinals 291, 277, 294) ─ */
 static void bridge_RtlInitializeCriticalSection(void)
 {
@@ -2300,23 +2350,24 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
      * compiler's late ESI save, which pairs with the "pop esi" at 0x0034760B.
      * Do not retry without new evidence. */
     case  44: return  8;  /* HalGetInterruptVector(2) */
-    /* Ordinal 46 stays at 12 bytes, and the slot is ALIASED - do not "fix" it.
+    /* Ordinal 46 is HalReadWritePCISpace, six arguments (24 bytes), and the
+     * correct value is 24 - but it ships OFF. Set MM3_PCI46=1 to enable.
      *
-     * Both "call esi" sites in sub_003474B0 dispatch to slot 114 = ordinal 46
-     * with six arguments (24 bytes): a read-modify-write of PCI config
-     * register 0x4C, HalReadWritePCISpace(bus, 0, 0x4C, buf, 4, write).
-     * MM3_CHECK_ICALL_ESP measures exactly delta=-12 on each, and popping 12
-     * strands twelve bytes, which shifts sub_003474B0's epilogue pops so EBX
-     * returns a local (1) instead of the caller's object pointer.
+     * The evidence for 24 is not in doubt: the whole XBE has exactly two call
+     * sites for this slot, both in sub_003474B0, both pushing six arguments,
+     * and MM3_CHECK_ICALL_ESP measures delta=-12 on each. Popping 12 strands
+     * twelve bytes and shifts that function's epilogue pops, so EBX returns a
+     * local (1) instead of the object pointer its caller sub_001ECB4A holds -
+     * which is the whole draw-1 crash chain.
      *
-     * Setting it to 24 does fix that corruption - run 416 shows zero CS-LOST
-     * and no crash - but regresses every sound metric hard: frontier 779,565
-     * -> 12,331, file ops 34 -> 3, frames 2 -> 0, boundary 61 -> 58. So the
-     * other callers of this slot really do pass three arguments, and a
-     * per-slot constant cannot serve both arities. The fix is per-call-site
-     * cleanup driven by what the caller pushed, not a table entry, plus a
-     * bridge for ordinal 46 (there is none today; it returns 0). */
-    case  46: return 12;  /* aliased slot: 3-arg callers; see note above */
+     * Enabling it removes the corruption completely (zero CS-LOST, no crash)
+     * and then stalls the title at ic 12,331 on [NV2A-STUCK] pending=1: with
+     * the interrupt setup in sub_003474B0 finally correct, the guest waits on
+     * an NV2A completion our stub never arms. Frontier 772,061 -> 12,331,
+     * frames 2 -> 0. So the corruption is currently load-bearing, and this
+     * cannot be turned on until the NV2A arm/interrupt path is real.
+     * Default stays 12 to hold the frontier; the flag is how you work on it. */
+    case  46: return pci46_enabled() ? 24 : 12;
     /* Ordinal 47 takes TWO arguments in this title, not six.
      *
      * Every one of its ten call sites in the XBE pushes 8 bytes; the one at
@@ -2562,8 +2613,13 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 107: return bridge_KeInitializeDpc;
     case 109: return bridge_KeInitializeInterrupt;
     case 119: return bridge_KeInsertQueueDpc;
-    /* This XBE's IAT maps the ISR's 0x3620AC entry to ordinal 46. */
-    case 46: return bridge_KeInsertQueueDpc;
+    /* The ISR's IAT entry at 0x3620AC holds ordinal 119, not 46 - checked in
+     * the XBE - so the old alias here (46 -> KeInsertQueueDpc) was wrong on
+     * its own terms. Ordinal 46 lives at 0x3620C8 and is HalReadWritePCISpace,
+     * called twice from sub_003474B0 with six arguments. The bridge must match
+     * whatever arg size case 46 hands out, or the stack is wrong either way. */
+    case  46: return pci46_enabled() ? bridge_HalReadWritePCISpace
+                                     : bridge_KeInsertQueueDpc;
     case 113: return bridge_KeInitializeTimerEx;
     case  98: return bridge_KeConnectInterrupt;
     case 100: return bridge_KeDisconnectInterrupt;
@@ -2615,6 +2671,16 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
 static bridge_func_t g_slot_bridges[XBOX_KERNEL_THUNK_TABLE_SIZE];
 static int g_slot_arg_bytes[XBOX_KERNEL_THUNK_TABLE_SIZE];
+
+/* MM3_PCI46: route ordinal 46 as HalReadWritePCISpace(6) instead of the
+ * 12-byte default. Correct, but blocked on NV2A interrupt delivery - see the
+ * note on case 46 below. Cached; this is read on a hot path. */
+static int g_pci46 = -1;
+static int pci46_enabled(void)
+{
+    if (g_pci46 < 0) g_pci46 = getenv("MM3_PCI46") ? 1 : 0;
+    return g_pci46;
+}
 
 /* Current dispatching slot */
 static int g_kernel_dispatch_slot = -1;
