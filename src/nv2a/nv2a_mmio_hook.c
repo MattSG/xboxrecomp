@@ -770,6 +770,40 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                         dev, get, put, consumed, dev + 0x196Cu);
                 nv2a_defer_completion_signal(dev);
             }
+            /* MM3_RING_PUBLISH=<trail>: advance the ring-header completion
+             * counter that sub_00344640 actually spins on.
+             *
+             * The loop is 0x00344733: ecx = *(dev+0x30), and it spins while
+             * that counter has not reached the requested slot. The rejection
+             * below ("publishing made things worse") was measured with the
+             * ordinal-46 stack corruption in place, which never reached this
+             * loop the same way, so it does not settle the question. Under
+             * MM3_PCI46=1 this is the exact field the title is stuck on.
+             * Value is the request count minus <trail> (hardware trails by
+             * two: xemu shows 09/07, 11/0F, 15/11). */
+            {
+                static int s_pub = -1;
+                static uint32_t s_trail;
+                if (s_pub < 0) {
+                    const char *e = getenv("MM3_RING_PUBLISH");
+                    s_trail = e ? (uint32_t)strtoul(e, NULL, 0) : 0u;
+                    s_pub = e ? 1 : 0;
+                }
+                if (s_pub && ring >= 0x1000u && ring < 0x04000000u) {
+                    volatile uint32_t *hdr =
+                        (volatile uint32_t *)(uintptr_t)(ring + g_mem_offset);
+                    uint32_t want = ring_slots - s_trail;
+                    if (*hdr != want) {
+                        static unsigned n_pub;
+                        if (n_pub++ < 12)
+                            fprintf(stderr, "[RING-PUBLISH] ring=%08X %08X -> "
+                                    "%08X slots=%08X\n",
+                                    ring, *hdr, want, ring_slots);
+                        *hdr = want;
+                    }
+                }
+            }
+
             /* Not advancing the ring-header completion counter here, and
              * that is deliberate.
              *
