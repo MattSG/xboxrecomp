@@ -165,6 +165,31 @@ void nv2a_update_irq(NV2AState *d)
         d->pmc.pending_interrupts &= ~NV_PMC_INTR_0_PGRAPH;
     }
 
+    /* MM3_FORCE_VBLANK: deliver PCRTC VBLANK even though the guest has not
+     * set an enable mask.
+     *
+     * Measured state late in a run is pcrtc=00000001/00000000 - the vblank
+     * thread raises the pending bit every 16 ms and update_irq drops it
+     * because enabled_interrupts is zero, so the interrupt never reaches the
+     * ISR. The title's flip queue processor (sub_00348200, gate at 0x00348234)
+     * retires a queued flip only when its counter [esi+0x1C0] matches the
+     * buffer's target, and that counter is what the ISR advances. With no
+     * vblank the queue never drains and the caller polls it forever, which is
+     * where the title parks at ~ic 784,000.
+     *
+     * Whether the guest legitimately never enables PCRTC (and uses some other
+     * path) or our MMIO write to the enable register is being dropped is not
+     * settled; this flag separates those two questions by testing the
+     * consequence directly. */
+    {
+        static int s_fv = -1;
+        if (s_fv < 0) s_fv = getenv("MM3_FORCE_VBLANK") ? 1 : 0;
+        if (s_fv && (d->pcrtc.pending_interrupts & NV_PCRTC_INTR_0_VBLANK)) {
+            d->pmc.pending_interrupts |= NV_PMC_INTR_0_PCRTC;
+            xbox_kernel_publish_interrupt();
+        }
+    }
+
     if (d->pmc.pending_interrupts && d->pmc.enabled_interrupts) {
         if (getenv("MM3_IRQ_TRACE"))
             fprintf(stderr, "[IRQ] nv2a assert pending=%08X enabled=%08X\n",
