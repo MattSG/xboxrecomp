@@ -675,7 +675,9 @@ static void bridge_NtAllocateVirtualMemory(void)
     /* Read the base address hint (0 = let kernel choose) */
     uint32_t base_hint = base_ptr ? BRIDGE_MEM32(base_ptr) : 0;
 
-    if (g_kernel_call_count <= 200) {
+    /* The <=200 cap hid every later allocation, so a run appeared to make
+     * only four. MM3_TRACE_VALLOC lifts it; the cap stays the default. */
+    if (g_kernel_call_count <= 200 || getenv("MM3_TRACE_VALLOC")) {
         fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: base=0x%08X size=%u type=0x%X prot=0x%X\n",
                 base_hint, size, alloc_type, protect);
         fflush(stderr);
@@ -700,7 +702,7 @@ static void bridge_NtAllocateVirtualMemory(void)
         /* MEM_COMMIT only, on an already-reserved region.
          * The memory is already committed by our bump allocator.
          * Don't change the base address - just return success. */
-        if (g_kernel_call_count <= 200) {
+        if (g_kernel_call_count <= 200 || getenv("MM3_TRACE_VALLOC")) {
             fprintf(stderr, "  [KERNEL] → MEM_COMMIT on existing region 0x%08X, no-op\n", base_hint);
             fflush(stderr);
         }
@@ -717,7 +719,7 @@ static void bridge_NtAllocateVirtualMemory(void)
      * runaway 12-byte copy past the mirror seam). */
     if (base_hint != 0 && (alloc_type & 0x2000) &&
         base_hint < (uint32_t)((XBOX_NUM_MIRRORS + 1) * XBOX_TOTAL_RAM)) {
-        if (g_kernel_call_count <= 200) {
+        if (g_kernel_call_count <= 200 || getenv("MM3_TRACE_VALLOC")) {
             fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: mirror-backed region base=0x%08X size=%u (wrapped RAM)\n",
                     base_hint, size);
             fflush(stderr);
@@ -791,7 +793,7 @@ static void bridge_NtQueryVirtualMemory(void)
     /* Translate the guest VA to the native mapping (critical). */
     void *native_base = XBOX_TO_NATIVE(base_va);
 
-    if (g_kernel_call_count <= 200) {
+    if (g_kernel_call_count <= 200 || getenv("MM3_TRACE_VALLOC")) {
         fprintf(stderr, "  [KERNEL] NtQueryVirtualMemory: base=0x%08X (native %p) len=%u\n",
                 base_va, native_base, info_len);
         fflush(stderr);
