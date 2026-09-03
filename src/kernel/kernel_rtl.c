@@ -345,17 +345,33 @@ VOID __stdcall xbox_RtlTimeToTimeFields(PLARGE_INTEGER Time, PXBOX_TIME_FIELDS T
 
 VOID __stdcall xbox_RtlUnwind(PVOID TargetFrame, PVOID TargetIp, PVOID ExceptionRecord, PVOID ReturnValue)
 {
-    /* Delegate to Win32 RtlUnwind */
-    RtlUnwind(TargetFrame, TargetIp, (PEXCEPTION_RECORD)ExceptionRecord, ReturnValue);
+    /* TargetFrame/TargetIp/ExceptionRecord are guest (simulated-stack)
+     * values, not native pointers/frames - delegating to the real Win32
+     * RtlUnwind would unwind the HOST stack using garbage guest data and
+     * crash. This is reached when guest code calls through the raw kernel
+     * thunk table (xbox_kernel_thunk_table, ordinal 312) instead of the
+     * unresolved-import bridge path in kernel_bridge.c, whose
+     * bridge_RtlUnwind documents the correct semantics: the generated model
+     * already resumes at the guest TargetIp via normal translated control
+     * flow, so this is a no-op here too. See kernel_bridge.c bridge_RtlUnwind. */
+    (void)TargetFrame; (void)TargetIp; (void)ExceptionRecord; (void)ReturnValue;
 }
 
 VOID __stdcall xbox_RtlRaiseException(PVOID ExceptionRecord)
 {
-    RaiseException(
-        ((PEXCEPTION_RECORD)ExceptionRecord)->ExceptionCode,
-        ((PEXCEPTION_RECORD)ExceptionRecord)->ExceptionFlags,
-        ((PEXCEPTION_RECORD)ExceptionRecord)->NumberParameters,
-        ((PEXCEPTION_RECORD)ExceptionRecord)->ExceptionInformation);
+    /* ExceptionRecord is a guest pointer (or, worse, raw guest stack data
+     * reinterpreted as one) - it is never a valid native PEXCEPTION_RECORD.
+     * Calling the real Win32 RaiseException with it previously re-raised
+     * the guest's NTSTATUS as a genuine, uncaught host SEH exception and
+     * silently killed the whole process (no WER report, since nothing
+     * expects this code) the moment guest code called through the raw
+     * kernel thunk table (ordinal 302) instead of the unresolved-import
+     * bridge path. On real Xbox this dispatches through the guest's own
+     * SEH chain; until that is modeled, log and continue - see the
+     * matching bridge_RtlRaiseException in kernel_bridge.c. */
+    fprintf(stderr, "  [KERNEL] xbox_RtlRaiseException: record=%p (guest, not dereferenced)\n",
+            ExceptionRecord);
+    fflush(stderr);
 }
 
 VOID __stdcall xbox_RtlRip(PCHAR ApiName, PCHAR Expression, PCHAR Message)

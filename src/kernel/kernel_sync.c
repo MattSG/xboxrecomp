@@ -319,6 +319,20 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
                 *(volatile uint32_t *)(uintptr_t)(guest + g_xbox_mem_offset),
                 g_esp);
     }
+    /* MM3_TRACE_WAIT_ANY: the post-icall-789800 stall (dice.bik open, then
+     * nothing) is not the 0x0035185C/0x0035186C object above - that one now
+     * resolves cleanly. Trace every wait object once execution is past the
+     * known-good region, to find whatever it blocks on next. */
+    if (getenv("MM3_TRACE_WAIT_ANY") && g_icall_count >= 789000ULL) {
+        static unsigned any_n;
+        if (any_n++ < 200)
+            fprintf(stderr, "[WAIT-ANY] enter ic=%llu guest=%08X native=%p ms=%lu "
+                "state=%08X type=%08X esp=%08X\n", (unsigned long long)g_icall_count,
+                guest, Object, (unsigned long)ms,
+                guest ? *(volatile uint32_t *)(uintptr_t)(guest + 4u + g_xbox_mem_offset) : 0,
+                guest ? *(volatile uint32_t *)(uintptr_t)(guest + g_xbox_mem_offset) : 0,
+                g_esp);
+    }
     if (guest) {
         volatile LONG *state = (volatile LONG *)(uintptr_t)(guest + 4u + g_xbox_mem_offset);
         if ((guest == 0x0035186Cu || guest == 0x0035185Cu) &&

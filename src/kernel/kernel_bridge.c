@@ -1328,7 +1328,7 @@ static void bridge_KeBugCheckEx(void)
     ExitProcess(1);
 }
 
-/* ── HalReadSMCTrayState (ordinal 47) ─────────────────────
+/* ── HalReadSMCTrayState (ordinal 9) ──────────────────────
  * VOID HalReadSMCTrayState(PDWORD TrayState, PDWORD TrayStateChangeCount)
  *
  * Returns DVD tray state. 0x10 = no disc, 0x14 = tray closed with disc.
@@ -1340,6 +1340,35 @@ static void bridge_HalReadSMCTrayState(void)
 
     if (state_ptr) BRIDGE_MEM32(state_ptr) = 0x10;  /* No disc */
     if (count_ptr) BRIDGE_MEM32(count_ptr) = 0;
+    g_eax = 0;
+}
+
+/* ── HalRegisterShutdownNotification (ordinal 47) ─────────
+ * VOID HalRegisterShutdownNotification(PHAL_SHUTDOWN_REGISTRATION Routine,
+ *                                       BOOLEAN Register)
+ *
+ * Registers (or unregisters) a callback to run on reboot/shutdown. We never
+ * initiate an Xbox-style shutdown - HalReturnToFirmware terminates the
+ * process - so the callback would never fire; there is nothing to do but
+ * acknowledge the call. Routine is an opaque registration record the guest
+ * owns (often a small sentinel, not a real buffer) - it must never be
+ * dereferenced here.
+ *
+ * This ordinal was previously (and wrongly) mapped to
+ * bridge_HalReadSMCTrayState, which unconditionally writes through its
+ * first argument. Xbox kernel ordinal 47 is HalRegisterShutdownNotification,
+ * not HalReadSMCTrayState (that is ordinal 9, fixed above); kernel_thunks.c's
+ * separate dispatch table already had this right, only this one did not.
+ * The mismatch let an authentic guest call -
+ * HalRegisterShutdownNotification(routine=1, Register=TRUE), a real sentinel
+ * registration - reach the tray function instead, which wrote 0x10 through
+ * guest VA 1: a hardware write breakpoint on guest VA 0 (via cdb, script in
+ * m4tmp/cdb_nullpage_watch.txt) caught this exact write, at icall ~5, as the
+ * true origin of a guest-low-memory corruption that surfaced only much
+ * later (icall ~787K) as an unrelated-looking crash in a D3D-resource
+ * null-check thunk reading guest VA 0 back and expecting a safe zero. */
+static void bridge_HalRegisterShutdownNotification(void)
+{
     g_eax = 0;
 }
 
@@ -2054,7 +2083,7 @@ static void bridge_NtCreateDirectoryObject(void)
  * VOID RtlInitAnsiString(PANSI_STRING Dest, PCSZ Source)
  * MM3's XPP memory-unit driver builds "\Device\MU_n" names with it.
  */
-static void bridge_RtlInitAnsiString(void)
+void bridge_RtlInitAnsiString(void)
 {
     uint32_t dst = STACK_ARG(0);
     uint32_t src = STACK_ARG(1);
@@ -2110,6 +2139,46 @@ static void bridge_RtlInitAnsiString(void)
     BRIDGE_MEM32(dst + 4) = src;
     g_eax = 0;
 }
+
+/* ── RtlEqualString (ordinal 279, 3 args = 12 bytes) ──────
+ * BOOLEAN RtlEqualString(PANSI_STRING String1, PANSI_STRING String2,
+ *                         BOOLEAN CaseInSensitive)
+ *
+ * Was entirely missing from this table (present in kernel_thunks.c's
+ * separate, correct table, and stdcall_args_for_ordinal already had its
+ * byte count right - only the dispatch entry was absent). Every call fell
+ * through to kernel_thunk_dispatch's "no bridge for ordinal" fallback,
+ * which returns g_eax=0 unconditionally: every guest RtlEqualString call
+ * silently reported "not equal" regardless of the real strings, right
+ * where the guest starts loading Scripts/userSetup.lua's Bink-video
+ * dependent boot sequence (dice.bik) - a proven, load-bearing string
+ * comparison always failing is a direct route to the guest taking a wrong
+ * branch and eventually spin-waiting forever. Matches xbox_RtlEqualString
+ * (kernel_rtl.c) exactly, operating on guest memory via BRIDGE_MEM/
+ * XBOX_TO_NATIVE instead of native ANSI_STRING pointers - the guest struct
+ * layout (Length u16 @0, MaximumLength u16 @2, Buffer guest-VA u32 @4)
+ * matches bridge_RtlInitAnsiString directly above. */
+void bridge_RtlEqualString(void)
+{
+    uint32_t str1 = STACK_ARG(0);
+    uint32_t str2 = STACK_ARG(1);
+    uint32_t case_insensitive = STACK_ARG(2);
+    if (!str1 || !str2) {
+        g_eax = 0;
+        return;
+    }
+    uint16_t len1 = BRIDGE_MEM16(str1);
+    uint16_t len2 = BRIDGE_MEM16(str2);
+    if (len1 != len2) {
+        g_eax = 0;
+        return;
+    }
+    const char *p1 = (const char *)XBOX_TO_NATIVE(BRIDGE_MEM32(str1 + 4));
+    const char *p2 = (const char *)XBOX_TO_NATIVE(BRIDGE_MEM32(str2 + 4));
+    g_eax = case_insensitive ? (_strnicmp(p1, p2, len1) == 0)
+                              : (strncmp(p1, p2, len1) == 0);
+}
+
 /* ── IoCreateSymbolicLink (ordinal 63) ───────────────────── */
 /* IoAllocateIrp (ordinal 59, 2 args = 8 bytes).
  * Drivers in the XPP/resource path require a real guest-resident IRP;
@@ -2138,7 +2207,7 @@ static void bridge_IoCreateSymbolicLink(void)
  * reads [DeviceObject+0x18] as the DeviceExtension pointer, so the object is
  * allocated from the Xbox heap with the extension at offset 0x18.
  */
-static void bridge_IoCreateDevice(void)
+void bridge_IoCreateDevice(void)
 {
     uint32_t ext_size = STACK_ARG(1);
     uint32_t dev_type = STACK_ARG(3);
@@ -2334,6 +2403,13 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  23: return  0;  /* Unknown_23(void) */
     case  42: return  0;  /* Unknown_42(void) */
 
+    /* ── HAL (continued: keep near ordinal 47 below; listed here because
+     * this switch is ordered by category, not ordinal) ── */
+    case   9: return  8;  /* HalReadSMCTrayState(2) - previously unlisted,
+                            * defaulted to 0 and would have left ESP 8 bytes
+                            * high on every call once ordinal 9 started
+                            * routing here (see the ordinal 47/9 swap below). */
+
     /* ── Pool Allocator ── */
     case  15: return  8;  /* ExAllocatePool(2) */
     case  16: return  8;  /* ExAllocatePoolWithTag(2) */
@@ -2368,14 +2444,15 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
      * cannot be turned on until the NV2A arm/interrupt path is real.
      * Default stays 12 to hold the frontier; the flag is how you work on it. */
     case  46: return pci46_enabled() ? 24 : 12;
-    /* Ordinal 47 takes TWO arguments in this title, not six.
-     *
-     * Every one of its ten call sites in the XBE pushes 8 bytes; the one at
-     * 0x0034757C stores a routine pointer (0x00348A70) into a local and then
-     * does "push ebx; push eax". This table was the only place claiming six
-     * arguments - the bridge dispatch below already maps ordinal 47 to
-     * HalReadSMCTrayState, which takes two. Whichever of the two-argument Hal
-     * routines it really is, the cleanup is 8 bytes, not 24.
+    /* Ordinal 47 takes TWO arguments in this title, not six: it is
+     * HalRegisterShutdownNotification(Routine, Register), confirmed against
+     * kernel_thunks.c's separately-verified ordinal table and against a live
+     * hardware write breakpoint (guest VA 0) that caught this ordinal's
+     * dispatch writing through a Routine value of 1 - see the bridge
+     * function's own comment. Every one of its ten call sites in the XBE
+     * pushes 8 bytes; the one at 0x0034757C stores a routine pointer
+     * (0x00348A70) into a local and then does "push ebx; push eax". This
+     * table was the only place claiming six arguments.
      *
      * Popping 24 bytes for an 8-byte call left ESP 16 bytes high on return.
      * Nothing faults: the caller's epilogue simply pops shifted slots, and a
@@ -2385,7 +2462,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
      * MEM32(ebx+0x4C) = eax wrote to address 0x4D instead of the object.
      * The title then dereferenced the never-written field ~770,000 icalls
      * later and died. See M4_PLAN.md. */
-    case  47: return  8;  /* two args; matches the HalReadSMCTrayState mapping */
+    case  47: return  8;  /* two args; HalRegisterShutdownNotification */
     case  49: return  4;  /* HalRequestSoftwareInterrupt(1) */
     case 358: return  0;  /* HalIsResetOrShutdownPending(void) */
 
@@ -2601,6 +2678,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 291: return bridge_RtlInitializeCriticalSection;
     case 277: return bridge_RtlEnterCriticalSection;
     case 294: return bridge_RtlLeaveCriticalSection;
+    case 279: return bridge_RtlEqualString;
 
     /* Timing */
     case 126: return bridge_KeQueryPerformanceCounter;
@@ -2633,7 +2711,8 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 238: return bridge_NtYieldExecution;
 
     /* Hardware */
-    case  47: return bridge_HalReadSMCTrayState;
+    case   9: return bridge_HalReadSMCTrayState;
+    case  47: return bridge_HalRegisterShutdownNotification;
     case  49: return bridge_HalRequestSoftwareInterrupt;
     case  44: return bridge_HalGetInterruptVector;
 
