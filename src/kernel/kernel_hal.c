@@ -182,6 +182,24 @@ NTSTATUS __stdcall xbox_KeRestoreFloatingPointState(PVOID FloatingPointState)
 
 VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
 {
+    /* Reached when guest code calls through the raw kernel thunk table
+     * (ordinal 95) instead of the unresolved-import bridge path in
+     * kernel_bridge.c. That path's bridge_KeBugCheck logs the code, caller
+     * RVA and surrounding guest state to stderr (with fflush) before a
+     * fixed ExitProcess(1) - deliberately diagnosable. This one only wrote
+     * to xbox_log()'s buffered, un-flushed file and then called
+     * ExitProcess(BugCheckCode) directly: the log line never reached disk
+     * (ExitProcess doesn't flush C streams) and the guest's raw
+     * BugCheckCode became the process exit code - e.g. a title-supplied
+     * 0xC0000354 read back as a mysterious, unreported host crash with no
+     * WER report and no "[KERNEL] KeBugCheck" line in any capture. Mirror
+     * the safe path: flush the log line to stderr immediately, then exit
+     * with the same fixed, recognizable code. */
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t module = (uintptr_t)GetModuleHandleW(NULL);
+    fprintf(stderr, "\n  [KERNEL] KeBugCheck (raw thunk): code=0x%08X caller_rva=0x%zX\n",
+        (unsigned)BugCheckCode, (size_t)(caller - module));
+    fflush(stderr);
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheck: code=0x%08X ***", BugCheckCode);
 
@@ -189,7 +207,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     DebugBreak();
 #endif
 
-    ExitProcess(BugCheckCode);
+    ExitProcess(1);
 }
 
 VOID __stdcall xbox_KeBugCheckEx(
@@ -199,6 +217,14 @@ VOID __stdcall xbox_KeBugCheckEx(
     ULONG_PTR Param3,
     ULONG_PTR Param4)
 {
+    /* See xbox_KeBugCheck above: same raw-thunk-table path, same fix. */
+    uintptr_t caller = (uintptr_t)_ReturnAddress();
+    uintptr_t module = (uintptr_t)GetModuleHandleW(NULL);
+    fprintf(stderr, "\n  [KERNEL] KeBugCheckEx (raw thunk): code=0x%08X "
+        "p1=0x%p p2=0x%p p3=0x%p p4=0x%p caller_rva=0x%zX\n",
+        (unsigned)BugCheckCode, (void*)Param1, (void*)Param2, (void*)Param3,
+        (void*)Param4, (size_t)(caller - module));
+    fflush(stderr);
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheckEx: code=0x%08X, params=(0x%p, 0x%p, 0x%p, 0x%p) ***",
         BugCheckCode, (void*)Param1, (void*)Param2, (void*)Param3, (void*)Param4);
@@ -207,7 +233,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     DebugBreak();
 #endif
 
-    ExitProcess(BugCheckCode);
+    ExitProcess(1);
 }
 
 /* ============================================================================
