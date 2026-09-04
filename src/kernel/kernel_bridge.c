@@ -850,15 +850,26 @@ static void bridge_ExAllocatePoolWithTag(void)
 }
 
 /* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ────── */
+/* Both are __fastcall on real Xbox/NT: NewIrql arrives in CL (low byte of
+ * ECX), not on the stack - the arg-byte table already declares 0 stack
+ * bytes for both (see stdcall_args_for_ordinal), matching that convention.
+ * But this bridge was still reading STACK_ARG(0), which - since no stack
+ * arg is ever pushed by a fastcall caller - reads the dummy return-address
+ * placeholder every guest call site pushes before an indirect call: always
+ * 0. So every Raise/Lower call silently operated on IRQL 0 (PASSIVE_LEVEL)
+ * regardless of the real value in ECX, meaning Raise never actually raised
+ * IRQL. Any guest code using this pair as a lock (raise to exclude
+ * preemption, lower to release) got no real exclusion at all - a genuine,
+ * silent, timing-dependent race on whatever it was meant to protect. */
 static void bridge_KfRaiseIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
+    uint32_t new_irql = g_ecx & 0xFFu;
     g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)new_irql);
 }
 
 static void bridge_KfLowerIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
+    uint32_t new_irql = g_ecx & 0xFFu;
     xbox_KfLowerIrql((UCHAR)new_irql);
     g_eax = 0;
 }

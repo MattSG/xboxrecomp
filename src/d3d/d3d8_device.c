@@ -135,9 +135,14 @@ static void d3d8_capture_frame(D3D8DeviceState *state, int idx)
             for (int y = h - 1; y >= 0; y--) {
                 const unsigned char *p = src + (size_t)y * map.RowPitch;
                 for (int x = 0; x < w; x++) {
-                    fputc(p[x * 4 + 0], f);
-                    fputc(p[x * 4 + 1], f);
+                    /* 24-bit BMP stores B,G,R; the backbuffer is
+                     * DXGI_FORMAT_R8G8B8A8_UNORM, so p[0] is RED. Writing
+                     * p[0],p[1],p[2] swapped red and blue in every capture
+                     * ever taken from this build - a clear colour read back
+                     * as 6070a0 is really a07060. Emit B,G,R. */
                     fputc(p[x * 4 + 2], f);
+                    fputc(p[x * 4 + 1], f);
+                    fputc(p[x * 4 + 0], f);
                 }
                 for (int pad = w * 3; pad < row; pad++) fputc(0, f);
             }

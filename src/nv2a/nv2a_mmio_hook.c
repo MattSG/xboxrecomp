@@ -650,9 +650,51 @@ void nv2a_drain_pushbuffer(void)
     }
 }
 
+/* MM3_FORCE_8700_CLEAR: session investigation only, off by default.
+ * sub_003430A0 spins forever on `while (MEM32(dev+0x8700) != 0)`, where
+ * dev = MEM32(0x351F48) + 0x4F8 - a device/context object whose 0x8140-
+ * 0x8958 field range matches the real NV2A PGRAPH register layout. Only
+ * one write site in the whole guest binary sets +0x8700 (to 1, as a
+ * "submitted"/"busy" flag right after writing +0x8140, +0x8908, +0x8948,
+ * +0x8950, +0x8958); nothing in guest code ever clears it back to 0 -
+ * that must be an asynchronous GPU completion signal, same class as the
+ * existing dev+0x1970 fence (nv2a_completion_signal_thread above), just
+ * not yet identified/wired up. This thread is the minimal experiment: poll
+ * the fixed guest VA and clear the busy flag once observed set, to test
+ * whether that alone is enough to unblock further progress before
+ * building a properly-timed completion signal. */
+static DWORD WINAPI nv2a_8700_clear_thread(LPVOID parameter)
+{
+    (void)parameter;
+    for (;;) {
+        Sleep(5);
+        uint32_t dev_root = *(uint32_t *)(uintptr_t)(0x351F48u + g_mem_offset);
+        if (dev_root < 0x1000u) continue;
+        uint32_t dev = *(uint32_t *)(uintptr_t)(dev_root + 0x4F8u + g_mem_offset);
+        if (dev < 0x1000u) continue;
+        volatile uint32_t *flag = (volatile uint32_t *)(uintptr_t)
+            (dev + 0x8700u + g_mem_offset);
+        if (*flag != 0) {
+            static unsigned s_cleared;
+            if (s_cleared++ < 20u) {
+                fprintf(stderr, "[8700-CLEAR] dev=%08X was=%08X\n",
+                        dev, (unsigned)*flag);
+                fflush(stderr);
+            }
+            *flag = 0;
+        }
+    }
+    return 0;
+}
+
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 {
     g_mem_offset = xbox_mem_offset;
+
+    if (getenv("MM3_FORCE_8700_CLEAR")) {
+        HANDLE t = CreateThread(NULL, 0, nv2a_8700_clear_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
 
     /* The guest VRAM aperture (0xF0000000-0xF3FFFFFF) is pre-committed
      * PAGE_READWRITE by main.c. Point the standalone GPU's VRAM at that

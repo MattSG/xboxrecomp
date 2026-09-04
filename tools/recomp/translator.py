@@ -664,9 +664,37 @@ class FunctionTranslator:
                 for t in switch_targets:
                     label_addrs.add(t)
 
-        flag_state = None
+        incoming_flag_states = {start: None}
+        lifted_blocks = {}
+        emission_order = []
         snap_counter = [0]  # function-wide flag-snapshot temp name counter
+        blocks_by_start = {bb.start: bb for bb in blocks}
+        pending = [start]
+        while pending:
+            block_start = pending.pop()
+            if block_start in lifted_blocks or block_start not in blocks_by_start:
+                continue
+            bb = blocks_by_start[block_start]
+            stmts, out_flag_state = lift_basic_block(
+                self.lifter, bb, flag_state=incoming_flag_states.get(bb.start),
+                snap_counter=snap_counter, fpu_cmp_available=has_fpu_cmp)
+            lifted_blocks[bb.start] = (stmts, out_flag_state)
+            emission_order.append(bb)
+            for succ in reversed(bb.successors):
+                if succ not in incoming_flag_states:
+                    incoming_flag_states[succ] = out_flag_state
+                pending.append(succ)
+
+        # Keep unreachable/dead blocks in the generated output too.
         for bb in blocks:
+            if bb.start in lifted_blocks:
+                continue
+            lifted_blocks[bb.start] = lift_basic_block(
+                self.lifter, bb, flag_state=incoming_flag_states.get(bb.start),
+                snap_counter=snap_counter, fpu_cmp_available=has_fpu_cmp)
+            emission_order.append(bb)
+
+        for bb in emission_order:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
                 # The trailing ';' is load-bearing: C requires a statement after
@@ -676,12 +704,7 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Propagate flag state from previous block (fallthrough path).
-            # This handles patterns like: test eax,eax / ja X / jb Y
-            # where jb uses the same flags as ja from the preceding block.
-            stmts, flag_state = lift_basic_block(
-                self.lifter, bb, flag_state=flag_state,
-                snap_counter=snap_counter, fpu_cmp_available=has_fpu_cmp)
+            stmts, _ = lifted_blocks[bb.start]
             for stmt in stmts:
                 lines.append(f"    {stmt}")
                 if (start == 0x001BCBC0 and
