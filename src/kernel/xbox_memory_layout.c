@@ -599,11 +599,28 @@ ptrdiff_t xbox_GetMemoryOffset(void)
 
 /* ── Dynamic heap allocator ────────────────────────────────
  *
- * Simple bump allocator for MmAllocateContiguousMemory and similar.
- * Returns Xbox VAs within the mapped region so MEM32() works correctly.
- * No free support (bump-only for now).
+ * Simple bump allocator backing the kernel-side Nt/Ke/Mm allocation
+ * bridges in kernel_bridge.c (pool memory, IRPs, device/thread objects,
+ * MmAllocateContiguousMemory and similar) - NOT the guest's own CRT/user
+ * heap, which the recompiled game manages itself (sub_000858F3 and
+ * friends in src/main.c, driven by the game's own malloc/HeapAlloc calls)
+ * starting at the same XBOX_HEAP_BASE and growing upward.
+ *
+ * Both allocators used to start at XBOX_HEAP_BASE and grow upward, so as
+ * soon as either grew past a few hundred KB they handed out addresses the
+ * other already owned - this allocator's memset-on-alloc would then zero
+ * live CRT-heap free-list nodes out from under it. Confirmed via a
+ * hardware write watchpoint (MM3_WATCH_GUEST) on a free-list node's
+ * `next` field: the corrupting write's ecx (byte count) and the
+ * subsequent [HEAP] log line matched a 1 MB xbox_HeapAlloc request whose
+ * range enclosed the node's live address, at a point where the CRT heap
+ * had already grown into that same range. Grow this allocator downward
+ * from the top of RAM instead, so the two only collide on genuine
+ * exhaustion of the shared 64 MB budget, not on ordinary growth from
+ * opposite ends of the same starting address. No free support (bump-only
+ * for now, in either direction).
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
+static uint32_t g_heap_next = XBOX_HEAP_BASE + XBOX_HEAP_SIZE;
 
 static int g_heap_alloc_count = 0;
 
@@ -620,17 +637,25 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
      * minimum of 4096 bytes so each allocation gets its own memory. */
     if (size < 4096) size = 4096;
 
-    /* Align the next pointer */
-    result = (g_heap_next + alignment - 1) & ~(alignment - 1);
+    /* Align the *end* of the block downward from the current top, then
+     * derive its start - mirrors the old upward bump but growing the
+     * other way. */
+    if ((uint64_t)size > (uint64_t)g_heap_next) {
+        result = 0; /* underflow guard; falls into the OOM path below */
+    } else {
+        result = (g_heap_next - size) & ~(alignment - 1);
+    }
 
-    if ((uint64_t)result + (uint64_t)size >
+    if (result < XBOX_HEAP_BASE || (uint64_t)result + (uint64_t)size >
         (uint64_t)XBOX_HEAP_BASE + XBOX_HEAP_SIZE) {
         /* 64-bit bound check: the 32-bit result+size wraps for requests
          * near 4 GB, which previously bypassed this check and let memset
          * walk the mirror region to the 0xA4000000 ceiling and fault.
          * Reject oversized requests; the game pool checks the NTSTATUS. */
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, result 0x%08X, used %u/%u)\n",
-                size, result, g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
+                size, result,
+                (uint32_t)(XBOX_HEAP_BASE + XBOX_HEAP_SIZE - g_heap_next),
+                XBOX_HEAP_SIZE);
         /* run-371 (read-only): the requested sizes (0xF80290 / 0x104D2C0 /
          * 0x104D2A0) are stale heap-region pointers passed as sizes. Pin the
          * guest caller: [g_esp] = guest return address of the thunk call,
@@ -667,7 +692,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         return 0;
     }
 
-    g_heap_next = result + size;
+    g_heap_next = result;
 
     /* Zero-fill the allocated block (Xbox memory is always zeroed) */
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
@@ -675,7 +700,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     g_heap_alloc_count++;
     fprintf(stderr, "  [HEAP] #%d: size=%u align=%u → 0x%08X..0x%08X (used %u/%u)\n",
             g_heap_alloc_count, size, alignment, result, result + size,
-            g_heap_next - XBOX_HEAP_BASE, XBOX_HEAP_SIZE);
+            (uint32_t)(XBOX_HEAP_BASE + XBOX_HEAP_SIZE - g_heap_next), XBOX_HEAP_SIZE);
     fflush(stderr);
 
     return result;
