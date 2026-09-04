@@ -104,6 +104,59 @@ def test_flag_state_crosses_block_boundary_with_snapshot():
     print("ok  flag_state_crosses_block_boundary_with_snapshot")
 
 
+def _successor_lift(blocks_by_addr, succ_map, start):
+    """Reproduce FunctionTranslator.translate_function's CFG-successor flag
+    propagation (translator.py, incoming_flag_states/pending loop) without
+    the full XBE/func_db plumbing that method needs. Same contract: each
+    block's incoming flag_state comes from whichever block's `successors`
+    actually names it, not from whatever block precedes it in `blocks_by_addr`
+    iteration order."""
+    lifter = Lifter()
+    incoming = {start: None}
+    lifted = {}
+    pending = [start]
+    while pending:
+        addr = pending.pop()
+        if addr in lifted or addr not in blocks_by_addr:
+            continue
+        bb = blocks_by_addr[addr]
+        stmts, out_state = lift_basic_block(lifter, bb, flag_state=incoming.get(addr))
+        lifted[addr] = "\n".join(stmts)
+        for succ in reversed(succ_map.get(addr, [])):
+            if succ not in incoming:
+                incoming[succ] = out_state
+            pending.append(succ)
+    return lifted
+
+
+def test_successor_driven_propagation_ignores_address_order_sibling():
+    """Regression guard for the bug fixed alongside the CFG-successor
+    rewrite in translate_function: flag state used to propagate from
+    whichever block was emitted immediately before another in `blocks`
+    (address order), not from its real CFG predecessor. A block address-
+    between a branch and its real target, but not actually on that edge,
+    must not donate its flags to the target.
+
+    Layout: A (cmp eax,ebx) branches to C directly. B sits at an address
+    between A and C, sets *different* flags (cmp ecx,edx), and is not on
+    any path to C. C has no flag-setting instruction of its own and must
+    see A's eax/ebx comparison, never B's ecx/edx one."""
+    a_addr, b_addr, c_addr = 0x1000, 0x1010, 0x2000
+    a_bb = _block(bytes.fromhex("39 d8"), start=a_addr)          # cmp eax, ebx
+    b_bb = _block(bytes.fromhex("39 d1"), start=b_addr)          # cmp ecx, edx (dead end)
+    c_bb = _block(bytes.fromhex("b8 10 00 00 00 75 f0"), start=c_addr)  # mov eax,0x10; jne
+
+    blocks_by_addr = {a_addr: a_bb, b_addr: b_bb, c_addr: c_bb}
+    succ_map = {a_addr: [c_addr], b_addr: []}  # B does not lead to C
+
+    lifted = _successor_lift(blocks_by_addr, succ_map, a_addr)
+    c_out = lifted[c_addr]
+    assert "CMP_NE(_fcmp_0_a, _fcmp_1_b)" in c_out, c_out  # A's snapshot
+    assert "CMP_NE(ecx, edx)" not in c_out, c_out
+    assert "CMP_NE(eax, ebx)" not in c_out, c_out  # must use snapshot, not live regs
+    print("ok  successor_driven_propagation_ignores_address_order_sibling")
+
+
 if __name__ == "__main__":
     test_jcc_uses_snapshot_not_clobbered_operand()
     test_setcc_uses_snapshot()
@@ -112,4 +165,5 @@ if __name__ == "__main__":
     test_cmp_jcc_snapshot_precedes_branch_for_taken_path()
     test_flag_state_crosses_block_boundary_with_snapshot()
     test_cmp_si_neg1_masks_imm_to_reg_width()
+    test_successor_driven_propagation_ignores_address_order_sibling()
     print("\nall block flag-tracking checks passed")
