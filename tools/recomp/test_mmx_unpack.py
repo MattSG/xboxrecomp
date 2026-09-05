@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Self-check: MMX byte unpack used by Bink pixel converters."""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
 from tools.recomp.disasm import Disassembler
 from tools.recomp.lifter import Lifter
 
