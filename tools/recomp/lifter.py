@@ -1162,7 +1162,8 @@ class Lifter:
                  "cmpneqps", "cmpeqps", "cmpltps", "cmpleps",
                  "cmpnltps", "cmpnleps",
                  "movmskps", "movmskpd",
-                 "pand", "pandn", "por", "pxor", "pcmpgtd"):
+                 "pand", "pandn", "por", "pxor", "pcmpgtd",
+                 "punpcklbw", "punpckhbw"):
             return self._lift_sse(insn, m, ops)
 
         # ── FPU ──
@@ -2366,6 +2367,20 @@ class Lifter:
                 return [f"/* {m} {insn.op_str} - source is not a register */"]
 
         # ── MMX / integer SIMD ──
+        if m in ("punpcklbw", "punpckhbw") and nops >= 2:
+            dst = _fmt_operand_read(ops[0])
+            src = (f"MEM64({_fmt_mem(ops[1])})" if ops[1].type == "mem"
+                   else _fmt_operand_read(ops[1]))
+            base = 0 if m == "punpcklbw" else 32
+            return [
+                "{ uint64_t _mm_a = (uint64_t)(%s), _mm_b = (uint64_t)(%s), _mm_r = 0;" % (dst, src),
+                "  for (unsigned _mm_i = 0; _mm_i < 4; ++_mm_i) {",
+                "    _mm_r |= (uint64_t)((_mm_a >> (%d + _mm_i * 8)) & 0xFFu) << (_mm_i * 16);" % base,
+                "    _mm_r |= (uint64_t)((_mm_b >> (%d + _mm_i * 8)) & 0xFFu) << (_mm_i * 16 + 8);" % base,
+                "  }",
+                "  %s } /* %s */" % (_fmt_operand_write(ops[0], "_mm_r"), m),
+            ]
+
         if m in ("pand", "pandn", "por", "pxor", "pcmpgtd"):
             if nops >= 2:
                 return [f"/* {m} {insn.op_str} (MMX/SIMD integer) */"]

@@ -571,14 +571,29 @@ class FunctionDetector:
         # is NOT a reliable discriminator — name is (loader.DATA_SECTION_NAMES
         # is the same list get_code_sections uses to exclude them).
         data_secs = [s for s in self.image.sections
-                     if s.name in DATA_SECTION_NAMES and s.raw_size >= 4]
+                     if (s.name in DATA_SECTION_NAMES or
+                         s.name.upper().endswith("DATA")) and s.raw_size >= 4]
         for sec in data_secs:
             data = self.image.get_section_data(sec)
             if not data:
                 continue
             # Only scan the raw portion (BSS tail has no initialized data)
             n = min(len(data), sec.raw_size) - 3
-            for i in range(0, n, 4):
+            offsets = range(0, n, 4)
+            if sec.name not in DATA_SECTION_NAMES:
+                # Library *DATA sections can mix opaque codec state with a
+                # dense callback table at the end. Scanning every random-looking
+                # dword creates false function starts; accept only a dense tail.
+                words = [struct.unpack_from('<I', data, i)[0] for i in offsets]
+                dense = set()
+                for j in range(len(words) - 7):
+                    window = words[j:j + 16]
+                    if sum(val in code_addrs for val in window) * 4 >= len(window) * 3:
+                        dense.update(k for k, val in enumerate(window, j)
+                                     if val in code_addrs)
+                offsets = (range(min(dense) * 4, (max(dense) + 1) * 4, 4)
+                           if dense else ())
+            for i in offsets:
                 val = struct.unpack_from('<I', data, i)[0]
                 if val not in code_addrs:
                     continue

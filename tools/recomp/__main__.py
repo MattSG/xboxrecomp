@@ -156,6 +156,8 @@ def main():
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
+    parser.add_argument("--overlay", action="append", metavar="ADDR",
+                        help="Generate one additional dispatch unit for this address")
 
     args = parser.parse_args()
 
@@ -218,6 +220,31 @@ def main():
     # List categories mode
     if args.list_categories:
         list_categories(translator)
+        return
+
+    if args.overlay:
+        gen_dir = args.gen_dir or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "src", "game", "recomp", "gen")
+        addresses = sorted(set(int(addr, 16) for addr in args.overlay))
+        bodies = [(addr, translator.translate_single(addr)) for addr in addresses]
+        if any(body is None for _, body in bodies):
+            missing = next(addr for addr, body in bodies if body is None)
+            print(f"ERROR: Could not translate overlay function at 0x{missing:08X}",
+                  file=sys.stderr)
+            sys.exit(1)
+        os.makedirs(gen_dir, exist_ok=True)
+        path = os.path.join(gen_dir, "recomp_overlay.c")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("#define RECOMP_GENERATED_CODE\n#include \"recomp_funcs.h\"\n\n")
+            for _, body in bodies:
+                fh.write(body + "\n")
+            fh.write("recomp_func_t recomp_overlay_lookup(uint32_t xbox_va)\n{\n")
+            fh.write("    switch (xbox_va) {\n")
+            for addr, _ in bodies:
+                fh.write(f"    case 0x{addr:08X}u: return (recomp_func_t)sub_{addr:08X};\n")
+            fh.write("    default: return NULL;\n    }\n}\n")
+        print(f"Generated overlay: {path} ({len(bodies)} functions)")
         return
 
     # Single function mode
