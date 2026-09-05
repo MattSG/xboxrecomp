@@ -620,6 +620,7 @@ ptrdiff_t xbox_GetMemoryOffset(void)
  * opposite ends of the same starting address. No free support (bump-only
  * for now, in either direction).
  */
+static uint32_t g_virtual_next = XBOX_HEAP_BASE;
 static uint32_t g_heap_next = XBOX_HEAP_BASE + XBOX_HEAP_SIZE;
 
 static int g_heap_alloc_count = 0;
@@ -646,7 +647,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         result = (g_heap_next - size) & ~(alignment - 1);
     }
 
-    if (result < XBOX_HEAP_BASE || (uint64_t)result + (uint64_t)size >
+    if (result < g_virtual_next || (uint64_t)result + (uint64_t)size >
         (uint64_t)XBOX_HEAP_BASE + XBOX_HEAP_SIZE) {
         /* 64-bit bound check: the 32-bit result+size wraps for requests
          * near 4 GB, which previously bypassed this check and let memset
@@ -703,6 +704,26 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
             (uint32_t)(XBOX_HEAP_BASE + XBOX_HEAP_SIZE - g_heap_next), XBOX_HEAP_SIZE);
     fflush(stderr);
 
+    return result;
+}
+
+uint32_t xbox_VirtualAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t result;
+
+    if (alignment < 4) alignment = 4;
+    if (size < 4096) size = 4096;
+
+    result = (g_virtual_next + alignment - 1) & ~(alignment - 1);
+    if ((uint64_t)result + (uint64_t)size > (uint64_t)g_heap_next) {
+        fprintf(stderr, "xbox_VirtualAlloc: out of memory (requested %u, result 0x%08X)\n",
+                size, result);
+        fflush(stderr);
+        return 0;
+    }
+
+    g_virtual_next = result + size;
+    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 }
 

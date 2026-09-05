@@ -43,6 +43,9 @@ extern uint32_t g_seh_ebp;
 extern volatile uint64_t g_icall_count;
 extern volatile uintptr_t g_penter_last_rva;
 extern volatile uintptr_t g_penter_caller_rva;
+extern volatile uintptr_t g_penter_trace[];
+extern volatile uint32_t g_penter_trace_idx;
+extern volatile int g_bink_trace_active;
 extern uintptr_t g_fake_kpcr_native;
 extern const char *recomp_probe_fn_name(uintptr_t rva);
 extern ptrdiff_t g_xbox_mem_offset;
@@ -104,9 +107,7 @@ static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
     case 323: return XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY;
     case 324: return XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION;
     case 325: return XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY;
-    case 326: return XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY;
-    case 327: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS;
-    case 328: return XBOX_KERNEL_DATA_BASE + KDATA_XE_IMAGE_FILENAME;
+    case 326: return XBOX_KERNEL_DATA_BASE + KDATA_XE_IMAGE_FILENAME;
     case 355: return XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY;         /* alias */
     case 356: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS; /* alias */
     case 357: return XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY;
@@ -165,13 +166,13 @@ static void kernel_data_init(void)
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
 
-    /* XboxLANKey (ordinals 326, 355) - 16 bytes of zeros */
+    /* XboxLANKey - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), 0, 16);
 
-    /* XboxAlternateSignatureKeys (ordinals 327, 356) - 256 bytes of zeros */
+    /* XboxAlternateSignatureKeys - 256 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), 0, 256);
 
-    /* XePublicKeyData (ordinal 357) - 284 bytes of zeros */
+    /* XePublicKeyData - 284 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY) + g_xbox_mem_offset), 0, 284);
 
     fprintf(stderr, "  Kernel data exports: initialized at Xbox VA 0x%08X\n",
@@ -190,6 +191,28 @@ static int g_kernel_call_count = 0;
  * After kernel_thunk_dispatch pops the dummy return address (g_esp += 4),
  * arg0 is at g_esp+0, arg1 at g_esp+4, etc. */
 #define STACK_ARG(n) ((uint32_t)BRIDGE_MEM32(g_esp + (n) * 4))
+
+static void bridge_XeLoadSection(void)
+{
+    uint32_t section = STACK_ARG(0);
+    if (!section) {
+        g_eax = 0xC000000Du; /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(section + 0x18u));
+    g_eax = 0;
+}
+
+static void bridge_XeUnloadSection(void)
+{
+    uint32_t section = STACK_ARG(0);
+    if (!section) {
+        g_eax = 0xC000000Du; /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    InterlockedDecrement((volatile LONG *)XBOX_TO_NATIVE(section + 0x18u));
+    g_eax = 0;
+}
 
 /* ── Per-ordinal bridge functions ─────────────────────────
  *
@@ -224,7 +247,7 @@ static int g_kernel_call_count = 0;
  * thread and returns, and the thread runs the actual game.
  */
 static int g_thread_call_count = 0;
-/* Fiber-based guest thread scheduling (single worker).
+/* Fiber-based guest thread scheduling.
  *
  * The recomp engine runs on ONE host thread; the register globals
  * (g_eax..g_edi, g_esp, g_seh_ebp) are shared by all guest threads, like real
@@ -232,10 +255,9 @@ static int g_thread_call_count = 0;
  * therefore run as Windows fibers on the same host thread, and the register
  * globals are saved/restored around each fiber switch. The worker blends one
  * screen, then its KeDelayExecutionThread parks it until the delay elapses;
- * the main fiber resumes it at the next kernel thunk call. Single worker
- * only: g_worker is one slot and g_worker_exit_jmp is one jmp_buf (nested
- * workers would need a slot table). */
-static jmp_buf g_worker_exit_jmp;
+ * the main fiber resumes it at the next kernel thunk call. */
+#define MAX_GUEST_WORKERS 8
+#define GUEST_WORKER_HANDLE_BASE 0xBEEF1000u
 static volatile int g_worker_active = 0;
 /* Which guest fiber is running. Both share a host thread, so a per-thread
  * probe cannot tell them apart; the profile is all worker and the main fiber
@@ -246,23 +268,35 @@ typedef struct {
     LPVOID fiber;            /* worker fiber handle (NULL until created) */
     recomp_func_t fn;
     uint32_t ctx1, ctx2;
+    uint32_t handle;
+    uint32_t object;
+    uint32_t stack_top;
+    uint32_t exit_status;
+    int started;
     volatile int parked;     /* 1 while the worker sleeps on KeDelay */
     volatile int done;       /* 1 after the worker routine returned */
     DWORD wake_tick;         /* GetTickCount() when the delay elapses */
-    unsigned long long wake_icall; /* guest-progress deadline (see below) */
+    HANDLE wait_handle;
+    DWORD wait_deadline;
+    NTSTATUS wait_status;
+    int waiting;
+    int wait_ready;
+    jmp_buf exit_jmp;
     /* Saved guest register set for this guest thread. */
     uint32_t eax, ecx, edx, ebx, esi, edi, esp, seh_ebp;
 } worker_state_t;
 
-static worker_state_t g_worker;
+static worker_state_t g_workers[MAX_GUEST_WORKERS];
+static worker_state_t *g_current_worker;
 static worker_state_t g_main_state;
 static LPVOID g_main_fiber = NULL;
+static unsigned g_worker_round_robin;
 
 static void worker_load_tib(const worker_state_t *w)
 {
     if (g_fake_kpcr_native)
         *(uint32_t *)(g_fake_kpcr_native + 0x04) =
-            (w == &g_worker) ? XBOX_WORKER_STACK_TOP : 0x00F7FFF0u;
+            (w == &g_main_state) ? 0x00F7FFF0u : w->stack_top;
 }
 
 
@@ -302,20 +336,35 @@ static void worker_load_regs(const worker_state_t *w)
 /* Park the worker fiber and resume the main one. */
 static void worker_switch_to_main(void)
 {
-    worker_save_regs(&g_worker);
+    worker_state_t *w = g_current_worker;
+    worker_save_regs(w);
     worker_load_regs(&g_main_state);
+    g_current_worker = NULL;
     g_in_worker_fiber = 0;
     SwitchToFiber(g_main_fiber);
 }
 
 /* Park the main fiber and resume the worker one (loads worker regs; the
  * worker restores the main register set before switching back). */
-static void worker_switch_to_worker(void)
+static void worker_switch_to_worker(worker_state_t *w)
 {
     worker_save_regs(&g_main_state);
-    worker_load_regs(&g_worker);
+    worker_load_regs(w);
+    g_current_worker = w;
     g_in_worker_fiber = 1;
-    SwitchToFiber(g_worker.fiber);
+    SwitchToFiber(w->fiber);
+}
+
+static void worker_reap_finished(worker_state_t *w)
+{
+    if (!w->done)
+        return;
+    if (w->fiber) {
+        DeleteFiber(w->fiber);
+        w->fiber = NULL;
+    }
+    if (!w->handle)
+        memset(w, 0, sizeof(*w));
 }
 
 /* The other half of worker_resume_if_due.
@@ -364,28 +413,27 @@ static unsigned g_main_slice_remaining;
 void xbox_kernel_worker_yield_tick(void)
 {
     static unsigned guest_calls;
-    if (!g_in_worker_fiber || !g_worker_active || !g_worker.fiber ||
-        g_worker.done) {
+    worker_state_t *w = g_current_worker;
+    if (!w || !w->fiber || w->done) {
         guest_calls = 0;
         return;
     }
     if (++guest_calls < WORKER_YIELD_EVERY_GUEST_CALLS)
         return;
     guest_calls = 0;
-    g_worker.wake_tick = GetTickCount();
-    g_worker.wake_icall = 0;
+    w->wake_tick = GetTickCount();
     g_main_slice_remaining = MAIN_SLICE_KERNEL_CALLS;
-    g_worker.parked = 1;
+    w->parked = 1;
     worker_switch_to_main();
-    g_worker.parked = 0;
+    w->parked = 0;
 }
 
 static void worker_yield_if_hogging(void)
 {
     static unsigned calls_since_switch;
+    worker_state_t *w = g_current_worker;
 
-    if (!g_in_worker_fiber || !g_worker_active || !g_worker.fiber ||
-        g_worker.done) {
+    if (!w || !w->fiber || w->done) {
         calls_since_switch = 0;
         return;
     }
@@ -393,16 +441,19 @@ static void worker_yield_if_hogging(void)
         return;
 
     calls_since_switch = 0;
-    g_worker.wake_tick = GetTickCount();   /* due at once; this is not a sleep */
-    g_worker.wake_icall = 0;               /* hog-yield is not a delay */
+    w->wake_tick = GetTickCount();   /* due at once; this is not a sleep */
     g_main_slice_remaining = MAIN_SLICE_KERNEL_CALLS;
-    g_worker.parked = 1;
+    w->parked = 1;
     worker_switch_to_main();
-    g_worker.parked = 0;
+    w->parked = 0;
 }
 
 static void worker_resume_if_due(void)
 {
+    unsigned n;
+
+    if (g_current_worker)
+        return;
     /* Let the main fiber finish its slice before handing the host thread
      * back. Only a hog-yield sets this; a worker parked on a real
      * KeDelayExecutionThread delay is still gated by wake_tick alone. */
@@ -411,45 +462,73 @@ static void worker_resume_if_due(void)
         return;
     }
 
-    if (g_worker_active && g_worker.fiber && g_worker.parked && !g_worker.done &&
-        (int)(GetTickCount() - g_worker.wake_tick) >= 0 &&
-        g_icall_count >= g_worker.wake_icall) {
-        worker_switch_to_worker();
-        if (g_worker.done) {
-            DeleteFiber(g_worker.fiber);
-            g_worker.fiber = NULL;
+    for (n = 0; n < MAX_GUEST_WORKERS; ++n) {
+        unsigned i = (g_worker_round_robin + n) % MAX_GUEST_WORKERS;
+        worker_state_t *w = &g_workers[i];
+        int due = 0;
+
+        if (!w->fiber || !w->started || !w->parked || w->done)
+            continue;
+        if (w->waiting) {
+            DWORD result = WaitForSingleObjectEx(w->wait_handle, 0, FALSE);
+            if (result == WAIT_OBJECT_0) {
+                w->wait_status = STATUS_SUCCESS;
+                w->wait_ready = 1;
+                due = 1;
+            } else if (result == WAIT_FAILED) {
+                w->wait_status = STATUS_UNSUCCESSFUL;
+                w->wait_ready = 1;
+                due = 1;
+            } else if (w->wait_deadline != INFINITE &&
+                       (int)(GetTickCount() - w->wait_deadline) >= 0) {
+                w->wait_status = STATUS_TIMEOUT;
+                w->wait_ready = 1;
+                due = 1;
+            }
+        } else {
+            due = (int)(GetTickCount() - w->wake_tick) >= 0;
         }
+        if (!due)
+            continue;
+
+        g_worker_round_robin = (i + 1) % MAX_GUEST_WORKERS;
+        worker_switch_to_worker(w);
+        worker_reap_finished(w);
+        return;
     }
 }
 
 static void WINAPI worker_fiber_main(LPVOID param)
 {
-    (void)param;
-    g_worker_active = 1;
+    worker_state_t *w = (worker_state_t *)param;
+    g_current_worker = w;
+    g_worker_active++;
     /* Reserve the TIB/stack-base metadata immediately below the stack top;
      * the worker's first pushes must not overwrite FS:[4]-0x14. */
-    g_esp = XBOX_WORKER_STACK_TOP - 0x20u;
+    g_esp = w->stack_top - 0x20u;
     g_seh_ebp = g_esp;
 
-    BRIDGE_MEM32(XBOX_WORKER_STACK_TOP - 0x14u) =
-        XBOX_WORKER_STACK_TOP - 0x10u;
+    BRIDGE_MEM32(w->stack_top - 0x14u) = w->stack_top - 0x10u;
 
 
     /* Xbox thread start routines receive (StartContext1, StartContext2). */
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = g_worker.ctx2;
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = g_worker.ctx1;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = w->ctx2;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = w->ctx1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
 
-    if (setjmp(g_worker_exit_jmp) == 0) {
-        g_worker.fn();
+    if (setjmp(w->exit_jmp) == 0) {
+        w->fn();
+        w->exit_status = 0;
         fprintf(stderr, "  [KERNEL] worker routine returned\n");
     } else {
         fprintf(stderr, "  [KERNEL] worker unwound via PsTerminateSystemThread\n");
     }
     fflush(stderr);
-    g_worker_active = 0;
-    g_worker.done = 1;
-    g_worker.parked = 0;
+    g_worker_active--;
+    w->done = 1;
+    w->parked = 0;
+    BRIDGE_MEM8(w->object + 4) = 1;
+    BRIDGE_MEM32(w->object + 0x120) = w->exit_status;
     worker_switch_to_main();   /* never returns */
 }
 
@@ -458,12 +537,14 @@ static void bridge_PsCreateSystemThreadEx(void)
     uint32_t xbox_handle_ptr = STACK_ARG(0);
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
+    uint32_t create_suspended = STACK_ARG(7);
     uint32_t start_routine   = STACK_ARG(9);
     int is_first_call = (g_thread_call_count == 0);
     g_thread_call_count++;
 
-    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
-            g_thread_call_count, start_routine, start_context1, start_context2);
+    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X suspended=%u\n",
+            g_thread_call_count, start_routine, start_context1, start_context2,
+            create_suspended);
     fflush(stderr);
 
     /* Write a fake handle to the output pointer */
@@ -495,26 +576,57 @@ static void bridge_PsCreateSystemThreadEx(void)
                 fn();
                 g_esp += 12;
             } else {
+                worker_state_t *w = NULL;
+                unsigned i;
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawning worker 0x%08X (ctx=0x%08X)\n",
                         start_routine, start_context1);
                 fflush(stderr);
 
                 if (!g_main_fiber)
                     g_main_fiber = ConvertThreadToFiber(NULL);
-                g_worker.fn = fn;
-                g_worker.ctx1 = start_context1;
-                g_worker.ctx2 = start_context2;
-                g_worker.parked = 0;
-                g_worker.done = 0;
-                g_worker.fiber = CreateFiber(0, worker_fiber_main, NULL);
-                if (g_worker.fiber) {
-                    worker_switch_to_worker();
-                    /* Worker parked on KeDelay or finished; main resumes here. */
-                    if (g_worker.done) {
-                        DeleteFiber(g_worker.fiber);
-                        g_worker.fiber = NULL;
+                for (i = 0; i < MAX_GUEST_WORKERS; ++i) {
+                    if (!g_workers[i].object) {
+                        w = &g_workers[i];
+                        break;
                     }
-                } else {
+                }
+                if (!w) {
+                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: worker table full\n");
+                    g_eax = 0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
+                    return;
+                }
+                memset(w, 0, sizeof(*w));
+                w->fn = fn;
+                w->ctx1 = start_context1;
+                w->ctx2 = start_context2;
+                w->handle = GUEST_WORKER_HANDLE_BASE + i;
+                w->object = xbox_HeapAlloc(0x128, 4);
+                if (!w->object) {
+                    memset(w, 0, sizeof(*w));
+                    g_eax = 0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
+                    return;
+                }
+                BRIDGE_MEM8(w->object + 4) = 0;
+                BRIDGE_MEM32(w->object + 0x120) = 0x103u; /* STATUS_PENDING */
+                {
+                    uint32_t stack = xbox_HeapAlloc(XBOX_WORKER_STACK_SIZE, 4096);
+                    if (!stack) {
+                        memset(w, 0, sizeof(*w));
+                        g_eax = 0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
+                        return;
+                    }
+                    w->stack_top = stack + XBOX_WORKER_STACK_SIZE - 16u;
+                }
+                w->started = !create_suspended;
+                w->parked = !!create_suspended;
+                w->fiber = CreateFiber(0, worker_fiber_main, w);
+                if (xbox_handle_ptr)
+                    BRIDGE_MEM32(xbox_handle_ptr) = w->handle;
+                if (w->fiber && w->started) {
+                    worker_switch_to_worker(w);
+                    /* Worker parked on KeDelay or finished; main resumes here. */
+                    worker_reap_finished(w);
+                } else if (!w->fiber) {
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: CreateFiber failed\n");
                     fflush(stderr);
                 }
@@ -543,6 +655,35 @@ static int     s_handle_file_slot[BRIDGE_HANDLE_MAX];
 
 static void   bridge_write_handle(uint32_t handle_va, HANDLE h);
 static HANDLE bridge_take_handle(uint32_t token);
+static HANDLE bridge_read_handle(uint32_t token);
+static void bridge_NtResumeThread(void);
+static void bridge_NtWaitForSingleObjectEx(void);
+
+static worker_state_t *worker_from_handle(uint32_t handle)
+{
+    uint32_t i = handle - GUEST_WORKER_HANDLE_BASE;
+    return i < MAX_GUEST_WORKERS && g_workers[i].handle == handle
+        ? &g_workers[i] : NULL;
+}
+
+static int guest_stack_contains_esp(uint32_t esp)
+{
+    uint32_t i;
+
+    if (esp >= 0x00770000u && esp <= 0x02780FFFu)
+        return 1;
+    for (i = 0; i < MAX_GUEST_WORKERS; ++i) {
+        const worker_state_t *w = &g_workers[i];
+        uint32_t stack_base;
+
+        if (!w->fiber || !w->stack_top)
+            continue;
+        stack_base = w->stack_top + 16u - XBOX_WORKER_STACK_SIZE;
+        if (esp >= stack_base && esp <= w->stack_top)
+            return 1;
+    }
+    return 0;
+}
 
 static void bridge_NtClose(void)
 {
@@ -550,6 +691,13 @@ static void bridge_NtClose(void)
     int file_slot = 0;
 
     /* Close real handles but skip fake/synthetic ones */
+    worker_state_t *worker = worker_from_handle(raw_handle);
+    if (worker) {
+        worker->handle = 0;
+        worker_reap_finished(worker);
+        g_eax = 0;
+        return;
+    }
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         if ((raw_handle & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
             uint32_t ti = raw_handle & BRIDGE_HANDLE_MASK;
@@ -730,8 +878,8 @@ static void bridge_NtAllocateVirtualMemory(void)
         return;
     }
 
-    /* Allocate from Xbox heap (MEM_RESERVE or MEM_RESERVE|MEM_COMMIT) */
-    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    /* Reserve guest VA independently from kernel-owned allocations. */
+    uint32_t xbox_va = xbox_VirtualAlloc(size, 4096);
     if (!xbox_va) {
         fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: HEAP REJECT size=%u base_hint=0x%08X type=0x%X prot=0x%X\n",
                 size, base_hint, alloc_type, protect);
@@ -1100,7 +1248,8 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t interval_va = STACK_ARG(2);
     static unsigned trace_delay;
 
-    if (g_worker_active) {
+    if (g_current_worker) {
+        worker_state_t *w = g_current_worker;
         /* Worker context: the whole recomp runs on one host thread, so a
          * native Sleep here would stall the pump too. Park the worker and
          * let the main fiber resume it when the delay has elapsed. */
@@ -1118,62 +1267,23 @@ static void bridge_KeDelayExecutionThread(void)
                     (unsigned long long)g_icall_count,
                     (unsigned long)GetCurrentThreadId(), interval_va,
                     iv ? (long long)iv->QuadPart : 0LL,
-                    (unsigned long)ms, g_worker.parked, g_worker_active,
+                    (unsigned long)ms, w->parked, g_worker_active,
                     g_esp);
             fflush(stderr);
         }
         if (ms > 0) {
-            /* Park on guest progress, not only on wall clock.
-             *
-             * A KeDelayExecutionThread of N ms means "about this much game
-             * time". We execute orders of magnitude slower than a 733 MHz
-             * Xbox, so a wall-clock deadline lets the other fiber run far
-             * more guest code during the delay than the title expects - and
-             * the faster the host build, the worse the skew. That is why
-             * removing the _penter overhead (MM3_PENTER_LIGHT, or
-             * MM3_GENERATED_PENTER=OFF) reproducibly crashes in the asset
-             * parser with a NULL source: main outruns the worker that is
-             * still filling the object at 0x01448070. Gating on icall
-             * progress as well keeps the relative schedule stable no matter
-             * how fast the host runs.
-             *
-             * BOTH deadlines must pass, and the guest-progress one dominates.
-             * A KeDelay of 1 ms is ~700,000 instructions on a 733 MHz Xbox,
-             * but ic advances only ~4,400/sec here - so a wall-clock-only
-             * wake gives the other fiber about 4 guest calls per park. That
-             * is what starves the main fiber: MM3's worker blends a screen
-             * (tens of thousands of guest calls, almost no kernel calls) and
-             * then delays 1 ms, so main was getting a rounding error's worth
-             * of execution per blend. Measured: the worker's blend loop holds
-             * 99,000 profile samples against 12 for everything else.
-             *
-             * An earlier version of this used ||, which made the bound inert
-             * because the tick is due almost immediately. Calibration is
-             * tunable via MM3_ICALLS_PER_MS. */
-            {
-                static unsigned long long s_icalls_per_ms;
-                if (!s_icalls_per_ms) {
-                    const char *e = getenv("MM3_ICALLS_PER_MS");
-                    /* ~700k instructions per guest ms; indirect calls are a
-                     * fraction of that. 7,000 keeps the worker's duty cycle
-                     * near its intent instead of ~4 calls per park. */
-                    s_icalls_per_ms = e ? strtoull(e, NULL, 10) : 7000ull;
-                    if (!s_icalls_per_ms) s_icalls_per_ms = 1ull;
-                }
-                g_worker.wake_icall = g_icall_count +
-                    (unsigned long long)ms * s_icalls_per_ms;
-            }
-            g_worker.wake_tick = GetTickCount() + ms;
-            g_worker.parked = 1;
+            /* Xbox delays expire from the kernel timer, not guest call count. */
+            w->wake_tick = GetTickCount() + ms;
+            w->parked = 1;
             worker_switch_to_main();   /* resumes when the delay is due */
-            g_worker.parked = 0;
+            w->parked = 0;
             if (getenv("MM3_TRACE_DELAY") && g_icall_count >= 300000ULL &&
                 trace_delay++ < 128) {
                 fprintf(stderr, "[DELAY-RESUME] ic=%llu tid=%lu parked=%d "
                         "done=%d eax=%08X esp=%08X\n",
                         (unsigned long long)g_icall_count,
                         (unsigned long)GetCurrentThreadId(),
-                        g_worker.parked, g_worker.done, g_eax, g_esp);
+                        w->parked, w->done, g_eax, g_esp);
                 fflush(stderr);
             }
         }
@@ -1281,11 +1391,12 @@ static void bridge_PsTerminateSystemThread(void)
 {
     uint32_t exit_status = STACK_ARG(0);
 
-    if (g_worker_active) {
+    if (g_current_worker) {
+        worker_state_t *w = g_current_worker;
         fprintf(stderr, "  [KERNEL] PsTerminateSystemThread: status=0x%08X - worker unwind\n", exit_status);
-    fflush(stderr);
-        g_worker_active = 0;
-        longjmp(g_worker_exit_jmp, 1);
+        fflush(stderr);
+        w->exit_status = exit_status;
+        longjmp(w->exit_jmp, 1);
     }
 
     fprintf(stderr, "  [KERNEL] PsTerminateSystemThread: status=0x%08X - calling ExitThread\n", exit_status);
@@ -1423,6 +1534,9 @@ static void bridge_KeConnectInterrupt(void)
     uint32_t interrupt_va = STACK_ARG(0);
     g_eax = xbox_KeConnectInterrupt(
         (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(interrupt_va));
+    if (getenv("MM3_TRACE_DSOUND_INIT"))
+        fprintf(stderr, "[DSOUND-IRQ] connect va=%08X result=%08X\n",
+                interrupt_va, (unsigned)g_eax);
 }
 
 static void bridge_KeDisconnectInterrupt(void)
@@ -1472,7 +1586,7 @@ static void bridge_KeSetTimer(void)
     g_eax = 0;
 }
 
-/* ── ExQueryPoolBlockSize (ordinal 24) ────────────────────
+/* ── ExQueryPoolBlockSize (ordinal 23) ────────────────────
  * ULONG ExQueryPoolBlockSize(PVOID PoolBlock)
  *
  * Returns the size of a pool memory block.
@@ -1598,6 +1712,113 @@ static HANDLE bridge_read_handle(uint32_t token)
     return (HANDLE)(uintptr_t)token;
 }
 
+static DWORD bridge_timeout_ms(uint32_t timeout_va)
+{
+    LARGE_INTEGER *timeout = (LARGE_INTEGER *)XBOX_TO_NATIVE(timeout_va);
+    LONGLONG value;
+
+    if (!timeout)
+        return INFINITE;
+    value = timeout->QuadPart;
+    if (value == 0)
+        return 0;
+    if (value < 0) {
+        ULONGLONG ticks = (ULONGLONG)(-value);
+        DWORD ms = (DWORD)(ticks / 10000u);
+        return ms ? ms : 1u;
+    }
+    {
+        FILETIME ft;
+        ULARGE_INTEGER now;
+        GetSystemTimeAsFileTime(&ft);
+        now.LowPart = ft.dwLowDateTime;
+        now.HighPart = ft.dwHighDateTime;
+        return value <= (LONGLONG)now.QuadPart
+            ? 0u : (DWORD)(((ULONGLONG)value - now.QuadPart) / 10000u);
+    }
+}
+
+static void bridge_NtResumeThread(void)
+{
+    uint32_t token = STACK_ARG(0);
+    uint32_t previous_va = STACK_ARG(1);
+    worker_state_t *w = worker_from_handle(token);
+
+    if (!w) {
+        g_eax = (uint32_t)xbox_NtResumeThread(
+            bridge_read_handle(token), XBOX_TO_NATIVE(previous_va));
+        return;
+    }
+    if (getenv("MM3_TRACE_BINK_THREADS"))
+        fprintf(stderr, "[BINK-THREAD] resume handle=%08X started=%d parked=%d\n",
+                token, w->started, w->parked);
+    if (previous_va)
+        BRIDGE_MEM32(previous_va) = w->started ? 0u : 1u;
+    if (!w->started) {
+        w->started = 1;
+        w->parked = 0;
+        worker_switch_to_worker(w);
+        worker_reap_finished(w);
+    }
+    g_eax = 0;
+}
+
+static void bridge_NtWaitForSingleObjectEx(void)
+{
+    HANDLE handle = bridge_read_handle(STACK_ARG(0));
+    uint32_t wait_mode = STACK_ARG(1);
+    BOOLEAN alertable = (BOOLEAN)STACK_ARG(2);
+    uint32_t timeout_va = STACK_ARG(3);
+    worker_state_t *w = g_current_worker;
+
+    (void)wait_mode;
+    if (!w) {
+        g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
+            handle, (KPROCESSOR_MODE)wait_mode, alertable,
+            XBOX_TO_NATIVE(timeout_va));
+        return;
+    }
+    {
+        DWORD ms = bridge_timeout_ms(timeout_va);
+        DWORD result = WaitForSingleObjectEx(handle, 0, alertable);
+        if (result == WAIT_OBJECT_0) {
+            g_eax = STATUS_SUCCESS;
+            return;
+        }
+        if (result == WAIT_FAILED) {
+            g_eax = STATUS_UNSUCCESSFUL;
+            return;
+        }
+        if (ms == 0) {
+            g_eax = STATUS_TIMEOUT;
+            return;
+        }
+        w->wait_handle = handle;
+        w->wait_deadline = ms == INFINITE ? INFINITE : GetTickCount() + ms;
+        w->wait_ready = 0;
+        w->waiting = 1;
+        w->parked = 1;
+        if (getenv("MM3_TRACE_BINK_THREADS"))
+            fprintf(stderr, "[BINK-THREAD] wait park handle=%p ms=%lu worker=%08X\n",
+                    handle, (unsigned long)ms, w->handle);
+        worker_switch_to_main();
+        w->parked = 0;
+        w->waiting = 0;
+        g_eax = w->wait_ready ? (uint32_t)w->wait_status : STATUS_UNSUCCESSFUL;
+        if (getenv("MM3_TRACE_BINK_THREADS"))
+            fprintf(stderr, "[BINK-THREAD] wait ready worker=%08X status=%08X\n",
+                    w->handle, (unsigned)g_eax);
+        w->wait_ready = 0;
+    }
+}
+
+static void bridge_NtSetEvent(void)
+{
+    uint32_t previous_va = STACK_ARG(1);
+    g_eax = (uint32_t)xbox_NtSetEvent(
+        bridge_read_handle(STACK_ARG(0)), XBOX_TO_NATIVE(previous_va));
+}
+
 /* Resolve a token to a HANDLE and release its table slot (for NtClose). */
 static HANDLE bridge_take_handle(uint32_t token)
 {
@@ -1660,10 +1881,10 @@ static NTSTATUS bridge_create_file_impl(
         if ((s_res_total % 200) == 0)
             fprintf(stderr, "[FILE-COUNT] total=%d\n", s_res_total);
         if (s_res_log < 400) {
-            fprintf(stderr, "[FILE] #%d ra=%08X path='%s' st=0x%08X h=%p access=0x%X share=0x%X disp=%d opts=0x%X gle=%u seh_ebp=0x%08X\n",
+            fprintf(stderr, "[FILE] #%d ra=%08X path='%s' st=0x%08X h=%p access=0x%X attrs=0x%X share=0x%X disp=%d opts=0x%X gle=%u seh_ebp=0x%08X\n",
                     s_res_total, BRIDGE_MEM32(g_esp),
                     name.Buffer ? name.Buffer : "(null)", (uint32_t)st, h,
-                    access, share, disposition, options, gle, g_seh_ebp);
+                    access, file_attrs, share, disposition, options, gle, g_seh_ebp);
             s_res_log++;
         }
     }
@@ -1802,6 +2023,35 @@ static void bridge_NtReadFile(void)
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
+    {
+        static HANDLE s_bink_handle;
+        static unsigned s_bink_reads;
+        uint32_t first = buffer_va < 0x04000000u ? BRIDGE_MEM32(buffer_va) : 0;
+        if (getenv("MM3_TRACE_BINK_IO") && !s_bink_handle &&
+            cur.QuadPart == 0 && ios.Information >= 4 &&
+            (first == 0x664B4942u || first == 0x674B4942u ||
+             first == 0x684B4942u || first == 0x694B4942u))
+        {
+            s_bink_handle = handle;
+            g_bink_trace_active = 1;
+        }
+        if (getenv("MM3_TRACE_BINK_IO") && handle == s_bink_handle &&
+            s_bink_reads++ < 64u) {
+            uint32_t pi = g_penter_trace_idx;
+            fprintf(stderr, "[BINK-READ] ic=%llu h=%p cur=%lld len=%u "
+                    "info=%u dst=%08X data=%08X chain:",
+                    (unsigned long long)g_icall_count, handle,
+                    (long long)cur.QuadPart, length,
+                    (uint32_t)ios.Information, buffer_va, first);
+            for (unsigned i = 1; i <= 16; ++i) {
+                const char *name = recomp_probe_fn_name(
+                    g_penter_trace[(pi - i) & 255u]);
+                fprintf(stderr, " %s", name ? name : "?");
+            }
+            fputc('\n', stderr);
+            fflush(stderr);
+        }
+    }
     {
         /* MM3 run-1048 (read-only): loader-window read trace. Logs the
          * guest-requested ByteOffset (off) plus the host file pointer before
@@ -2254,11 +2504,22 @@ static void bridge_ObReferenceObjectByHandle(void)
     uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
     uint32_t object = 0;
-    /* The fake system-thread handle written by bridge_PsCreateSystemThreadEx.
-     * Workers run synchronously and have already completed by the time the
-     * game waits, so hand out a guest-resident "ready" thread object:
-     * [+4] != 0 (signaled) and [+0x120] != 0x103 (wait result), which is
-     * exactly what sub_00083989 / sub_001E7CF6 poll for. */
+    worker_state_t *worker = worker_from_handle(handle);
+
+    (void)obj_type;
+    if (worker)
+        object = worker->object;
+    if (getenv("MM3_TRACE_BINK_THREADS")) {
+        static unsigned trace_thread_ref;
+        if (trace_thread_ref++ < 32)
+            fprintf(stderr, "[THREAD-REF] ic=%llu handle=%08X object=%08X "
+                    "worker=%p started=%d parked=%d waiting=%d done=%d\n",
+                    (unsigned long long)g_icall_count, handle, object,
+                    (void *)worker, worker ? worker->started : -1,
+                    worker ? worker->parked : -1, worker ? worker->waiting : -1,
+                    worker ? worker->done : -1);
+    }
+    /* The first PsCreateSystemThreadEx call runs the main guest entry inline. */
     if (handle == 0xBEEF0001u) {
         static uint32_t s_ready_thread_obj = 0;
         if (!s_ready_thread_obj) {
@@ -2411,7 +2672,6 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
 
     /* ── Unknown stubs ── */
     case   8: return  0;  /* Unknown_8(void) */
-    case  23: return  0;  /* Unknown_23(void) */
     case  42: return  0;  /* Unknown_42(void) */
 
     /* ── HAL (continued: keep near ordinal 47 below; listed here because
@@ -2425,7 +2685,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  15: return  8;  /* ExAllocatePool(2) */
     case  16: return  8;  /* ExAllocatePoolWithTag(2) */
     /* case  17: DATA export - ExEventObjectType */
-    case  24: return  4;  /* ExQueryPoolBlockSize(1) */
+    case  23: return  4;  /* ExQueryPoolBlockSize(1) */
 
     /* ── HAL ── */
     case  40: return  4;  /* HalClearSoftwareInterrupt(1) */
@@ -2571,11 +2831,13 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 218: return 20;  /* NtQueryVolumeInformationFile(5) */
     case 219: return 32;  /* NtReadFile(8) */
     case 222: return 12;  /* NtReleaseSemaphore(3) */
+    case 224: return  8;  /* NtResumeThread(2) */
     case 225: return  8;  /* NtSetEvent(2) */
     case 226: return 20;  /* NtSetInformationFile(5) */
     case 228: return  8;  /* NtSetSystemTime(2) */
-    case 233: return 20;  /* NtWaitForMultipleObjectsEx(5) */
-    case 234: return 12;  /* NtWaitForSingleObject(3) */
+    case 233: return 12;  /* NtWaitForSingleObject(3) */
+    case 234: return 16;  /* NtWaitForSingleObjectEx(4) */
+    case 235: return 20;  /* NtWaitForMultipleObjectsEx(5) */
     case 236: return 32;  /* NtWriteFile(8) */
     case 238: return  0;  /* NtYieldExecution(void) */
 
@@ -2608,10 +2870,12 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 305: return  8;  /* RtlTimeToTimeFields(2) */
     case 308: return 12;  /* RtlUnicodeStringToAnsiString(3) */
     case 312: return 16;  /* RtlUnwind(4) */
+    case 327: return  4;  /* XeLoadSection(1) */
+    case 328: return  4;  /* XeUnloadSection(1) */
     case 354: return 12;  /* RtlRip(3) */
 
-    /* ── Xbox Identity (data exports) ── */
-    /* cases 322-328, 355-357: DATA exports */
+    /* ── Xbox Identity / loader ── */
+    /* 322-326 and 355-357 are DATA exports; 327/328 are section functions. */
 
     /* ── Port I/O ── */
     case 335: return 12;  /* WRITE_PORT_BUFFER_USHORT(3) */
@@ -2636,6 +2900,9 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
 static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 {
     switch (ordinal) {
+    case 327: return bridge_XeLoadSection;
+    case 328: return bridge_XeUnloadSection;
+
     /* Threading */
     case 255: return bridge_PsCreateSystemThreadEx;
     case 258: return bridge_PsTerminateSystemThread;
@@ -2678,7 +2945,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* Pool */
     case  15: return bridge_ExAllocatePool;
     case  16: return bridge_ExAllocatePoolWithTag;
-    case  24: return bridge_ExQueryPoolBlockSize;
+    case  23: return bridge_ExQueryPoolBlockSize;
 
     /* IRQL */
     case 160: return bridge_KfRaiseIrql;
@@ -2717,6 +2984,9 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  95: return bridge_KeBugCheck;
     case  96: return bridge_KeBugCheckEx;
     case 189: return bridge_NtCreateEvent;
+    case 224: return bridge_NtResumeThread;
+    case 225: return bridge_NtSetEvent;
+    case 234: return bridge_NtWaitForSingleObjectEx;
     case 145: return bridge_KeSetEvent;
     case 159: return bridge_KeWaitForSingleObject;
     case 238: return bridge_NtYieldExecution;
@@ -3160,7 +3430,7 @@ static void kernel_thunk_dispatch(void)
 
     /* Detect ESP corruption: after the thunk, ESP should be near esp_before
      * (the dummy return + args were popped). Large deviations indicate a bug. */
-    if (g_esp < 0x00770000 || g_esp > 0x03000000) {
+    if (!guest_stack_contains_esp(g_esp)) {
         fprintf(stderr, "  [KERNEL] ESP CORRUPTION after ordinal %u (slot %d): "
             "before=0x%08X after=0x%08X delta=%d\n",
             ordinal, slot, esp_before, g_esp, (int)(g_esp - esp_before));
@@ -3173,7 +3443,7 @@ static void kernel_thunk_dispatch(void)
     }
 
     /* ESP-guard: catch corruption immediately */
-    if (g_esp < 0x00770000 || g_esp > 0x02780FFF) {
+    if (!guest_stack_contains_esp(g_esp)) {
         fprintf(stderr, "  [FATAL] ESP corrupt after kernel call #%d: esp=0x%08X\n",
             g_kernel_call_count, g_esp);
         fflush(stderr);

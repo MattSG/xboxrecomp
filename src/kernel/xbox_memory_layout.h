@@ -186,6 +186,13 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 /**
+ * Reserve guest virtual memory from the low end of the dynamic arena.
+ * Kept separate from kernel-owned allocations so guest heaps retain the
+ * ascending address order expected by Xbox NtAllocateVirtualMemory.
+ */
+uint32_t xbox_VirtualAlloc(uint32_t size, uint32_t alignment);
+
+/**
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).
  */
 void xbox_HeapFree(uint32_t xbox_va);
