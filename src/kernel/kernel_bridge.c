@@ -1154,6 +1154,11 @@ static void bridge_MmQueryAddressProtect(void)
     g_eax = (uint32_t)xbox_MmQueryAddressProtect(XBOX_TO_NATIVE(address));
 }
 
+static void bridge_MmQueryAllocationSize(void)
+{
+    g_eax = xbox_QueryAllocationSize(STACK_ARG(0));
+}
+
 /* ── NtCreateEvent (ordinal 189) ─────────────────────────── */
 static void bridge_NtCreateEvent(void)
 {
@@ -2974,6 +2979,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 182: return bridge_MmSetAddressProtect;
     case 181: return bridge_MmQueryStatistics;
     case 179: return bridge_MmQueryAddressProtect;
+    case 180: return bridge_MmQueryAllocationSize;
 
     /* Memory - virtual */
     case 184: return bridge_NtAllocateVirtualMemory;

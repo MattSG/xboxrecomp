@@ -87,3 +87,12 @@ def test_nt_create_mutant_has_its_xbox_abi_bridge():
     assert "case 221: return bridge_NtReleaseMutant;" in dispatch
     assert "xbox_NtCreateMutant(" in create
     assert "bridge_write_handle(handle_ptr, handle);" in create
+
+
+def test_mm_query_allocation_size_uses_guest_allocation_metadata():
+    layout = (Path(__file__).parents[2] / "src/kernel/xbox_memory_layout.h").read_text()
+    assert "uint32_t xbox_QueryAllocationSize(uint32_t xbox_va);" in layout
+    dispatch = body("static bridge_func_t bridge_for_ordinal(")
+    assert "case 180: return bridge_MmQueryAllocationSize;" in dispatch
+    bridge = body("static void bridge_MmQueryAllocationSize(")
+    assert "xbox_QueryAllocationSize(STACK_ARG(0))" in bridge

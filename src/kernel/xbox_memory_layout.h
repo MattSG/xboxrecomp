@@ -192,6 +192,9 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
  */
 uint32_t xbox_VirtualAlloc(uint32_t size, uint32_t alignment);
 
+/* Return the recorded size of a shared Xbox allocator range, or zero. */
+uint32_t xbox_QueryAllocationSize(uint32_t xbox_va);
+
 /**
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).
  */

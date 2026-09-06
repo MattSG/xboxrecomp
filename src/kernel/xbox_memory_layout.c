@@ -623,6 +623,32 @@ ptrdiff_t xbox_GetMemoryOffset(void)
 static uint32_t g_virtual_next = XBOX_HEAP_BASE;
 static uint32_t g_heap_next = XBOX_HEAP_BASE + XBOX_HEAP_SIZE;
 
+typedef struct xbox_allocation_record {
+    uint32_t base;
+    uint32_t size;
+} xbox_allocation_record_t;
+
+#define XBOX_ALLOCATION_RECORDS 16384
+static xbox_allocation_record_t g_allocations[XBOX_ALLOCATION_RECORDS];
+static uint32_t g_allocation_count;
+
+static void xbox_record_allocation(uint32_t base, uint32_t size)
+{
+    if (!base || !size || g_allocation_count >= XBOX_ALLOCATION_RECORDS)
+        return;
+    g_allocations[g_allocation_count++] = (xbox_allocation_record_t){base, size};
+}
+
+uint32_t xbox_QueryAllocationSize(uint32_t xbox_va)
+{
+    for (uint32_t i = g_allocation_count; i != 0; --i) {
+        const xbox_allocation_record_t *r = &g_allocations[i - 1];
+        if (xbox_va >= r->base && xbox_va - r->base < r->size)
+            return r->size;
+    }
+    return 0;
+}
+
 static int g_heap_alloc_count = 0;
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
@@ -697,6 +723,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 
     /* Zero-fill the allocated block (Xbox memory is always zeroed) */
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    xbox_record_allocation(result, size);
 
     g_heap_alloc_count++;
     fprintf(stderr, "  [HEAP] #%d: size=%u align=%u → 0x%08X..0x%08X (used %u/%u)\n",
@@ -724,6 +751,7 @@ uint32_t xbox_VirtualAlloc(uint32_t size, uint32_t alignment)
 
     g_virtual_next = result + size;
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    xbox_record_allocation(result, size);
     return result;
 }
 
