@@ -1399,8 +1399,6 @@ static void bridge_AvSetDisplayMode(void)
                 pitch, fb, g_esp);
 
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
-    if (step == 0)
-        d3d8_PresentFrameFrom("av-setmode");
     g_eax = 0;
 }
 
