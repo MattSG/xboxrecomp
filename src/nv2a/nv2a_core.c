@@ -59,7 +59,7 @@ void nv2a_register_dma_object(uint32_t handle, uint32_t dma_class,
 
     uint32_t context = (instance >> 4) | (1u << 16) |
                        ((channel_id & 0x1Fu) << 24) | 0x80000000u;
-    hwaddr off = 0x1F0000u + (hwaddr)hash * 8u;
+    hwaddr off = (hwaddr)hash * 8u;
     if (off + 8u > memory_region_size(&d->ramin)) return;
     memcpy(d->ramin_ptr + off, &handle, 4);
     memcpy(d->ramin_ptr + off + 4, &context, 4);
@@ -77,7 +77,7 @@ void nv2a_trace_ramht_lookup(uint32_t handle, uint32_t channel_id,
     uint32_t hash = 0;
     for (uint32_t h = handle; h; h >>= 11) hash ^= h & 0x7FFu;
     hash ^= (channel_id & 0x1Fu) << 7;
-    hwaddr off = 0x1F0000u + (hwaddr)hash * 8u;
+    hwaddr off = (hwaddr)hash * 8u;
     uint32_t entry_handle = 0, context = 0;
     if (off + 8u <= memory_region_size(&d->ramin)) {
         memcpy(&entry_handle, d->ramin_ptr + off, 4);
@@ -89,7 +89,7 @@ void nv2a_trace_ramht_lookup(uint32_t handle, uint32_t channel_id,
     if (getenv("MM3_TRACE_RAMHT")) {
         uint32_t probe[4][2] = {{0}};
         for (unsigned int i = 0; i < 4; ++i) {
-            hwaddr poff = 0x1F0000u + (hwaddr)((hash + i) & 0x7FFu) * 8u;
+            hwaddr poff = (hwaddr)((hash + i) & 0x7FFu) * 8u;
             if (poff + 8u <= memory_region_size(&d->ramin)) {
                 memcpy(&probe[i][0], d->ramin_ptr + poff, 4);
                 memcpy(&probe[i][1], d->ramin_ptr + poff + 4, 4);
@@ -109,7 +109,7 @@ int nv2a_bind_ramht_object(uint32_t handle, uint32_t channel_id,
     uint32_t hash = 0;
     for (uint32_t h = handle; h; h >>= 11) hash ^= h & 0x7FFu;
     hash ^= (channel_id & 0x1Fu) << 7;
-    hwaddr off = 0x1F0000u + (hwaddr)hash * 8u;
+    hwaddr off = (hwaddr)hash * 8u;
     uint32_t entry = 0, context = 0;
     if (!d || !d->ramin_ptr || off + 8u > memory_region_size(&d->ramin))
         return 0;
@@ -129,7 +129,7 @@ void nv2a_register_ramht_entry(uint32_t handle, uint32_t hash,
 {
     NV2AState *d = g_nv2a;
     if (!d || !d->ramin_ptr) return;
-    hwaddr off = 0x1F0000u + (hwaddr)(hash & 0x7FFu) * 8u;
+    hwaddr off = (hwaddr)(hash & 0x7FFu) * 8u;
     if (off + 8u > memory_region_size(&d->ramin)) return;
     memcpy(d->ramin_ptr + off, &handle, 4);
     memcpy(d->ramin_ptr + off + 4, &context, 4);
@@ -1058,11 +1058,10 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
     qemu_cond_init(&d->pfifo.fifo_cond);
     qemu_cond_init(&d->pfifo.fifo_idle_cond);
 
-    /* Xbox GPU bootstrap places the 4 KiB RAMHT at PRAMIN 0x1F0000.
-     * The standalone host has no MCPX/BIOS PFIFO setup, so leaving this
-     * register zero makes every otherwise-natural object lookup read RAMHT
-     * from PRAMIN zero (the DMA-object area). */
-    d->pfifo.regs[NV_PFIFO_RAMHT] = 0x000001F0;
+    /* The guest's PFIFO setup writes its RAMHT entries at PRAMIN offset 0
+     * (handles 0x0D/0x0E/0x10 land at offsets 0x68/0x70/0x80).  Keep the
+     * standalone register aligned with that guest-owned table. */
+    d->pfifo.regs[NV_PFIFO_RAMHT] = 0x00000000;
 
     /* Phase-1 stub: report the GPU as idle with the pushbuffer drained.
      * sub_00347E6D blocks until CACHE1_STATUS LOW_MARK (0x3214 bit 0x10) and
