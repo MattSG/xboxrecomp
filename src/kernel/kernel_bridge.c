@@ -1193,6 +1193,12 @@ static void bridge_NtCreateMutant(void)
     g_eax = (uint32_t)status;
 }
 
+static void bridge_NtReleaseMutant(void)
+{
+    g_eax = (uint32_t)xbox_NtReleaseMutant(
+        bridge_read_handle(STACK_ARG(0)), XBOX_TO_NATIVE(STACK_ARG(1)));
+}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
@@ -2843,6 +2849,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 217: return 16;  /* NtQueryVirtualMemory(4) */
     case 218: return 20;  /* NtQueryVolumeInformationFile(5) */
     case 219: return 32;  /* NtReadFile(8) */
+    case 221: return  8;  /* NtReleaseMutant(2) */
     case 222: return 12;  /* NtReleaseSemaphore(3) */
     case 224: return  8;  /* NtResumeThread(2) */
     case 225: return  8;  /* NtSetEvent(2) */
@@ -2998,6 +3005,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  96: return bridge_KeBugCheckEx;
     case 189: return bridge_NtCreateEvent;
     case 192: return bridge_NtCreateMutant;
+    case 221: return bridge_NtReleaseMutant;
     case 224: return bridge_NtResumeThread;
     case 225: return bridge_NtSetEvent;
     case 234: return bridge_NtWaitForSingleObjectEx;

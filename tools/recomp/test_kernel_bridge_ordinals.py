@@ -77,5 +77,7 @@ def test_nt_create_mutant_has_its_xbox_abi_bridge():
 
     assert "case 192: return 12;  /* NtCreateMutant(3) */" in args
     assert "case 192: return bridge_NtCreateMutant;" in dispatch
+    assert "case 221: return  8;  /* NtReleaseMutant(2) */" in args
+    assert "case 221: return bridge_NtReleaseMutant;" in dispatch
     assert "xbox_NtCreateMutant(" in create
     assert "bridge_write_handle(handle_ptr, handle);" in create
