@@ -126,7 +126,9 @@ static void pgraph_untwiddle32(uint32_t *dst, const uint32_t *src,
 
 static IDirect3DTexture8 *pgraph_upload_vram_texture(IDirect3DDevice8 *dev,
                                                      uint32_t vram_off,
-                                                     uint32_t fmt)
+                                                     uint32_t fmt,
+                                                     uint32_t rect_w,
+                                                     uint32_t rect_h)
 {
     uint32_t vram_size = 0;
     uint8_t *vram = nv2a_get_vram(&vram_size);
@@ -138,6 +140,12 @@ static IDirect3DTexture8 *pgraph_upload_vram_texture(IDirect3DDevice8 *dev,
     uint32_t cf = TEXFMT_COLOR(fmt);
     uint32_t w  = 1u << TEXFMT_LOG_W(fmt);
     uint32_t h  = 1u << TEXFMT_LOG_H(fmt);
+    /* Linear render-target blits carry their actual extent in IMAGE_RECT;
+     * the format's base-size bits remain the hardware tile size (2x1 here). */
+    if (rect_w >= 4 && rect_w <= 2048 && rect_h >= 4 && rect_h <= 2048) {
+        w = rect_w;
+        h = rect_h;
+    }
 
     if (trace)
         fprintf(stderr, "[TEX] off=%08X fmt=%08X colour=%02X dim=%u %ux%u\n",
@@ -158,7 +166,8 @@ static IDirect3DTexture8 *pgraph_upload_vram_texture(IDirect3DDevice8 *dev,
     }
 
     IDirect3DTexture8 *tex = NULL;
-    HRESULT hr = dev->lpVtbl->CreateTexture(dev, w, h, 1, 0, 0x06, 0, &tex);
+    D3DFORMAT d3d_fmt = pgraph_fmt_is_swizzled(cf) ? 0x06 : 0x12;
+    HRESULT hr = dev->lpVtbl->CreateTexture(dev, w, h, 1, 0, d3d_fmt, 0, &tex);
     if (hr != 0 || !tex) {
         if (trace) fprintf(stderr, "[TEX] CreateTexture failed hr=%08X\n", hr);
         return NULL;
@@ -313,6 +322,7 @@ static struct {
         uint32_t control0;   /* Control0 register (method 0x1B08) */
         int enabled;         /* Decoded from control0 bit 30 */
     } tex[4];
+    uint32_t image_rect;
 
     /* Cached texture pointers */
     void *menu_texture;           /* IDirect3DTexture8* from Global.txd */
@@ -425,6 +435,8 @@ static void submit_draw(void)
         return;
 
     const uint32_t *src = g_pg.inline_data;
+    const float tex_u_extent = (float)(g_pg.surface_clip_h >> 16);
+    const float tex_v_extent = (float)(g_pg.surface_clip_v >> 16);
     int actual_prim_type = g_pg.d3d_prim_type;
     uint32_t out_vert_count = num_verts;
 
@@ -468,6 +480,10 @@ static void submit_draw(void)
         out[dst_idx].rhw   = 1.0f; \
         out[dst_idx].u     = u2f(g_pg.attr_immediate ? src[_b + 0] : src[_b + 2]); \
         out[dst_idx].v     = u2f(g_pg.attr_immediate ? src[_b + 1] : src[_b + 3]); \
+        if (g_pg.attr_immediate && tex_u_extent > 0.0f && fabsf(out[dst_idx].u) > 1.0f) \
+            out[dst_idx].u /= tex_u_extent; \
+        if (g_pg.attr_immediate && tex_v_extent > 0.0f && fabsf(out[dst_idx].v) > 1.0f) \
+            out[dst_idx].v /= tex_v_extent; \
         out[dst_idx].color = g_pg.attr_immediate ? 0xFFFFFFFFu : src[_b + 4]; \
         pgraph_apply_composite(&out[dst_idx].x, &out[dst_idx].y, \
                                &out[dst_idx].z, &out[dst_idx].rhw); \
@@ -555,7 +571,11 @@ static void submit_draw(void)
     /* DrawPrimitiveUP prepares the device pipeline from the current shader;
      * bind the game NV2A program after the FVF setup, not earlier at PB method
      * execution where this call would overwrite it. */
-    prepare_vsh();
+    /* Immediate 2D vertices already carry transformed screen coordinates.
+     * The startup program has no declared vertex inputs; binding it here
+     * discards the inline stream and produces a flat/empty output. */
+    if (!g_pg.attr_immediate)
+        prepare_vsh();
 
     /* Bind texture based on NV2A VRAM offset.
      * Game-specific texture mapping is handled via GAME_HAS_FONT_ATLAS
@@ -643,7 +663,8 @@ static void submit_draw(void)
             if (s_cached_tex && off == s_cached_off && fmt == s_cached_fmt) {
                 tex = s_cached_tex;
             } else {
-                tex = pgraph_upload_vram_texture(dev, off, fmt);
+                tex = pgraph_upload_vram_texture(dev, off, fmt,
+                    g_pg.image_rect >> 16, g_pg.image_rect & 0xFFFFu);
                 if (tex) {
                     if (s_cached_tex) s_cached_tex->lpVtbl->Release(s_cached_tex);
                     s_cached_tex = tex;
@@ -1013,6 +1034,13 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         g_pg.tex[stage].enabled = (param >> 30) & 1;
         return 1;
     }
+
+    case 0x1B1C: /* NV097_SET_TEXTURE_IMAGE_RECT */
+        g_pg.image_rect = param;
+        if (getenv("MM3_TRACE_TEX"))
+            fprintf(stderr, "[TEX] image_rect=%08X %ux%u\n",
+                    param, param >> 16, param & 0xFFFFu);
+        return 1;
 
     case NV097_SET_FLIP_READ:
         g_pg.flip_read = param;
