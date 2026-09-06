@@ -68,3 +68,14 @@ def test_bink_worker_thread_ordinals_and_scheduler_are_live():
     scheduler = body("static void worker_resume_if_due(")
     assert "MM3_ICALLS_PER_MS" not in delay
     assert "g_icall_count >= w->wake_icall" not in scheduler
+
+
+def test_nt_create_mutant_has_its_xbox_abi_bridge():
+    args = body("static int stdcall_args_for_ordinal(")
+    dispatch = body("static bridge_func_t bridge_for_ordinal(")
+    create = body("static void bridge_NtCreateMutant(")
+
+    assert "case 192: return 12;  /* NtCreateMutant(3) */" in args
+    assert "case 192: return bridge_NtCreateMutant;" in dispatch
+    assert "xbox_NtCreateMutant(" in create
+    assert "bridge_write_handle(handle_ptr, handle);" in create

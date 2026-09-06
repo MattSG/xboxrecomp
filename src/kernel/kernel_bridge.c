@@ -1181,6 +1181,18 @@ static void bridge_NtCreateEvent(void)
     g_eax = (uint32_t)status;
 }
 
+static void bridge_NtCreateMutant(void)
+{
+    uint32_t handle_ptr = STACK_ARG(0);
+    HANDLE handle = NULL;
+    NTSTATUS status = xbox_NtCreateMutant(
+        &handle, XBOX_TO_NATIVE(STACK_ARG(1)), (BOOLEAN)STACK_ARG(2));
+
+    if (NT_SUCCESS(status) && handle_ptr)
+        bridge_write_handle(handle_ptr, handle);
+    g_eax = (uint32_t)status;
+}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
@@ -2814,6 +2826,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 187: return  4;  /* NtClose(1) */
     case 189: return 16;  /* NtCreateEvent(4) */
     case 190: return 36;  /* NtCreateFile(9) */
+    case 192: return 12;  /* NtCreateMutant(3) */
     case 193: return 16;  /* NtCreateSemaphore(4) */
     case 195: return  4;  /* NtDeleteFile(1) */
     case 196: return 40;  /* NtDeviceIoControlFile(10) */
@@ -2984,6 +2997,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  95: return bridge_KeBugCheck;
     case  96: return bridge_KeBugCheckEx;
     case 189: return bridge_NtCreateEvent;
+    case 192: return bridge_NtCreateMutant;
     case 224: return bridge_NtResumeThread;
     case 225: return bridge_NtSetEvent;
     case 234: return bridge_NtWaitForSingleObjectEx;
