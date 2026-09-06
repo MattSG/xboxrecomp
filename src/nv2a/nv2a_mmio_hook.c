@@ -69,35 +69,10 @@ static DWORD WINAPI nv2a_completion_signal_thread(LPVOID parameter)
             Sleep(1);
             continue;
         }
-        /* The original GPU interrupt is asynchronous. Wait for the guest's
-         * sub_00344640 arm/clear write before delivering the completion.
-         *
-         * Removing this gate looked justified - xemu shows dev+0x1970 holding
-         * 1 across ten presents - but that sample is taken at Present entry,
-         * not during the fence wait, so it says nothing about the arm
-         * protocol. Delivering without the gate cost 60% of the frontier
-         * (ic 327,000 against 800,000) and the texture upload stopped
-         * happening at all. The guest really does clear this to arm. */
-        Sleep(1);
-        /* MM3_NV2A_NOARM re-tests the gate above. The 60% frontier loss that
-         * justified it was measured with the ordinal-46 stack corruption in
-         * place, which sent the guest down a different fence path entirely.
-         * Under MM3_PCI46=1 the guest reaches sub_00344640 and then deadlocks
-         * against this wait, so the old measurement does not settle it. */
-        static int s_noarm = -1;
-        if (s_noarm < 0) s_noarm = getenv("MM3_NV2A_NOARM") ? 1 : 0;
-        for (unsigned i = 0; !s_noarm && i < 1000 && *state != 0; ++i)
-            Sleep(1);
-        if (!s_noarm && *state != 0) {
-            static int s_stuck_log;
-            if (s_stuck_log < 8) {
-                s_stuck_log++;
-                fprintf(stderr, "[NV2A-STUCK] pending=%ld state=%08X\n",
-                        (long)g_pending_release_count, *state);
-                fflush(stderr);
-            }
-            continue;
-        }
+        /* xemu's 0x1D70 method writes the semaphore as soon as the push
+         * buffer method is consumed; completion is not conditional on the
+         * guest's later display-arm bookkeeping at dev+0x1970. */
+        (void)state;
         if (InterlockedDecrement(&g_pending_release_count) < 0)
             continue;
         uint32_t event = dev + 0x196Cu;
