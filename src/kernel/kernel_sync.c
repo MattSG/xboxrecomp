@@ -275,6 +275,7 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     ULONG Count,
     HANDLE Handles[],
     ULONG WaitType,
+    KPROCESSOR_MODE WaitMode,
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
@@ -283,6 +284,7 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     DWORD result;
 
     /* WaitType: 0 = WaitAll, 1 = WaitAny (matches NT definitions) */
+    (void)WaitMode;
     bWaitAll = (WaitType == 0) ? TRUE : FALSE;
 
     result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);

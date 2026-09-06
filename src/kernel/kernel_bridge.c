@@ -1830,6 +1830,24 @@ static void bridge_NtWaitForSingleObjectEx(void)
     }
 }
 
+static void bridge_NtWaitForMultipleObjectsEx(void)
+{
+    uint32_t count = STACK_ARG(0);
+    uint32_t handles_va = STACK_ARG(1);
+    HANDLE handles[MAXIMUM_WAIT_OBJECTS];
+    uint32_t i;
+
+    if (!handles_va || count == 0 || count > MAXIMUM_WAIT_OBJECTS) {
+        g_eax = STATUS_INVALID_PARAMETER;
+        return;
+    }
+    for (i = 0; i < count; ++i)
+        handles[i] = bridge_read_handle(BRIDGE_MEM32(handles_va + i * 4));
+    g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
+        count, handles, STACK_ARG(2), (KPROCESSOR_MODE)STACK_ARG(3),
+        (BOOLEAN)STACK_ARG(4), XBOX_TO_NATIVE(STACK_ARG(5)));
+}
+
 static void bridge_NtSetEvent(void)
 {
     uint32_t previous_va = STACK_ARG(1);
@@ -2857,7 +2875,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 228: return  8;  /* NtSetSystemTime(2) */
     case 233: return 12;  /* NtWaitForSingleObject(3) */
     case 234: return 16;  /* NtWaitForSingleObjectEx(4) */
-    case 235: return 20;  /* NtWaitForMultipleObjectsEx(5) */
+    case 235: return 24;  /* NtWaitForMultipleObjectsEx(6) */
     case 236: return 32;  /* NtWriteFile(8) */
     case 238: return  0;  /* NtYieldExecution(void) */
 
@@ -3009,6 +3027,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 224: return bridge_NtResumeThread;
     case 225: return bridge_NtSetEvent;
     case 234: return bridge_NtWaitForSingleObjectEx;
+    case 235: return bridge_NtWaitForMultipleObjectsEx;
     case 145: return bridge_KeSetEvent;
     case 159: return bridge_KeWaitForSingleObject;
     case 238: return bridge_NtYieldExecution;

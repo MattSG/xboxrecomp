@@ -687,7 +687,7 @@ NTSTATUS __stdcall xbox_NtCreateSemaphore(PHANDLE SemaphoreHandle, PXBOX_OBJECT_
 NTSTATUS __stdcall xbox_NtReleaseSemaphore(HANDLE SemaphoreHandle, LONG ReleaseCount, PLONG PreviousCount);
 NTSTATUS __stdcall xbox_NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(HANDLE Handle, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
-NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(ULONG Count, HANDLE Handles[], ULONG WaitType, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
+NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(ULONG Count, HANDLE Handles[], ULONG WaitType, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
 NTSTATUS __stdcall xbox_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
 NTSTATUS __stdcall xbox_NtClearEvent(HANDLE EventHandle);

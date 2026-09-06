@@ -48,9 +48,15 @@ def test_bink_worker_thread_ordinals_and_scheduler_are_live():
 
     assert "case 224: return  8;  /* NtResumeThread(2) */" in args
     assert "case 234: return 16;  /* NtWaitForSingleObjectEx(4) */" in args
+    assert "case 235: return 24;  /* NtWaitForMultipleObjectsEx(6) */" in args
     assert "case 224: return bridge_NtResumeThread;" in dispatch
     assert "case 225: return bridge_NtSetEvent;" in dispatch
     assert "case 234: return bridge_NtWaitForSingleObjectEx;" in dispatch
+    assert "case 235: return bridge_NtWaitForMultipleObjectsEx;" in dispatch
+    multi = body("static void bridge_NtWaitForMultipleObjectsEx(")
+    assert "HANDLE handles[MAXIMUM_WAIT_OBJECTS];" in multi
+    assert "bridge_read_handle(BRIDGE_MEM32(handles_va + i * 4))" in multi
+    assert "(KPROCESSOR_MODE)STACK_ARG(3)" in multi
     assert "worker_state_t g_workers[MAX_GUEST_WORKERS]" in SOURCE
     assert "uint32_t create_suspended = STACK_ARG(7);" in SOURCE
     assert SOURCE.count("!guest_stack_contains_esp(g_esp)") == 2
