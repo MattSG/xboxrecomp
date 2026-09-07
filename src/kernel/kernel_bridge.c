@@ -115,6 +115,15 @@ static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
     }
 }
 
+static DWORD WINAPI kernel_tick_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = GetTickCount();
+        Sleep(1);
+    }
+}
+
 /**
  * Initialize kernel data export values at the kernel data area.
  * Called during bridge init, after Xbox memory is mapped.
@@ -141,9 +150,14 @@ static void kernel_data_init(void)
     BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) = 5849;
     BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 0;
 
-    /* KeTickCount (ordinal 156) - initialized to current tick count.
-     * A background thread in main.c updates this every ~1ms. */
+    /* KeTickCount (ordinal 156) - initialized to current tick count. */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = GetTickCount();
+
+    /* Xbox exposes this as live shared kernel data.  Start the writer here,
+     * after the bridge mapping exists, so timer consumers see natural time. */
+    static HANDLE tick_thread;
+    if (!tick_thread)
+        tick_thread = CreateThread(NULL, 0, kernel_tick_thread, NULL, 0, NULL);
 
     /* LaunchDataPage (ordinal 164) - NULL (no launch data) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = 0;

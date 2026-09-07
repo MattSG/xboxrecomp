@@ -1173,8 +1173,8 @@ class Lifter:
         # ── Privileged / special ──
         if m == "rdtsc":
             return ["/* rdtsc → edx:eax */",
-                    "edx = (uint32_t)(__rdtsc() >> 32);",
-                    "eax = (uint32_t)__rdtsc();"]
+                    "{ uint64_t _tsc = recomp_guest_rdtsc();",
+                    "  eax = (uint32_t)_tsc; edx = (uint32_t)(_tsc >> 32); }"]
         if m == "cpuid":
             return ["/* cpuid */",
                     "{ int _cpu_info[4];",
