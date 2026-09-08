@@ -457,7 +457,7 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
-        if start in (0x001EC708, 0x001E7F1B):
+        if start in (0x001EC708, 0x001E7F1B, 0x001E7B41):
             lines.append("    uint32_t _saved_ebx = ebx;")
         if start == 0x0003B493:
             lines.append("    recomp_snapshot_3b493_entry();")
@@ -731,7 +731,7 @@ class FunctionTranslator:
 
             lines.append(f"")
 
-        if start in (0x001EC708, 0x001E7F1B):
+        if start in (0x001EC708, 0x001E7F1B, 0x001E7B41):
             lines = [line.replace("return;", "ebx = _saved_ebx; return;")
                      for line in lines]
 
