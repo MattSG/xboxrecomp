@@ -1751,7 +1751,7 @@ class Lifter:
                         0x001E7D65, 0x001E82DB, 0x0017013D, 0x00025384,
                         0x00025339, 0x001EC708, 0x0016FF04, 0x0002539A,
                         0x001E7F1B, 0x001E7B41, 0x00170EC0, 0x001E7AF4,
-                        0x00083B04)) or
+                        0x00083B04, 0x000127A9)) or
                     (self.func_start == 0x001E7F1B and insn.call_target in (
                         0x00340460, 0x0033FD10, 0x00342AE0, 0x000F5050,
                         0x000F5027, 0x000F4FEF, 0x00342B00, 0x00342860)) or
