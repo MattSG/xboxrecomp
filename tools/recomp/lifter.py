@@ -1203,7 +1203,12 @@ class Lifter:
         if nops := len(ops) < 2:
             return [f"/* mov: bad operands */"]
         src = _fmt_operand_read(ops[1])
-        lines = [_fmt_operand_write(ops[0], src)]
+        lines = []
+        if self.func_start == 0x001E839C and insn.address == 0x001E8620:
+            lines.append("recomp_trace_owner_before(0x001E8620, (uint32_t)ebx, (uint32_t)eax);")
+        lines.append(_fmt_operand_write(ops[0], src))
+        if self.func_start == 0x001E839C and insn.address == 0x001E8620:
+            lines.append("recomp_trace_owner_after(0x001E8620, (uint32_t)ebx, (uint32_t)eax);")
         # Diagnostic write hooks for the D3D8LTCG internals (0x0034D8EE,
         # 0x00345740, and the 0x00340000-0x00358000 range) were removed.
         # They instrumented Microsoft's statically linked D3D8 library, which
