@@ -2583,7 +2583,20 @@ static void bridge_ObReferenceObjectByHandle(void)
         object = s_ready_thread_obj;
     }
     if (object_ptr) BRIDGE_MEM32(object_ptr) = object;
-    g_eax = 0;  /* STATUS_SUCCESS */
+
+    /* Real xboxkrnl fails this call for a handle that doesn't resolve to a
+     * live object (STATUS_INVALID_HANDLE), which is how callers know not to
+     * trust *Object. Returning STATUS_SUCCESS unconditionally - as this
+     * bridge did before - hides that from the guest: a caller that only
+     * checks the returned status for failure (the normal contract) goes on
+     * to dereference/poll an object pointer that is 0, and if that caller
+     * is a "wait until *(object+4) becomes nonzero" retry loop (as
+     * sub_00083989 in the generated MM3 code is), it spins forever on a
+     * flag byte at guest address 4 that nothing ever sets - see STATUS.md
+     * "Run9047-52". Handle 0xBEEF0001 stays synthesized/success above; any
+     * other handle that didn't resolve to a tracked worker now fails like
+     * real hardware would. */
+    g_eax = object ? 0 : 0xC0000008u; /* STATUS_SUCCESS : STATUS_INVALID_HANDLE */
 }
 
 /* ── RtlRaiseException (ordinal 302) ─────────────────────
