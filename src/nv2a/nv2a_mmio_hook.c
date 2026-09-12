@@ -622,6 +622,18 @@ void nv2a_drain_pushbuffer(void)
     if (consumed != get) {
         g_gpu_get = consumed;
         nv2a_mmio_write(nv2a_get_state(), 0x800000u + 0x44u, consumed, 4);
+
+        /* The guest arms this completion bit in sub_00342F20 and then
+         * sub_003430A0 waits for the GPU to retire the submitted work.
+         * Retirement is established here by consuming the ring span; clear
+         * the guest-visible busy bit only after that real progress. */
+        uint32_t state = devp[0x4F8 / 4];
+        /* The state pointer is the guest's synthetic MMIO base (normally
+         * 0xFD000000), so route the completion through the same register
+         * model used by the VEH rather than treating it as RAM. */
+        if (state >= 0xFD000000u && state < 0xFE000000u)
+            nv2a_mmio_write(nv2a_get_state(),
+                            (state - 0xFD000000u) + 0x8700u, 0, 4);
     }
 }
 
