@@ -756,8 +756,8 @@ class FunctionTranslator:
             # such as `mov al,1` immediately before a shared epilogue can drop
             # off the generated C function instead of reaching that epilogue.
             last = bb.last_insn
-            if (start in (0x001E7627, 0x0020F7EB) and last is not None and
-                    bb.successors):
+            if (start in (0x001E7627, 0x0020F7EB, 0x000888CF) and
+                    last is not None and bb.successors):
                 m = last.mnemonic.lower()
                 terminal = m.startswith("ret") or m in ("jmp", "ljmp")
                 if not terminal:

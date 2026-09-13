@@ -7,6 +7,7 @@ fall-through when CFG emission order places the epilogue first.
 
 import os
 import sys
+import inspect
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -33,6 +34,13 @@ def test_20f7eb_failure_falls_through_to_epilogue():
     assert "goto loc_0020F837; /* CFG fall-through */" in out[failure:]
 
 
+def test_cfg_fallthrough_special_cases_include_888cf():
+    """The Lua-stack helper has the same reordered fall-through shape."""
+    source = inspect.getsource(FunctionTranslator.translate_function)
+    assert "0x000888CF" in source
+
+
 if __name__ == "__main__":
     test_20f7eb_failure_falls_through_to_epilogue()
+    test_cfg_fallthrough_special_cases_include_888cf()
     print("ok  20f7eb_failure_falls_through_to_epilogue")
