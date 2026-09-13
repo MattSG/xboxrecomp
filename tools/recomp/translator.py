@@ -586,10 +586,17 @@ class FunctionTranslator:
         # The global is tested inline first, so a run with HLE off pays only
         # a load and a not-taken branch per call.
         if D3D8_HLE_LO <= start < D3D8_HLE_HI:
-            lines.append(
-                f"    if (g_recomp_hle_on && recomp_hle_dispatch(0x{start:08X})) return;")
+            if start == 0x00342B20:
+                lines.append("    recomp_trace_342b20_dispatch(0, 0);")
+                lines.append(
+                    f"    if (g_recomp_hle_on && recomp_hle_dispatch(0x{start:08X})) {{ recomp_trace_342b20_dispatch(1, 1); return; }}")
+                lines.append("    recomp_trace_342b20_dispatch(1, 0);")
+            else:
+                lines.append(
+                    f"    if (g_recomp_hle_on && recomp_hle_dispatch(0x{start:08X})) return;")
             lines.append(f"")
         if start in (0x001EC520, 0x001EC6EE, 0x001EC7F7, 0x001E73AF, 0x001E7627, 0x001E77F3,
+            0x001E6EAD, 0x001E83BB, 0x001E7CE2, 0x001E7CF6, 0x00342B20, 0x0020F75B, 0x0020F83B, 0x0020F7EB,
                      0x001BF1D4, 0x001BCE30,
                      0x00344A20, 0x00342B00, 0x001EC8E6, 0x001F373E,
                      0x00083BE1, 0x00083B04, 0x00083C55,
@@ -703,9 +710,23 @@ class FunctionTranslator:
                 # otherwise produce `loc_X:` immediately before `}` and fail to
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
+            if start == 0x00348200 and bb.start == 0x00348200:
+                lines.append(" recomp_trace_348200_loop();")
+            if start == 0x00342B20 and bb.start in (0x00342B77, 0x00342B85, 0x00342B96, 0x00342C01, 0x00342C12, 0x00342CFB, 0x00342D60):
+                lines.append(f"    recomp_trace_342b20_step(0x{bb.start:08X}, (uint32_t)edx, (uint32_t)ecx, (uint32_t)eax, (uint32_t)esp);")
+            if start == 0x001DB6E8 and bb.start == 0x001DB981:
+                lines.append("    recomp_trace_1db6e8_branch(0x001DB981, (uint32_t)eax, (uint32_t)ebp, (uint32_t)esp, (uint32_t)esi, (uint32_t)edi, (uint32_t)MEM32(ebp + 0x0C), (uint32_t)MEM8(ebp + 0x13), ((uint32_t)(eax) & 0xFFu) != 0);")
 
             stmts, _ = lifted_blocks[bb.start]
             for stmt in stmts:
+                if (start == 0x001DB6E8 and bb.start == 0x001DB997 and
+                        stmt.strip().startswith("if (CMP_EQ(MEM8(ebp + 0x13), 0))")):
+                    lines.append("    uint32_t _mm3_1db6e8_state = (uint32_t)MEM8(ebp + 0x13);")
+                    lines.append("    recomp_trace_1db6e8_branch(0x001DB997, (uint32_t)eax, (uint32_t)ebp, (uint32_t)esp, (uint32_t)esi, (uint32_t)edi, (uint32_t)MEM32(ebp + 0x0C), _mm3_1db6e8_state, (_mm3_1db6e8_state == 0));")
+                    stmt = stmt.replace("MEM8(ebp + 0x13)", "_mm3_1db6e8_state", 2)
+                if (start == 0x001E7627 and bb.start == 0x001E7741 and
+                        stmt.strip().startswith("if (CMP_EQ(MEM8(eax + 0x24), LO8(ebx))")):
+                    lines.append("    recomp_trace_1e7741(MEM8(eax + 0x24), LO8(ebx), eax, ebx, esi);")
                 lines.append(f"    {stmt}")
                 if (start == 0x001BCBC0 and
                         stmt.strip() == "ebp = esp + -112;"):
@@ -728,6 +749,24 @@ class FunctionTranslator:
                 if (start == 0x00093B9D and
                         "sub_00097AFC();" in stmt):
                     lines.append("    recomp_trace_97afc_result((uint32_t)eax, (uint32_t)esp);")
+
+            # A CFG walk emits reachable blocks in DFS order, not necessarily
+            # physical-address order.  Preserve an ordinary x86 fall-through
+            # when its successor was emitted earlier/later; otherwise a block
+            # such as `mov al,1` immediately before a shared epilogue can drop
+            # off the generated C function instead of reaching that epilogue.
+            last = bb.last_insn
+            if (start in (0x001E7627, 0x0020F7EB) and last is not None and
+                    bb.successors):
+                m = last.mnemonic.lower()
+                terminal = m.startswith("ret") or m in ("jmp", "ljmp")
+                if not terminal:
+                    fallthrough = last.end_address
+                    if fallthrough in bb.successors:
+                        next_start = emission_order[emission_order.index(bb) + 1].start \
+                            if emission_order.index(bb) + 1 < len(emission_order) else None
+                        if next_start != fallthrough:
+                            lines.append(f"    goto loc_{fallthrough:08X}; /* CFG fall-through */")
 
             lines.append(f"")
 
