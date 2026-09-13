@@ -743,6 +743,26 @@ class FunctionTranslator:
                         "RECOMP_ICALL_SAFE(MEM32(edi + 0x18)" in stmt):
                     lines.insert(len(lines) - 1,
                                  "    recomp_trace_1e793e_callback(MEM32(edi + 0x18), edx, MEM32(ebp + -4));")
+                if (start == 0x00088876 and
+                        "RECOMP_ICALL_SAFE(MEM32(edi)" in stmt):
+                    lines.insert(len(lines) - 1,
+                                 "    recomp_trace_guest_call(MEM32(edi), 0x000888B8);")
+                if (start == 0x0024CA76 and
+                        "RECOMP_ICALL_SAFE(MEM32(eax + 8)" in stmt):
+                    lines.insert(len(lines) - 1,
+                                 "    recomp_trace_guest_call(MEM32(eax + 8), 0x0024CA90);")
+                if (start == 0x0024CA76 and
+                        "RECOMP_ICALL_SAFE(MEM32(eax + 0x10)" in stmt):
+                    lines.insert(len(lines) - 1,
+                                 "    recomp_trace_guest_call(MEM32(eax + 0x10), 0x0024CAA1);")
+                if (start == 0x0024CA76 and
+                        "RECOMP_ICALL_SAFE(MEM32(edx + 0x34)" in stmt):
+                    lines.insert(len(lines) - 1,
+                                 "    recomp_trace_guest_call(MEM32(edx + 0x34), 0x0024CAC0);")
+                if (start == 0x002294F3 and
+                        "RECOMP_ICALL_SAFE(MEM32(eax)" in stmt):
+                    lines.insert(len(lines) - 1,
+                                 "    recomp_trace_guest_call(MEM32(eax), 0x00229501);")
                 if (start == 0x001E7AF4 and
                         stmt.strip() == "MEM32(ebp + -4) = eax;"):
                     lines.append("    recomp_trace_1e7af4_tile(edi, esi, ebp);")
@@ -756,7 +776,7 @@ class FunctionTranslator:
             # such as `mov al,1` immediately before a shared epilogue can drop
             # off the generated C function instead of reaching that epilogue.
             last = bb.last_insn
-            if (start in (0x001E7627, 0x0020F7EB, 0x000888CF) and
+            if (start in (0x001E7627, 0x0020F7EB, 0x000888CF, 0x0024CA76, 0x00195341) and
                     last is not None and bb.successors):
                 m = last.mnemonic.lower()
                 terminal = m.startswith("ret") or m in ("jmp", "ljmp")

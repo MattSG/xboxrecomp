@@ -38,6 +38,8 @@ def test_cfg_fallthrough_special_cases_include_888cf():
     """The Lua-stack helper has the same reordered fall-through shape."""
     source = inspect.getsource(FunctionTranslator.translate_function)
     assert "0x000888CF" in source
+    assert "0x0024CA76" in source
+    assert "0x00195341" in source
 
 
 if __name__ == "__main__":
