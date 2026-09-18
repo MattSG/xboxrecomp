@@ -23,7 +23,8 @@ import sys
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
-from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+from .lifter import (Lifter, lift_basic_block, flag_state_after_block,
+                     detect_seh_helpers,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
 
@@ -300,11 +301,16 @@ class FunctionTranslator:
 
         for caller, func_info in list(self.func_db.items()):
             end = func_info.get("end", caller)
-            raw_bytes = self._read_func_bytes(caller, end)
-            if not raw_bytes:
-                continue
-            instructions = self.disasm.disassemble_function(
-                raw_bytes, caller, end)
+            recovered = self._recovered_cfg.get(caller)
+            if recovered and recovered.get("instructions"):
+                end = recovered.get("end", end)
+                instructions = recovered["instructions"]
+            else:
+                raw_bytes = self._read_func_bytes(caller, end)
+                if not raw_bytes:
+                    continue
+                instructions = self.disasm.disassemble_function(
+                    raw_bytes, caller, end)
             for lower, upper in self._find_static_indirect_ranges(instructions):
                 targets = self._read_static_callback_table(
                     lower, upper, original_starts)
@@ -817,6 +823,12 @@ class FunctionTranslator:
                     continue
                 if operand.mem_base and not coalescing:
                     continue
+                if operand.mem_index and operand.mem_scale != 4:
+                    # Destructive ownership proof only understands a dword
+                    # pointer table indexed by entry number. Other SIB scales
+                    # can skip/interleave dwords, so scanning every 4 bytes
+                    # would invent case targets that runtime cannot select.
+                    continue
                 table_va = operand.mem_disp
                 if va_to_file_offset(table_va) is None:
                     continue
@@ -1124,6 +1136,15 @@ class FunctionTranslator:
             preserved_writes = set()
             pushed_value = (pushed_value_from(operands, constants)
                             if insn.mnemonic == "push" else None)
+            popped_value = None
+            pop_destination = None
+            if (insn.mnemonic == "pop" and operands
+                    and operands[0].type == "reg"
+                    and operands[0].reg in full_registers):
+                pop_destination = aliases.get(
+                    operands[0].reg, operands[0].reg)
+                popped_value = constants.get(
+                    ("mem", None, "esp", None, 1, 0, 4))
             if (insn.mnemonic == "mov" and len(operands) >= 2
                     and operands[0].type == "reg"):
                 raw_destination = operands[0].reg
@@ -1188,6 +1209,9 @@ class FunctionTranslator:
                 clear_memory(constants)
                 if pushed_value is not None:
                     constants[("mem", None, "esp", None, 1, 0, 4)] = pushed_value
+
+            if pop_destination is not None and popped_value is not None:
+                constants[pop_destination] = popped_value
 
             if (operands and operands[0].type == "mem"
                     and insn.mnemonic not in non_writers
@@ -1936,7 +1960,49 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
-        out_state = {}
+        # Solve block-entry flag provenance independently of emission order.
+        # Computed edges can jump backward to a lower-address block, so an
+        # address-ordered single pass can encounter the consumer before its
+        # real predecessor. Propagate predecessor contributions to a fixed point
+        # first, then lift every block with its settled incoming snapshot.
+        blocks_by_start = {bb.start: bb for bb in blocks}
+        flag_successors = {bb.start: set() for bb in blocks}
+        for successor, sources in preds.items():
+            for source in sources:
+                if source in flag_successors:
+                    flag_successors[source].add(successor)
+
+        flag_in_state = {start: None}
+        flag_out_state = {}
+        flag_contributions = {}
+        missing = object()
+        worklist = [start] if start in blocks_by_start else []
+        while worklist:
+            address = worklist.pop()
+            bb = blocks_by_start[address]
+            incoming = flag_in_state[address]
+            outgoing = flag_state_after_block(bb, incoming)
+            if (address in flag_out_state
+                    and flag_out_state[address] == outgoing):
+                continue
+            flag_out_state[address] = outgoing
+
+            for successor in flag_successors[address]:
+                # A function entry is also reachable from the host dispatcher,
+                # where incoming guest flags are unspecified. Preserve that
+                # conservative boundary even when guest code loops to start.
+                if successor == start:
+                    continue
+                contributions = flag_contributions.setdefault(successor, {})
+                if contributions.get(address, missing) == outgoing:
+                    continue
+                contributions[address] = outgoing
+                merged = _merge_flag_states(list(contributions.values()))
+                if (successor not in flag_in_state
+                        or flag_in_state[successor] != merged):
+                    flag_in_state[successor] = merged
+                    worklist.append(successor)
+
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -1947,21 +2013,8 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit agreed state, including compatible CMP/TEST snapshots
-            # whose source operands differ between predecessor paths.
-            # Blocks are walked in address order, so a back edge's predecessor
-            # may not be computed yet -- treat that as unknown rather than
-            # guessing at which operation produced the runtime flags.
-            sources = preds[bb.start]
-            if bb.start == start or not sources:
-                incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = _merge_flag_states(states)
-            else:
-                incoming = None
-
-            stmts, out_state[bb.start] = lift_basic_block(
+            incoming = flag_in_state.get(bb.start)
+            stmts, _ = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
@@ -2139,6 +2192,9 @@ class BatchTranslator:
             trace_functions=trace_functions)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
+        for explicit_helper in (seh_prolog, seh_epilog):
+            if explicit_helper not in (None, 0):
+                self.translator.protected_function_starts.add(explicit_helper)
         if coalesce_json_paths:
             self.translator.discover_static_indirect_targets(coalescing=True)
             for path in coalesce_json_paths:

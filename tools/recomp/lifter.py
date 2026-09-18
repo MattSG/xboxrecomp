@@ -3229,6 +3229,54 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
+def flag_state_after_block(bb, flag_state=None):
+    """Return the EFLAGS provenance leaving ``bb`` without emitting code."""
+    if flag_state:
+        last_flag_setter, last_flag_ops = flag_state
+    else:
+        last_flag_setter = None
+        last_flag_ops = []
+
+    for curr in bb.instructions:
+        if curr.mnemonic in FLAG_SETTERS:
+            last_flag_setter = curr.mnemonic
+            last_flag_ops = list(curr.operands)
+        elif curr.mnemonic in _FLAGS_UNDEFINED:
+            last_flag_setter = None
+            last_flag_ops = []
+        elif curr.mnemonic in _EFLAGS_SETTERS:
+            last_flag_setter = curr.mnemonic
+            last_flag_ops = list(curr.operands)
+        elif curr.mnemonic in _EFLAGS_PRESERVE:
+            pass
+        elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
+                               "fucomip", "fcomi"):
+            last_flag_setter = curr.mnemonic
+            last_flag_ops = list(curr.operands)
+        elif curr.mnemonic == "sahf":
+            last_flag_setter = "sahf"
+            last_flag_ops = list(curr.operands)
+        elif curr.mnemonic.startswith("f") or curr.mnemonic.startswith("cmov"):
+            pass
+        elif curr.mnemonic.startswith("j"):
+            pass
+        elif curr.mnemonic.startswith("set"):
+            pass
+        elif curr.mnemonic.startswith("rep"):
+            rest = curr.op_str.strip() if hasattr(curr, "op_str") else ""
+            raw_m = curr.mnemonic
+            if ("cmpsb" in raw_m or "scasb" in raw_m
+                    or "cmpsb" in rest or "scasb" in rest):
+                last_flag_setter = raw_m
+                last_flag_ops = list(curr.operands)
+        else:
+            last_flag_setter = None
+            last_flag_ops = []
+
+    return ((last_flag_setter, last_flag_ops)
+            if last_flag_setter else None)
+
+
 def lift_basic_block(lifter, bb, flag_state=None):
     """
     Lift a basic block to C statements.
@@ -3395,5 +3443,5 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         i += 1
 
-    out_flag_state = (last_flag_setter, last_flag_ops) if last_flag_setter else None
+    out_flag_state = flag_state_after_block(bb, flag_state)
     return stmts, out_flag_state
