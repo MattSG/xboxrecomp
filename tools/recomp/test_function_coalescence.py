@@ -876,6 +876,19 @@ def test_backward_computed_edge_preserves_flag_state():
     assert "if (_flags /* jge" not in target_body
 
 
+def test_loop_branch_preserves_flag_state_for_successor():
+    successor = BASE + 5
+    done = BASE + 9
+    body = bytes.fromhex("83f805e1047d029090c3")
+    subject = translator(body, [])
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+
+    successor_body = code.split(f"loc_{successor:08X}:", 1)[1]
+    successor_body = successor_body.split(f"loc_{done:08X}:", 1)[0]
+    assert "CMP_GE(" in successor_body
+    assert "if (_flags /* jge" not in successor_body
+
+
 def test_resolved_register_edge_participates_in_join_proof():
     target = BASE + 18
     continuation = BASE + 20

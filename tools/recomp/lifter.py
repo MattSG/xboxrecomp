@@ -3258,7 +3258,7 @@ def flag_state_after_block(bb, flag_state=None):
             last_flag_ops = list(curr.operands)
         elif curr.mnemonic.startswith("f") or curr.mnemonic.startswith("cmov"):
             pass
-        elif curr.mnemonic.startswith("j"):
+        elif curr.mnemonic.startswith(("j", "loop")):
             pass
         elif curr.mnemonic.startswith("set"):
             pass
