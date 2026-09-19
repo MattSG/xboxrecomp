@@ -24,6 +24,7 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, flag_state_after_block,
+                     _RESULT_SNAPSHOT_SETTERS,
                      detect_seh_helpers,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
