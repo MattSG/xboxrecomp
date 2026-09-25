@@ -263,6 +263,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             hc->reg[HcDoneHead / 4] = 0;
         }
         *r &= ~v;                       /* write 1 to clear                 */
+        hc->ack_seq++;
         return;
 
     case HcInterruptEnable:
@@ -1016,7 +1017,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         /* A stuck source is one the handler never clears, which shows up as
          * the same status delivered over and over. Counting deliveries alone
          * would trip on a device that is simply busy. */
-        if (status == last_status) {
+        if (status == last_status && hc->ack_seq == last_ack) {
             if (++repeats > 200) {
                 fprintf(stderr, "  [OHCI0] status %08X delivered 200 times "
                                 "without being cleared; stopping\n", status);
