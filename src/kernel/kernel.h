@@ -106,6 +106,9 @@ enum {
 #ifndef STATUS_NO_MEMORY
 #define STATUS_NO_MEMORY                ((NTSTATUS)0xC0000017L)
 #endif
+#ifndef STATUS_CONFLICTING_ADDRESSES
+#define STATUS_CONFLICTING_ADDRESSES    ((NTSTATUS)0xC0000018L)
+#endif
 #ifndef STATUS_ALREADY_COMMITTED
 #define STATUS_ALREADY_COMMITTED        ((NTSTATUS)0xC0000021L)
 #endif
@@ -787,6 +790,10 @@ int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlTransitions(void);
 void    xbox_IrqlDumpHolders(void);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
+
+/* This thread entering (+1) or leaving (-1) kernel code that may hold host
+ * locks; NtSuspendThread only leaves a thread suspended outside it. */
+void    xbox_kernel_busy(int delta);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 
 VOID    __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds);

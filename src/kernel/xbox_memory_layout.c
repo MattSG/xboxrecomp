@@ -872,6 +872,48 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* Pushbuffer executor load over the last second, in percent. */
+static int s_exec_busy_pct;
+int nv2a_exec_busy_percent(void) { return s_exec_busy_pct; }
+
+static void nv2a_ack_flags(volatile uint32_t *regs)
+{
+    for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+        if (*r & NV2A_ACK[i].busy_mask) {
+            *r &= ~NV2A_ACK[i].busy_mask;
+        }
+    }
+    for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+        if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
+            *r |= NV2A_IDLE[i].idle_mask;
+        }
+    }
+}
+
+/* Busy/idle flags, on a thread of their own.
+ *
+ * Software sets a request bit and spins until "hardware" clears it -- XDK
+ * D3D's CDevice::KickOff does this on every kickoff ([nv2a + 0x100410] bit
+ * 16, the write-combine flush). The thread below this one also runs the
+ * pushbuffer executor and the render back end, so one pass of it can take a
+ * whole frame; with the flags cleared only there, every kickoff waited a
+ * frame. X-Men Legends' mission load, thousands of kickoffs long, looked
+ * frozen on its loading screen. Clearing the flags is a few loads and stores,
+ * so it gets a loop that does nothing else. */
+static DWORD WINAPI nv2a_flag_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        nv2a_ack_flags(regs);
+        Sleep(0);
+    }
+    return 0;
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -933,7 +975,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
-                    extern void nv2a_pb_scan(uint32_t, uint32_t);
+                    extern void nv2a_pb_scan(uint32_t);
                     extern void nv2a_pb_scan_report(void);
                     static DWORD last_report;
 
@@ -1058,6 +1100,9 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    /* ponytail: not joined at shutdown; it only reads and writes guest RAM
+     * and stops with g_nv2a_ack_stop like the thread above. */
+    CloseHandle(CreateThread(NULL, 0, nv2a_flag_thread, g_nv2a_memory, 0, NULL));
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
@@ -1070,6 +1115,10 @@ static void *g_kernel_memory = NULL;
 
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
+
+/* Set once xbox_MemoryLayoutInit successfully reserves real host memory
+ * for guest_vmem.c's extended-VMA range; see that reservation below. */
+int g_xbox_extvma_reserved = 0;
 
 /* Bounds of the title's executable sections, from its own XBE section table.
  *
@@ -2542,6 +2591,50 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
+     * Host backing for guest_vmem.c's extended-VMA tracker -- the range
+     * above the RAM-mirror scheme (aliased_top, exactly where the last
+     * mirror view above ends) up to the top of Xbox user address space
+     * (0x7FFE0000). guest_vmem.c reserves/commits guest requests up here
+     * for titles that ask NtAllocateVirtualMemory for a specific high
+     * address, but until now nothing ever gave that range real host
+     * memory -- confirmed live, a title's own allocation there succeeded
+     * at the bookkeeping level and then took a real access violation the
+     * first time it touched the memory, because g_xbox_mem_offset+guest_va
+     * pointed at host address space nobody had reserved.
+     *
+     * Reserve it here, right after the mirrors, for the same reason the
+     * mirrors themselves use an exact-address MapViewOfFileEx this early:
+     * this point in the process's life is when a fixed host address is
+     * most likely to still be free. Doing this lazily instead, the first
+     * time a title actually asks for extended VMA (which can be deep into
+     * boot, after the CRT heap, loaded DLLs, and other engine subsystems
+     * have already claimed nearby address space), measurably fails --
+     * that was the original, lazy version of this reservation, and it lost
+     * the exact address to something else nearly every run.
+     *
+     * MEM_RESERVE only: guest_vmem_allocate's own commit path
+     * (extvma_commit in guest_vmem.c) MEM_COMMITs the specific sub-ranges
+     * a title actually uses, exactly like real Xbox reserve-then-commit.
+     */
+    {
+        uint64_t aliased_top = (uint64_t)g_xbox_total_ram * (1u + XBOX_NUM_MIRRORS);
+        uint64_t extvma_size = (uint64_t)0x7FFE0000u - aliased_top;
+        void *extvma_base = (void *)((uintptr_t)g_memory_base + (uintptr_t)aliased_top);
+
+        if (VirtualAlloc(extvma_base, (SIZE_T)extvma_size, MEM_RESERVE, PAGE_NOACCESS)) {
+            g_xbox_extvma_reserved = 1;
+            fprintf(stderr, "  Extended VMA: reserved %llu MB at %p\n",
+                    (unsigned long long)(extvma_size / (1024 * 1024)), extvma_base);
+        } else {
+            fprintf(stderr, "  Extended VMA: FAILED to reserve %llu MB at %p (error %lu) --"
+                            " a title reservation up here will get a clean failure"
+                            " instead of using this memory\n",
+                    (unsigned long long)(extvma_size / (1024 * 1024)), extvma_base,
+                    GetLastError());
+        }
+    }
+
+    /*
      * Tiled / write-combined aperture at 0xF0000000.
      *
      * The NV2A exposes physical RAM a second time here and titles render
@@ -2802,6 +2895,26 @@ static int g_heap_alloc_count = 0;
 static struct { uint32_t addr; uint32_t size; uint8_t free; }
     g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
+/* Guest threads (DirectSound, CRI's movie threads, the game) allocate at
+ * once; the table was unguarded. */
+static SRWLOCK g_heap_lock = SRWLOCK_INIT;
+
+/* Insert a free block at index `at`, keeping address order. Reuses an empty
+ * slot (size 0, left behind by coalescing) when one is already there. */
+static int heap_insert_free(int at, uint32_t addr, uint32_t size)
+{
+    if (!(at < g_heap_block_count && g_heap_blocks[at].size == 0)) {
+        if (g_heap_block_count >= XBOX_HEAP_MAX_BLOCKS)
+            return 0;
+        memmove(&g_heap_blocks[at + 1], &g_heap_blocks[at],
+                (size_t)(g_heap_block_count - at) * sizeof g_heap_blocks[0]);
+        g_heap_block_count++;
+    }
+    g_heap_blocks[at].addr = addr;
+    g_heap_blocks[at].size = size;
+    g_heap_blocks[at].free = 1;
+    return 1;
+}
 
 /*
  * Simulated stacks for spawned threads.
@@ -2938,10 +3051,26 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * title allocates once. */
 static uint32_t g_contig_next = XBOX_CONTIG_BASE;
 
+/* Where the arena starts: just above the loaded image, not at the window base.
+ *
+ * The window is separate storage from low RAM, but its physical addresses
+ * (VA - 0x80000000) are the same numbers as low-RAM VAs, and
+ * MmGetPhysicalAddress passes non-contiguous VAs through unchanged. With the
+ * arena at physical 0, a DMA address below the image end was ambiguous: X-Men
+ * Legends' USB stack hands the controller both contiguous descriptors
+ * (physical 0x006DC6A0) and a static .data buffer (VA 0x005DCE24), and no rule
+ * can tell those apart. Starting the arena above the image makes the two
+ * ranges disjoint: xbox_ContiguousIsPhysical() then answers exactly. */
+static uint32_t g_contig_start = XBOX_CONTIG_BASE;
+
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
+    if (g_contig_next == XBOX_CONTIG_BASE && g_xbox_image_hi) {
+        g_contig_start = XBOX_CONTIG_BASE + ((g_xbox_image_hi + 0xFFFFu) & ~0xFFFFu);
+        g_contig_next = g_contig_start;
+    }
     if (alignment < 4096) alignment = 4096;
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);
 
@@ -2957,6 +3086,8 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     }
 
     g_contig_next = result + size;
+    xbox_ContiguousSetPhysicalRange(g_contig_start - XBOX_CONTIG_BASE,
+                                    g_contig_next  - XBOX_CONTIG_BASE);
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 }
@@ -2971,8 +3102,24 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
     return g_contig_next - XBOX_CONTIG_BASE;
 }
 
+/* xbox_ContiguousIsPhysical lives in xbox_devbus.c, where a device model can
+ * reach it without linking the kernel; every change to the arena is published
+ * there. */
+void xbox_ContiguousSetPhysicalRange(uint32_t lo, uint32_t hi);
+
+
+static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_heap_lock);
+    r = heap_alloc_locked(size, alignment);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return r;
+}
+
+static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -2991,17 +3138,38 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
      * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
      * with E_OUTOFMEMORY -- which the title reports by clearing
      * global_d3d_device, so the rasterizer asserts and startup stops. */
+    /* ...and take only what the request needs from it. Reuse used to hand
+     * over the whole block: a 16-byte request could take a freed 2 MB block,
+     * and once audio streaming started churning allocations the 48 MB heap
+     * drained in seconds (209 failed 2 MB requests, then no thread stack for
+     * the next movie's decoder, which then ran inline on the main thread and
+     * froze the game). The aligned piece is carved out; what is left in front
+     * and behind stays free. */
+    size = (size + 15) & ~15u;
     for (int i = 0; i < g_heap_block_count; i++) {
+        uint32_t a, start, end, front, back;
         if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
             continue;
         }
-        if (g_heap_blocks[i].addr & (alignment - 1)) {
-            continue;   /* wrong alignment for this request */
+        a = g_heap_blocks[i].addr;
+        start = (a + alignment - 1) & ~(alignment - 1);
+        end = a + g_heap_blocks[i].size;
+        if (start + size > end || start + size < start) {
+            continue;   /* not enough room once aligned */
         }
+        front = start - a;
+        back = end - (start + size);
+        if (front && !heap_insert_free(i, a, front))
+            continue;   /* table full: leave this block alone */
+        if (front)
+            i++;        /* the taken piece moved up one slot */
+        g_heap_blocks[i].addr = start;
+        g_heap_blocks[i].size = size;
         g_heap_blocks[i].free = 0;
-        result = g_heap_blocks[i].addr;
-        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
-        return result;
+        if (back && !heap_insert_free(i + 1, start + size, back))
+            g_heap_blocks[i].size += back;   /* table full: keep it attached */
+        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
+        return start;
     }
 
     /* Align the next pointer */
@@ -3084,17 +3252,22 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
 {
     int i;
+    uint32_t r = 0;
 
     if (!xbox_va)
         return 0;
+    AcquireSRWLockShared(&g_heap_lock);
     for (i = 0; i < g_heap_block_count; i++) {
         if (g_heap_blocks[i].free)
             continue;
         if (xbox_va >= g_heap_blocks[i].addr &&
-            xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size)
-            return g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
+            xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size) {
+            r = g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
+            break;
+        }
     }
-    return 0;
+    ReleaseSRWLockShared(&g_heap_lock);
+    return r;
 }
 
 void xbox_HeapFree(uint32_t xbox_va)
@@ -3104,6 +3277,7 @@ void xbox_HeapFree(uint32_t xbox_va)
     if (!xbox_va) {
         return;
     }
+    AcquireSRWLockExclusive(&g_heap_lock);
     frees++;
     if (frees <= 8) {
         fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",
@@ -3121,24 +3295,31 @@ void xbox_HeapFree(uint32_t xbox_va)
             fflush(stderr);
         }
 
-        /* Coalesce with neighbours. Blocks are recorded in bump order, so
-         * index order is address order and adjacency is a simple end==start
-         * test. Keeps large contiguous requests satisfiable after a lot of
-         * small churn. */
-        if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
-            g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
-            g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
-            g_heap_blocks[i + 1].size = 0;
-            g_heap_blocks[i + 1].addr = 0;
+        /* Coalesce with neighbours. Index order is address order, and
+         * adjacency is a simple end==start test -- stepping over the empty
+         * slots (size 0) earlier merges left behind, which used to stop a
+         * merge dead. Keeps large requests satisfiable after small churn. */
+        {
+            int n = i + 1, p = i - 1;
+            while (n < g_heap_block_count && g_heap_blocks[n].size == 0) n++;
+            while (p >= 0 && g_heap_blocks[p].size == 0) p--;
+            if (n < g_heap_block_count && g_heap_blocks[n].free &&
+                g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[n].addr) {
+                g_heap_blocks[i].size += g_heap_blocks[n].size;
+                g_heap_blocks[n].size = 0;
+                g_heap_blocks[n].addr = 0;
+            }
+            if (p >= 0 && g_heap_blocks[p].free &&
+                g_heap_blocks[p].addr + g_heap_blocks[p].size == g_heap_blocks[i].addr) {
+                g_heap_blocks[p].size += g_heap_blocks[i].size;
+                g_heap_blocks[i].size = 0;
+                g_heap_blocks[i].addr = 0;
+            }
         }
-        if (i > 0 && g_heap_blocks[i - 1].free &&
-            g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
-            g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
-            g_heap_blocks[i].size = 0;
-            g_heap_blocks[i].addr = 0;
-        }
+        ReleaseSRWLockExclusive(&g_heap_lock);
         return;
     }
+    ReleaseSRWLockExclusive(&g_heap_lock);
 }
 
 HANDLE xbox_GetMappingHandle(void)
