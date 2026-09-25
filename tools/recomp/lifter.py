@@ -3594,6 +3594,12 @@ def flag_state_after_block(bb, flag_state=None):
     return state
 
 
+def _is_rep_compare(insn):
+    if not insn.mnemonic.startswith("rep"):
+        return False
+    text = f"{insn.mnemonic} {getattr(insn, 'op_str', '') or ''}"
+    return any(form in text for form in ("cmpsb", "cmpsw", "cmpsd", "scasb", "scasw", "scasd"))
+
 def lift_basic_block(lifter, bb, flag_state=None):
     """
     Lift a basic block to C statements.
@@ -3644,7 +3650,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
         # Handle jecxz/jcxz specially (not flag-based)
         if curr.mnemonic in ("jecxz", "jcxz"):
             results = lifter._lift_jcc(curr)
-            stmts.extend(results)
+            if _is_rep_compare(curr) and last_flag_setter:
+            zf = _make_condition("je", last_flag_setter, last_flag_ops)
+            if zf:
+                stmts.append(f"_flags = ({zf[0]}) ? 1 : 0; /* ZF in: zero count keeps it */")
+        stmts.extend(results)
             i += 1
             continue
 
@@ -3725,6 +3735,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 curr, curr.operands, preserve_carry=preserve)
         else:
             results = lifter.lift_instruction(insns[i])
+        if _is_rep_compare(curr) and last_flag_setter:
+            zf = _make_condition("je", last_flag_setter, last_flag_ops)
+            if zf:
+                stmts.append(f"_flags = ({zf[0]}) ? 1 : 0; /* ZF in: zero count keeps it */")
         stmts.extend(results)
 
         next_flag_state = _advance_flag_state(
