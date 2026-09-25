@@ -1004,6 +1004,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * the first lap and exact afterwards, and scanning a
                      * little short of the true end costs the same commands
                      * that were being lost anyway. */
+                    extern void nv2a_pb_resync(uint32_t);
+                    static uint32_t get_written = 0xFFFFFFFFu;
+                    uint32_t get_now = *(volatile uint32_t *)
+                                       ((char *)regs + NV2A_USER_DMA_GET);
+                    if (get_written == 0xFFFFFFFFu || get_now != get_written)
+                        nv2a_pb_resync(get_now);
                     static uint32_t put_lo, put_hi;
                     if (!put_lo || put < put_lo) put_lo = put;
                     if (put > put_hi) put_hi = put;
@@ -1040,6 +1046,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         (volatile uint32_t *)((char *)regs
                                               + NV2A_USER_DMA_GET);
                     *get = put;
+                    get_written = put;
                 }
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either

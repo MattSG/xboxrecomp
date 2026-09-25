@@ -129,6 +129,31 @@ void xbox_IrqlDumpHolders(void)
     fflush(stderr);
 }
 
+#if defined(_WIN32)
+static CRITICAL_SECTION g_dispatch_lock;
+static INIT_ONCE g_dispatch_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_dispatch_lock);
+    return TRUE;
+}
+
+static void irql_transition(KIRQL from, KIRQL to)
+{
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_lock_init, NULL, NULL);
+    if (from < DISPATCH_LEVEL && to >= DISPATCH_LEVEL) {
+        EnterCriticalSection(&g_dispatch_lock);
+        xbox_kernel_busy(1);
+    } else if (from >= DISPATCH_LEVEL && to < DISPATCH_LEVEL) {
+        xbox_kernel_busy(-1);
+        LeaveCriticalSection(&g_dispatch_lock);
+    }
+}
+#else
+static void irql_transition(KIRQL from, KIRQL to) { (void)from; (void)to; }
+#endif
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
@@ -175,6 +200,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
     }
 
     irql_track(old, NewIrql, __builtin_return_address(0));
+    irql_transition(old, NewIrql);
     g_current_irql = NewIrql;
     return old;
 }
@@ -211,6 +237,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
     }
 
     irql_track(g_current_irql, NewIrql, __builtin_return_address(0));
+    irql_transition(g_current_irql, NewIrql);
     g_current_irql = NewIrql;
 }
 
@@ -222,6 +249,7 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
     KIRQL old = g_current_irql;
 
     irql_track(old, DISPATCH_LEVEL, __builtin_return_address(0));
+    irql_transition(old, DISPATCH_LEVEL);
     g_current_irql = DISPATCH_LEVEL;
     return old;
 }
