@@ -313,7 +313,7 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None):
+                 trace_functions=None, force_returns=None):
         """
         xbe_data: bytes - raw XBE file contents
         func_db: dict - addr → function info from functions.json
@@ -328,6 +328,7 @@ class FunctionTranslator:
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
         self.trace_functions = set(trace_functions or ())
+        self.force_returns = dict(force_returns or {})
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
@@ -1845,6 +1846,26 @@ class FunctionTranslator:
         # kept coming up. The lifter emits the matching exit trace at each ret.
         self.lifter.trace_exit_name = name if start in self.trace_functions else None
 
+        # --force-return: hand this function's callers a constant.
+        #
+        # Bring-up keeps arriving at the same shape. A title waits on a
+        # service the runtime does not implement yet; the function that
+        # reports "is it finished" answers no for ever; everything past it is
+        # unreachable and therefore untestable. Shin Megami Tensei: Nine does
+        # exactly this -- its title screen asks whether the intro movie has
+        # ended, and its XMV decoder never reaches end of stream.
+        #
+        # What people resort to instead is editing the generated C by hand,
+        # which buries the shortcut in hundreds of megabytes of output where
+        # nothing names it and nobody else can reproduce the run. As a
+        # generation option it is on the command line, it lands in the
+        # title's build script, and the emitted code is inert unless
+        # RECOMP_FORCE_RETURN is set at run time.
+        #
+        # It is a probe, not a fix: the body still runs and its side effects
+        # still happen, only the answer changes.
+        self.lifter.force_return_value = self.force_returns.get(start)
+
         # ebp is the only callee-saved register declared as a local.
         # ebx, esi, edi are global via #define macros (g_ebx, g_esi, g_edi)
         # and must NOT be declared locally, otherwise the local shadows
@@ -2197,7 +2218,7 @@ class BatchTranslator:
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, coalesce_json_paths=None,
-                 protected_function_starts=None):
+                 protected_function_starts=None, force_returns=None):
         self.xbe_path = xbe_path
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
@@ -2252,7 +2273,8 @@ class BatchTranslator:
             self.xbe_data, self.func_db, self.label_db,
             self.classification_db, self.abi_db,
             seh_prolog=0, seh_epilog=0,
-            trace_functions=trace_functions)
+            trace_functions=trace_functions,
+            force_returns=force_returns)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         prolog_inputs = (seh_prolog if isinstance(

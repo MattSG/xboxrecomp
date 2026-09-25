@@ -59,6 +59,17 @@ def find_data_files(disasm_dir=None, func_id_dir=None, abi_dir=None, overrides=N
     return paths
 
 
+def _parse_force_returns(items):
+    """Parse --force-return ADDR=VALUE pairs into {addr: value}."""
+    out = {}
+    for item in items or ():
+        if "=" not in item:
+            raise SystemExit(f"--force-return wants ADDR=VALUE, got {item!r}")
+        addr, _, value = item.partition("=")
+        out[int(addr, 0)] = int(value, 0)
+    return out
+
+
 def _load_addrs(path):
     """Load a JSON address list (or {addr: name} map) as a set of ints."""
     if not path:
@@ -229,6 +240,15 @@ def main():
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
+    parser.add_argument("--force-return", metavar="ADDR=VALUE",
+                        action="append", default=[],
+                        help="Make a function hand its callers a constant "
+                             "instead of what it computed, e.g. "
+                             "0x0015D780=0. Repeatable. A bring-up probe for "
+                             "a title waiting on a service the runtime does "
+                             "not implement yet: the body still runs, only "
+                             "the answer changes, and the emitted code is "
+                             "inert unless RECOMP_FORCE_RETURN is set")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -294,6 +314,7 @@ def main():
         trace_functions=_load_addrs(args.trace_functions),
         coalesce_json_paths=args.coalesce_functions,
         protected_function_starts=protected_function_starts,
+        force_returns=_parse_force_returns(args.force_return),
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
     )
