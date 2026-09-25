@@ -42,15 +42,46 @@ def _merge_flag_states(states):
     first = states[0]
     if all(state == first for state in states[1:]):
         return first
-    if first[0] not in ("cmp", "test") or len(first[1]) != 2:
+    if first[0] in ("cmp", "test") and len(first[1]) == 2:
+        width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+        for kind, ops in states[1:]:
+            if kind != first[0] or len(ops) != 2:
+                return None
+            if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
+                return None
+        return first
+    return _merge_zero_flag(states)
+
+
+def _merge_zero_flag(states):
+    """Predecessors that disagree on the operation but not on the zero flag.
+
+    `sub eax, ecx` reaching a loop head by fall-through and `dec eax` reaching
+    it by the back edge are different setters, so the state cannot be
+    inherited as itself -- yet both leave ZF as (eax == 0), which is the whole
+    of what a je or jne there is asking.
+
+    Unlike the CMP/TEST merge above, these reconstruct their operands rather
+    than reading a snapshot, so the merge only survives when every predecessor
+    names the same destination register. The name carries the width, so
+    `dec al` and `sub eax, ecx` do not merge.
+
+    The marker is deliberately narrow: only ZF is answerable from it, and
+    _make_condition refuses everything else.
+    """
+    from .lifter import ZF_FROM_DEST
+    dests = set()
+    for setter, ops in states:
+        if setter not in ZF_FROM_DEST or not ops:
+            return None
+        op = ops[0]
+        # disasm.Operand, not a capstone operand: .type is the string "reg".
+        if getattr(op, "type", None) != "reg" or not op.reg:
+            return None
+        dests.add(op.reg)
+    if len(dests) != 1:
         return None
-    width = _operand_width(first[1][0]) or _operand_width(first[1][1])
-    for kind, ops in states[1:]:
-        if kind != first[0] or len(ops) != 2:
-            return None
-        if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
-            return None
-    return first
+    return ("__zf_from_dest", [states[0][1][0]])
 
 
 def write_if_changed(path, text):
@@ -252,6 +283,20 @@ def load_coalescences(path):
         })
     return parsed
 
+
+
+def _seh_prologs_of(lifter):
+    """Every __SEH_prolog address a lifter knows about, as a set.
+
+    Reads SEH_PROLOGS when present and falls back to the scalar SEH_PROLOG,
+    so a lifter stub that only sets the old attribute still works -- the test
+    suite builds exactly such a stub, and so may callers outside this repo.
+    """
+    prologs = getattr(lifter, "SEH_PROLOGS", None)
+    if prologs:
+        return set(prologs)
+    one = getattr(lifter, "SEH_PROLOG", None)
+    return {one} if one is not None else set()
 
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
@@ -1013,10 +1058,10 @@ class FunctionTranslator:
         """
         if self._func_has_prologue(instructions):
             return True
-        seh_prolog = getattr(self.lifter, "SEH_PROLOG", None)
-        if seh_prolog is None:
+        seh_prologs = _seh_prologs_of(self.lifter)
+        if not seh_prologs:
             return False
-        return any(getattr(insn, "call_target", None) == seh_prolog
+        return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
     def _indirect_code_refs(self, instructions, start, end, proof_mode=False,
@@ -1747,8 +1792,10 @@ class FunctionTranslator:
         # hardcoded to one game's CRT here, so for every other title the forcing
         # silently never fired and the generated C failed to compile with
         # "'ebp': undeclared identifier".
-        seh_funcs = {a for a in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG)
-                     if a is not None}
+        seh_funcs = _seh_prologs_of(self.lifter)
+        epilog = getattr(self.lifter, "SEH_EPILOG", None)
+        if epilog is not None:
+            seh_funcs = seh_funcs | {epilog}
         if seh_funcs and any(insn.call_target in seh_funcs
                              for insn in instructions):
             used_regs.add("ebp")
@@ -2208,7 +2255,9 @@ class BatchTranslator:
             trace_functions=trace_functions)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
-        for explicit_helper in (seh_prolog, seh_epilog):
+        prolog_inputs = (seh_prolog if isinstance(
+            seh_prolog, (list, tuple, set, frozenset)) else (seh_prolog,))
+        for explicit_helper in (*prolog_inputs, seh_epilog):
             if explicit_helper not in (None, 0):
                 self.translator.protected_function_starts.add(explicit_helper)
         if coalesce_json_paths:
@@ -2228,17 +2277,23 @@ class BatchTranslator:
         # Detect once here so the result can be reported and overridden from
         # the command line without retaining an address of a removed fragment.
         if seh_prolog is None or seh_epilog is None:
-            found_prolog, found_epilog = detect_seh_helpers(
+            found_prologs, found_epilog = detect_seh_helpers(
                 helper_func_db, self.xbe_data, verbose=True)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
+            seh_prolog = seh_prolog if seh_prolog is not None else found_prologs
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
-        self.seh_prolog = seh_prolog
+        prolog_values = (seh_prolog if isinstance(
+            seh_prolog, (list, tuple, set, frozenset)) else (seh_prolog,))
+        prolog_values = tuple(sorted({value for value in prolog_values
+                                      if value not in (None, 0)}))
+        self.seh_prolog = (prolog_values[0] if len(prolog_values) == 1 else
+                           prolog_values or None)
         self.seh_epilog = seh_epilog
 
         setjmp_fn, longjmp_fn = detect_setjmp_helpers(
             helper_func_db, self.xbe_data, verbose=True)
 
-        self.translator.lifter.SEH_PROLOG = seh_prolog
+        self.translator.lifter.SEH_PROLOGS = frozenset(prolog_values)
+        self.translator.lifter.SEH_PROLOG = min(prolog_values) if prolog_values else None
         self.translator.lifter.SEH_EPILOG = seh_epilog
         self.translator.lifter.SETJMP_FN = setjmp_fn
         self.translator.lifter.LONGJMP_FN = longjmp_fn

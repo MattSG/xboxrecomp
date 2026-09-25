@@ -241,6 +241,37 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 #define NV2A_USER_DMA_GET 0x800044u
 
 /*
+ * The same channel's pointers on the PFIFO side of the aperture.
+ *
+ * The USER area above is the window software writes through; PFIFO holds the
+ * engine's own copy, and D3D reads it back on the path where the USER pointer
+ * is not usable. The title's channel context switch saves and restores all
+ * four of these as one block (DDS9 0x002FE2xx), which is what identifies them:
+ *
+ *   0x3240 CACHE1_DMA_PUT          0x3248 CACHE1_REF
+ *   0x3244 CACHE1_DMA_GET          0x324C CACHE1_DMA_SUBROUTINE
+ *
+ * DMA_SUBROUTINE matters because it is not a flag: bits 31:1 are the offset
+ * the engine returns to when a pushbuffer subroutine ends, and bit 0 says
+ * whether one is running. DDS9's free-space calculation (sub_002F6CC0) reads
+ * the USER GET first and falls back to this register's return offset when
+ * that lands outside the ring -- i.e. "the GPU is off in a subroutine, so ask
+ * where it will come back to". Zeroed RAM answers 0 to both, which is below
+ * the ring base, and the free-space subtraction then goes negative and is
+ * clamped to zero. The reserve wants 0x2000 bytes, gets 0, and spins.
+ *
+ * Not acknowledged here, only reported. DDS9 reads the USER pair and never
+ * reaches the fallback, so every value in this block is zero for the one
+ * title that was traced -- mirroring PUT to GET would be a guess dressed as
+ * a handshake. The watchdog prints them so the next title to spin here is
+ * diagnosed from data instead.
+ */
+#define NV2A_PFIFO_DMA_PUT        0x003240u
+#define NV2A_PFIFO_DMA_GET        0x003244u
+#define NV2A_PFIFO_REF            0x003248u
+#define NV2A_PFIFO_DMA_SUBROUTINE 0x00324Cu
+
+/*
  * Free-running counters in the MCPX aperture.
  *
  * Some hardware registers are clocks, not flags: software reads them and waits
@@ -256,6 +287,137 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  * paces audio off it yet. Derive it from a real clock if timing starts to
  * matter.
  */
+/*
+ * AC'97 bus-master reset, modelled by trapping the write rather than by
+ * clearing the bit afterwards.
+ *
+ * Each of the three DMA channels -- PCM In, PCM Out, Mic In -- has a one-byte
+ * control register at NABM + 0x0B, and bit 1 is RR, "Reset Registers".
+ * Software sets it and waits for the controller to clear it. DDS9 does that
+ * inside DirectSoundCreate, and the wait is worth quoting because it is not a
+ * poll:
+ *
+ *     mov  cl, [eax+0xFEC0010B]
+ *     and  cl, 2
+ *   L: test cl, cl
+ *     jne  L
+ *
+ * MSVC hoisted the load out of the loop -- the pointer was not volatile -- so
+ * the title reads the register exactly ONCE, a few instructions after writing
+ * it, and spins forever on whatever that single read returned. On hardware
+ * the reset has long completed by then.
+ *
+ * That rules out the NV2A_ACK approach. A thread that clears the bit
+ * afterwards is racing a window a few instructions wide and gets only one
+ * attempt; measured, it loses, and the title sits on a stale cl = 2 while the
+ * register itself reads 0. The bit has to be clear at the moment of the read,
+ * which means the write must never deposit it.
+ *
+ * So the page is PAGE_READONLY: reads run at full speed and see plain memory,
+ * writes fault. The fault handler makes the page writable, single-steps the
+ * faulting instruction, then masks RR out of the three control bytes and
+ * re-protects. No instruction decoding, which matters because the write forms
+ * a compiler emits here are not worth enumerating -- and being wrong about
+ * one would corrupt a register rather than fail visibly.
+ *
+ * Only RR. Bit 0 is RPBM, run/pause bus master, which software owns.
+ */
+#define AC97_NABM_OFFSET  0x400000u   /* 0xFEC00000 within the MCPX aperture */
+#define AC97_TRAP_BYTES   0x1000u
+#define AC97_RR           0x02u
+
+static void *g_ac97_page = NULL;      /* host address of the trapped page */
+static void *g_ac97_veh  = NULL;
+static RECOMP_TLS int s_ac97_stepping = 0;
+
+static void ac97_clear_reset_bits(void)
+{
+    /* Every bus-master channel, not the three a PC AC'97 has.
+     *
+     * The generic controller has PCM In, PCM Out and Mic In at NABM +0x00,
+     * +0x10 and +0x20; the MCPX has more, and DDS9 walks a table of channel
+     * offsets rather than naming them. It reset the channel at +0x00 first
+     * and then one at +0x60 -- which a three-entry list did not cover, so it
+     * spun on the second exactly as it had on the first. Sweeping the whole
+     * NABM block is both simpler and right: +0x0B is the control byte of
+     * whatever channel lives there, and RR is the same bit in all of them. */
+    uint32_t off;
+
+    for (off = 0x10B; off < 0x180; off += 0x10) {
+        volatile uint8_t *r = (volatile uint8_t *)((char *)g_ac97_page + off);
+        if (*r & AC97_RR)
+            *r = (uint8_t)(*r & ~AC97_RR);
+    }
+}
+
+static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+
+    if (!g_ac97_page)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /* Second half: the faulting write has now executed. Apply what the
+     * controller would have done and close the page again. Thread-local,
+     * because another thread must not mistake its own single-step for this
+     * one -- and re-protecting from the wrong thread would strand this one
+     * mid-step. */
+    if (code == EXCEPTION_SINGLE_STEP && s_ac97_stepping) {
+        s_ac97_stepping = 0;
+        ac97_clear_reset_bits();
+        VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
+        ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+
+        if (fault >= (uintptr_t)g_ac97_page
+                && fault < (uintptr_t)g_ac97_page + AC97_TRAP_BYTES) {
+            if (!VirtualProtect(g_ac97_page, AC97_TRAP_BYTES,
+                                PAGE_READWRITE, &old))
+                return EXCEPTION_CONTINUE_SEARCH;
+            s_ac97_stepping = 1;
+            ep->ContextRecord->EFlags |= 0x100u;   /* TF: step the write */
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Arm the trap. Called once the MCPX aperture exists, and only alongside the
+ * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
+ * channel has nothing to gain from it, and the page fault costs something. */
+static void ac97_arm_write_trap(void)
+{
+    DWORD old;
+
+    if (!g_mcpx_memory || g_ac97_page)
+        return;
+    g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
+    /* First, so it runs before the game target's own crash reporter, which
+     * would otherwise print the write as an access violation. */
+    g_ac97_veh = AddVectoredExceptionHandler(1, ac97_write_veh);
+    if (!g_ac97_veh
+            || !VirtualProtect(g_ac97_page, AC97_TRAP_BYTES,
+                               PAGE_READONLY, &old)) {
+        if (g_ac97_veh) {
+            RemoveVectoredExceptionHandler(g_ac97_veh);
+            g_ac97_veh = NULL;
+        }
+        g_ac97_page = NULL;
+        fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
+                        " a channel reset will spin\n");
+        return;
+    }
+    fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
+                    " (channel reset completes on write)\n",
+            XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+}
+
 static const uint32_t MCPX_COUNTERS[] = {
     0x020010,   /* APU GP sample counter, DirectSound SetupVoiceProcessor */
 };
@@ -926,6 +1088,72 @@ static uint32_t *s_watchdog_esp;
 static uint32_t *s_watchdog_regs[6];
 static unsigned  s_watchdog_secs;
 
+/* Can RECOMP_PEEK dereference this guest address?
+ *
+ * It used to accept only the first 64 MB, which reads as "RAM" but is not the
+ * question -- every window this file maps is mapped at va + g_memory_offset,
+ * so the register apertures are just as dereferenceable as RAM is. Rejecting
+ * them silently printed nothing for an address that was perfectly readable,
+ * and a hang spinning on a GPU register is exactly the case where the value
+ * that matters lives at 0xFD......  Peeking one is how the busy-wait in
+ * DDS9's pushbuffer reserve was pinned to a DMA pointer rather than a flag.
+ *
+ * Every window is checked against its own pointer, because they are mapped
+ * independently and any of them can be absent for this run. The 4 is the
+ * width of the read below: an address one or two bytes short of the end is
+ * inside the window and still faults. */
+static int peek_readable(uint32_t va)
+{
+    struct { const void *mapped; uint32_t base; uint64_t size; } win[] = {
+        { g_memory_base,   XBOX_BASE_ADDRESS, (uint64_t)g_memory_size },
+        { g_contig_memory, XBOX_CONTIG_BASE,  XBOX_CONTIG_SIZE },
+        { g_nv2a_memory,   XBOX_NV2A_BASE,    XBOX_NV2A_SIZE },
+        { g_mcpx_memory,   XBOX_MCPX_BASE,    XBOX_MCPX_SIZE },
+        { g_flash_memory,  XBOX_FLASH_BASE,   XBOX_FLASH_SIZE },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(win) / sizeof(win[0]); i++) {
+        if (!win[i].mapped || !win[i].size)
+            continue;
+        if (va >= win[i].base
+                && (uint64_t)va + 4 <= (uint64_t)win[i].base + win[i].size)
+            return 1;
+    }
+    return 0;
+}
+
+/* Print the RECOMP_PEEK globals. Shared, because the two moments worth
+ * sampling are a hang and an early exit, and only the first had it: a title
+ * whose main() returns during init never reaches the watchdog, so the one
+ * question that mattered -- which of its init calls failed -- was the one the
+ * tooling could not answer. Silent unless RECOMP_PEEK is set. */
+void xbox_PeekSample(const char *label)
+{
+    const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    const char *spec = getenv("RECOMP_PEEK");
+    char buf[256], *q, *end;
+
+    if (!spec || !*spec || g_memory_base == NULL)
+        return;
+    strncpy(buf, spec, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    fprintf(stderr, "  %s:", label ? label : "peek");
+    for (q = buf; *q; ) {
+        unsigned long va = strtoul(q, &end, 0);
+        if (end == q)
+            break;
+        if (peek_readable((uint32_t)va))
+            fprintf(stderr, " [%08lX]=%08X", va,
+                    *(const uint32_t *)(mem + va));
+        else
+            fprintf(stderr, " [%08lX]=??", va);
+        q = (*end == ',') ? end + 1 : end;
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 {
     const uint8_t *mem;
@@ -968,24 +1196,30 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * makes no kernel calls is invisible to RECOMP_KERNEL_WATCH too. A pure
      * CPU loop polling a global is exactly the case neither of those covers.
      */
-    {
-        const char *spec = getenv("RECOMP_PEEK");
-        char buf[256], *q, *end;
-        if (spec && *spec) {
-            strncpy(buf, spec, sizeof buf - 1);
-            buf[sizeof buf - 1] = 0;
-            fprintf(stderr, "  peek:");
-            for (q = buf; *q; ) {
-                unsigned long va = strtoul(q, &end, 0);
-                if (end == q)
-                    break;
-                if (va >= XBOX_BASE_ADDRESS && va < XBOX_TOTAL_RAM)
-                    fprintf(stderr, " [%08lX]=%08X", va,
-                            *(const uint32_t *)(mem + va));
-                q = (*end == ',') ? end + 1 : end;
-            }
-            fprintf(stderr, "\n");
-        }
+    xbox_PeekSample("peek");
+    /* The pushbuffer pointers, unconditionally.
+     *
+     * "Extend the table as more handshakes turn up -- run the title and the
+     * watchdog sample will name the register" is only true if the sample
+     * actually shows them. It did not: a title spinning on a DMA pointer made
+     * no kernel calls and no indirect calls, so every other line the watchdog
+     * prints was identical between two samples taken 40 seconds apart, and the
+     * register that was stuck did not appear at all.
+     *
+     * Both sides of the channel, because which one the title consults is a
+     * property of its D3D and not of the hardware: Halo waits on the USER
+     * pair, DDS9 reads USER first and falls back to PFIFO's DMA_SUBROUTINE.
+     * Printing only the pair that some other title used is how this stayed
+     * invisible. */
+    if (g_nv2a_memory) {
+        const char *r = (const char *)g_nv2a_memory;
+#define WD_NV2A(off) (*(const volatile uint32_t *)(r + (off)))
+        fprintf(stderr, "  NV2A USER  PUT=%08X GET=%08X\n"
+                        "  NV2A PFIFO PUT=%08X GET=%08X REF=%08X SUBR=%08X\n",
+                WD_NV2A(NV2A_USER_DMA_PUT), WD_NV2A(NV2A_USER_DMA_GET),
+                WD_NV2A(NV2A_PFIFO_DMA_PUT), WD_NV2A(NV2A_PFIFO_DMA_GET),
+                WD_NV2A(NV2A_PFIFO_REF), WD_NV2A(NV2A_PFIFO_DMA_SUBROUTINE));
+#undef WD_NV2A
     }
 
     for (i = 0; i < 400 && esp; i++) {
@@ -1204,7 +1438,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * the diagnostic silently did nothing. It stays as a floor for a host
          * with pages wider than the TIB offset, where skipping really is
          * better than breaking the run. */
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+        long host_page;
+        GetSystemInfo(&si);
+        host_page = (long)si.dwPageSize;
+#else
         long host_page = sysconf(_SC_PAGESIZE);
+#endif
         if (host_page > 0 && (uint32_t)host_page > XBOX_TIB_MAIN) {
             fprintf(stderr, "  RECOMP_TRAP_NULL: not available -- the host page "
                     "is %ld bytes, so trapping guest page zero would also trap "
@@ -1736,6 +1977,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
+                /* Before the trap is armed: this write would otherwise be
+                 * the first thing to fault. */
+                ac97_arm_write_trap();
                 fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
                                 " (DirectSound will initialise)\n",
                         XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
