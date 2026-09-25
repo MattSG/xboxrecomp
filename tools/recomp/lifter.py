@@ -3650,6 +3650,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
         # Handle jecxz/jcxz specially (not flag-based)
         if curr.mnemonic in ("jecxz", "jcxz"):
             results = lifter._lift_jcc(curr)
+            if _is_rep_compare(curr) and last_flag_setter:
+            zf = _make_condition("je", last_flag_setter, last_flag_ops)
+            if zf:
+                stmts.append(f"_flags = ({zf[0]}) ? 1 : 0; /* ZF in: zero count keeps it */")
         stmts.extend(results)
             i += 1
             continue
