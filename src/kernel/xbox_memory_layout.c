@@ -75,8 +75,6 @@ static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
  * means ~3 of 28 collide, and *which* three changes with ASLR. Claiming the
  * whole range first, then carving views out of ground we hold, removes the
  * question. */
-static void *g_span_base = NULL;
-static size_t g_span_size = 0;
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -904,6 +902,8 @@ static void nv2a_ack_flags(volatile uint32_t *regs)
  * frame. X-Men Legends' mission load, thousands of kickoffs long, looked
  * frozen on its loading screen. Clearing the flags is a few loads and stores,
  * so it gets a loop that does nothing else. */
+void xbox_ContiguousSetPhysicalRange(uint32_t lo, uint32_t hi);
+
 static DWORD WINAPI nv2a_flag_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -916,6 +916,7 @@ static DWORD WINAPI nv2a_flag_thread(LPVOID param)
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
+    static uint32_t get_written = 0xFFFFFFFFu;
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
@@ -1005,7 +1006,6 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * little short of the true end costs the same commands
                      * that were being lost anyway. */
                     extern void nv2a_pb_resync(uint32_t);
-                    static uint32_t get_written = 0xFFFFFFFFu;
                     uint32_t get_now = *(volatile uint32_t *)
                                        ((char *)regs + NV2A_USER_DMA_GET);
                     if (get_written == 0xFFFFFFFFu || get_now != get_written)
@@ -1013,18 +1013,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     static uint32_t put_lo, put_hi;
                     if (!put_lo || put < put_lo) put_lo = put;
                     if (put > put_hi) put_hi = put;
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
+                    if (put != last_put)
+                        nv2a_pb_scan(put);
+                    if (last_put && put < last_put) {
                         if (getenv("RECOMP_PB_WRAP_TRACE")) {
                             static unsigned wraps;
                             if (wraps++ < 8)
@@ -1820,22 +1811,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * tried the fixed addresses and gave up. Invisible on Windows, where
          * one of the low bases succeeds -- fatal on arm64 macOS, where all of
          * them sit inside the 4 GB __PAGEZERO segment and none can. */
-        /* Reserve base + mirrors as one range, and map the base at its head.
-         * VirtualFree releases just the slice about to be used, so each view
-         * replaces our own reservation rather than racing for free space. */
-        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
-        if (g_span_base) {
-            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
-            g_memory_base = MapViewOfFileEx(g_mapping_handle,
-                                            FILE_MAP_ALL_ACCESS, 0, 0,
-                                            g_memory_size, g_span_base);
-            if (!g_memory_base) {
-                VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
-                g_span_base = NULL;
-                g_span_size = 0;
-            }
-        }
+        /* Fixed Xbox-compatible bases keep the RAM mirrors below in known free address space. */
 
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
         for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
@@ -2563,9 +2539,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
-                                    (uintptr_t)(m + 1) * g_memory_size;
-            uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
-            uint64_t guest_hi = guest_lo + g_memory_size;
+                                    (uintptr_t)(m + 1) * g_xbox_total_ram;
+            uint64_t guest_lo = (uint64_t)(m + 1) * g_xbox_total_ram;
+            uint64_t guest_hi = guest_lo + g_xbox_total_ram;
+
+            /* The base view already covers this physical-RAM mirror. */
+            if (guest_lo < g_memory_size)
+                continue;
+
 
             if (guest_lo < tiled_hi && tiled_lo < guest_hi) {
                 fprintf(stderr, "  Mirror %d: skipped, overlaps the tiled"
@@ -2576,13 +2557,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             /* Inside the reservation this hands back the slice we are about
              * to use; outside it (no reservation) this is a no-op on an
              * address we never held. */
-            if (g_span_base)
-                VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
                 0, 0,
-                g_memory_size,
+                g_xbox_total_ram,
                 (LPVOID)mirror_base
             );
             if (g_mirror_views[m]) {
@@ -2592,55 +2571,43 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         m + 1, (void *)mirror_base, GetLastError());
             }
         }
-        fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
-                mirrors_ok, XBOX_NUM_MIRRORS,
-                (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
+        fprintf(stderr, "  RAM mirror: %d/%d physical views mapped (covers %d MB)\n",
+                mirrors_ok, XBOX_NUM_MIRRORS - 1,
+                (int)((g_memory_size + mirrors_ok * g_xbox_total_ram) / (1024 * 1024)));
     }
 
-    /*
-     * Host backing for guest_vmem.c's extended-VMA tracker -- the range
-     * above the RAM-mirror scheme (aliased_top, exactly where the last
-     * mirror view above ends) up to the top of Xbox user address space
-     * (0x7FFE0000). guest_vmem.c reserves/commits guest requests up here
-     * for titles that ask NtAllocateVirtualMemory for a specific high
-     * address, but until now nothing ever gave that range real host
-     * memory -- confirmed live, a title's own allocation there succeeded
-     * at the bookkeeping level and then took a real access violation the
-     * first time it touched the memory, because g_xbox_mem_offset+guest_va
-     * pointed at host address space nobody had reserved.
-     *
-     * Reserve it here, right after the mirrors, for the same reason the
-     * mirrors themselves use an exact-address MapViewOfFileEx this early:
-     * this point in the process's life is when a fixed host address is
-     * most likely to still be free. Doing this lazily instead, the first
-     * time a title actually asks for extended VMA (which can be deep into
-     * boot, after the CRT heap, loaded DLLs, and other engine subsystems
-     * have already claimed nearby address space), measurably fails --
-     * that was the original, lazy version of this reservation, and it lost
-     * the exact address to something else nearly every run.
-     *
-     * MEM_RESERVE only: guest_vmem_allocate's own commit path
-     * (extvma_commit in guest_vmem.c) MEM_COMMITs the specific sub-ranges
-     * a title actually uses, exactly like real Xbox reserve-then-commit.
-     */
+
+    /* Reserve extended VMA after physical mirror addresses have been mapped. */
     {
         uint64_t aliased_top = (uint64_t)g_xbox_total_ram * (1u + XBOX_NUM_MIRRORS);
         uint64_t extvma_size = (uint64_t)0x7FFE0000u - aliased_top;
         void *extvma_base = (void *)((uintptr_t)g_memory_base + (uintptr_t)aliased_top);
-
+        uintptr_t cursor = (uintptr_t)extvma_base;
+        uintptr_t limit = cursor + (uintptr_t)extvma_size;
+        while (cursor < limit) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((void *)cursor, &mbi, sizeof(mbi))) break;
+            if (mbi.State != MEM_FREE) {
+                extvma_size = (uint64_t)(cursor - (uintptr_t)extvma_base);
+                fprintf(stderr, "  [VMA] capped at occupied base=%p size=%llu state=0x%lx type=0x%lx\n",
+                        mbi.BaseAddress, (unsigned long long)mbi.RegionSize,
+                        mbi.State, mbi.Type);
+                break;
+            }
+            uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            if (next <= cursor) break;
+            cursor = next;
+        }
         if (VirtualAlloc(extvma_base, (SIZE_T)extvma_size, MEM_RESERVE, PAGE_NOACCESS)) {
             g_xbox_extvma_reserved = 1;
             fprintf(stderr, "  Extended VMA: reserved %llu MB at %p\n",
                     (unsigned long long)(extvma_size / (1024 * 1024)), extvma_base);
         } else {
-            fprintf(stderr, "  Extended VMA: FAILED to reserve %llu MB at %p (error %lu) --"
-                            " a title reservation up here will get a clean failure"
-                            " instead of using this memory\n",
+            fprintf(stderr, "  Extended VMA: FAILED to reserve %llu MB at %p (error %lu)\n",
                     (unsigned long long)(extvma_size / (1024 * 1024)), extvma_base,
                     GetLastError());
         }
     }
-
     /*
      * Tiled / write-combined aperture at 0xF0000000.
      *
@@ -2750,7 +2717,7 @@ void xbox_ProtectMirrorsForDebug(void)
     for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
         DWORD old;
         if (g_mirror_views[m] &&
-            VirtualProtect(g_mirror_views[m], g_memory_size,
+            VirtualProtect(g_mirror_views[m], g_xbox_total_ram,
                            PAGE_READONLY, &old)) {
             n++;
         }
@@ -2818,11 +2785,6 @@ void xbox_MemoryLayoutShutdown(void)
 
     /* Whatever is left of the base+mirrors reservation. The views carved out
      * of it are already unmapped above; this releases the range itself. */
-    if (g_span_base) {
-        VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
-        g_span_base = NULL;
-        g_span_size = 0;
-    }
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }
 
@@ -3103,7 +3065,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  *
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
- * a surface offset is physical, and only the window makes it addressable. */
+
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig_next - XBOX_CONTIG_BASE;
@@ -3112,7 +3074,7 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
 /* xbox_ContiguousIsPhysical lives in xbox_devbus.c, where a device model can
  * reach it without linking the kernel; every change to the arena is published
  * there. */
-void xbox_ContiguousSetPhysicalRange(uint32_t lo, uint32_t hi);
+
 
 
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);

@@ -152,6 +152,7 @@ typedef struct {
     int      index;
     int      periodic_seen;
     int      ple_seen;
+    volatile unsigned ack_seq;
 } OhciController;
 
 static OhciController s_hc[2];
@@ -989,6 +990,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     int plugged = 0;
     uint32_t last_status = 0;
     unsigned repeats = 0;
+    unsigned last_ack = 0;
     unsigned held_off = 0;
     int      held_off_warned = 0, held_off_forced = 0;
 
@@ -1176,6 +1178,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             }
         } else {
             last_status = status;
+            last_ack = hc->ack_seq;
             repeats = 0;
         }
         ohci_raise(hc, status);

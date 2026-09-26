@@ -33,6 +33,17 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+KIRQL xbox_CurrentIrql(void)
+{
+    return g_current_irql;
+}
+
+#if defined(_MSC_VER)
+#define XBOX_RETURN_ADDRESS() _ReturnAddress()
+#else
+#define XBOX_RETURN_ADDRESS() __builtin_return_address(0)
+#endif
+
 /* How many threads are holding IRQL at or above DISPATCH_LEVEL.
  *
  * The level itself is per-thread, which is right for a guest that asks "what
@@ -199,7 +210,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
-    irql_track(old, NewIrql, __builtin_return_address(0));
+    irql_track(old, NewIrql, XBOX_RETURN_ADDRESS());
     irql_transition(old, NewIrql);
     g_current_irql = NewIrql;
     return old;
@@ -236,7 +247,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
             g_current_irql, NewIrql);
     }
 
-    irql_track(g_current_irql, NewIrql, __builtin_return_address(0));
+    irql_track(g_current_irql, NewIrql, XBOX_RETURN_ADDRESS());
     irql_transition(g_current_irql, NewIrql);
     g_current_irql = NewIrql;
 }
@@ -248,7 +259,7 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
 
-    irql_track(old, DISPATCH_LEVEL, __builtin_return_address(0));
+    irql_track(old, DISPATCH_LEVEL, XBOX_RETURN_ADDRESS());
     irql_transition(old, DISPATCH_LEVEL);
     g_current_irql = DISPATCH_LEVEL;
     return old;

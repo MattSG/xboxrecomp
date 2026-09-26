@@ -88,7 +88,7 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
     uint64_t end = (uint64_t)va + bytes;
     uint64_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
-    if (va < XBOX_FS_BASE)      /* page zero is deliberately unmapped */
+    if (va < XBOX_BASE_ADDRESS) /* XBE image memory starts at 0x10000 */
         return 0;
     if (end <= mapped)
         return 1;
@@ -3044,8 +3044,7 @@ static NTSTATUS bridge_create_file_impl(
     XBOX_IO_STATUS_BLOCK   ios;
     HANDLE   h  = NULL;
     NTSTATUS st;
-
-    bridge_build_oa(obj_attrs_va, &oa, &name);
+bridge_build_oa(obj_attrs_va, &oa, &name);
     if (!name.Buffer) {
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;

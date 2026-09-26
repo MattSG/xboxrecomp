@@ -1941,6 +1941,47 @@ static void backend_tri(uint32_t i0, uint32_t i1, uint32_t i2, void *ctx)
         *n += 3;
 }
 
+static void for_each_triangle(void (*emit)(uint32_t, uint32_t, uint32_t, void *),
+                              void *ctx)
+{
+    const uint32_t *x = s_gpu.idx;
+    uint32_t i, n = s_gpu.idx_count;
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3)
+            emit(x[i], x[i + 1], x[i + 2], ctx);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        /* Alternate the winding so every strip triangle faces the same way. */
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1)
+                emit(x[i + 1], x[i], x[i + 2], ctx);
+            else
+                emit(x[i], x[i + 1], x[i + 2], ctx);
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+        for (i = 1; i + 1 < n; i++)
+            emit(x[0], x[i], x[i + 1], ctx);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            emit(x[i], x[i + 1], x[i + 2], ctx);
+            emit(x[i], x[i + 2], x[i + 3], ctx);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            emit(x[i], x[i + 1], x[i + 3], ctx);
+            emit(x[i], x[i + 3], x[i + 2], ctx);
+        }
+        break;
+    default:
+        break;                              /* points and lines: not yet */
+    }
+}
+
 static void backend_batch(void)
 {
     Nv2aSurface surf;
@@ -1999,6 +2040,7 @@ void nv2a_pb_exec_get_stats(uint32_t out[4])
 static void raster_batch(void)
 {
     uint32_t before = s_gpu.tris_drawn;
+    uint32_t i;
 
     s_vp.gen++;
     if (s_gpu.idx_count < 3)

@@ -48,7 +48,10 @@ add_subdirectory(src/nv2a)
 
 # USB: MCPX OHCI host controllers. A title's XAPI is statically linked and
 # drives these registers directly, so a pad only exists if they do.
-add_subdirectory(src/usb)
+option(XBOXRECOMP_BUILD_USB "Build Xbox USB host controller support" ON)
+if(XBOXRECOMP_BUILD_USB)
+    add_subdirectory(src/usb)
+endif()
 
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
@@ -65,7 +68,7 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_d3d8
     xbox_dsound
     xbox_input
-    xbox_usb
+    $<$<BOOL:${XBOXRECOMP_BUILD_USB}>:xbox_usb>
     xbox_apu
     xbox_nv2a
     xbox_video
