@@ -341,6 +341,13 @@ FLAG_SETTERS = frozenset({
     "comiss", "comisd", "ucomiss", "ucomisd",  # SSE float compare
 })
 
+# Result setters must snapshot their destination before later guest code clobbers it.
+_RESULT_SNAPSHOT_SETTERS = frozenset({
+    "and", "or", "xor", "adc", "sbb", "neg",
+    "shl", "sal", "shr", "sar", "shld", "shrd", "add", "sub",
+})
+_RESULT_SRC_SETTERS = frozenset({"add", "sub"})
+
 # Arithmetic whose carry-out the lifter computes into _cf next to the write.
 #
 # A jb/jae reading CF after one of these is exact, which matters because the
@@ -512,6 +519,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if flag_setter in ("cmp", "test", "bsf", "bsr") and len(flag_ops) >= 2:
         signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
         lhs, rhs = ("_fas", "_fbs") if signed else ("_fa", "_fb")
+    elif flag_setter in _RESULT_SNAPSHOT_SETTERS and flag_ops:
+        lhs = "_fa"
+        if flag_setter in _RESULT_SRC_SETTERS and len(flag_ops) >= 2:
+            rhs = "_fb"
+        elif len(flag_ops) >= 2:
+            rhs = _fmt_operand_read(flag_ops[1])
+        else:
+            rhs = None
     elif len(flag_ops) >= 2:
         lhs = _fmt_operand_read(flag_ops[0])
         rhs = _fmt_operand_read(flag_ops[1])
@@ -1760,6 +1775,20 @@ class Lifter:
             return [f"{{ uint32_t _tmp; POP32(esp, _tmp); {_fmt_operand_write(ops[0], '_tmp')} }}"]
 
     # ── ALU binary operations ──
+
+    def _result_snapshot(self, ops, m, src_too=False):
+        size = _operand_width(ops[0])
+        if size not in self._SNAP_MASK:
+            size = 4
+        mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
+        if src_too:
+            src = _fmt_operand_read(ops[1])
+            return (f"_fb = (uint32_t)({src}) & {mask};"
+                    f" _fbs = (int32_t){sx}(_fb);"
+                    f" /* {m} source, before the write */")
+        dst = _fmt_operand_read(ops[0])
+        return (f"_fa = (uint32_t)({dst}) & {mask};"
+                f" _fas = (int32_t){sx}(_fa); /* {m} result */")
 
     def _lift_alu_binop(self, insn, ops, m):
         if len(ops) < 2:
@@ -3599,6 +3628,14 @@ def flag_state_after_block(bb, flag_state=None):
     for curr in bb.instructions:
         state = _advance_flag_state(curr, state)
     return state
+
+
+def _is_rep_compare(insn):
+    if not insn.mnemonic.startswith("rep"):
+        return False
+    text = f"{insn.mnemonic} {getattr(insn, 'op_str', '') or ''}"
+    return any(form in text for form in ("cmpsb", "cmpsw", "cmpsd",
+                                         "scasb", "scasw", "scasd"))
 
 
 def lift_basic_block(lifter, bb, flag_state=None):
