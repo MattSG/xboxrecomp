@@ -2334,6 +2334,8 @@ class BatchTranslator:
         self.translator.lifter.SEH_PROLOGS = frozenset(prolog_values)
         self.translator.lifter.SEH_PROLOG = min(prolog_values) if prolog_values else None
         self.translator.lifter.SEH_EPILOG = seh_epilog
+        self.translator.lifter.SEH_HELPERS = frozenset(prolog_values) | (
+            {seh_epilog} if seh_epilog is not None else set())
         self.translator.lifter.SETJMP_FN = setjmp_fn
         self.translator.lifter.LONGJMP_FN = longjmp_fn
         if not coalesce_json_paths:
