@@ -145,6 +145,12 @@ static void prof_count(const char *name, uint32_t va)
 
 void recomp_trace_enter(const char *name, uint32_t va)
 {
+    if (va == 0x00087954u && getenv("MM3_TRACE_PATH_TABLE")) {
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        fprintf(stderr, "[PATH_TABLE] enter esp=%08X arg=%08X\n", g_esp,
+                *(const uint32_t *)(mem + g_esp + 4));
+        fflush(stderr);
+    }
     if (prof_enabled()) { prof_count(name, va); return; }
     if (!trace_budget()) return;
     /* The return address as well as the registers: at entry it is still at
@@ -207,6 +213,10 @@ void recomp_trace_enter(const char *name, uint32_t va)
  * comes back wrong. */
 void recomp_trace_exit(const char *name, uint32_t va)
 {
+    if (va == 0x00087954u && getenv("MM3_TRACE_PATH_TABLE")) {
+        fprintf(stderr, "[PATH_TABLE] exit esp=%08X eax=%08X\n", g_esp, g_eax);
+        fflush(stderr);
+    }
     if (prof_enabled()) return;     /* entries alone carry the count */
     if (!trace_budget()) return;
     fprintf(stderr, "[TRACE] <- %s (0x%08X)  esp=%08X eax=%08X ecx=%08X "
