@@ -257,6 +257,8 @@ void recomp_trace_abi_call(uint32_t va, uint32_t esp, const char *phase)
     output = 0;
     if (destination < 0x1000000u)
         memcpy(&output, mem + destination, sizeof(output));
+    if (strcmp(phase, "after") == 0 && g_eax <= output)
+        output -= g_eax;
     if (arguments < 0x1000000u)
         memcpy(&value, mem + arguments, sizeof(value));
     fprintf(stderr, "[FORMAT_CALL] %s esp=%08X dest=%08X fmt=%08X args=%08X value=%08X out=%08X text=%.16s result=%.16s eax=%08X\n",
