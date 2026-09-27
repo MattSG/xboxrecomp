@@ -184,47 +184,87 @@ static BOOL  s_initialized = FALSE;
  * read fails. A directory cannot answer a 512-byte read at a file offset, so
  * the device is backed by an image file instead.
  *
- * The table is the standard retail geometry. This is emulating a device that
- * has to be there, not fabricating anything the title owns.
+ * The table identifies the running title's cache partition. It is persisted
+ * with the save data so a title sees the same selection on later runs.
  */
 #define XBOX_DISK_IMAGE_NAME   L"Partition0.img"
 #define XBOX_PART_TABLE_OFFSET 0x800
-#define XBOX_PART_IN_USE       0x80000000u
+#define XBOX_PART_TABLE_MAGIC     0x97315286u
+#define XBOX_PART_TABLE_VERSION   2u
+#define XBOX_PART_TABLE_SENTINEL 0xAA550000u
 
-static void xbox_write_partition_table(const WCHAR *path)
+static BOOL xbox_read_title_id(ULONG *title_id)
 {
-    /* name[16], flags, lba_start, lba_size, reserved -- 32 bytes each */
-    static const struct { const char *name; ULONG start, size; } parts[] = {
-        { "XBOX_PART_X",  0x00000400, 0x00177000 },  /* X: cache      */
-        { "XBOX_PART_Y",  0x00177400, 0x00177000 },  /* Y: cache      */
-        { "XBOX_PART_Z",  0x002EE400, 0x00177000 },  /* Z: cache      */
-        { "XBOX_PART_C",  0x00465400, 0x000FA000 },  /* C: system     */
-        { "XBOX_PART_E",  0x0055F400, 0x00465400 },  /* E: game/save  */
-    };
-    unsigned char sector[512];
+    WCHAR path[MAX_PATH];
+    unsigned char header[0x11C];
+    ULONG image_base, cert_va;
+    LARGE_INTEGER off, file_size;
+    DWORD read;
     HANDLE h;
-    DWORD written;
-    LARGE_INTEGER off;
-    size_t i;
 
-    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    swprintf_s(path, MAX_PATH, L"%s\\default.xbe", s_game_dir);
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return FALSE;
+    if (!GetFileSizeEx(h, &file_size) || file_size.QuadPart < sizeof(header) ||
+        !ReadFile(h, header, (DWORD)sizeof(header), &read, NULL) || read != sizeof(header) ||
+        memcmp(header, "XBEH", 4) != 0) {
+        CloseHandle(h);
+        return FALSE;
+    }
+    memcpy(&image_base, header + 0x104, sizeof(image_base));
+    memcpy(&cert_va, header + 0x118, sizeof(cert_va));
+    if (cert_va < image_base || (ULONGLONG)(cert_va - image_base) + 12 > (ULONGLONG)file_size.QuadPart) {
+        CloseHandle(h);
+        return FALSE;
+    }
+    off.QuadPart = (LONGLONG)(cert_va - image_base) + 8;
+    if (!SetFilePointerEx(h, off, NULL, FILE_BEGIN) ||
+        !ReadFile(h, title_id, sizeof(*title_id), &read, NULL) || read != sizeof(*title_id)) {
+        CloseHandle(h);
+        return FALSE;
+    }
+    CloseHandle(h);
+    return *title_id != 0;
+}
+
+static void xbox_write_partition_table(const WCHAR *path, ULONG title_id)
+{
+    unsigned char sector[512];
+    ULONG word;
+    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD read, written;
+    LARGE_INTEGER off = {0};
+
     if (h == INVALID_HANDLE_VALUE)
         return;
-
-    memset(sector, 0, sizeof(sector));
-    memcpy(sector, "****PARTINFO****", 16);
-    for (i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
-        unsigned char *e = sector + 48 + i * 32;   /* 16 magic + 32 reserved */
-        size_t n = strlen(parts[i].name);
-        memset(e, ' ', 16);
-        memcpy(e, parts[i].name, n < 16 ? n : 16);
-        *(ULONG *)(e + 16) = XBOX_PART_IN_USE;
-        *(ULONG *)(e + 20) = parts[i].start;
-        *(ULONG *)(e + 24) = parts[i].size;
-        *(ULONG *)(e + 28) = 0;
+    off.QuadPart = XBOX_PART_TABLE_OFFSET;
+    if (SetFilePointerEx(h, off, NULL, FILE_BEGIN) &&
+        ReadFile(h, sector, sizeof(sector), &read, NULL) && read == sizeof(sector)) {
+        memcpy(&word, sector, 4);
+        if (word == XBOX_PART_TABLE_MAGIC) {
+            ULONG version, stored_title, active, sentinel;
+            memcpy(&version, sector + 4, 4);
+            memcpy(&stored_title, sector + 8, 4);
+            memcpy(&active, sector + 16, 4);
+            memcpy(&sentinel, sector + 0x1F8, 4);
+            if (version == XBOX_PART_TABLE_VERSION && stored_title == title_id &&
+                active == 1 && sentinel == XBOX_PART_TABLE_SENTINEL) {
+                CloseHandle(h);
+                return;
+            }
+        }
     }
 
+    memset(sector, 0, sizeof(sector));
+    word = XBOX_PART_TABLE_MAGIC; memcpy(sector, &word, 4);
+    word = XBOX_PART_TABLE_VERSION; memcpy(sector + 4, &word, 4);
+    memcpy(sector + 8, &title_id, 4);
+    word = 0; memcpy(sector + 12, &word, 4); /* cache partition */
+    word = 1; memcpy(sector + 16, &word, 4); /* active */
+    word = XBOX_PART_TABLE_SENTINEL; memcpy(sector + 0x1F8, &word, 4);
     off.QuadPart = XBOX_PART_TABLE_OFFSET;
     if (SetFilePointerEx(h, off, NULL, FILE_BEGIN))
         WriteFile(h, sector, sizeof(sector), &written, NULL);
@@ -239,7 +279,7 @@ static void xbox_write_partition_table(const WCHAR *path)
  * like -- is an ordinary filesystem access and falls through to the rules
  * table, which puts it in a directory.
  *
- * Partition0 is the whole disk and carries the partition table written above.
+ * Partition0 is the whole disk and carries the title cache table above.
  * The rest start empty, which is what an unformatted partition looks like, so
  * a title that wants a filesystem there formats one.
  */
@@ -317,16 +357,18 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
                                        L"SystemData" };
         WCHAR image[MAX_PATH];
         WCHAR dir[MAX_PATH];
+        ULONG title_id;
         SHCreateDirectoryExW(NULL, s_save_dir, NULL);
         for (int i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
             swprintf_s(dir, MAX_PATH, L"%s\\%s", s_save_dir, subs[i]);
             SHCreateDirectoryExW(NULL, dir, NULL);
         }
         swprintf_s(image, MAX_PATH, L"%s\\%s", s_save_dir, XBOX_DISK_IMAGE_NAME);
-        xbox_write_partition_table(image);
-        /* The other partition devices, sized to the same geometry the table
-         * above describes, so a title that asks the device how big it is gets
-         * an answer consistent with the table it just read. Marked sparse
+        if (xbox_read_title_id(&title_id))
+            xbox_write_partition_table(image, title_id);
+        else
+            fprintf(stderr, "[PATH] Cannot read title ID from %S\\default.xbe; leaving Partition0 table unchanged\n", s_game_dir);
+        /* Keep the other partition images at retail capacities. Marked sparse
          * first: the cache partitions are 750 MB each and none of that is
          * touched until something writes to it. */
         {
