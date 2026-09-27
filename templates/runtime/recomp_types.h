@@ -372,6 +372,7 @@ void recomp_trace_enter(const char *name, uint32_t va);
 void recomp_trace_exit(const char *name, uint32_t va);
 #define RECOMP_TRACE_EXIT(name, va) recomp_trace_exit((name), (va))
 void recomp_trace_esp(const char *name, const char *tag);
+void recomp_trace_abi_call(uint32_t va, uint32_t esp, const char *phase);
 #define RECOMP_TRACE_ESP(name, tag) recomp_trace_esp((name), (tag))
 
 
@@ -887,7 +888,14 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
         recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
 } while(0)
 #else
-#define RECOMP_ABI_CALL(va, fn) (fn)()
+#define RECOMP_ABI_CALL(va, fn) do { \
+    uint32_t _trace_call_esp = g_esp; \
+    if ((uint32_t)(va) == 0x00097E46u) \
+        recomp_trace_abi_call((uint32_t)(va), _trace_call_esp, "before"); \
+    (fn)(); \
+    if ((uint32_t)(va) == 0x00097E46u) \
+        recomp_trace_abi_call((uint32_t)(va), _trace_call_esp, "after"); \
+} while (0)
 #endif
 
 /**
