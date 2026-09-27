@@ -3044,8 +3044,11 @@ static NTSTATUS bridge_create_file_impl(
     XBOX_IO_STATUS_BLOCK   ios;
     HANDLE   h  = NULL;
     NTSTATUS st;
-bridge_build_oa(obj_attrs_va, &oa, &name);
+    bridge_build_oa(obj_attrs_va, &oa, &name);
     if (!name.Buffer) {
+        if (getenv("MM3_TRACE_FILE_THREAD"))
+            fprintf(stderr, "  [FILE_RESULT] tid=%lu guest=<null> status=%08X\n",
+                    GetCurrentThreadId(), (unsigned)STATUS_OBJECT_PATH_NOT_FOUND);
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
@@ -3063,6 +3066,11 @@ bridge_build_oa(obj_attrs_va, &oa, &name);
 
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
                            file_attrs, share, disposition, options);
+    if (getenv("MM3_TRACE_FILE_THREAD")) {
+        fprintf(stderr, "  [FILE_RESULT] tid=%lu guest=%s status=%08X\n",
+                GetCurrentThreadId(), name.Buffer, (unsigned)st);
+        fflush(stderr);
+    }
 
     if (NT_SUCCESS(st)) {
         bridge_write_handle(handle_va, h);

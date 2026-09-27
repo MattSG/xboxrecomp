@@ -14,6 +14,7 @@
 
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -453,6 +454,11 @@ translate:
         }
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %S", xbox_path, host_path_buf);
+        if (getenv("MM3_TRACE_FILE_THREAD")) {
+            fprintf(stderr, "  [PATH_MAP] tid=%lu guest=%s host=%S\n",
+                    (unsigned long)GetCurrentThreadId(), xbox_path, host_path_buf);
+            fflush(stderr);
+        }
         xbox_remember_host_path(host_path_buf);
         return TRUE;
     }
@@ -599,6 +605,10 @@ translate:
         }
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+        if (getenv("MM3_TRACE_FILE_THREAD")) {
+            fprintf(stderr, "  [PATH_MAP] guest=%s host=%s\n", xbox_path, host_path_buf);
+            fflush(stderr);
+        }
         return TRUE;
     }
 }
