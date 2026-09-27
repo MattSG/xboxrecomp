@@ -2396,8 +2396,6 @@ class Lifter:
         targets = self.jump_table_targets.get(table_va)
         if targets is None:
             targets = self._read_jump_table(table_va)
-        if not targets:
-            return []
         # Truncate at the first entry outside the function rather than
         # demanding that every entry be inside it.
         #
@@ -2415,14 +2413,28 @@ class Lifter:
         # none of them, the indexed jump became an unresolvable indirect call,
         # and sprintf silently produced the wrong string.
         inside = []
-        for target in targets:
+        for target in targets or ():
             if not (self.func_start <= target < self.func_end):
                 break
             inside.append(target)
         # Two arms is the smallest thing worth calling a switch; one is more
         # likely a coincidence than a jump table.
         if len(inside) >= 2:
+            # Remember tables discovered while lifting a function without a
+            # recovered CFG. A later negative-index jump can use the first
+            # arm as its base (one past the table), so it needs this census.
+            if table_va not in self.jump_table_targets:
+                self.jump_table_targets[table_va] = inside
             return inside
+
+        # A negative index may address a validated table immediately before
+        # the displacement. Accept that alias only when the displacement is
+        # exactly one past the table and is itself one of its local targets.
+        for base, table in self.jump_table_targets.items():
+            if (len(table) >= 2
+                    and table_va == base + len(table) * 4
+                    and table_va in table):
+                return table
         return []
 
     def _lift_jmp(self, insn, ops):
