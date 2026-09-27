@@ -19,10 +19,11 @@
  * Everything this does not handle is counted and ranked by
  * nv2a_pb_exec_report(), so what remains is a list rather than a guess.
  *
- * Enabled with RECOMP_PB_EXEC. RECOMP_RASTER_TEST draws one known triangle
- * after every clear, which separates "the pixel path is broken" from "the title
- * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes the surface to
- * <prefix>NNN.bmp, so the result can be looked at without a display.
+ * Runs by default; RECOMP_PB_SCAN keeps diagnostics scan-only. RECOMP_RASTER_TEST
+ * draws one known triangle after every clear, which separates "the pixel path
+ * is broken" from "the title has not given us any vertices". RECOMP_FB_DUMP=<prefix>
+ * writes the surface to <prefix>NNN.bmp, so the result can be inspected without
+ * a display.
  */
 #include <math.h>
 #include <stdio.h>
