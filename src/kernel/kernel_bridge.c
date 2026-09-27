@@ -3205,8 +3205,15 @@ static void bridge_NtCreateFile(void)
                 tls >= 8 ? BRIDGE_MEM32(tls - 8) : 0,
                 tls >= 4 ? BRIDGE_MEM32(tls - 4) : 0);
         fprintf(stderr,
-                "[FILE_REQUEST] tid=%lu caller=%08X oa=%08X root=%08X attr=%08X name=%08X len=%u max=%u buf=%08X guest=%s\n",
-                GetCurrentThreadId(), g_xbox_kernel_caller, obj_attrs, root, attributes,
+                "[FILE_REQUEST] tid=%lu caller=%08X sp=%08X stack=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X oa=%08X root=%08X attr=%08X name=%08X len=%u max=%u buf=%08X guest=%s\n",
+                GetCurrentThreadId(), g_xbox_kernel_caller, g_esp,
+                BRIDGE_MEM32(g_esp + 0), BRIDGE_MEM32(g_esp + 4),
+                BRIDGE_MEM32(g_esp + 8), BRIDGE_MEM32(g_esp + 12),
+                BRIDGE_MEM32(g_esp + 16), BRIDGE_MEM32(g_esp + 20),
+                BRIDGE_MEM32(g_esp + 24), BRIDGE_MEM32(g_esp + 28),
+                BRIDGE_MEM32(g_esp + 32), BRIDGE_MEM32(g_esp + 36),
+                BRIDGE_MEM32(g_esp + 40), BRIDGE_MEM32(g_esp + 44),
+                obj_attrs, root, attributes,
                 name_va, (unsigned)length, (unsigned)maximum, buffer_va,
                 path ? path : "<null>");
     }
