@@ -3167,6 +3167,23 @@ static void bridge_NtCreateFile(void)
     uint32_t disposition = STACK_ARG(7);  /* CreateDisposition */
     uint32_t options     = STACK_ARG(8);  /* CreateOptions */
 
+    if (getenv("MM3_TRACE_FILE_THREAD")) {
+        uint32_t tls = BRIDGE_MEM32(g_fs_base + 4);
+        fprintf(stderr,
+                "[FILE_THREAD] tid=%lu esp=%08X fs=%08X tib=%08X,%08X,%08X,%08X,%08X,%08X tls=%08X data=%08X,%08X,%08X,%08X,%08X\n",
+                GetCurrentThreadId(), g_esp, g_fs_base,
+                BRIDGE_MEM32(g_fs_base), tls,
+                BRIDGE_MEM32(g_fs_base + 8),
+                BRIDGE_MEM32(g_fs_base + 0x18),
+                BRIDGE_MEM32(g_fs_base + 0x20),
+                BRIDGE_MEM32(g_fs_base + 0x28), tls,
+                tls >= 20 ? BRIDGE_MEM32(tls - 20) : 0,
+                tls >= 16 ? BRIDGE_MEM32(tls - 16) : 0,
+                tls >= 12 ? BRIDGE_MEM32(tls - 12) : 0,
+                tls >= 8 ? BRIDGE_MEM32(tls - 8) : 0,
+                tls >= 4 ? BRIDGE_MEM32(tls - 4) : 0);
+    }
+
     /* The out-parameter addresses matter as much as the result: this bridge
      * hands them to a real Win32 call, so a bogus one has Windows itself write
      * into Xbox memory. That is how a wild write ends up with a stack inside
