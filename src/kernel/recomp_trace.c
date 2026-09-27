@@ -248,17 +248,20 @@ void recomp_trace_esp(const char *name, const char *tag)
 void recomp_trace_abi_call(uint32_t va, uint32_t esp, const char *phase)
 {
     const uint8_t *mem;
-    uint32_t destination, format, arguments, output;
+    uint32_t destination, format, arguments, output, value = 0;
     if (va != 0x00097E46u || !getenv("MM3_TRACE_FORMATTER")) return;
     mem = (const uint8_t *)xbox_GetMemoryOffset();
-    destination = MEM32(esp + 4u);
-    format = MEM32(esp + 8u);
-    arguments = MEM32(esp + 12u);
-    output = destination < 0x1000000u ? MEM32(destination) : 0;
+    memcpy(&destination, mem + esp + 4u, sizeof(destination));
+    memcpy(&format, mem + esp + 8u, sizeof(format));
+    memcpy(&arguments, mem + esp + 12u, sizeof(arguments));
+    output = 0;
+    if (destination < 0x1000000u)
+        memcpy(&output, mem + destination, sizeof(output));
+    if (arguments < 0x1000000u)
+        memcpy(&value, mem + arguments, sizeof(value));
     fprintf(stderr, "[FORMAT_CALL] %s esp=%08X dest=%08X fmt=%08X args=%08X value=%08X out=%08X text=%.16s result=%.16s eax=%08X\n",
             phase, esp, destination, format, arguments,
-            arguments < 0x1000000u ? MEM32(arguments) : 0,
-            output, format < 0x1000000u ? (const char *)(mem + format) : "",
+            value, output, format < 0x1000000u ? (const char *)(mem + format) : "",
             output < 0x1000000u ? (const char *)(mem + output) : "", g_eax);
     fflush(stderr);
 }
