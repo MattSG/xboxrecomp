@@ -67,16 +67,29 @@ def test_loop_head_inherits_flags_from_both_predecessors():
     assert "CMP_EQ" in code or "== 0" in code, code
 
 
+def test_sub_countdown_snapshots_result_before_jne():
+    #   L: sub ecx, 1
+    #      jne L
+    #      ret
+    image = bytes.fromhex("83 E9 01 75 FB C3")
+    code = _translate(image)
+    sub = code.index("ecx = ecx - 1;")
+    snapshot = code.index("_fa = (uint32_t)(ecx) & 0xFFFFFFFFu;", sub)
+    branch = code.index("if ((_fa != 0)) goto loc_00010000;", snapshot)
+    assert sub < snapshot < branch, code
+
+
 def test_disagreeing_predecessors_keep_the_fallback():
-    # Two predecessors reach the jz: one after `sub`, one after `inc`, whose
-    # flags come from a different operand. The join must refuse.
-    #   +0  sub eax, ecx
-    #   +2  jmp +3            -> the jz at +5
-    #   +4  inc edx           (falls through to the jz, different flag source)
+    # Two predecessors reach the jz: one after `cmp`, one after `inc`. Their
+    # ZF meanings differ (operand equality versus a result), so the join must
+    # refuse.
+    #   +0  cmp eax, ecx
+    #   +2  jnz +1            -> the jz at +5 when ZF is clear
+    #   +4  inc edx           (fallthrough reaches the jz with different flags)
     #   +5 L: jz +1
     #   +7  ret
-    image = (b"\x29\xC8"          # sub eax, ecx
-             b"\xEB\x01"          # jmp +1 -> +5
+    image = (b"\x39\xC8"          # cmp eax, ecx
+             b"\x75\x01"          # jnz +1 -> +5
              b"\x42"              # inc edx
              b"\x74\x00"          # jz +0 -> +7
              b"\xC3")             # ret
@@ -86,5 +99,6 @@ def test_disagreeing_predecessors_keep_the_fallback():
 
 if __name__ == "__main__":
     test_loop_head_inherits_flags_from_both_predecessors()
+    test_sub_countdown_snapshots_result_before_jne()
     test_disagreeing_predecessors_keep_the_fallback()
     print("ok")

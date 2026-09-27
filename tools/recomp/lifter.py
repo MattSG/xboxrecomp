@@ -1800,19 +1800,31 @@ class Lifter:
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             out = ["_cf = 0; /* xor clears CF */"] if self.needs_cf else []
             out.append(_fmt_operand_write(ops[0], "0") + " /* xor self */")
+            out.append("_fa = 0; _fas = 0; /* xor result */")
             return out
         expr = f"{dst} {c_op} {src}"
         out = []
+        size = _operand_width(ops[0]) or 4
+        mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
+        if m in _RESULT_SRC_SETTERS:
+            out.extend([
+                f"_fb = (uint32_t)({src}) & {mask};",
+                f"_fbs = (int32_t){sx}(_fb); /* {m} source */",
+            ])
         if self.needs_cf:
             # CF must be computed from the pre-write operands.
             if m == "add":
-                w = _operand_width(ops[0]) or 4
-                out.append(f"_cf = (int)((((uint64_t)({dst}) + (uint64_t)({src})) >> {w * 8}) & 1);")
+                out.append(f"_cf = (int)((((uint64_t)({dst}) + (uint64_t)({src})) >> {size * 8}) & 1);")
             elif m == "sub":
                 out.append(f"_cf = (int)((uint32_t)({dst}) < (uint32_t)({src}));")
             else:
                 out.append("_cf = 0; /* logical op clears CF */")
         out.append(_fmt_operand_write(ops[0], expr))
+        if m in _RESULT_SNAPSHOT_SETTERS:
+            out.extend([
+                f"_fa = (uint32_t)({dst}) & {mask};",
+                f"_fas = (int32_t){sx}(_fa); /* {m} result */",
+            ])
         return out
 
     def _lift_inc_dec(self, insn, ops, m):
