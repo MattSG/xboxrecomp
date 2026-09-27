@@ -237,10 +237,10 @@ void recomp_trace_esp(const char *name, const char *tag)
     if (getenv("MM3_TRACE_PATH_TABLE") &&
         strcmp(name, "sub_00086E7D") == 0 &&
         strcmp(tag, "after call 0x00093DD3") == 0 &&
-        g_eax >= 0x10000u && g_eax < 0x1000000u) {
+        g_esp >= 0x10000u && g_esp + 0x20u < 0x1000000u) {
         const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-        fprintf(stderr, "[NAME_APPEND] eax=%08X text=%.32s\n",
-                g_eax, (const char *)(mem + g_eax));
+        fprintf(stderr, "[NAME_APPEND] va=%08X text=%.32s\n",
+                g_esp + 0xCu, (const char *)(mem + g_esp + 0xCu));
     }
     fflush(stderr);
 }
