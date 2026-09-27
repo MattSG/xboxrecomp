@@ -232,9 +232,10 @@ void nv2a_pb_scan(uint32_t put_phys)
     uint32_t words = 0, jumps = 0, unknown = 0;
 
     if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(s_exec_enabled || getenv("RECOMP_PB_SCAN")))
-        return;
+        /* Normal title execution needs the NV2A stream consumed. Preserve
+         * RECOMP_PB_SCAN as an explicit scan-only diagnostic. */
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL ||
+                         getenv("RECOMP_PB_SCAN") == NULL;
     if (s_get == 0xFFFFFFFFu) {               /* never resynced: start at PUT */
         s_get = put;
         return;

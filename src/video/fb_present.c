@@ -12,7 +12,7 @@
  * and the screen the better -- and it must keep working while the D3D8 layer
  * is busy with something else, such as the FMV player's own window.
  *
- * Off unless RECOMP_FB_WINDOW is set.
+ * The visible host scanout for the guest framebuffer.
  */
 #include <stdint.h>
 
@@ -349,8 +349,6 @@ void xbox_FramebufferWindowStart(void)
 {
     HANDLE th;
 
-    if (!getenv("RECOMP_FB_WINDOW"))
-        return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
     th = CreateThread(NULL, 0, fb_thread, NULL, 0, NULL);

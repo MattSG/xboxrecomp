@@ -1127,8 +1127,8 @@ static void clear_surface(uint32_t param)
      * and nothing appeared.
      *
      * Here is the better trigger anyway: this runs when a surface address is
-     * known to be real, because a clear just used it. Idempotent and gated on
-     * RECOMP_FB_WINDOW, so the cost is one interlocked compare per clear. */
+     * known to be real, because a clear just used it. Idempotent, so this costs
+     * one interlocked compare per clear. */
     xbox_FramebufferWindowStart();
 }
 
