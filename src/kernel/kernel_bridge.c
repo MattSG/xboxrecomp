@@ -3177,6 +3177,20 @@ static void bridge_NtCreateFile(void)
 
     if (getenv("MM3_TRACE_FILE_THREAD")) {
         uint32_t tls = BRIDGE_MEM32(g_fs_base + 4);
+        uint32_t name_va = 0, buffer_va = 0, root = 0, attributes = 0;
+        uint16_t length = 0, maximum = 0;
+        const char *path = NULL;
+        if (obj_attrs && bridge_va_mapped(obj_attrs, 12)) {
+            root = BRIDGE_MEM32(obj_attrs);
+            name_va = BRIDGE_MEM32(obj_attrs + 4);
+            attributes = BRIDGE_MEM32(obj_attrs + 8);
+        }
+        if (name_va && bridge_va_mapped(name_va, 8)) {
+            length = BRIDGE_MEM16(name_va);
+            maximum = BRIDGE_MEM16(name_va + 2);
+            buffer_va = BRIDGE_MEM32(name_va + 4);
+        }
+        path = bridge_get_xbox_path(obj_attrs);
         fprintf(stderr,
                 "[FILE_THREAD] tid=%lu esp=%08X fs=%08X tib=%08X,%08X,%08X,%08X,%08X,%08X tls=%08X data=%08X,%08X,%08X,%08X,%08X\n",
                 GetCurrentThreadId(), g_esp, g_fs_base,
@@ -3190,6 +3204,11 @@ static void bridge_NtCreateFile(void)
                 tls >= 12 ? BRIDGE_MEM32(tls - 12) : 0,
                 tls >= 8 ? BRIDGE_MEM32(tls - 8) : 0,
                 tls >= 4 ? BRIDGE_MEM32(tls - 4) : 0);
+        fprintf(stderr,
+                "[FILE_REQUEST] tid=%lu caller=%08X oa=%08X root=%08X attr=%08X name=%08X len=%u max=%u buf=%08X guest=%s\n",
+                GetCurrentThreadId(), g_xbox_kernel_caller, obj_attrs, root, attributes,
+                name_va, (unsigned)length, (unsigned)maximum, buffer_va,
+                path ? path : "<null>");
     }
 
     /* The out-parameter addresses matter as much as the result: this bridge
