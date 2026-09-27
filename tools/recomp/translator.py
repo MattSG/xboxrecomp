@@ -1842,6 +1842,11 @@ class FunctionTranslator:
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
 
+        # The MM3 startup worker calls helpers through the shared guest
+        # register file. Preserve its caller's EBX across those calls.
+        if start == 0x001E7B41:
+            lines.append("    uint32_t _saved_ebx = ebx;")
+
         # Optional entry trace. Bring-up is mostly "which of these ten init
         # calls does it not come back from", and answering that by overriding
         # a function loses the body you were trying to observe.
@@ -2130,6 +2135,10 @@ class FunctionTranslator:
             lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
             lines.append(f"")
+
+        if start == 0x001E7B41:
+            lines = [line.replace("return;", "ebx = _saved_ebx; return;")
+                     for line in lines]
 
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
         # The pattern is: optional PUSH32 args, then
