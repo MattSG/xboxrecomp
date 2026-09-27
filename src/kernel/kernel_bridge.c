@@ -1596,9 +1596,9 @@ static void bridge_RtlEnterCriticalSection(void)
 {
     uint32_t cs_va = STACK_ARG(0);
     if (g_xbox_kernel_caller == 0x00085945u)
-        fprintf(stderr, "[RTL_ABI] before site=%08X cs=%08X ebx=%08X esi=%08X edi=%08X ebp=%08X seh=%08X arg8=%08X\n",
+        fprintf(stderr, "[RTL_ABI] before site=%08X cs=%08X ebx=%08X esi=%08X edi=%08X seh=%08X arg8=%08X\n",
                 g_xbox_kernel_caller, cs_va, g_ebx, g_esi, g_edi,
-                g_ebp, g_seh_ebp, BRIDGE_MEM32(g_ebp + 8));
+                g_seh_ebp, BRIDGE_MEM32(g_seh_ebp + 8));
     xbox_RtlEnterCriticalSection(XBOX_TO_NATIVE(cs_va));
     g_eax = 0;
     if (g_xbox_kernel_caller == 0x00085945u)
