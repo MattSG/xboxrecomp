@@ -2669,6 +2669,8 @@ class Lifter:
                 "{ int32_t _st = RECOMP_DF_STEP(1);",
                 "while (ecx != 0) {",
                 "    _flags = (MEM8(esi) == MEM8(edi));",
+                *(["    _cf = (MEM8(esi) < MEM8(edi));"]
+                  if self.needs_cf else []),
                 "    esi += _st; edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
                 f"}} }} /* {m} */",
@@ -2680,6 +2682,8 @@ class Lifter:
                 "{ int32_t _st = RECOMP_DF_STEP(1);",
                 "while (ecx != 0) {",
                 "    _flags = (LO8(eax) == MEM8(edi));",
+                *(["    _cf = (LO8(eax) < MEM8(edi));"]
+                  if self.needs_cf else []),
                 "    edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
                 f"}} }} /* {m} */",
@@ -2699,6 +2703,8 @@ class Lifter:
                 f"{{ int32_t _st = RECOMP_DF_STEP({step});",
                 "while (ecx != 0) {",
                 f"    _flags = ({acc}(esi) == {acc}(edi));",
+                *([f"    _cf = ({acc}(esi) < {acc}(edi));"]
+                  if self.needs_cf else []),
                 "    esi += _st; edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
                 f"}} }} /* {m} */",
@@ -2713,6 +2719,8 @@ class Lifter:
                 f"{{ int32_t _st = RECOMP_DF_STEP({step});",
                 "while (ecx != 0) {",
                 f"    _flags = ({value} == {acc}(edi));",
+                *([f"    _cf = ({value} < {acc}(edi));"]
+                  if self.needs_cf else []),
                 "    edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
                 f"}} }} /* {m} */",
