@@ -20,7 +20,7 @@ DEF_RE = re.compile(r"^void (\w*?(?:sub_)?([0-9A-Fa-f]{8}))\(void\)\s*(?:\{|$)",
 _SUB_DEF_RE = re.compile(r"^void (sub_([0-9A-Fa-f]{8}))\(void\)\s*(?:\{|$)", re.M)
 # recomp_manual.c wraps rather than replaces some functions: it defines sub_X
 # itself and calls the generated body as sub_X_gen.
-_WRAP_RE = re.compile(r"^extern void (sub_([0-9A-Fa-f]{8}))_gen\(void\);", re.M)
+_WRAP_RE = re.compile(r"^extern void (sub_([0-9A-Fa-f]{8}))_gen\(void\)(?:\s*/\*.*?\*/)?\s*;", re.M)
 
 
 def strip_disabled(src):
