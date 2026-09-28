@@ -3637,10 +3637,8 @@ def _advance_flag_state(curr, flag_state=None):
             or curr.mnemonic.startswith("set")):
         return flag_state
     if curr.mnemonic.startswith("rep"):
-        rest = curr.op_str.strip() if hasattr(curr, "op_str") else ""
         raw_m = curr.mnemonic
-        if ("cmpsb" in raw_m or "scasb" in raw_m
-                or "cmpsb" in rest or "scasb" in rest):
+        if _is_rep_compare(curr):
             return (raw_m, list(curr.operands))
         return flag_state
     return None
