@@ -1981,13 +1981,18 @@ class Lifter:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        out = []
+        count = f"((uint32_t)({cnt}) & 31u)"
+        out = [f"{{ uint32_t _c = {count};"]
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
-            # CF is the last bit shifted out; a zero count leaves CF alone.
-            bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
+            # CF is the last bit shifted out. A zero count preserves all flags;
+            # CF is undefined above the operand width.
+            bit = "_c - 1" if c_op == ">>" else f"{w}u - _c"
+            out.append(f"if (_c && _c <= {w}u) _cf = (int)((({dst}) >> ({bit})) & 1);")
+        result = _fmt_operand_write(ops[0], f"{dst} {c_op} _c")
+        out.append(f"if (_c) {{ {result}")
+        out.append(f"{self._result_snapshot(ops, insn.mnemonic)} }}")
+        out.append("}")
         return out
 
     def _lift_sar(self, insn, ops):
@@ -2024,10 +2029,13 @@ class Lifter:
         cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
         width = (_operand_width(ops[0]) or 4) * 8
         signed = f"(int32_t)(int{width}_t)({dst})"
-        out = []
+        out = [f"{{ uint32_t _c = {cnt};"]
         if self.needs_cf:
-            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> (({cnt}) - 1)) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> {cnt})"))
+            out.append(f"if (_c) _cf = (int)(((uint32_t)({signed}) >> (_c - 1)) & 1);")
+        result = _fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> _c)")
+        out.append(f"if (_c) {{ {result}")
+        out.append(f"{self._result_snapshot(ops, 'sar')} }}")
+        out.append("}")
         return out
 
     def _lift_rotate_carry(self, insn, ops, m):

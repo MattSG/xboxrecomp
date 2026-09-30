@@ -169,6 +169,22 @@ def test_every_setter_publishes_what_its_condition_reads(mnemonic, operands):
     assert "_fa =" in _lift(mnemonic, operands)
 
 
+def test_shift_flags_survive_an_earlier_flag_setter():
+    insns = [
+        Instruction(0, 2, "and", "eax, 3", "", [_reg("eax"), _imm(3)]),
+        Instruction(2, 2, "shr", "ecx, 2", "", [_reg("ecx"), _imm(2)]),
+        Instruction(4, 2, "je", "0x20", "", [], jump_target=0x20),
+    ]
+    stmts, _ = lift_basic_block(Lifter(), BasicBlock(0, insns))
+    shift = next(i for i, stmt in enumerate(stmts)
+                 if "ecx = ecx >> _c" in stmt)
+    snapshot = next(i for i, stmt in enumerate(stmts)
+                    if i > shift and "_fa =" in stmt)
+    branch = next(i for i, stmt in enumerate(stmts)
+                  if i > snapshot and "if ((_fa == 0))" in stmt)
+    assert shift < snapshot < branch
+
+
 def test_a_condition_never_re_reads_the_destination():
     for width, lo, dest_read, mask in _WIDTHS:
         for mnemonic, ops in (("and", [_reg(lo), _imm(mask)]),
