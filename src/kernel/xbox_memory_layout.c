@@ -323,12 +323,14 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 #define AC97_NABM_OFFSET  0x400000u   /* 0xFEC00000 within the MCPX aperture */
 #define AC97_TRAP_BYTES   0x1000u
 #define AC97_RR           0x02u
+#define AC97_CODEC_STATUS 0x130u
+#define AC97_CODEC_READY  0x100u
 
 static void *g_ac97_page = NULL;      /* host address of the trapped page */
 static void *g_ac97_veh  = NULL;
 static RECOMP_TLS int s_ac97_stepping = 0;
 
-static void ac97_clear_reset_bits(void)
+static void ac97_apply_register_side_effects(void)
 {
     /* Every bus-master channel, not the three a PC AC'97 has.
      *
@@ -346,6 +348,9 @@ static void ac97_clear_reset_bits(void)
         if (*r & AC97_RR)
             *r = (uint8_t)(*r & ~AC97_RR);
     }
+    /* GLOB_STA's codec-ready bit is read-only while the codec is attached. */
+    *(volatile uint32_t *)((char *)g_ac97_page + AC97_CODEC_STATUS)
+        |= AC97_CODEC_READY;
 }
 
 static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
@@ -363,7 +368,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
      * mid-step. */
     if (code == EXCEPTION_SINGLE_STEP && s_ac97_stepping) {
         s_ac97_stepping = 0;
-        ac97_clear_reset_bits();
+        ac97_apply_register_side_effects();
         VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
         ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -386,9 +391,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* Arm the trap. Called once the MCPX aperture exists, and only alongside the
- * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
- * channel has nothing to gain from it, and the page fault costs something. */
+/* Arm the controller write trap once the MCPX aperture exists. */
 static void ac97_arm_write_trap(void)
 {
     DWORD old;
@@ -2389,31 +2392,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * which crashes. Reporting the codec as present is what lets the
              * engine initialise at all.
              *
-             * The aperture is plain memory, so setting the bit once is enough:
-             * nothing clears it, and the poll reads it on the first pass. */
-            #define MCPX_AC97_CODEC_STATUS 0x00400130u   /* 0xFEC00130 */
-            #define MCPX_AC97_CODEC_READY  0x00000100u
-            /* Opt-in, and not because it is wrong.
-             *
-             * Reporting the codec is the correct answer -- DSERR_NODRIVER is
-             * not what hardware returns -- but it is only correct as far as it
-             * goes. DirectSound then hands the audio DSP a command block in
-             * RAM and spins until the DSP clears it, and there is no DSP here,
-             * so the title trades a late crash for an early hang: 44 assets
-             * loaded and then a fault, versus one asset and a stall in audio
-             * init. Until the DSP handshake is answered, the honest default is
-             * the failure that gets further, with the correct behaviour one
-             * variable away. */
-            if (getenv("RECOMP_AC97_READY")) {
-                /* The APU's registers have to fault so they can be routed to
-                 * the emulated APU, which is the half that answers the DSP
-                 * handshake. Backed as plain memory the guest's writes go
-                 * nowhere the APU can see, so it initialises and then waits
-                 * forever. Only the APU's own 512K is unmapped: AC'97 above it
-                 * stays plain memory, which is what the codec-ready bit needs.
-                 *
-                 * Enabled by the same variable, because neither half is any
-                 * use without the other. */
+             * The write trap restores the read-only ready bit after writes. */
+            /* An attached codec reports ready at boot. Route APU accesses to
+             * the existing device model and apply AC'97 reset side effects
+             * during normal initialization. This does not acknowledge DSP
+             * commands or provide a host output device. */
+            {
+                /* Route the APU's 512K to its MMIO handlers. AC'97 has a
+                 * separate write trap above it in the MCPX aperture. */
                 DWORD old_protect;
                 if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
                                    PAGE_NOACCESS, &old_protect))
@@ -2422,14 +2408,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
                             XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
                 *(volatile uint32_t *)((char *)g_mcpx_memory
-                                       + MCPX_AC97_CODEC_STATUS)
-                    |= MCPX_AC97_CODEC_READY;
+                                       + AC97_NABM_OFFSET + AC97_CODEC_STATUS)
+                    |= AC97_CODEC_READY;
                 /* Before the trap is armed: this write would otherwise be
                  * the first thing to fault. */
                 ac97_arm_write_trap();
                 fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
                                 " (DirectSound will initialise)\n",
-                        XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
+                        XBOX_MCPX_BASE + AC97_NABM_OFFSET + AC97_CODEC_STATUS);
             }
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
                     "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
