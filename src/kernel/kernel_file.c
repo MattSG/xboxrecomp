@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -144,6 +145,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    DWORD open_error = ERROR_SUCCESS;
+    DWORD open_started = 0;
+    BOOL trace_open = getenv("MM3_TRACE_FILE_THREAD") != NULL;
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
@@ -178,6 +182,15 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
+    if (trace_open) {
+        open_started = GetTickCount();
+        fprintf(stderr, "[FILE_OPEN_BEGIN] tid=%lu path=%S access=%08lX share=%08lX"
+                        " disposition=%lu options=%08lX\n",
+                GetCurrentThreadId(), win_path, DesiredAccess, ShareAccess,
+                CreateDisposition, CreateOptions);
+        fflush(stderr);
+    }
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
@@ -194,8 +207,17 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
     }
 
+    if (h == INVALID_HANDLE_VALUE)
+        open_error = GetLastError();
+    if (trace_open) {
+        fprintf(stderr, "[FILE_OPEN_END] tid=%lu elapsed_ms=%lu result=%s error=%lu\n",
+                GetCurrentThreadId(), GetTickCount() - open_started,
+                h == INVALID_HANDLE_VALUE ? "failed" : "success", open_error);
+        fflush(stderr);
+    }
+
     if (h == INVALID_HANDLE_VALUE) {
-        DWORD err = GetLastError();
+        DWORD err = open_error;
         /* Kept for the caller's trace. An NTSTATUS says "it did not open";
          * only the Win32 error distinguishes a title probing for a file that
          * is genuinely absent from one it cannot open because this runtime
