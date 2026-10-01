@@ -1854,7 +1854,8 @@ class Lifter:
         if preserve_carry or self.needs_cf:
             # neg sets CF iff the operand was non-zero (neg/sbb sign-extract).
             out.append(f"_cf = (int)(({val}) != 0);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})"))
+        out.append(_fmt_operand_write(ops[0], f"0u - {val}"))
+        out.append(self._result_snapshot(ops, "neg"))
         return out
 
     def _lift_not(self, insn, ops):
