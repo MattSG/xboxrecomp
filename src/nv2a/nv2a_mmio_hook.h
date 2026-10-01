@@ -25,6 +25,9 @@
  */
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset);
 
+/* Read the modeled PVIDEO page for host scanout without touching trapped RAM. */
+bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
+
 /*
  * Handle an NV2A MMIO access fault.
  *

@@ -21,7 +21,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include "pvideo_scanout.h"
+
+extern bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern size_t xbox_GetMappedSize(void);
@@ -53,9 +56,13 @@ static void fb_overlay(void)
     MEMORY_BASIC_INFORMATION mapping;
     unsigned i, bank;
     if (!VirtualQuery((const void *)mapped, &mapping, sizeof mapping) ||
-        mapping.State != MEM_COMMIT || (mapping.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        mapping.State != MEM_COMMIT || (mapping.Protect & PAGE_GUARD))
         return;
-    for (i = 0; i < sizeof regs / sizeof regs[0]; i++) regs[i] = mapped[i];
+    if (mapping.Protect & PAGE_NOACCESS) {
+        if (!nv2a_hook_pvideo_snapshot(regs)) return;
+    } else {
+        for (i = 0; i < sizeof regs / sizeof regs[0]; i++) regs[i] = mapped[i];
+    }
     for (bank = 0; bank < 2; bank++) {
         uint64_t physical = (uint64_t)regs[(NV_PVIDEO_BASE + bank * 4) / 4] +
                             regs[(NV_PVIDEO_OFFSET + bank * 4) / 4];

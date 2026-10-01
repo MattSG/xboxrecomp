@@ -475,13 +475,13 @@ void pramdac_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 }
 
 /* ============================================================
- * PVIDEO - video overlay (stub)
+ * PVIDEO - video overlay register state
  * ============================================================ */
 
 uint64_t pvideo_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
-    uint64_t r = d->pvideo.regs[addr];
+    uint64_t r = addr == NV_PVIDEO_STOP ? 0 : d->pvideo.regs[addr];
     nv2a_reg_log_read(NV_PVIDEO, addr, size, r);
     return r;
 }
@@ -490,7 +490,12 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
     nv2a_reg_log_write(NV_PVIDEO, addr, size, val);
-    d->pvideo.regs[addr] = val;
+    /* STOP is a command, not stored state. Bit zero disables both banks. */
+    if (addr == NV_PVIDEO_STOP) {
+        if (val & 1u) d->pvideo.regs[NV_PVIDEO_BUFFER] = 0;
+    } else {
+        d->pvideo.regs[addr] = val;
+    }
 }
 
 /* ============================================================

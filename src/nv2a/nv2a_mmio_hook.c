@@ -30,6 +30,19 @@ static int g_mmio_decode_fail = 0;
 
 #if defined(_WIN32)
 
+static SRWLOCK g_pvideo_lock = SRWLOCK_INIT;
+
+bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
+{
+    NV2AState *state = nv2a_get_state();
+    unsigned i;
+    if (!state) return false;
+    AcquireSRWLockShared(&g_pvideo_lock);
+    for (i = 0; i < 0x1000 / 4; ++i) regs[i] = (uint32_t)state->pvideo.regs[i * 4];
+    ReleaseSRWLockShared(&g_pvideo_lock);
+    return true;
+}
+
 /* ============================================================
  * x86-64 register access helpers
  * ============================================================ */
@@ -395,7 +408,12 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     /* Compute MMIO offset within NV2A register space */
     uint32_t mmio_offset = fault_xbox_va - NV2A_MMIO_BASE;
 
-    return decode_and_handle(ctx, mmio_offset, is_write);
+    bool handled;
+    bool pvideo = mmio_offset >= 0x8000u && mmio_offset < 0x9000u;
+    if (pvideo) AcquireSRWLockExclusive(&g_pvideo_lock);
+    handled = decode_and_handle(ctx, mmio_offset, is_write);
+    if (pvideo) ReleaseSRWLockExclusive(&g_pvideo_lock);
+    return handled;
 }
 
 bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
@@ -418,6 +436,9 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
 }
 
 #else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
+
+bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
+{ (void)regs; return false; }
 
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 { (void)xbox_mem_offset; }
