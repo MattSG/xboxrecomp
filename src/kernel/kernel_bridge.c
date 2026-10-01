@@ -48,7 +48,7 @@
  * xbox_memory_layout.h and must match the definitions there -- a plain extern
  * here binds to the TLS template rather than the calling thread's copy, which
  * reads as every register being zero. */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
 extern RECOMP_TLS uint32_t g_seh_ebp;
@@ -3214,8 +3214,8 @@ static void bridge_NtCreateFile(void)
                 tls >= 8 ? BRIDGE_MEM32(tls - 8) : 0,
                 tls >= 4 ? BRIDGE_MEM32(tls - 4) : 0);
         fprintf(stderr,
-                "[FILE_REQUEST] tid=%lu caller=%08X sp=%08X stack=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X oa=%08X root=%08X attr=%08X name=%08X len=%u max=%u buf=%08X guest=%s\n",
-                GetCurrentThreadId(), g_xbox_kernel_caller, g_esp,
+                "[FILE_REQUEST] tid=%lu caller=%08X sp=%08X bp=%08X stack=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X oa=%08X root=%08X attr=%08X name=%08X len=%u max=%u buf=%08X guest=%s\n",
+                GetCurrentThreadId(), g_xbox_kernel_caller, g_esp, g_ebp,
                 BRIDGE_MEM32(g_esp + 0), BRIDGE_MEM32(g_esp + 4),
                 BRIDGE_MEM32(g_esp + 8), BRIDGE_MEM32(g_esp + 12),
                 BRIDGE_MEM32(g_esp + 16), BRIDGE_MEM32(g_esp + 20),
