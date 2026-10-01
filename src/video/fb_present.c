@@ -21,8 +21,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "pvideo_scanout.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern size_t xbox_GetMappedSize(void);
+extern int xbox_ContiguousIsPhysical(uint32_t phys);
 
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
@@ -41,6 +44,39 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+
+static void fb_overlay(void)
+{
+    volatile const uint32_t *mapped = (volatile const uint32_t *)
+        ((uintptr_t)0xfd008000u + xbox_GetMemoryOffset());
+    uint32_t regs[0x1000 / 4];
+    MEMORY_BASIC_INFORMATION mapping;
+    unsigned i, bank;
+    if (!VirtualQuery((const void *)mapped, &mapping, sizeof mapping) ||
+        mapping.State != MEM_COMMIT || (mapping.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return;
+    for (i = 0; i < sizeof regs / sizeof regs[0]; i++) regs[i] = mapped[i];
+    for (bank = 0; bank < 2; bank++) {
+        uint64_t physical = (uint64_t)regs[(NV_PVIDEO_BASE + bank * 4) / 4] +
+                            regs[(NV_PVIDEO_OFFSET + bank * 4) / 4];
+        uint64_t bytes = (uint64_t)(regs[(NV_PVIDEO_FORMAT + bank * 4) / 4] & 0x1fff) *
+                        ((regs[(NV_PVIDEO_SIZE_IN + bank * 4) / 4] >> 16) & 0x7ff);
+        uintptr_t va;
+        size_t available;
+        if (!bytes || physical + bytes > 0x04000000u) continue;
+        if (xbox_ContiguousIsPhysical((uint32_t)physical)) {
+            if (!xbox_ContiguousIsPhysical((uint32_t)(physical + bytes - 1))) continue;
+            va = 0x80000000u + (uintptr_t)physical;
+            available = (size_t)bytes;
+        } else {
+            if (physical + bytes > xbox_GetMappedSize()) continue;
+            va = (uintptr_t)physical;
+            available = (size_t)bytes;
+        }
+        pvideo_scanout(regs, (const uint8_t *)(va + xbox_GetMemoryOffset()),
+                       available, s_rgb, s_fb_width, s_fb_height, bank);
+    }
+}
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -299,15 +335,17 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
+        } else if (s_rgb) {
+            memset(s_rgb, 0, (size_t)s_fb_width * s_fb_height * 4);
+        }
+        if (s_rgb) {
+            fb_overlay();
             StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
