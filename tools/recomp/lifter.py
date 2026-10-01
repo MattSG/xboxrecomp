@@ -339,6 +339,7 @@ FLAG_SETTERS = frozenset({
     "cmp", "test", "sub", "add", "and", "or", "xor",
     "inc", "dec", "neg", "shl", "shr", "sar", "imul", "adc", "sbb",
     "comiss", "comisd", "ucomiss", "ucomisd",  # SSE float compare
+    "popfd",  # restores a complete flags image
 })
 
 # Result setters must snapshot their destination before later guest code clobbers it.
@@ -387,15 +388,8 @@ _EFLAGS_SETTERS = frozenset({
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
-    "rdtsc", "cpuid",      # Special instructions
+    "rdtsc",               # Special instructions
     "lock xadd",           # Lock prefix - complex flag behavior
-    # popfd REPLACES every flag with whatever was pushed. Its flags are not
-    # architecturally undefined -- they are simply not knowable from the
-    # instruction stream -- but the tracking action is the same: whatever the
-    # last comparison left is gone, and a jcc after it must not be resolved
-    # from that comparison. It used to sit in _EFLAGS_PRESERVE, next to
-    # pushfd, which does read-and-preserve and does belong there.
-    "popfd",
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
@@ -414,8 +408,9 @@ _EFLAGS_PRESERVE = frozenset({
     # loop still answers the jcc after it.
     "loop", "loope", "loopne",
     # pushfd READS the flags and leaves them alone, so it belongs here.
-    # popfd does NOT -- see _FLAGS_UNDEFINED.
+    # popfd restores the virtual flags word and is a setter.
     "pushfd", "pushal",
+    "cpuid",  # changes registers, preserves EFLAGS
     "sgdt", "ljmp", "sfence",
     # SSE scalar float
     "movss", "movsd",
@@ -491,6 +486,23 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if not cond_info:
         return None
     cmp_macro, test_macro, desc = cond_info
+
+    if flag_setter == "popfd":
+        cf, zf, sf, of, pf = (f"((g_eflags & {mask}u) != 0)"
+                             for mask in (1, 0x40, 0x80, 0x800, 4))
+        expressions = {
+            "jb": cf, "jnae": cf, "jc": cf,
+            "jae": f"!{cf}", "jnb": f"!{cf}", "jnc": f"!{cf}",
+            "je": zf, "jz": zf, "jne": f"!{zf}", "jnz": f"!{zf}",
+            "jbe": f"({cf} || {zf})", "jna": f"({cf} || {zf})",
+            "ja": f"(!{cf} && !{zf})", "jnbe": f"(!{cf} && !{zf})",
+            "js": sf, "jns": f"!{sf}", "jo": of, "jno": f"!{of}",
+            "jp": pf, "jnp": f"!{pf}",
+            "jl": f"({sf} != {of})", "jge": f"({sf} == {of})",
+            "jle": f"({zf} || {sf} != {of})",
+            "jg": f"(!{zf} && {sf} == {of})",
+        }
+        return (expressions[jcc], desc) if jcc in expressions else None
 
     # A join whose predecessors disagree on which instruction set the flags,
     # but agree that the zero flag came from the same destination register.
@@ -1316,6 +1328,15 @@ class Lifter:
             return self._lift_push(insn, ops)
         if m == "pop":
             return self._lift_pop(insn, ops)
+        if m == "popfd":
+            out = ["{ uint32_t _image; POP32(esp, _image);",
+                   "g_eflags = recomp_pop_flags(g_eflags, _image);",
+                   "g_df = (int)((g_eflags >> 10) & 1u);"]
+            if self.needs_cf:
+                out.append("_cf = (int)(g_eflags & 1u);")
+            return out + ["}"]
+        if m == "cpuid":
+            return ["recomp_cpuid(eax, ecx, &eax, &ebx, &ecx, &edx);"]
 
         # ── Arithmetic ──
         if m in ("add", "sub", "and", "or", "xor"):
@@ -2096,6 +2117,23 @@ class Lifter:
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
     # ── Compare / Test (standalone) ──
+
+    def _lift_pushfd(self, insn, setter, ops):
+        # Materialize the six arithmetic bits from existing operand snapshots.
+        # Unknown provenance stays an explicit unsupported instruction.
+        if setter == "popfd":
+            arithmetic = "g_eflags"
+        elif setter in ("cmp", "test", "and", "or", "xor") and ops:
+            bits = (_operand_width(ops[0]) or 4) * 8
+            if setter == "cmp":
+                arithmetic = f"recomp_flags_cmp(_fa, _fb, {bits}u)"
+            else:
+                value = "(_fa & _fb)" if setter == "test" else "_fa"
+                arithmetic = f"recomp_flags_szp({value}, {bits}u)"
+        else:
+            return self.lift_instruction(insn)
+        return [f"g_eflags = recomp_materialize_flags(g_eflags, {arithmetic}, g_df);",
+                "PUSH32(esp, g_eflags & ~0x30000u);"]
 
     # Sign-extending cast and mask per operand width, shared by the flag
     # snapshot below and by the arithmetic shift above.
@@ -3791,7 +3829,9 @@ def lift_basic_block(lifter, bb, flag_state=None):
         # NEG sets CF when its operand is nonzero. Preserve that value when
         # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
         # instructions (e.g. neg eax; push edi; sbb eax, eax).
-        if curr.mnemonic == "neg":
+        if curr.mnemonic == "pushfd":
+            results = lifter._lift_pushfd(curr, last_flag_setter, last_flag_ops)
+        elif curr.mnemonic == "neg":
             j = i + 1
             while (j < len(insns)
                     # popfd is no longer in _EFLAGS_PRESERVE, so the set
