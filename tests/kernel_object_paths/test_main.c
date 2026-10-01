@@ -39,9 +39,27 @@ int main(void) {
     *(uint32_t *)(mem+0x1000C)=0x800000E2;
     xbox_kernel_set_thunk_address(0x10000,4); xbox_kernel_bridge_init();
     int ok=1;
+    /* E:\TDATA and E:\UDATA live in the per-title save-data tree, even when
+     * Partition1 is also used as a game-file root through a title symlink. */
+    xbox_path_init(path,save);
+    xbox_host_char translated[MAX_PATH], expected[MAX_PATH];
+    WCHAR game_w[MAX_PATH], save_w[MAX_PATH];
+    MultiByteToWideChar(CP_ACP,0,path,-1,game_w,MAX_PATH);
+    MultiByteToWideChar(CP_ACP,0,save,-1,save_w,MAX_PATH);
+    swprintf_s(expected,MAX_PATH,L"%s\\TitleData\\4d53002a",save_w);
+    if(!xbox_translate_path("\\Device\\Harddisk0\\Partition1\\TDATA\\4d53002a",translated,MAX_PATH)||wcscmp(translated,expected)) {
+        fprintf(stderr,"FAIL Partition1 TDATA path: %S\n",translated); ok=0;
+    }
+    swprintf_s(expected,MAX_PATH,L"%s\\UserData\\4d53002a\\SaveImage.xbx",save_w);
+    if(!xbox_translate_path("\\Device\\Harddisk0\\Partition1\\UDATA\\4d53002a\\SaveImage.xbx",translated,MAX_PATH)||wcscmp(translated,expected)) {
+        fprintf(stderr,"FAIL Partition1 UDATA path: %S\n",translated); ok=0;
+    }
+    swprintf_s(expected,MAX_PATH,L"%s\\TDATA2\\asset.bin",game_w);
+    if(!xbox_translate_path("\\Device\\Harddisk0\\Partition1\\TDATA2\\asset.bin",translated,MAX_PATH)||wcscmp(translated,expected)) {
+        fprintf(stderr,"FAIL Partition1 sibling directory path: %S\n",translated); ok=0;
+    }
     /* XFindFirstFile shortens ANSI_STRING.Length to exclude its wildcard,
      * without inserting a NUL at the new end of the directory name. */
-    xbox_path_init(path,save);
     uint8_t sector[512];
     image_file=CreateFileA(image,GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL);
     offset.QuadPart=0x800;

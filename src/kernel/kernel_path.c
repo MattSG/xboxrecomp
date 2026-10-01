@@ -34,6 +34,24 @@ static int match_prefix(const char* path, const char* prefix)
     return i;
 }
 
+/* Match a complete path component and consume its optional separator. */
+static int match_rule_prefix(const char* path, const char* prefix)
+{
+    int matched = match_prefix(path, prefix);
+    size_t prefix_len = strlen(prefix);
+    char next;
+
+    if (!matched || prefix_len == 0 || prefix[prefix_len - 1] == '\\')
+        return matched;
+
+    next = path[matched];
+    if (next && next != '\\' && next != '/')
+        return 0;
+    if (next == '\\' || next == '/')
+        matched++;
+    return matched;
+}
+
 /* A device-path translation rule, shared by both backends. */
 typedef struct {
     const char* prefix;     /* Xbox path prefix (backslash form)         */
@@ -44,6 +62,8 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    { "\\Device\\Harddisk0\\Partition1\\TDATA", 1, "\\TitleData", "/TitleData" },
+    { "\\Device\\Harddisk0\\Partition1\\UDATA", 1, "\\UserData", "/UserData" },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -147,7 +167,7 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     out[tlen + rlen] = '\0';
 
     for (i = 0; i < PATH_RULE_COUNT; i++) {
-        if (match_prefix(out, s_rules[i].prefix))
+        if (match_rule_prefix(out, s_rules[i].prefix))
             return 1;           /* the target is somewhere we can place */
     }
     return 0;
@@ -447,7 +467,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        skip = match_rule_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
@@ -603,7 +623,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        skip = match_rule_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
