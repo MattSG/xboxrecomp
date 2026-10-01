@@ -49,7 +49,7 @@ from tools.disasm.loader import DATA_SECTION_NAMES, load_image
 # Each pattern must have exactly one group: the hex address.
 LOG_PATTERNS = [
     # Unresolved indirect call, from the RECOMP_ICALL dispatch failure path.
-    (re.compile(r"Failed to resolve VA (0x[0-9A-Fa-f]+)"),
+    (re.compile(r"Failed (?:to )?resolve VA (0x[0-9A-Fa-f]+)"),
      "Indirect-call target observed at runtime"),
     # PsCreateSystemThreadEx handed a routine with no dispatch entry. Nothing
     # in the image calls this address, so only a run can reveal it.
