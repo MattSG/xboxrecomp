@@ -3601,7 +3601,8 @@ static int bridge_async_io_enabled(void)
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
-    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t handle_token = STACK_ARG(0);
+    HANDLE   handle    = bridge_resolve_handle(handle_token);
     uint32_t iostatus  = STACK_ARG(4);
     uint32_t buffer_va = STACK_ARG(5);
     uint32_t length    = STACK_ARG(6);
@@ -3634,6 +3635,63 @@ static void bridge_NtReadFile(void)
         s_io.reads++;
         s_io.bytes += ios.Information;
         if (us > s_io.read_us_max) s_io.read_us_max = us;
+    }
+
+    if (handle_token == 0xFFFFFFFFu && length == 0x20000u &&
+        g_eax == 0xC0000001u) {
+        uint32_t frame = g_ebp;
+        unsigned i;
+        fprintf(stderr,
+                "[READ_FAIL_CONTEXT] caller=%08X handle=%08X esp=%08X ebp=%08X buffer=%08X iosb=%08X\n",
+                g_xbox_kernel_caller, handle_token, g_esp, g_ebp,
+                buffer_va, iostatus);
+        fprintf(stderr, "[READ_FAIL_STACK]");
+        for (i = 0; i < 12 && bridge_va_mapped(g_esp + i * 4, 4); i++)
+            fprintf(stderr, " %08X", BRIDGE_MEM32(g_esp + i * 4));
+        fprintf(stderr, "\n");
+        for (i = 0; i < 8 && bridge_va_mapped(frame, 8); i++) {
+            uint32_t previous = BRIDGE_MEM32(frame);
+            uint32_t ret = BRIDGE_MEM32(frame + 4);
+            fprintf(stderr, "[READ_FAIL_FRAME] depth=%u ebp=%08X prev=%08X ret=%08X\n",
+                    i, frame, previous, ret);
+            if (i <= 4) {
+                int frame_word;
+                fprintf(stderr, "[READ_FAIL_FRAME_DATA] depth=%u", i);
+                for (frame_word = -4; frame_word <= 6; frame_word++) {
+                    uint32_t address = frame + (uint32_t)(frame_word * 4);
+                    if (bridge_va_mapped(address, 4))
+                        fprintf(stderr, " %d:%08X", frame_word, BRIDGE_MEM32(address));
+                }
+                fprintf(stderr, "\n");
+                if (i == 1) {
+                    uint32_t token = BRIDGE_MEM32(frame + 8);
+                    uint32_t page = token >> 5;
+                    uint32_t page_address = 0x46E800u + page * 4;
+                    uint32_t page_base = BRIDGE_MEM32(page_address);
+                    uint32_t entry = page_base + (token & 0x1Fu) * 0x28u;
+                    fprintf(stderr, "[READ_FAIL_HANDLE_SLOT] token=%08X limit=%08X page=%08X entry=%08X",
+                            token, BRIDGE_MEM32(0x46E7E8u), page_base, entry);
+                    if (page_base && bridge_va_mapped(entry, 0x28))
+                        for (frame_word = 0; frame_word < 10; frame_word++)
+                            fprintf(stderr, " +%02X:%08X", frame_word * 4,
+                                    BRIDGE_MEM32(entry + (uint32_t)(frame_word * 4)));
+                    fprintf(stderr, "\n");
+                }
+                if (i == 2) {
+                    uint32_t object = BRIDGE_MEM32(frame + 0x14);
+                    if (bridge_va_mapped(object, 0x1C)) {
+                        fprintf(stderr, "[READ_FAIL_STREAM] object=%08X", object);
+                        for (frame_word = 0; frame_word <= 6; frame_word++)
+                            fprintf(stderr, " +%02X:%08X", frame_word * 4,
+                                    BRIDGE_MEM32(object + (uint32_t)(frame_word * 4)));
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+            if (previous <= frame) break;
+            frame = previous;
+        }
+        fflush(stderr);
     }
 
     /* What a read actually delivered. A decoder that rejects its input cannot

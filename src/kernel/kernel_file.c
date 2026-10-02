@@ -284,8 +284,20 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_SUCCESS;
     }
 
-    XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p, len=%u) failed err=%u",
-               FileHandle, Length, GetLastError());
+    {
+        DWORD read_error = GetLastError();
+        WCHAR file_path[MAX_PATH] = L"<unresolved>";
+        DWORD path_chars = GetFinalPathNameByHandleW(
+            FileHandle, file_path, MAX_PATH, FILE_NAME_NORMALIZED);
+        long long offset = ByteOffset ? (long long)ByteOffset->QuadPart : -1;
+        if (path_chars == 0)
+            _snwprintf_s(file_path, MAX_PATH, _TRUNCATE, L"<unresolved:%lu>",
+                         (unsigned long)GetLastError());
+        fprintf(stderr,
+                "[NTREAD_FAIL] handle=%p path=%S offset=%lld len=%u err=%u\n",
+                FileHandle, file_path, offset, Length, read_error);
+        fflush(stderr);
+    }
     IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
     IoStatusBlock->Information = 0;
     return STATUS_UNSUCCESSFUL;
