@@ -1753,19 +1753,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
-     * Map the base view at the desired virtual address.
-     * Try the original Xbox base address first. If that fails (common on
-     * Windows 11 where low addresses are often reserved), try page-aligned
-     * addresses upward until we find a free region.
+     * Map guest RAM at an OS-chosen host address first. Placing the base at
+     * 0x10000 can succeed while later Xbox RAM mirrors collide with unrelated
+     * Windows mappings (for example, guest 0x78000000); guest accesses already
+     * go through g_memory_offset, so there is no benefit to pinning the host
+     * view to the guest address.
      */
     {
         static const uintptr_t try_bases[] = {
+            0,                      /* let Windows choose a host range */
             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
             0x00800000,             /* 8 MB - above typical PEB/TEB region */
             0x01000000,             /* 16 MB */
             0x02000000,             /* 32 MB */
             0x10000000,             /* 256 MB */
-            0,                      /* sentinel - let OS choose */
         };
 
         /* Iterate the whole array, sentinel included. The old condition
