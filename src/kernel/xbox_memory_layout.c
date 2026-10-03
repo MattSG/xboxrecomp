@@ -2449,6 +2449,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;
         if (g_nv2a_memory) {
+            DWORD old_protect;
+            if (VirtualProtect((char *)g_nv2a_memory + 0x8000, 0x1000,
+                               PAGE_NOACCESS, &old_protect)) {
+                fprintf(stderr, "  NV2A PVIDEO registers routed through MMIO\n");
+            } else {
+                fprintf(stderr, "  WARNING: PVIDEO MMIO trap failed "
+                                "(error %lu)\n", GetLastError());
+            }
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
                     XBOX_NV2A_SIZE / (1024 * 1024), XBOX_NV2A_BASE);

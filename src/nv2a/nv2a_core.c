@@ -490,6 +490,14 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
     nv2a_reg_log_write(NV_PVIDEO, addr, size, val);
+    /* STOP is a command, not storage. The engine waits for BUFFER[0] to
+     * clear after issuing it; xemu clears that bit synchronously. */
+    if (addr == 0x704) {
+        if (val & 1)
+            d->pvideo.regs[0x700] &= ~1u;
+        d->pvideo.regs[addr] = 0;
+        return;
+    }
     d->pvideo.regs[addr] = val;
 }
 
