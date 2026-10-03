@@ -216,239 +216,12 @@ static void *g_flash_memory = NULL;
  * twice. See the tiled aperture below for why that matters.
  */
 static HANDLE g_contig_mapping = NULL;
-
-/* Windows: one reservation for the whole guest address space.
- *
- * Every guest window lives at host g_memory_offset + guest VA: RAM at 0, its
- * mirrors, the contiguous window at 0x80000000, the tiled aperture at
- * 0xF0000000, and the NV2A, MCPX and flash apertures near the top. Reserving
- * only RAM and its mirrors, and letting the OS pick the base, leaves the rest
- * to luck. Under Wine the base landed at host 0x7FFF0000, so the contiguous
- * window fell on host 0xFFFF0000, which was taken (error 487). The kernel page
- * inside it went with it, and the title faulted reading guest 0x8000FFF0.
- *
- * So reserve 4 GB (or base + mirrors, if that is more) as one placeholder
- * (VirtualAlloc2 + MEM_RESERVE_PLACEHOLDER). Each window is then carved out of
- * it: split the placeholder (VirtualFree MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)
- * and replace that piece with a view (MapViewOfFile3) or with private memory
- * (VirtualAlloc2), both with MEM_REPLACE_PLACEHOLDER. Nothing else in the
- * process can be placed inside the window in between. One exception, opt-in:
- * under RECOMP_EXT_VMA the range above the mirrors is released outright for
- * guest_vmem, which reserves it with a plain VirtualAlloc. Another
- * thread could take it in that gap; guest_vmem then reports the reservation
- * failed and stays off, which is detectable, not corrupting.
- *
- * Both functions are resolved at run time from kernelbase.dll: they need
- * Windows 10 1803 or later, and Wine has them too. Without them, the fallback
- * looks for a free 4 GB hole and maps into it without holding it (see
- * win_reserve_guest_window).
- *
- * POSIX hosts do not use any of this. They keep the base + mirrors span in
- * xbox_MemoryLayoutInit, which works there because munmap can release part of
- * a mapping. */
-#if defined(_WIN32)
-#ifndef MEM_REPLACE_PLACEHOLDER
-#define MEM_REPLACE_PLACEHOLDER  0x00004000
-#endif
-#ifndef MEM_RESERVE_PLACEHOLDER
-#define MEM_RESERVE_PLACEHOLDER  0x00040000
-#endif
-#ifndef MEM_PRESERVE_PLACEHOLDER
-#define MEM_PRESERVE_PLACEHOLDER 0x00000002
-#endif
-#define WIN_GUEST_WINDOW 0x100000000ULL   /* the guest's 32-bit address space */
-
-/* Our own prototypes, so this does not depend on how a given SDK gates the
- * declarations (_WIN32_WINNT, API families). The extended-parameter argument is
- * always NULL here. */
-typedef PVOID (WINAPI *pfn_VirtualAlloc2)(HANDLE, PVOID, SIZE_T, ULONG, ULONG,
-                                          void *, ULONG);
-typedef PVOID (WINAPI *pfn_MapViewOfFile3)(HANDLE, HANDLE, PVOID, ULONG64,
-                                           SIZE_T, ULONG, ULONG, void *, ULONG);
-static pfn_VirtualAlloc2  s_VirtualAlloc2;
-static pfn_MapViewOfFile3 s_MapViewOfFile3;
-
-/* Non-zero while the window is held as placeholders. */
-static uintptr_t g_win_window_base;
-static size_t    g_win_window_size;
-static const char *g_win_reserve_method = "none (fixed base list, nothing held)";
-
-static int win_in_window(uintptr_t addr, size_t size)
-{
-    return g_win_window_size && addr >= g_win_window_base
-        && addr + size <= g_win_window_base + g_win_window_size;
-}
-
-/* Make [addr, addr + size) a placeholder of its own. This fails when the range
- * already is exactly one placeholder, which is fine. The replace call that
- * follows reports any real problem. */
-static void win_split_placeholder(uintptr_t addr, size_t size)
-{
-    VirtualFree((LPVOID)addr, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
-}
-
-/* Release every region still inside the window: placeholders, and the
- * reservations they were turned into. Views and committed apertures must be
- * released before this is called. */
-static void win_release_window(void)
-{
-    uintptr_t a = g_win_window_base;
-    uintptr_t end = g_win_window_base + g_win_window_size;
-
-    while (a < end) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi)) || !mbi.RegionSize)
-            break;
-        if (mbi.State == MEM_RESERVE && (uintptr_t)mbi.AllocationBase == a)
-            VirtualFree((LPVOID)a, 0, MEM_RELEASE);
-        a = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-    }
-    g_win_window_base = 0;
-    g_win_window_size = 0;
-}
-
-/* Turn the placeholders left over after init into ordinary reservations.
- *
- * Unmapped guest ranges still fault, as before. But code that later commits
- * memory at a fixed guest address with plain VirtualAlloc(MEM_COMMIT) works
- * again; the NV2A VRAM fault hook does this. A placeholder accepts only
- * MEM_REPLACE_PLACEHOLDER calls. Best effort: a failure leaves a placeholder,
- * which is still ours and still faults. */
-static void win_settle_placeholders(void)
-{
-    uintptr_t a = g_win_window_base;
-    uintptr_t end = g_win_window_base + g_win_window_size;
-
-    while (a < end) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((LPCVOID)a, &mbi, sizeof(mbi)) || !mbi.RegionSize)
-            break;
-        if (mbi.State == MEM_RESERVE && (uintptr_t)mbi.AllocationBase == a)
-            s_VirtualAlloc2(GetCurrentProcess(), (PVOID)a, mbi.RegionSize,
-                            MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
-                            PAGE_NOACCESS, NULL, 0);
-        a = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-    }
-}
-#endif /* _WIN32 */
-
-/* RECOMP_EXT_VMA (guest_vmem): the guest range from the top of the
- * RAM mirrors to GUEST_VMEM_TOP, or 0 when the switch is off or the mirrors
- * already reach past it. Only when this is non-zero does the layout below
- * differ from the stock one. */
-static uint64_t ext_vma_span(uint64_t mirror_top)
-{
-    if (!getenv("RECOMP_EXT_VMA") || mirror_top >= GUEST_VMEM_TOP)
-        return 0;
-    return GUEST_VMEM_TOP - mirror_top;
-}
-
-/* Map a view of `mapping` at a fixed host address. On Windows, inside the
- * reserved window, the view replaces the placeholder there. Elsewhere this is
- * the MapViewOfFileEx call it always was. */
-static void *layout_map_view(HANDLE mapping, size_t size, void *addr)
-{
-#if defined(_WIN32)
-    if (win_in_window((uintptr_t)addr, size)) {
-        win_split_placeholder((uintptr_t)addr, size);
-        return s_MapViewOfFile3(mapping, GetCurrentProcess(), addr, 0, size,
-                                MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
-                                NULL, 0);
-    }
-#endif
-    span_release_for(addr, size);
-    return MapViewOfFileEx(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size, addr);
-}
-
-/* Commit zeroed read-write memory at a fixed host address. Same split as
- * layout_map_view. Replace the placeholder with a reservation, then commit it.
- * Two steps, because MEM_COMMIT together with MEM_REPLACE_PLACEHOLDER is not
- * documented to work. */
-static void *layout_commit_at(void *addr, size_t size)
-{
-#if defined(_WIN32)
-    if (win_in_window((uintptr_t)addr, size)) {
-        win_split_placeholder((uintptr_t)addr, size);
-        if (!s_VirtualAlloc2(GetCurrentProcess(), addr, size,
-                             MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
-                             PAGE_NOACCESS, NULL, 0))
-            return NULL;
-        return VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE);
-    }
-#endif
-    span_release_for(addr, size);
-    return VirtualAlloc(addr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-}
-
-#if defined(_WIN32)
-/* Reserve the guest window and map RAM at its base. Returns the RAM view, or
- * NULL. On NULL the caller falls back to the fixed try_bases list.
- *
- * 1. Placeholders (see above): the whole window is ours before anything is
- *    mapped into it.
- * 2. No placeholder API, or it failed: reserve a window to find a free hole,
- *    release it, and map RAM at its base. The later windows are mapped at
- *    fixed addresses without a reservation. That is racy, but at init nothing
- *    else is likely to allocate 4 GB of address space in between. */
-static void *win_reserve_guest_window(HANDLE mapping, size_t ram_size)
-{
-    size_t span = ram_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-    size_t window = span > WIN_GUEST_WINDOW ? span : (size_t)WIN_GUEST_WINDOW;
-    HMODULE kb = GetModuleHandleA("kernelbase.dll");
-    void *ram;
-
-    window = (window + 0xFFFF) & ~(size_t)0xFFFF;
-    if (kb) {
-        s_VirtualAlloc2 = (pfn_VirtualAlloc2)(void (*)(void))
-            GetProcAddress(kb, "VirtualAlloc2");
-        s_MapViewOfFile3 = (pfn_MapViewOfFile3)(void (*)(void))
-            GetProcAddress(kb, "MapViewOfFile3");
-    }
-
-    if (s_VirtualAlloc2 && s_MapViewOfFile3) {
-        void *base = s_VirtualAlloc2(GetCurrentProcess(), NULL, window,
-                                     MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                     PAGE_NOACCESS, NULL, 0);
-        if (base) {
-            g_win_window_base = (uintptr_t)base;
-            g_win_window_size = window;
-            ram = layout_map_view(mapping, ram_size, base);
-            if (ram == base) {
-                g_win_reserve_method = "placeholder (VirtualAlloc2 + MapViewOfFile3)";
-                return ram;
-            }
-            fprintf(stderr, "xbox_MemoryLayoutInit: placeholder reservation at %p"
-                    " could not take the RAM view (error %lu); falling back\n",
-                    base, GetLastError());
-            if (ram)
-                UnmapViewOfFile(ram);
-            win_release_window();
-        } else {
-            fprintf(stderr, "xbox_MemoryLayoutInit: VirtualAlloc2 placeholder"
-                    " reservation of %zu MB failed (error %lu); falling back\n",
-                    window >> 20, GetLastError());
-        }
-    } else {
-        fprintf(stderr, "xbox_MemoryLayoutInit: VirtualAlloc2/MapViewOfFile3 not"
-                " found in kernelbase.dll; falling back to an unreserved"
-                " 4 GB window\n");
-    }
-
-    {
-        void *probe = VirtualAlloc(NULL, window, MEM_RESERVE, PAGE_NOACCESS);
-        if (probe) {
-            VirtualFree(probe, 0, MEM_RELEASE);
-            ram = MapViewOfFileEx(mapping, FILE_MAP_ALL_ACCESS, 0, 0,
-                                  ram_size, probe);
-            if (ram) {
-                g_win_reserve_method = "probed free window (not held; racy)";
-                return ram;
-            }
-        }
-    }
-    return NULL;
-}
-#endif /* _WIN32 */
+/* Contiguous offsets are not the whole range below a bump pointer: alignment
+ * gaps and ordinary RAM can sit below that high-water mark. Publish exact
+ * allocations so bus masters resolve only memory the runtime handed out. */
+#define XBOX_CONTIG_MAX_ALLOCS (XBOX_CONTIG_SIZE / 4096u)
+static struct { uint32_t offset, size; } g_contig_allocs[XBOX_CONTIG_MAX_ALLOCS];
+static volatile LONG g_contig_alloc_count;
 /* How much of the tiled aperture can exist.
  *
  * Two ceilings, both below the mapped RAM size once that is large:
@@ -4259,11 +4032,17 @@ static void contig_lock(void)
         LeaveCriticalSection(&g_allocator_lock);
         return 0;
     }
-    return on;
-}
+    if (g_contig_alloc_count >= XBOX_CONTIG_MAX_ALLOCS) {
+        fprintf(stderr, "  [CONTIG] allocation table full\n");
+        LeaveCriticalSection(&g_allocator_lock);
+        return 0;
+    }
 
     g_contig_next = result + size;
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    g_contig_allocs[g_contig_alloc_count].offset = result - XBOX_CONTIG_BASE;
+    g_contig_allocs[g_contig_alloc_count].size = size;
+    InterlockedIncrement(&g_contig_alloc_count);
     LeaveCriticalSection(&g_allocator_lock);
     return result;
 }
@@ -4369,15 +4148,30 @@ uint32_t xbox_ContiguousBlockSize(uint32_t va)
  *
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
- * a surface offset is physical, and only the window makes it addressable.
- * Never decreases, so a freed-and-reused texture stays addressable. */
-uint32_t xbox_ContiguousAllocatedBytes(void)
+ * a surface offset is physical, and only the window makes it addressable. */
+int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
 {
-    uint32_t allocated;
-    EnterCriticalSection(&g_allocator_lock);
-    allocated = g_contig_next - XBOX_CONTIG_BASE;
-    LeaveCriticalSection(&g_allocator_lock);
-    return allocated;
+    LONG lo = 0;
+    LONG hi = InterlockedCompareExchange(&g_contig_alloc_count, 0, 0);
+
+    if (!size)
+        size = 1;
+    while (lo < hi) {
+        LONG mid = lo + (hi - lo) / 2;
+        if (g_contig_allocs[mid].offset <= physical_offset)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (!lo)
+        return 0;
+    {
+        uint32_t start = g_contig_allocs[lo - 1].offset;
+        uint32_t block_size = g_contig_allocs[lo - 1].size;
+        return physical_offset >= start &&
+               (uint64_t)physical_offset + size <=
+                   (uint64_t)start + block_size;
+    }
 }
 
 

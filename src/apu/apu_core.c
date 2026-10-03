@@ -78,56 +78,14 @@ void mcpx_debug_end_frame(void) {}
  * and a RAM page of the image or the heap. The cases below decide which one
  * the title meant. */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
-extern uint32_t xbox_ContiguousAllocatedBytes(void);
-extern size_t g_xbox_total_ram;
-extern size_t g_xbox_map_size;     /* host mapping; 0 means same as RAM */
-
-/* How far up the host actually mapped guest RAM: the map size when it was
- * set apart from the RAM size (xbox_SetMapSize), else the RAM size. */
-static inline uint32_t apu_mapped_ram(void)
-{
-    return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
-}
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
-    /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
-     * the heap sits above 0x04000000, and so do the sound buffers a title
-     * malloc()s and hands to DirectSound as plain pointers, which
-     * MmGetPhysicalAddress turns into physical addresses (the identity for
-     * RAM). Folding those into the low 64 MB, as the fallback below does,
-     * read code as PCM: full-scale white noise on every effect, and music
-     * that lost its upper half each time its ring crossed the boundary.
-     * There is no window up here, so it is RAM as far as the host mapped it;
-     * only above that does the address wrap. */
-    if (a >= (64u << 20)) {
-        if (a < apu_mapped_ram())
-            return g_apu_ram_ptr + a;
-        return g_apu_ram_ptr + (a & 0x03FFFFFFu);
-    }
-    /* A heap page the title named through MmGetPhysicalAddress is RAM, even
-     * where the contiguous allocator has handed out the same number as a
-     * window page. A title that loads its effect banks and music stream into
-     * the heap puts those physical numbers in the voices' SGE lists; read
-     * from the window, effects played whatever the window held there (white
-     * noise) and the stream played zeros. Only heap pages are recorded, so
-     * the voice-array case below still holds for the image. */
-    if (xbox_PhysRamNameMap()[a >> 12])
-        return g_apu_ram_ptr + a;
-    /* A page the contiguous allocator handed out is the window, even where
-     * it overlaps the image's physical range: an image whose BSS runs past
-     * 48 MB can have DirectSound's voice array at a window address inside
-     * that range. Resolved to RAM, the VP never saw the driver take an idle
-     * voice off its list and re-trapped it every frame. (The OHCI resolves
-     * the image first: a USB driver can read its descriptors into .data on a
-     * page the boot has also allocated as contiguous memory.) */
-    if (xbox_ContiguousPageMap()[a >> 12])
+    if (xbox_ContiguousRangeAllocated(a, 1))
         return g_apu_ram_ptr + 0x80000000u + a;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
-    if (a < xbox_ContiguousAllocatedBytes())
-        return g_apu_ram_ptr + 0x80000000u + a;
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
 
