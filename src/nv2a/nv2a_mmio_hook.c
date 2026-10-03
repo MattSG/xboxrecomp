@@ -31,8 +31,6 @@ static int g_mmio_decode_fail = 0;
 
 #if defined(_WIN32)
 
-/* PVIDEO's registers are written by the title's thread through the MMIO
- * hook and read by the window thread for scanout. */
 static SRWLOCK g_pvideo_lock = SRWLOCK_INIT;
 
 bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
@@ -47,16 +45,14 @@ bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
     return true;
 }
 
-/* The scanout has taken the bank: clear its pending bit in BUFFER, which is
- * what the title polls before it reuses the memory. */
 void nv2a_hook_pvideo_consume(unsigned bank)
 {
     NV2AState *state = nv2a_get_state();
     uint64_t buffer;
     if (!state || bank > 1) return;
     AcquireSRWLockExclusive(&g_pvideo_lock);
-    buffer = nv2a_mmio_read(state, NV2A_PVIDEO_MMIO + NV_PVIDEO_BUFFER, 4);
-    nv2a_mmio_write(state, NV2A_PVIDEO_MMIO + NV_PVIDEO_BUFFER,
+    buffer = nv2a_mmio_read(state, 0x8700, 4);
+    nv2a_mmio_write(state, 0x8700,
                     buffer & ~(uint64_t)(1u << (bank * 4)), 4);
     ReleaseSRWLockExclusive(&g_pvideo_lock);
 }
@@ -443,6 +439,8 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                   mmio_offset < NV2A_PVIDEO_MMIO + 0x1000u;
     bool handled;
 
+    bool handled;
+    bool pvideo = mmio_offset >= 0x8000u && mmio_offset < 0x9000u;
     if (pvideo) AcquireSRWLockExclusive(&g_pvideo_lock);
     handled = decode_and_handle(ctx, mmio_offset, is_write);
     if (pvideo) ReleaseSRWLockExclusive(&g_pvideo_lock);
