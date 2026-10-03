@@ -25,6 +25,10 @@
  */
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset);
 
+/* Copy modeled PVIDEO registers for the host scanout thread. */
+bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
+void nv2a_hook_pvideo_consume(unsigned bank);
+
 /*
  * Handle an NV2A MMIO access fault.
  *

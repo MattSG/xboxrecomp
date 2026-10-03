@@ -21,8 +21,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#include "pvideo_scanout.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
+extern void nv2a_hook_pvideo_consume(unsigned bank);
 
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
@@ -41,6 +45,36 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+
+static void fb_overlay(void)
+{
+    uint32_t regs[0x1000 / 4];
+    unsigned bank;
+    if (!s_rgb || !nv2a_hook_pvideo_snapshot(regs)) return;
+    for (bank = 0; bank < 2; ++bank) {
+        uint64_t physical = (uint64_t)regs[(NV_PVIDEO_BASE + bank * 4) / 4] +
+                            regs[(NV_PVIDEO_OFFSET + bank * 4) / 4];
+        unsigned pitch = regs[(NV_PVIDEO_FORMAT + bank * 4) / 4] & 0x1fff;
+        unsigned height = (regs[(NV_PVIDEO_SIZE_IN + bank * 4) / 4] >> 16) & 0x7ff;
+        uint64_t bytes = (uint64_t)pitch * height;
+        uintptr_t va;
+        MEMORY_BASIC_INFORMATION mapping;
+        const uint8_t *source;
+        size_t available;
+        if (!bytes || physical + bytes > 0x04000000u) continue;
+        va = (uintptr_t)(0x80000000u + (uint32_t)physical) +
+             (uintptr_t)xbox_GetMemoryOffset();
+        if (!VirtualQuery((const void *)va, &mapping, sizeof(mapping)) ||
+            mapping.State != MEM_COMMIT || (mapping.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+            continue;
+        available = mapping.RegionSize - (size_t)(va - (uintptr_t)mapping.BaseAddress);
+        if (bytes > available) continue;
+        source = (const uint8_t *)va;
+        if (pvideo_scanout(regs, source, available, s_rgb,
+                           s_fb_width, s_fb_height, bank))
+            nv2a_hook_pvideo_consume(bank);
+    }
+}
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -314,6 +348,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
+            if (!getenv("RECOMP_FB_VA"))
+                fb_overlay();
             StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
@@ -323,6 +359,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
+            if (!getenv("RECOMP_FB_VA"))
+                fb_overlay();
             StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
