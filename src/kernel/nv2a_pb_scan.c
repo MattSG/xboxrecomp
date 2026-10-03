@@ -25,6 +25,7 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include "kernel.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -150,6 +151,13 @@ static const char *nv097_name(uint32_t m)
         if (NV097_NAMES[i].m == m)
             return NV097_NAMES[i].name;
     return "";
+}
+
+static uint32_t pb_contiguous_va(uint32_t physical)
+{
+    /* The Xbox has a 26-bit physical address bus. PFIFO jump/call targets
+     * wrap at 64 MB, matching the contiguous window's backing size. */
+    return XBOX_CONTIG_BASE | (physical & (XBOX_CONTIG_SIZE - 1u));
 }
 
 void nv2a_pb_scan_report(void)
@@ -483,7 +491,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             (*jumps)++;
             if (!in_call)
                 break;                        /* the ring: a jump ends it */
-            va = 0x80000000u | (target & 0x0FFFFFFFu);
+            va = pb_contiguous_va(target);
             end_va = va + 0x400000u;
             continue;
         }
@@ -494,7 +502,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
         }
         if ((w & 3u) == 2u) {                    /* CALL */
             if (!in_call) {
-                uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+                uint32_t sub = pb_contiguous_va(w & 0xFFFFFFFCu);
                 s_tot_calls++;
                 s_in_call = 1;
                 words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
