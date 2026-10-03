@@ -385,35 +385,31 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
     /* XAudio2 path: render and submit a buffer */
     if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
-
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
+        if (g_audio_muted) {
             memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
+        } else {
+            if (g_test_tone.active) {
+                for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                    int32_t tone = (int32_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                    int32_t left = d->monitor.frame_buf[i][0] + tone;
+                    int32_t right = d->monitor.frame_buf[i][1] + tone;
+                    if (left > 32767) left = 32767;
+                    if (left < -32768) left = -32768;
+                    if (right > 32767) right = 32767;
+                    if (right < -32768) right = -32768;
+                    d->monitor.frame_buf[i][0] = (int16_t)left;
+                    d->monitor.frame_buf[i][1] = (int16_t)right;
                     g_test_tone.phase += g_test_tone.phase_inc;
                     if (g_test_tone.phase >= 2.0 * M_PI)
                         g_test_tone.phase -= 2.0 * M_PI;
                 }
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
+            mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
         }
 
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        xa2_submit_samples((const int16_t *)d->monitor.frame_buf,
+                           MIXER_FRAME_SAMPLES);
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
         return;
     }
 
