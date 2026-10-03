@@ -105,11 +105,78 @@ static void span_release_for(void *addr, size_t size)
 #endif
 }
 static void *g_tiled_view = NULL;
+#ifdef _WIN32
+#ifndef MEM_REPLACE_PLACEHOLDER
+#define MEM_REPLACE_PLACEHOLDER 0x00004000
+#endif
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER 0x00040000
+#endif
+#ifndef MEM_PRESERVE_PLACEHOLDER
+#define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#endif
+#ifndef MEM_COALESCE_PLACEHOLDERS
+#define MEM_COALESCE_PLACEHOLDERS 0x00000001
+#endif
+#ifndef MEM_RESERVE
+#define MEM_RESERVE 0x00002000
+#endif
+#ifndef MEM_COMMIT
+#define MEM_COMMIT 0x00001000
+#endif
+#ifndef PAGE_NOACCESS
+#define PAGE_NOACCESS 0x01
+#endif
+typedef PVOID (WINAPI *XBOX_VirtualAlloc2)(HANDLE, PVOID, SIZE_T,
+                                          ULONG, ULONG, PVOID, ULONG);
+typedef PVOID (WINAPI *XBOX_MapViewOfFile3)(HANDLE, HANDLE, PVOID,
+                                            ULONG64, SIZE_T, ULONG, ULONG,
+                                            PVOID, ULONG);
+typedef BOOL (WINAPI *XBOX_UnmapViewOfFile2)(HANDLE, PVOID, ULONG);
+static XBOX_VirtualAlloc2 s_virtual_alloc2;
+static XBOX_MapViewOfFile3 s_map_view_of_file3;
+static XBOX_UnmapViewOfFile2 s_unmap_view_of_file2;
+static int g_placeholder_span = 0;
+static int g_contig_is_view = 0;
+
+static int xbox_split_placeholder(void *address, size_t size)
+{
+    return VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+}
+
+static void *xbox_map_placeholder(HANDLE mapping, uintptr_t address,
+                                 ULONG64 offset, size_t size)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    SIZE_T queried = VirtualQuery((void *)address, &mbi, sizeof(mbi));
+    int is_whole_placeholder = queried && mbi.AllocationBase == (void *)address &&
+                               mbi.RegionSize == size && mbi.Type == MEM_PRIVATE;
+    if (!is_whole_placeholder && !xbox_split_placeholder((void *)address, size)) {
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T queried = VirtualQuery((void *)address, &mbi, sizeof(mbi));
+        fprintf(stderr, "  Placeholder split failed at %p size %zu (error %lu)\n",
+                (void *)address, size, GetLastError());
+        if (queried)
+            fprintf(stderr, "    region base=%p allocation=%p size=%zu state=0x%lx type=0x%lx\n",
+                mbi.BaseAddress, mbi.AllocationBase, (size_t)mbi.RegionSize,
+                mbi.State, mbi.Type);
+        return NULL;
+    }
+    void *view = s_map_view_of_file3(mapping, GetCurrentProcess(), (void *)address,
+                               offset, size, MEM_REPLACE_PLACEHOLDER,
+                               PAGE_READWRITE, NULL, 0);
+    if (!view)
+        fprintf(stderr, "  Placeholder view failed at %p size %zu offset %llu (error %lu)\n",
+                (void *)address, size, (unsigned long long)offset, GetLastError());
+    return view;
+}
+#endif
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
  * the same numbers for MmClaimGpuInstanceMemory. */
 static void *g_contig_memory = NULL;
+static int g_kernel_memory_owned = 0;
 
 /* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
  * that D3D8 code linked into the title can poke it without faulting. */
@@ -2606,8 +2673,47 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * 0x80000000) needs, which then fails with error 487 and the first
          * touch of the kernel page faults. Larger map sizes push the span
          * above 4 GB, which is why Half-Life 2 (768 MB) never saw it. Doing
-         * this on Windows needs placeholder reservations (VirtualAlloc2),
-         * which is what RECOMP_WIN_PLACEHOLDER above does. */
+         * this on Windows needs placeholder reservations (VirtualAlloc2). */
+#ifdef _WIN32
+        {
+            HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+            s_virtual_alloc2 = (XBOX_VirtualAlloc2)GetProcAddress(kernel32, "VirtualAlloc2");
+            s_map_view_of_file3 = (XBOX_MapViewOfFile3)GetProcAddress(kernel32, "MapViewOfFile3");
+            s_unmap_view_of_file2 = (XBOX_UnmapViewOfFile2)GetProcAddress(kernel32, "UnmapViewOfFile2");
+            if (!s_virtual_alloc2 || !s_map_view_of_file3 || !s_unmap_view_of_file2) {
+                HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+                if (!s_virtual_alloc2) s_virtual_alloc2 = (XBOX_VirtualAlloc2)GetProcAddress(kernelbase, "VirtualAlloc2");
+                if (!s_map_view_of_file3) s_map_view_of_file3 = (XBOX_MapViewOfFile3)GetProcAddress(kernelbase, "MapViewOfFile3");
+                if (!s_unmap_view_of_file2) s_unmap_view_of_file2 = (XBOX_UnmapViewOfFile2)GetProcAddress(kernelbase, "UnmapViewOfFile2");
+            }
+            size_t ram_span = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+            size_t contig_end = (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+            fprintf(stderr, "  RAM placeholders: APIs=%d/%d/%d map=%zu mirrors=%d contig-align=%d\n",
+                s_virtual_alloc2 != NULL, s_map_view_of_file3 != NULL,
+                s_unmap_view_of_file2 != NULL, g_memory_size, XBOX_NUM_MIRRORS,
+                (int)(XBOX_CONTIG_BASE % g_memory_size == 0));
+            if (s_virtual_alloc2 && s_map_view_of_file3 && s_unmap_view_of_file2 &&
+                ram_span <= XBOX_TILED_BASE && XBOX_CONTIG_BASE % g_memory_size == 0) {
+                g_span_size = ram_span > contig_end ? ram_span : contig_end;
+                g_span_base = s_virtual_alloc2(GetCurrentProcess(), NULL,
+                    g_span_size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                    PAGE_NOACCESS, NULL, 0);
+                if (!g_span_base)
+                    fprintf(stderr, "  RAM placeholder reservation failed (error %lu, size %zu MB)\n",
+                        GetLastError(), g_span_size / (1024 * 1024));
+                if (g_span_base) {
+                    g_placeholder_span = 1;
+                    g_memory_base = xbox_map_placeholder(g_mapping_handle,
+                        (uintptr_t)g_span_base, 0, g_memory_size);
+                    if (!g_memory_base) {
+                        fprintf(stderr, "  RAM base view replacement failed (error %lu)\n", GetLastError());
+                        VirtualFree(g_span_base, g_span_size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+                        g_span_base = NULL; g_span_size = 0; g_placeholder_span = 0;
+                    }
+                }
+            }
+        }
+#else
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
         /* Stop below the contiguous window: at 128 MB the span would
          * otherwise run to 0xE8000000 and hold 0x80000000 against it. */
@@ -3163,14 +3269,30 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         g_contig_mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
             0, (DWORD)XBOX_CONTIG_SIZE, NULL);
+#ifdef _WIN32
+        if (g_placeholder_span) {
+            g_contig_memory = xbox_map_placeholder(g_contig_mapping,
+                contig_native, 0, XBOX_CONTIG_SIZE);
+            g_contig_is_view = g_contig_memory != NULL;
+        } else
+#endif
+        {
         g_contig_memory = g_contig_mapping
             ? layout_map_view(g_contig_mapping, XBOX_CONTIG_SIZE,
                               (LPVOID)contig_native)
             : NULL;
+        g_contig_is_view = g_contig_memory != NULL;
         if (!g_contig_memory)
-            g_contig_memory = layout_commit_at((LPVOID)contig_native,
-                                               XBOX_CONTIG_SIZE);
+            g_contig_memory = VirtualAlloc(
+                (LPVOID)contig_native,
+                XBOX_CONTIG_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE
+            );
+        }
         if (g_contig_memory) {
+            fprintf(stderr, "  Contiguous host view: %p (RAM base %p)\n",
+                    g_contig_memory, g_memory_base);
             fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
                     XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
         } else {
@@ -3380,7 +3502,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * 0x80010000 sits inside it - so just use that storage. */
         g_kernel_memory = g_contig_memory
             ? (void *)kernel_native
-            : layout_commit_at((LPVOID)kernel_native, KERNEL_ALLOC_SIZE);
+            : VirtualAlloc((LPVOID)kernel_native, KERNEL_PAGE_SIZE,
+                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!g_contig_memory && g_kernel_memory)
+            g_kernel_memory_owned = 1;
         if (g_kernel_memory) {
             /* Zero-fill then set e_lfanew = 0x80 (offset to PE header).
              * With the rest zeroed, NumberOfSections = 0 and the INIT
@@ -3464,11 +3589,28 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
             /* Inside the reservation this hands back the slice we are about
              * to use; outside it (no reservation) this is a no-op on an
-             * address we never held. When the span holds the whole window
-             * (RECOMP_EXT_VMA), layout_map_view releases the slice itself:
-             * freeing it here too would unmap it twice, and the second
-             * munmap could take out another thread's mapping in the gap. */
-            if (g_span_base && !g_span_whole_window)
+             * address we never held. */
+            if (g_placeholder_span) {
+                uint64_t map_lo = guest_lo;
+                uint64_t map_hi = guest_hi;
+                uint64_t contig_lo = XBOX_CONTIG_BASE;
+                uint64_t contig_hi = contig_lo + XBOX_CONTIG_SIZE;
+                if (map_lo < contig_hi && contig_lo < map_hi) {
+                    if (map_lo < contig_lo) map_hi = contig_lo;
+                    else map_lo = contig_hi;
+                }
+                if (map_lo < map_hi) {
+                    g_mirror_views[m] = xbox_map_placeholder(g_mapping_handle,
+                        (uintptr_t)g_memory_base + (uintptr_t)map_lo,
+                        map_lo - guest_lo, (size_t)(map_hi - map_lo));
+                    if (g_mirror_views[m]) mirrors_ok++;
+                    else fprintf(stderr, "  Mirror %d: FAILED (placeholder map, error %lu)\n", m + 1, GetLastError());
+                } else {
+                    mirrors_ok++;
+                }
+                continue;
+            }
+            if (g_span_base)
                 VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
             g_mirror_views[m] = layout_map_view(g_mapping_handle,
                                                 g_memory_size,
@@ -3638,10 +3780,11 @@ void xbox_ProtectMirrorsForDebug(void)
 
 void xbox_MemoryLayoutShutdown(void)
 {
-    if (g_kernel_memory) {
+    if (g_kernel_memory && g_kernel_memory_owned) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
-        g_kernel_memory = NULL;
     }
+    g_kernel_memory = NULL;
+    g_kernel_memory_owned = 0;
     if (g_nv2a_ack_thread) {
         InterlockedExchange(&g_nv2a_ack_stop, 1);
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
@@ -3655,13 +3798,23 @@ void xbox_MemoryLayoutShutdown(void)
     /* Unmap mirror views first */
     for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
         if (g_mirror_views[m]) {
-            UnmapViewOfFile(g_mirror_views[m]);
+#ifdef _WIN32
+            if (g_placeholder_span)
+                s_unmap_view_of_file2(GetCurrentProcess(), g_mirror_views[m], MEM_PRESERVE_PLACEHOLDER);
+            else
+#endif
+                UnmapViewOfFile(g_mirror_views[m]);
             g_mirror_views[m] = NULL;
         }
     }
     /* Unmap base view */
     if (g_memory_base) {
-        UnmapViewOfFile(g_memory_base);
+#ifdef _WIN32
+        if (g_placeholder_span)
+            s_unmap_view_of_file2(GetCurrentProcess(), g_memory_base, MEM_PRESERVE_PLACEHOLDER);
+        else
+#endif
+            UnmapViewOfFile(g_memory_base);
         g_memory_base = NULL;
         g_memory_size = 0;
     }
@@ -3675,20 +3828,17 @@ void xbox_MemoryLayoutShutdown(void)
         g_tiled_view = NULL;
     }
     if (g_contig_memory) {
-#if defined(_WIN32)
-        /* Usually a view of g_contig_mapping, which VirtualFree cannot
-         * release. Committed memory only when that view failed. */
-        if (!UnmapViewOfFile(g_contig_memory))
+#ifdef _WIN32
+        if (g_contig_is_view && g_placeholder_span)
+            s_unmap_view_of_file2(GetCurrentProcess(), g_contig_memory, MEM_PRESERVE_PLACEHOLDER);
+        else if (g_contig_is_view)
+            UnmapViewOfFile(g_contig_memory);
+        else
 #endif
-        VirtualFree(g_contig_memory, 0, MEM_RELEASE);
+            VirtualFree(g_contig_memory, 0, MEM_RELEASE);
         g_contig_memory = NULL;
     }
-#if defined(_WIN32)
-    if (g_contig_mapping) {
-        CloseHandle(g_contig_mapping);
-        g_contig_mapping = NULL;
-    }
-#endif
+    if (g_contig_mapping) { CloseHandle(g_contig_mapping); g_contig_mapping = NULL; }
     if (g_mcpx_memory) {
         VirtualFree(g_mcpx_memory, 0, MEM_RELEASE);
         g_mcpx_memory = NULL;
@@ -3709,10 +3859,15 @@ void xbox_MemoryLayoutShutdown(void)
     /* Whatever is left of the base+mirrors reservation. The views carved out
      * of it are already unmapped above; this releases the range itself. */
     if (g_span_base) {
+#ifdef _WIN32
+        if (g_placeholder_span)
+            VirtualFree(g_span_base, g_span_size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+        else
+#endif
         VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
         g_span_base = NULL;
         g_span_size = 0;
-        g_span_whole_window = 0;
+        g_placeholder_span = 0;
     }
 #if defined(_WIN32)
     /* The rest of the Windows guest window: the leftover placeholders and
