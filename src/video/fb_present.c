@@ -29,6 +29,8 @@ extern bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
 extern void nv2a_hook_pvideo_consume(unsigned bank);
 
 static volatile LONG s_fb_running;
+static volatile LONG s_pvideo_capture_count;
+static DWORD s_pvideo_next_capture_tick;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
@@ -71,8 +73,41 @@ static void fb_overlay(void)
         if (bytes > available) continue;
         source = (const uint8_t *)va;
         if (pvideo_scanout(regs, source, available, s_rgb,
-                           s_fb_width, s_fb_height, bank))
+                           s_fb_width, s_fb_height, bank)) {
+            const char *capture = getenv("RECOMP_PVIDEO_DUMP");
+            DWORD now = GetTickCount();
+            if (capture && (LONG)(now - s_pvideo_next_capture_tick) >= 0) {
+                LONG frame = InterlockedIncrement(&s_pvideo_capture_count);
+                s_pvideo_next_capture_tick = now + 500;
+                if (frame <= 12) {
+                    char path[1024];
+                    FILE *f;
+                    int n;
+                    n = snprintf(path, sizeof(path), "%s.frame%02ld.bank%u.regs.bin",
+                                 capture, frame, bank);
+                    f = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "wb") : NULL;
+                    if (f) {
+                        fwrite(regs, 1, sizeof(regs), f);
+                        fclose(f);
+                    }
+                    n = snprintf(path, sizeof(path), "%s.frame%02ld.bank%u.yuy2",
+                                 capture, frame, bank);
+                    f = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "wb") : NULL;
+                    if (f) {
+                        fwrite(source, 1, (size_t)bytes, f);
+                        fclose(f);
+                    }
+                    fprintf(stderr,
+                            "  [PVIDEO] captured frame=%ld bank=%u physical=0x%llX format=0x%08X pitch=%u size=%ux%u source=%p bytes=%llu\n",
+                            frame, bank, (unsigned long long)physical,
+                            regs[(NV_PVIDEO_FORMAT + bank * 4) / 4], pitch,
+                            regs[(NV_PVIDEO_SIZE_IN + bank * 4) / 4] & 0x7ff,
+                            height, (const void *)source,
+                            (unsigned long long)bytes);
+                }
+            }
             nv2a_hook_pvideo_consume(bank);
+        }
     }
 }
 
