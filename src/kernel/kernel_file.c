@@ -196,6 +196,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
+        fprintf(stderr, "[NtCreateFile] FAILED path=%ls err=%lu\n",
+                win_path, (unsigned long)err);
         /* Kept for the caller's trace. An NTSTATUS says "it did not open";
          * only the Win32 error distinguishes a title probing for a file that
          * is genuinely absent from one it cannot open because this runtime
@@ -262,8 +264,13 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_SUCCESS;
     }
 
-    XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p, len=%u) failed err=%u",
-               FileHandle, Length, GetLastError());
+    {
+        DWORD error = GetLastError();
+        fprintf(stderr, "[NtReadFile] FAILED handle=%p len=%u err=%lu\n",
+                FileHandle, Length, (unsigned long)error);
+        XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p, len=%u) failed err=%u",
+                   FileHandle, Length, error);
+    }
     IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
     IoStatusBlock->Information = 0;
     return STATUS_UNSUCCESSFUL;

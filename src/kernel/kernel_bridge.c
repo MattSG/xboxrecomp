@@ -3234,7 +3234,8 @@ static int bridge_async_io_enabled(void)
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
-    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t guest_handle = STACK_ARG(0);
+    HANDLE   handle    = bridge_resolve_handle(guest_handle);
     uint32_t iostatus  = STACK_ARG(4);
     uint32_t buffer_va = STACK_ARG(5);
     uint32_t length    = STACK_ARG(6);
@@ -3256,6 +3257,10 @@ static void bridge_NtReadFile(void)
     }
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+
+    if ((NTSTATUS)g_eax != STATUS_SUCCESS)
+        fprintf(stderr, "[NtReadFile] guest_handle=%08X host_handle=%p caller=%08X status=%08X\n",
+                guest_handle, handle, g_xbox_kernel_caller, (uint32_t)g_eax);
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
