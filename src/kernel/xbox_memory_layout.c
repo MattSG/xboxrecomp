@@ -48,6 +48,9 @@
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
+/* ponytail: one lock for both arenas and metadata; split if contention appears. */
+static CRITICAL_SECTION g_allocator_lock;
+static int g_allocator_lock_initialized;
 
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
@@ -2578,6 +2581,10 @@ static void xbox_heap_reset_base(void);
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
+    if (!g_allocator_lock_initialized) {
+        InitializeCriticalSection(&g_allocator_lock);
+        g_allocator_lock_initialized = 1;
+    }
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
@@ -4237,151 +4244,27 @@ static void contig_lock(void)
         SwitchToThread();
 }
 
-static void contig_unlock(void)
-{
-    InterlockedExchange(&g_contig_lock, 0);
-}
+    EnterCriticalSection(&g_allocator_lock);
+    if (alignment < 4096) alignment = 4096;
+    result = (g_contig_next + alignment - 1) & ~(alignment - 1);
 
-/* Usage over time, at most a line per 2 MB of movement or per 1024 calls --
- * enough to see the arena breathe without a line per texture. Lock held. */
-static void contig_report(const char *what, uint32_t va, uint32_t pages)
-{
-    static uint32_t last_pages, ops;
-    uint32_t delta = g_contig_pages_in_use > last_pages
-                   ? g_contig_pages_in_use - last_pages
-                   : last_pages - g_contig_pages_in_use;
-
-    if (!g_contig_t0)
-        g_contig_t0 = GetTickCount();
-    if (++ops > 16 && delta < 512 && (ops & 1023) != 0)
-        return;
-    last_pages = g_contig_pages_in_use;
-    fprintf(stderr, "  [CONTIG] t=%.1fs %s 0x%08X %u KB: in use %u KB, "
-            "peak %u KB, high-water %u KB (allocs=%u frees=%u)\n",
-            (GetTickCount() - g_contig_t0) / 1000.0, what, va,
-            pages * (CONTIG_PAGE / 1024),
-            g_contig_pages_in_use * (CONTIG_PAGE / 1024),
-            g_contig_peak_pages * (CONTIG_PAGE / 1024),
-            g_contig_high / 1024, g_contig_allocs, g_contig_frees);
-    fflush(stderr);
-}
-
-static void contig_take(uint32_t first, uint32_t n)
-{
-    uint32_t end = (first + n) * CONTIG_PAGE;
-
-    memset(&g_contig_used[first], 1, n);
-    g_contig_len[first] = n;
-    g_contig_pages_in_use += n;
-    if (g_contig_pages_in_use > g_contig_peak_pages)
-        g_contig_peak_pages = g_contig_pages_in_use;
-    if (end > g_contig_high)
-        g_contig_high = end;
-    while (g_contig_first_free < CONTIG_PAGES
-           && g_contig_used[g_contig_first_free])
-        g_contig_first_free++;
-}
-
-/* Whether page q may start or extend a new block.
- *
- * The first pass also keeps out of the loaded image's physical range. Here
- * the window and the RAM the image sits in are separate storage, so a block
- * placed at an image page gives one physical number two meanings, and a
- * device model holding only the number has to guess. Darkwatch's XPP lost
- * that guess both ways: a 1200 KB block at 0x0045C000 covered its .data
- * control-transfer buffer (0x004C20D4), and its OHCI descriptors, allocated
- * inside the block, resolved to the image and read back zero, so the pad
- * never enumerated. The console never has the overlap: its kernel keeps the
- * image's pages out of the pool. The second pass allows them, because an
- * image whose BSS runs past 48 MB would otherwise leave almost no window.
- *
- * Opt-in (RECOMP_CONTIG_AVOID_IMAGE=1): it moves every block above the
- * image, and game glue names some of them by address (a DSP doorbell, say). */
-static int contig_avoid_image(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_CONTIG_AVOID_IMAGE");
-        on = e && atoi(e) != 0;
+    /* Leave the top of the window for GPU instance memory. */
+    if ((uint64_t)result + size >
+            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
+                - XBOX_GPU_INSTANCE_DEFAULT) {
+        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
+                size, g_contig_next - XBOX_CONTIG_BASE,
+                (unsigned)XBOX_CONTIG_SIZE);
+        fflush(stderr);
+        LeaveCriticalSection(&g_allocator_lock);
+        return 0;
     }
     return on;
 }
 
-static int contig_page_free(uint32_t q, int avoid_image)
-{
-    if (g_contig_used[q])
-        return 0;
-    return !(avoid_image && g_xbox_image_hi
-             && q >= g_xbox_image_lo / CONTIG_PAGE
-             && q < (g_xbox_image_hi + CONTIG_PAGE - 1) / CONTIG_PAGE);
-}
-
-uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
-                                uint32_t phys_lo, uint32_t phys_hi)
-{
-    uint32_t n, align_pages, lo_page, limit, p, q, pass, result = 0;
-
-    if (alignment < CONTIG_PAGE) alignment = CONTIG_PAGE;
-    if (alignment & (alignment - 1)) {            /* round up to a power of 2 */
-        uint32_t a = CONTIG_PAGE;
-        while (a && a < alignment) a <<= 1;
-        alignment = a ? a : 0x80000000u;
-    }
-    if (size == 0) size = 1;
-    n = (uint32_t)(((uint64_t)size + CONTIG_PAGE - 1) / CONTIG_PAGE);
-    align_pages = alignment / CONTIG_PAGE;
-
-    /* Physical range -> page range. Highest is inclusive. */
-    lo_page = (uint32_t)(((uint64_t)phys_lo + CONTIG_PAGE - 1) / CONTIG_PAGE);
-    limit = (uint32_t)(((uint64_t)phys_hi + 1) / CONTIG_PAGE);
-    if (limit > CONTIG_USABLE) limit = CONTIG_USABLE;
-
-    contig_lock();
-    if (lo_page < g_contig_first_free) lo_page = g_contig_first_free;
-    for (pass = contig_avoid_image() ? 0 : 1; pass < 2 && !result; pass++) {
-        int avoid = pass == 0;
-        p = (lo_page + align_pages - 1) & ~(align_pages - 1);
-        while ((uint64_t)p + n <= limit) {
-            /* A request free to go above 16 MB steps over the low reserve. */
-            if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
-                    && p + n > CONTIG_LOW_RESERVE_START) {
-                p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
-                continue;
-            }
-            for (q = p; q < p + n && contig_page_free(q, avoid); q++)
-                ;
-            if (q == p + n) {
-                contig_take(p, n);
-                result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
-                break;
-            }
-            /* Skip the run that stopped us, then realign. */
-            while (q < limit && !contig_page_free(q, avoid)) q++;
-            p = (q + align_pages - 1) & ~(align_pages - 1);
-        }
-    }
-    if (result) {
-        g_contig_allocs++;
-        contig_report("alloc", result, n);
-    } else {
-        uint32_t best = 0, run = 0;
-        for (q = 0; q < CONTIG_USABLE; q++) {
-            run = g_contig_used[q] ? 0 : run + 1;
-            if (run > best) best = run;
-        }
-        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, align %u, "
-                "phys 0x%08X..0x%08X; %u of %u KB in use, largest free run "
-                "%u KB)\n", size, alignment, phys_lo, phys_hi,
-                g_contig_pages_in_use * (CONTIG_PAGE / 1024),
-                (unsigned)(CONTIG_USABLE * (CONTIG_PAGE / 1024)),
-                best * (CONTIG_PAGE / 1024));
-        fflush(stderr);
-    }
-    contig_unlock();
-
-    if (result)
-        memset((void *)((uintptr_t)result + g_memory_offset), 0,
-               (size_t)n * CONTIG_PAGE);
+    g_contig_next = result + size;
+    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    LeaveCriticalSection(&g_allocator_lock);
     return result;
 }
 
@@ -4490,101 +4373,11 @@ uint32_t xbox_ContiguousBlockSize(uint32_t va)
  * Never decreases, so a freed-and-reused texture stays addressable. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
-    return g_contig_high;
-}
-
-/* The in-use map, one byte per 4 KB page of the window: for a device model
- * (the APU) deciding whether a physical address names the window or RAM. */
-const volatile uint8_t *xbox_ContiguousPageMap(void)
-{
-    return g_contig_used;
-}
-
-/* Bytes in use right now. */
-uint32_t xbox_ContiguousInUseBytes(void)
-{
-    return g_contig_pages_in_use * CONTIG_PAGE;
-}
-
-/* Physical pages below 64 MB that MmGetPhysicalAddress has handed out for a
- * heap address, whose physical number is its virtual address.
- *
- * On the console a physical page is one page of RAM. Here the window and the
- * RAM below 64 MB are separate storage, and the arena above hands out
- * physical numbers that the heap and the image also use. So one number can
- * name two different pages, and a device given only the number cannot tell
- * which the title meant. A title that loads its sound effects and music
- * stream into the heap has DirectSound put each page's MmGetPhysicalAddress
- * into the voice's scatter-gather list; when those numbers fall inside a
- * block the arena has handed out, the APU read the window copy and played
- * whatever the window held there as PCM.
- *
- * MmGetPhysicalAddress is the one moment the runtime sees which copy the title
- * means, so it records RAM names here. Heap pages only: the image, its BSS and
- * the stacks are never freed, so a record there would never clear, and a
- * title's DirectSound voice array can sit at a window address whose number
- * falls inside a large image (see mcpx_apu_phys). The record is kept until the
- * heap frees the page. A window name does not clear it, because D3D names its
- * window pages all the time and the effect buffer in RAM is still live. If one
- * page holds live sound data in both copies, the APU picks RAM; this record
- * cannot tell them apart.
- *
- * Plain byte stores and loads. The APU thread may see a mark a voice-processor
- * pass late (or a cleared one a pass early); the title fills a buffer after
- * naming it and frees it after stopping the voice, so a stale read costs at
- * most one pass of one voice. */
-static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
-
-void xbox_PhysNoteRamName(uint32_t va)
-{
-    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
-        g_phys_ram_named[va / CONTIG_PAGE] = 1;
-}
-
-/* Heap block m is free (and merged with any free neighbours): its pages name
- * nothing now, except an edge page it shares with a live block. Index order is
- * address order, so the blocks that can share an edge page are the nearest
- * ones on either side; empty slots (size 0) and free blocks are stepped over.
- * Caller holds g_heap_lock. */
-static void heap_forget_ram_names(int m)
-{
-    uint32_t lo = g_heap_blocks[m].addr;
-    int64_t first, last;
-
-    if (!g_heap_blocks[m].size)
-        return;
-    first = lo / CONTIG_PAGE;
-    last = ((uint64_t)lo + g_heap_blocks[m].size - 1) / CONTIG_PAGE;
-    for (int j = m - 1; j >= 0; j--) {
-        if (!g_heap_blocks[j].size)
-            continue;
-        if ((uint64_t)g_heap_blocks[j].addr + g_heap_blocks[j].size <=
-                (uint64_t)first * CONTIG_PAGE)
-            break;
-        if (!g_heap_blocks[j].free) {
-            first++;
-            break;
-        }
-    }
-    for (int j = m + 1; j < g_heap_block_count; j++) {
-        if (!g_heap_blocks[j].size)
-            continue;
-        if ((uint64_t)g_heap_blocks[j].addr >= (uint64_t)(last + 1) * CONTIG_PAGE)
-            break;
-        if (!g_heap_blocks[j].free) {
-            last--;
-            break;
-        }
-    }
-    if (last >= (int64_t)CONTIG_PAGES)
-        last = (int64_t)CONTIG_PAGES - 1;
-    for (int64_t p = first; p <= last; p++)
-        g_phys_ram_named[p] = 0;
-}
-
-const volatile uint8_t *xbox_PhysRamNameMap(void)
-{
-    return g_phys_ram_named;
+    uint32_t allocated;
+    EnterCriticalSection(&g_allocator_lock);
+    allocated = g_contig_next - XBOX_CONTIG_BASE;
+    LeaveCriticalSection(&g_allocator_lock);
+    return allocated;
 }
 
 
@@ -4604,6 +4397,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
+    EnterCriticalSection(&g_allocator_lock);
     if (alignment < 4) alignment = 4;
 
     /* Enforce minimum allocation size.
@@ -4638,6 +4432,14 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
             memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
             return result;
         }
+        if (g_heap_blocks[i].addr & (alignment - 1)) {
+            continue;   /* wrong alignment for this request */
+        }
+        g_heap_blocks[i].free = 0;
+        result = g_heap_blocks[i].addr;
+        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+        LeaveCriticalSection(&g_allocator_lock);
+        return result;
     }
 
     /* Align the next pointer */
@@ -4676,6 +4478,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
                 fflush(stderr);
             }
         }
+        LeaveCriticalSection(&g_allocator_lock);
         return 0;
     }
 
@@ -4702,6 +4505,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
         fflush(stderr);
     }
 
+    LeaveCriticalSection(&g_allocator_lock);
     return result;
 }
 
@@ -4725,18 +4529,20 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
 
     if (!xbox_va)
         return 0;
-    AcquireSRWLockShared(&g_heap_lock);
+    EnterCriticalSection(&g_allocator_lock);
     for (i = 0; i < g_heap_block_count; i++) {
         if (g_heap_blocks[i].free)
             continue;
         if (xbox_va >= g_heap_blocks[i].addr &&
             xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size) {
-            r = g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
-            break;
+            uint32_t remaining = g_heap_blocks[i].size -
+                                 (xbox_va - g_heap_blocks[i].addr);
+            LeaveCriticalSection(&g_allocator_lock);
+            return remaining;
         }
     }
-    ReleaseSRWLockShared(&g_heap_lock);
-    return r;
+    LeaveCriticalSection(&g_allocator_lock);
+    return 0;
 }
 
 void xbox_HeapFree(uint32_t xbox_va)
@@ -4746,7 +4552,7 @@ void xbox_HeapFree(uint32_t xbox_va)
     if (!xbox_va) {
         return;
     }
-    AcquireSRWLockExclusive(&g_heap_lock);
+    EnterCriticalSection(&g_allocator_lock);
     frees++;
     if (frees <= 8) {
         fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",
@@ -4794,10 +4600,10 @@ void xbox_HeapFree(uint32_t xbox_va)
              * reused at once is named afresh after this, not wiped by it. */
             heap_forget_ram_names(m);
         }
-        ReleaseSRWLockExclusive(&g_heap_lock);
+        LeaveCriticalSection(&g_allocator_lock);
         return;
     }
-    ReleaseSRWLockExclusive(&g_heap_lock);
+    LeaveCriticalSection(&g_allocator_lock);
 }
 
 HANDLE xbox_GetMappingHandle(void)
