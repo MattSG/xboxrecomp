@@ -189,6 +189,12 @@ static void *g_flash_memory = NULL;
  * twice. See the tiled aperture below for why that matters.
  */
 static HANDLE g_contig_mapping = NULL;
+/* Contiguous offsets are not the whole range below a bump pointer: alignment
+ * gaps and ordinary RAM can sit below that high-water mark. Publish exact
+ * allocations so bus masters resolve only memory the runtime handed out. */
+#define XBOX_CONTIG_MAX_ALLOCS (XBOX_CONTIG_SIZE / 4096u)
+static struct { uint32_t offset, size; } g_contig_allocs[XBOX_CONTIG_MAX_ALLOCS];
+static volatile LONG g_contig_alloc_count;
 /* How much of the tiled aperture can exist.
  *
  * Two ceilings, both below the mapped RAM size once that is large:
@@ -3189,9 +3195,17 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
         LeaveCriticalSection(&g_allocator_lock);
         return 0;
     }
+    if (g_contig_alloc_count >= XBOX_CONTIG_MAX_ALLOCS) {
+        fprintf(stderr, "  [CONTIG] allocation table full\n");
+        LeaveCriticalSection(&g_allocator_lock);
+        return 0;
+    }
 
     g_contig_next = result + size;
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    g_contig_allocs[g_contig_alloc_count].offset = result - XBOX_CONTIG_BASE;
+    g_contig_allocs[g_contig_alloc_count].size = size;
+    InterlockedIncrement(&g_contig_alloc_count);
     LeaveCriticalSection(&g_allocator_lock);
     return result;
 }
@@ -3201,13 +3215,29 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
  * a surface offset is physical, and only the window makes it addressable. */
-uint32_t xbox_ContiguousAllocatedBytes(void)
+int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
 {
-    uint32_t allocated;
-    EnterCriticalSection(&g_allocator_lock);
-    allocated = g_contig_next - XBOX_CONTIG_BASE;
-    LeaveCriticalSection(&g_allocator_lock);
-    return allocated;
+    LONG lo = 0;
+    LONG hi = InterlockedCompareExchange(&g_contig_alloc_count, 0, 0);
+
+    if (!size)
+        size = 1;
+    while (lo < hi) {
+        LONG mid = lo + (hi - lo) / 2;
+        if (g_contig_allocs[mid].offset <= physical_offset)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (!lo)
+        return 0;
+    {
+        uint32_t start = g_contig_allocs[lo - 1].offset;
+        uint32_t block_size = g_contig_allocs[lo - 1].size;
+        return physical_offset >= start &&
+               (uint64_t)physical_offset + size <=
+                   (uint64_t)start + block_size;
+    }
 }
 
 

@@ -96,29 +96,11 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  */
 static uint32_t dma_resolve(uint32_t offset)
 {
-    extern uint32_t xbox_ContiguousAllocatedBytes(void);
-
-    /* Did this runtime hand the offset out as contiguous memory? Then the
-     * bytes live in the window, and that is not a guess: the arena is a bump
-     * allocator from XBOX_CONTIG_BASE, so everything below its high-water
-     * mark is memory some MmAllocateContiguousMemory call returned. The
-     * title's own writes go through the window, so the executor's must too.
-     *
-     * Checking this BEFORE the image test is the whole point. The image test
-     * only catches an offset that would land on the title's code, and whether
-     * it does is an accident of where the image happens to end: Half-Life 2's
-     * colour surface is physical 0x00A6C000, which clears the image by 700 KB.
-     * So it looked like an ordinary VA, and the executor cleared 1.2 MB of
-     * black straight through the guest heap -- which faulted the title three
-     * frames later on a pointer that had been overwritten, while the real
-     * framebuffer at 0x80A6C000 stayed untouched and the screen stayed black. */
-    if (offset < xbox_ContiguousAllocatedBytes())
+    /* Only offsets inside a block returned by the contiguous allocator use
+     * the separate window. Gaps below its bump pointer are ordinary RAM. */
+    if (xbox_ContiguousRangeAllocated(offset, 1))
         return XBOX_CONTIG_BASE + offset;
-    if (!surface_hits_image(offset, 1))
-        return offset;
-    if ((uint64_t)offset < XBOX_CONTIG_SIZE)
-        return XBOX_CONTIG_BASE + offset;
-    return offset;                         /* nothing better to offer */
+    return offset;
 }
 
 static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)

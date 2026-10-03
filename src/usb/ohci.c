@@ -494,32 +494,32 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
  * again, forever. */
-static uint32_t bus_resolve(uint32_t addr)
+static uint32_t bus_resolve(uint32_t addr, uint32_t bytes)
 {
+    if (xbox_ContiguousRangeAllocated(addr, bytes))
+        return OHCI_CONTIG_BASE + addr;
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
-    if (addr && addr < xbox_ContiguousAllocatedBytes())
-        return OHCI_CONTIG_BASE + addr;
     return addr;
 }
 
 static uint32_t rd32(uint32_t va)
 {
-    va = bus_resolve(va);
+    va = bus_resolve(va, 4);
     if (!guest_ok(va, 4))
         return 0;
     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
 }
 static void wr32(uint32_t va, uint32_t v)
 {
-    va = bus_resolve(va);
+    va = bus_resolve(va, 4);
     if (!guest_ok(va, 4))
         return;
     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
-    va = bus_resolve(va);
+    va = bus_resolve(va, bytes);
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }
