@@ -62,6 +62,8 @@ static void fb_overlay(void)
         uintptr_t va;
         MEMORY_BASIC_INFORMATION mapping;
         const uint8_t *source;
+        const uint8_t *scan_source;
+        uint8_t *snapshot = NULL;
         size_t available;
         if (!bytes || physical + bytes > 0x04000000u) continue;
         va = (uintptr_t)(0x80000000u + (uint32_t)physical) +
@@ -72,7 +74,15 @@ static void fb_overlay(void)
         available = mapping.RegionSize - (size_t)(va - (uintptr_t)mapping.BaseAddress);
         if (bytes > available) continue;
         source = (const uint8_t *)va;
-        if (pvideo_scanout(regs, source, available, s_rgb,
+        scan_source = source;
+        if (getenv("RECOMP_PVIDEO_DUMP") && bytes <= SIZE_MAX) {
+            snapshot = (uint8_t *)malloc((size_t)bytes);
+            if (snapshot) {
+                memcpy(snapshot, source, (size_t)bytes);
+                scan_source = snapshot;
+            }
+        }
+        if (pvideo_scanout(regs, scan_source, available, s_rgb,
                            s_fb_width, s_fb_height, bank)) {
             const char *capture = getenv("RECOMP_PVIDEO_DUMP");
             DWORD now = GetTickCount();
@@ -83,6 +93,11 @@ static void fb_overlay(void)
                     char path[1024];
                     FILE *f;
                     int n;
+                    size_t i, changed = 0;
+                    if (snapshot) {
+                        for (i = 0; i < (size_t)bytes; ++i)
+                            changed += snapshot[i] != source[i];
+                    }
                     n = snprintf(path, sizeof(path), "%s.frame%02ld.bank%u.regs.bin",
                                  capture, frame, bank);
                     f = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "wb") : NULL;
@@ -94,20 +109,22 @@ static void fb_overlay(void)
                                  capture, frame, bank);
                     f = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "wb") : NULL;
                     if (f) {
-                        fwrite(source, 1, (size_t)bytes, f);
+                        fwrite(scan_source, 1, (size_t)bytes, f);
                         fclose(f);
                     }
                     fprintf(stderr,
-                            "  [PVIDEO] captured frame=%ld bank=%u physical=0x%llX format=0x%08X pitch=%u size=%ux%u source=%p bytes=%llu\n",
+                            "  [PVIDEO] captured frame=%ld bank=%u physical=0x%llX format=0x%08X pitch=%u size=%ux%u source=%p bytes=%llu changed=%llu\n",
                             frame, bank, (unsigned long long)physical,
                             regs[(NV_PVIDEO_FORMAT + bank * 4) / 4], pitch,
                             regs[(NV_PVIDEO_SIZE_IN + bank * 4) / 4] & 0x7ff,
                             height, (const void *)source,
-                            (unsigned long long)bytes);
+                            (unsigned long long)bytes,
+                            (unsigned long long)changed);
                 }
             }
             nv2a_hook_pvideo_consume(bank);
         }
+        free(snapshot);
     }
 }
 
