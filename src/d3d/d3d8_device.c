@@ -16,6 +16,7 @@
  */
 
 #include "d3d8_internal.h"
+#include <d3d11_4.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -237,6 +238,18 @@ static HRESULT d3d11_create_device_and_swap_chain(
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);
         return hr;
+    }
+
+    /* The recompiled title can call the shared immediate context from worker
+     * threads. D3D11 leaves that context unprotected by default. */
+    {
+        ID3D11Multithread *multithread = NULL;
+        if (SUCCEEDED(ID3D11DeviceContext_QueryInterface(
+                state->d3d11_context, &IID_ID3D11Multithread,
+                (void **)&multithread))) {
+            ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
+            ID3D11Multithread_Release(multithread);
+        }
     }
 
     state->hwnd = pp->hDeviceWindow;
