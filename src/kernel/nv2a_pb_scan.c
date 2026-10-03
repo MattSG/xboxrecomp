@@ -134,6 +134,13 @@ static uint32_t pb_contiguous_va(uint32_t physical)
     return XBOX_CONTIG_BASE | (physical & (XBOX_CONTIG_SIZE - 1u));
 }
 
+static const uint8_t *pb_word_ptr(const uint8_t *mem, uint32_t va)
+{
+    /* A logical scan can cross the end of the mapped window. The Xbox bus
+     * wraps those reads back to the start of physical RAM. */
+    return mem + pb_contiguous_va(va - XBOX_CONTIG_BASE);
+}
+
 void nv2a_pb_scan_report(void)
 {
     int i;
@@ -174,7 +181,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
     uint32_t words = 0;
 
     while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        uint32_t w = *(const uint32_t *)pb_word_ptr(mem, va);
         va += 4;
         words++;
 
@@ -215,7 +222,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                  * disagree about what the stream said. */
                 if (s_exec_enabled)
                     nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
+                                        *(const uint32_t *)pb_word_ptr(mem, va));
                 va += 4;
                 words++;
             }
