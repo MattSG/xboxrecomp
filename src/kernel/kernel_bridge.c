@@ -9101,8 +9101,9 @@ static void kernel_thunk_dispatch(void)
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
-                    g_kernel_call_count, ordinal, slot, g_esp);
+            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
+                    g_kernel_call_count, ordinal, slot, g_esp,
+                    g_esp ? BRIDGE_MEM32(g_esp) : 0);
             /* And which ones, ranked. "Latest" names whatever the sample
              * happened to land on; the question behind this line is what a
              * title sitting still is actually asking the kernel for, and
