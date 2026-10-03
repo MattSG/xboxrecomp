@@ -886,17 +886,63 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    memcpy(period, d->monitor.frame_buf, sizeof(period));
-    /* The VP monitor point accumulates into frame_buf, so the next period
-     * has to start from silence. */
-    memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    /* XAudio2 path: render and submit a buffer */
+    if (xa2_is_active()) {
+        if (g_audio_muted) {
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        } else {
+            if (g_test_tone.active) {
+                for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                    int32_t tone = (int32_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                    int32_t left = d->monitor.frame_buf[i][0] + tone;
+                    int32_t right = d->monitor.frame_buf[i][1] + tone;
+                    if (left > 32767) left = 32767;
+                    if (left < -32768) left = -32768;
+                    if (right > 32767) right = 32767;
+                    if (right < -32768) right = -32768;
+                    d->monitor.frame_buf[i][0] = (int16_t)left;
+                    d->monitor.frame_buf[i][1] = (int16_t)right;
+                    g_test_tone.phase += g_test_tone.phase_inc;
+                    if (g_test_tone.phase >= 2.0 * M_PI)
+                        g_test_tone.phase -= 2.0 * M_PI;
+                }
+            }
+            mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
+        }
 
-    if (g_audio_muted) {
-        memset(period, 0, sizeof(period));
-    } else {
-        memset(extra, 0, sizeof(extra));
-        if (g_test_tone.active) {
-            for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+        xa2_submit_samples((const int16_t *)d->monitor.frame_buf,
+                           MIXER_FRAME_SAMPLES);
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        return;
+    }
+
+    if (!g_waveout.initialized) return;
+
+    int idx = g_waveout.next_buf;
+    WAVEHDR *hdr = &g_waveout.hdrs[idx];
+
+    /* Wait if this buffer is still playing (with timeout) */
+    int wait_loops = 0;
+    while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
+        qemu_mutex_unlock(&d->lock);
+        Sleep(1);
+        qemu_mutex_lock(&d->lock);
+        if (++wait_loops > 50) break;
+    }
+
+    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
+    int16_t *out = (int16_t *)g_waveout.bufs[idx];
+    int remaining = WAVEOUT_BUF_SAMPLES;
+    int out_offset = 0;
+
+    while (remaining > 0) {
+        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
+
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+
+        /* Test tone (skip if muted) */
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < chunk; i++) {
                 int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
                 extra[i][0] = s;
                 extra[i][1] = s;
