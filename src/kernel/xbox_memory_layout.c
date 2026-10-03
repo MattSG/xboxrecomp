@@ -42,6 +42,9 @@
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
+/* ponytail: one lock for both arenas and metadata; split if contention appears. */
+static CRITICAL_SECTION g_allocator_lock;
+static int g_allocator_lock_initialized;
 
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
@@ -1772,6 +1775,10 @@ volatile uint64_t g_icall_count = 0;
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
+    if (!g_allocator_lock_initialized) {
+        InitializeCriticalSection(&g_allocator_lock);
+        g_allocator_lock_initialized = 1;
+    }
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
@@ -3167,6 +3174,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
+    EnterCriticalSection(&g_allocator_lock);
     if (alignment < 4096) alignment = 4096;
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);
 
@@ -3178,11 +3186,13 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
                 size, g_contig_next - XBOX_CONTIG_BASE,
                 (unsigned)XBOX_CONTIG_SIZE);
         fflush(stderr);
+        LeaveCriticalSection(&g_allocator_lock);
         return 0;
     }
 
     g_contig_next = result + size;
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    LeaveCriticalSection(&g_allocator_lock);
     return result;
 }
 
@@ -3193,7 +3203,11 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  * a surface offset is physical, and only the window makes it addressable. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
-    return g_contig_next - XBOX_CONTIG_BASE;
+    uint32_t allocated;
+    EnterCriticalSection(&g_allocator_lock);
+    allocated = g_contig_next - XBOX_CONTIG_BASE;
+    LeaveCriticalSection(&g_allocator_lock);
+    return allocated;
 }
 
 
@@ -3201,6 +3215,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
+    EnterCriticalSection(&g_allocator_lock);
     if (alignment < 4) alignment = 4;
 
     /* Enforce minimum allocation size.
@@ -3226,6 +3241,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         g_heap_blocks[i].free = 0;
         result = g_heap_blocks[i].addr;
         memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+        LeaveCriticalSection(&g_allocator_lock);
         return result;
     }
 
@@ -3264,6 +3280,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
                 fflush(stderr);
             }
         }
+        LeaveCriticalSection(&g_allocator_lock);
         return 0;
     }
 
@@ -3290,6 +3307,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         fflush(stderr);
     }
 
+    LeaveCriticalSection(&g_allocator_lock);
     return result;
 }
 
@@ -3312,13 +3330,19 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
 
     if (!xbox_va)
         return 0;
+    EnterCriticalSection(&g_allocator_lock);
     for (i = 0; i < g_heap_block_count; i++) {
         if (g_heap_blocks[i].free)
             continue;
         if (xbox_va >= g_heap_blocks[i].addr &&
-            xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size)
-            return g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
+            xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size) {
+            uint32_t remaining = g_heap_blocks[i].size -
+                                 (xbox_va - g_heap_blocks[i].addr);
+            LeaveCriticalSection(&g_allocator_lock);
+            return remaining;
+        }
     }
+    LeaveCriticalSection(&g_allocator_lock);
     return 0;
 }
 
@@ -3329,6 +3353,7 @@ void xbox_HeapFree(uint32_t xbox_va)
     if (!xbox_va) {
         return;
     }
+    EnterCriticalSection(&g_allocator_lock);
     frees++;
     if (frees <= 8) {
         fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",
@@ -3362,8 +3387,10 @@ void xbox_HeapFree(uint32_t xbox_va)
             g_heap_blocks[i].size = 0;
             g_heap_blocks[i].addr = 0;
         }
+        LeaveCriticalSection(&g_allocator_lock);
         return;
     }
+    LeaveCriticalSection(&g_allocator_lock);
 }
 
 HANDLE xbox_GetMappingHandle(void)
