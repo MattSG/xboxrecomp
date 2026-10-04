@@ -231,6 +231,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
         d->vp.ssl[selected_handle].ssl_seg = 0;
         d->vp.ssl[selected_handle].ssl_index = 0;
+        d->vp.filters[selected_handle].resample_phase = 0.0;
+        d->vp.filters[selected_handle].resample_valid = 0;
+        d->vp.filters[selected_handle].resample_read = 0;
+        d->vp.filters[selected_handle].resample_count = 0;
 
         unsigned int ea_start = GET_MASK(argument, NV1BA0_PIO_VOICE_ON_ENVA);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
@@ -940,32 +944,56 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
+ * Voice resampling (linear interpolation, no libsamplerate)
  *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * Preserve input/output rate and fractional position across VP frames.
  * ============================================================ */
+
+static int voice_resample_pull(MCPXAPUState *d, uint16_t v, float sample[2])
+{
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    if (filter->resample_read == filter->resample_count) {
+        int count = voice_get_samples(d, v, (float (*)[2])filter->resample_buf,
+                                      NUM_SAMPLES_PER_FRAME);
+        if (count <= 0) return 0;
+        filter->resample_read = 0;
+        filter->resample_count = (unsigned int)count;
+    }
+    sample[0] = filter->resample_buf[filter->resample_read * 2];
+    sample[1] = filter->resample_buf[filter->resample_read * 2 + 1];
+    filter->resample_read++;
+    return 1;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
-
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    int produced = 0;
+    if (!(rate > 0.0f) || !isfinite(rate)) return -1;
+    /* rate is output/input, as in libsamplerate. Keep fractional position
+     * across VP frames: 44.1 kHz voices must not consume 48,000 samples/sec. */
+    while (produced < requested_num) {
+        while (filter->resample_valid < 2) {
+            if (!voice_resample_pull(d, v, filter->resample_pair[filter->resample_valid]))
+                return produced ? produced : -1;
+            filter->resample_valid++;
+        }
+        if (filter->resample_phase >= 1.0) {
+            memcpy(filter->resample_pair[0], filter->resample_pair[1], sizeof(filter->resample_pair[0]));
+            filter->resample_valid = 1;
+            filter->resample_phase -= 1.0;
+            continue;
+        }
+        for (int channel = 0; channel < 2; channel++) {
+            float left = filter->resample_pair[0][channel];
+            float right = filter->resample_pair[1][channel];
+            samples[produced][channel] = left + (right - left) * (float)filter->resample_phase;
+        }
+        produced++;
+        filter->resample_phase += 1.0 / rate;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    return produced;
 }
 
 /* ============================================================
