@@ -496,10 +496,10 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * again, forever. */
 static uint32_t bus_resolve(uint32_t addr, uint32_t bytes)
 {
-    if (xbox_ContiguousRangeAllocated(addr, bytes))
-        return OHCI_CONTIG_BASE + addr;
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
+    if (xbox_ContiguousRangeAllocated(addr, bytes))
+        return OHCI_CONTIG_BASE + addr;
     return addr;
 }
 
