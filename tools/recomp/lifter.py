@@ -2080,13 +2080,18 @@ class Lifter:
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        # x86 masks the shift operand to five bits for byte, word and dword
+        # shifts.  Leaving the register's low byte intact emits undefined C
+        # shifts for counts >= 32 (common in bitstream decoders).
+        cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
         out = []
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
             # CF is the last bit shifted out; a zero count leaves CF alone.
             bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
+            # CF is undefined when the masked count exceeds the operand
+            # width.  Leave it unchanged rather than emit an invalid C shift.
+            out.append(f"if (({cnt}) && ({cnt}) <= {w}) _cf = (int)((({dst}) >> ({bit})) & 1);")
         out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
         out.append(self._result_snapshot(ops, "shift"))
         return out
