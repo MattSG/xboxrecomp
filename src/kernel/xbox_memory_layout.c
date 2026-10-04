@@ -1724,7 +1724,9 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 
     for (i = 0; i < 400 && esp; i++) {
         uint32_t a = esp + i * 4;
-        if (a < XBOX_STACK_BASE || a >= XBOX_STACK_TOP) break;
+        /* XAPI workers allocate their stacks from guest virtual memory;
+         * they need not occupy the host entry thread's fixed stack range. */
+        if (!peek_readable(a)) break;
         fprintf(stderr, "    GS %08X %08X\n", a,
                 *(const uint32_t *)(mem + a));
     }
