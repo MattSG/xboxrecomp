@@ -3071,27 +3071,39 @@ uint32_t xbox_AllocThreadTib(void)
     /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
     #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
     const uint32_t tib_size = 0x40;
-    uint32_t tib, block, thread_data, total;
+    const uint32_t context_size = 0x200;
+    uint32_t tib, block, thread_data, context, total;
 
     if (!g_tls_total)
         return 0;                    /* image has no TLS; nothing to copy */
 
     total = g_tls_total;
-    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size, 16);
+    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size + context_size, 16);
     if (!tib)
         return 0;
     block       = tib + tib_size;
     thread_data = block + total;
+    context = thread_data + g_tls_thread_size;
 
     /* The TIB itself, copied so stack bounds and the fields the title filled
      * in are inherited, then the two that must not be. */
     memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_size);
     memcpy(TIB_VA(block), TIB_VA(g_tls_template_va), total);
     memset(TIB_VA(thread_data), 0, g_tls_thread_size);
+    /* XAPI's native thread bootstrap follows fs:[0x28]+0x28 to the TLS
+     * block and initializes it. Sharing the loader's context lets workers
+     * redirect or overwrite one another's TLS and stack frames. */
+    memset(TIB_VA(context), 0, context_size);
+    *(uint32_t *)TIB_VA(context + 0x28) = block;
 
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+    *(uint32_t *)TIB_VA(tib + 0x18) = tib;
+    *(uint32_t *)TIB_VA(tib + 0x28) = context;
+    if (getenv("RECOMP_THREAD_TLS_TRACE"))
+        fprintf(stderr, "[THREAD_TLS] tib=%08X fs4=%08X context=%08X block=%08X slot0=%08X\n",
+                tib, block+total, context, block, thread_data);
 
     return tib;
     #undef TIB_VA
