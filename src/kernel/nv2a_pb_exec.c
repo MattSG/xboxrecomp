@@ -2017,7 +2017,15 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         sv = (float)s_gpu.texs[0].height;
     }
     for (k = 0; k < 3; k++) {
-        T.iw[k] = 1.0f / v[k]->pos[3];
+        /* NV2A clamps raster W to [2^-64, 2^64] (xemu glsl/vsh.c,
+         * clampAwayZeroInf). Screen-space shaders can emit RCP(0) = +Inf;
+         * taking its reciprocal directly makes every interpolated texture
+         * coordinate 0/0, corrupting fullscreen composites. Keep shader
+         * output intact and apply the hardware range at raster setup. */
+        float raster_w = v[k]->pos[3];
+        if (raster_w > 0x1p64f) raster_w = 0x1p64f;
+        if (raster_w < 0x1p-64f) raster_w = 0x1p-64f;
+        T.iw[k] = 1.0f / raster_w;
         T.uv[k][0] = v[k]->tex[0][0] * su * T.iw[k];
         T.uv[k][1] = v[k]->tex[0][1] * sv * T.iw[k];
     }
@@ -2185,7 +2193,8 @@ static void raster_batch_program(void)
         }
         /* Spread out: one every 20000 program batches, so a run that spends
          * its first half in menus still traces the 3D scene. */
-        if (left > 0 && n >= 3 && s_gpu.batches_program % 20000 == 0) {
+        if (left > 0 && n >= 3 &&
+            (s_ftrace == 2 || s_gpu.batches_program % 20000 == 0)) {
             float in[4];
             left--;
             fprintf(stderr, "[VTRACE] prim %u n %u idx %u %u %u\n", s_gpu.prim,
