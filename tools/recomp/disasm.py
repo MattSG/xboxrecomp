@@ -233,7 +233,15 @@ class Disassembler:
                 del decoded[addr]
             for cs_insn in self._cs.disasm(raw_bytes[point - start_va:size],
                                            point):
-                if cs_insn.address in decoded:
+                rejoined = cs_insn.address in decoded
+                # Discard every overlapping instruction from the old stream,
+                # including bogus starts inside this corrected instruction.
+                for addr in [a for a, i in decoded.items()
+                             if a != cs_insn.address
+                             and a < cs_insn.address + cs_insn.size
+                             and cs_insn.address < a + i.size]:
+                    del decoded[addr]
+                if rejoined:
                     break          # rejoined a stream we already have
                 # The misaligned stream did not only straddle `point`: until
                 # it rejoins, every instruction it decoded starts *inside* one
