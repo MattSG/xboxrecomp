@@ -3180,6 +3180,15 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
+    /* The kernel allocates physical pages, not byte-sized fragments. XDK
+     * DirectSound keeps its silent samples in the remainder of a small
+     * allocation's page (MM3: 0x98-byte request, samples at +0x22c).
+     * Publishing only the requested bytes made the APU resolve that tail
+     * through ordinary RAM instead of the contiguous window. */
+    if (!size || size > UINT32_MAX - 0xFFFu)
+        return 0;
+    size = (size + 0xFFFu) & ~0xFFFu;
+
     EnterCriticalSection(&g_allocator_lock);
     if (alignment < 4096) alignment = 4096;
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);
