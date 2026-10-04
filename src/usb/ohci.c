@@ -498,6 +498,12 @@ static uint32_t bus_resolve(uint32_t addr, uint32_t bytes)
 {
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
+    /* XPP's private arena ends at 0x80001000 and bypasses the contiguous
+     * allocator. Its report buffers still carry physical DMA addresses.
+     * Page zero is reserved from allocations, so the allocation table cannot
+     * identify these buffers; their bytes live in the contiguous view. */
+    if (addr < 0x1000u && (uint64_t)addr + bytes <= 0x1000u)
+        return OHCI_CONTIG_BASE + addr;
     if (xbox_ContiguousRangeAllocated(addr, bytes))
         return OHCI_CONTIG_BASE + addr;
     return addr;
