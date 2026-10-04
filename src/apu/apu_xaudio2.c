@@ -28,8 +28,10 @@
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
 /* The APU submits 256 samples (5.33 ms), not a full 1024-sample slot.
  * Three slots only covered 16 ms and dropped buffers during scheduler bursts.
- * Twelve slots cover 64 ms while preserving the FIFO and slot ownership. */
-#define XA2_NUM_BUFS      12
+ * Sixty-four slots cover 341 ms: enough for the APU's bounded 250 ms
+ * catch-up plus scheduler jitter. Capacity does not force a full queue;
+ * steady-state submission remains one 256-sample buffer every 5.33 ms. */
+#define XA2_NUM_BUFS      64
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -39,6 +41,20 @@ static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 static FILE                   *g_xa2_pcm_dump = NULL;
+
+/* Endpoint loss otherwise looks like a permanently full queue. Keep the
+ * callback small; destruction/recovery must happen outside the audio thread. */
+static void STDMETHODCALLTYPE xa2_processing_start(IXAudio2EngineCallback *self) { (void)self; }
+static void STDMETHODCALLTYPE xa2_processing_end(IXAudio2EngineCallback *self) { (void)self; }
+static void STDMETHODCALLTYPE xa2_critical_error(IXAudio2EngineCallback *self, HRESULT error)
+{
+    (void)self;
+    fprintf(stderr, "[XA2] Critical engine error: 0x%08lX\n", error);
+}
+static struct IXAudio2EngineCallbackVtbl g_xa2_callback_vtable = {
+    xa2_processing_start, xa2_processing_end, xa2_critical_error
+};
+static IXAudio2EngineCallback g_xa2_callback = { &g_xa2_callback_vtable };
 
 int xa2_init(void)
 {
@@ -58,6 +74,12 @@ int xa2_init(void)
     hr = XAudio2Create(&g_xa2, 0, XAUDIO2_DEFAULT_PROCESSOR);
     if (FAILED(hr) || !g_xa2) {
         fprintf(stderr, "[XA2] XAudio2Create failed: 0x%08lX\n", hr);
+        goto fail;
+    }
+
+    hr = IXAudio2_RegisterForCallbacks(g_xa2, &g_xa2_callback);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[XA2] RegisterForCallbacks failed: 0x%08lX\n", hr);
         goto fail;
     }
 
