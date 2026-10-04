@@ -3193,6 +3193,17 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     if (alignment < 4096) alignment = 4096;
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);
 
+    /* Low RAM and the contiguous window have separate host backing but share
+     * physical address numbers. Never claim pages already used by the heap:
+     * bus masters would otherwise switch a live heap buffer to unrelated
+     * contiguous storage (MM3's third Bink movie lost all audio this way).
+     * Keep freed heap addresses reserved too, since HeapAlloc reuses them. */
+    if ((uint64_t)(result - XBOX_CONTIG_BASE) + size > XBOX_HEAP_BASE &&
+        result - XBOX_CONTIG_BASE < g_heap_next) {
+        result = (XBOX_CONTIG_BASE + g_heap_next + alignment - 1) &
+                 ~(alignment - 1);
+    }
+
     /* Leave the top of the window for GPU instance memory. */
     if ((uint64_t)result + size >
             (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
@@ -3286,6 +3297,15 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
+
+    /* Reciprocal ownership rule: a new heap block must not use physical
+     * pages already owned by the independently backed contiguous window. */
+    for (LONG i = 0; i < g_contig_alloc_count; i++) {
+        uint32_t start = g_contig_allocs[i].offset;
+        uint32_t end = start + g_contig_allocs[i].size;
+        if ((uint64_t)result + size > start && result < end)
+            result = (end + alignment - 1) & ~(alignment - 1);
+    }
 
     if (result + size > XBOX_HEAP_TOP) {
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
