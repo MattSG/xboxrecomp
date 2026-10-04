@@ -1022,7 +1022,11 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
     }
 
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US)
+        /* Windows waits may overshoot one 5.33 ms output frame. Preserve
+         * the deadline and catch up instead of discarding that elapsed time
+         * every wake: Bink's wall-clock decoding then outruns audio playback.
+         * Rebase only after a substantial pause to bound catch-up work. */
+        now_us - d->next_frame_time_us > 250000) {
         d->next_frame_time_us = now_us;
 
     /* In the band the lead a render-ahead built is already in the queue;
