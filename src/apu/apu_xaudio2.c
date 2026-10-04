@@ -25,31 +25,11 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-/* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
- * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
- * override them at xa2_init, clamped to the static storage below. */
-#define XA2_BUF_SAMPLES_DEFAULT 512
-#define XA2_NUM_BUFS_DEFAULT    4
-#define XA2_BUF_SAMPLES_MIN     128
-#define XA2_BUF_SAMPLES_MAX     4096
-#define XA2_NUM_BUFS_MIN        2
-#define XA2_NUM_BUFS_MAX        8
-
-static int g_xa2_buf_samples = XA2_BUF_SAMPLES_DEFAULT;
-static int g_xa2_num_bufs    = XA2_NUM_BUFS_DEFAULT;
-#define XA2_BUF_SAMPLES g_xa2_buf_samples
-#define XA2_NUM_BUFS    g_xa2_num_bufs
-
-static int xa2_env_int(const char *name, int def, int lo, int hi)
-{
-    const char *e = getenv(name);
-    int v;
-    if (!e || !*e) return def;
-    v = atoi(e);
-    if (v < lo) v = lo;
-    if (v > hi) v = hi;
-    return v;
-}
+#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
+/* The APU submits 256 samples (5.33 ms), not a full 1024-sample slot.
+ * Three slots only covered 16 ms and dropped buffers during scheduler bursts.
+ * Twelve slots cover 64 ms while preserving the FIFO and slot ownership. */
+#define XA2_NUM_BUFS      12
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -67,6 +47,7 @@ static int       g_xa2_dry;
 static ULONGLONG g_xa2_underrun_logged;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
+static FILE                   *g_xa2_pcm_dump = NULL;
 
 int xa2_init(void)
 {
@@ -127,6 +108,14 @@ int xa2_init(void)
     g_xa2_dry = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
+    {
+        const char *path = getenv("RECOMP_XA2_PCM_DUMP");
+        if (path && *path) {
+            g_xa2_pcm_dump = fopen(path, "wb");
+            fprintf(stderr, "[XA2] PCM capture %s: %s (s16le stereo 48000 Hz)\n",
+                    g_xa2_pcm_dump ? "opened" : "failed", path);
+        }
+    }
 
     fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)\n",
             XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES,
@@ -142,6 +131,10 @@ fail:
 
 void xa2_shutdown(void)
 {
+    if (g_xa2_pcm_dump) {
+        fclose(g_xa2_pcm_dump);
+        g_xa2_pcm_dump = NULL;
+    }
     if (g_xa2_source) {
         IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
         IXAudio2SourceVoice_FlushSourceBuffers(g_xa2_source);
@@ -205,10 +198,16 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
         if (FAILED(hr)) { ok = 0; continue; }
 
-        g_xa2_next_buf = (idx + 1) % XA2_RING;
-        g_xa2_frames_written++;
+    hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+    if (FAILED(hr)) return 0;
+    if (g_xa2_pcm_dump) {
+        fwrite(g_xa2_bufs[idx], 1, xbuf.AudioBytes, g_xa2_pcm_dump);
+        fflush(g_xa2_pcm_dump);
     }
-    return ok;
+
+    g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
+    g_xa2_frames_written++;
+    return 1;
 }
 
 int xa2_get_buffer_size(void)
