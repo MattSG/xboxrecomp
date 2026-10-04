@@ -2197,6 +2197,12 @@ static void raster_batch_program(void)
             (s_ftrace == 2 || s_gpu.batches_program % 20000 == 0)) {
             float in[4];
             left--;
+            if (s_gpu.inline_active) {
+                fprintf(stderr, "[VTRACE] inline dwords=%u:", s_gpu.inline_count);
+                for (i = 0; i < s_gpu.inline_count && i < 16; i++)
+                    fprintf(stderr, " %08X", s_gpu.inline_buf[i]);
+                fprintf(stderr, "\n");
+            }
             fprintf(stderr, "[VTRACE] prim %u n %u idx %u %u %u\n", s_gpu.prim,
                     n, s_gpu.idx[0], s_gpu.idx[1], s_gpu.idx[2]);
             for (i = 0; i < NV_VERTEX_ATTRS; i++) {
@@ -2209,8 +2215,8 @@ static void raster_batch_program(void)
                         at->size, at->stride, in[0], in[1], in[2], in[3]);
             }
             {
-                static const uint32_t cs[] = {58, 59, 96, 97, 112, 113, 114, 115};
-                for (i = 0; i < 8; i++) {
+                static const uint32_t cs[] = {0, 1, 58, 59, 96, 97, 98, 99, 112, 113, 114, 115};
+                for (i = 0; i < sizeof(cs) / sizeof(cs[0]); i++) {
                     const float *c = nv2a_vsh_constant(cs[i]);
                     fprintf(stderr, "[VTRACE]   c[%u] %g %g %g %g%c", cs[i],
                             c[0], c[1], c[2], c[3], 10);
