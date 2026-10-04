@@ -242,6 +242,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
         d->vp.ssl[selected_handle].ssl_seg = 0;
         d->vp.ssl[selected_handle].ssl_index = 0;
+        d->vp.filters[selected_handle].resample_phase = 0.0;
+        d->vp.filters[selected_handle].resample_valid = 0;
+        d->vp.filters[selected_handle].resample_read = 0;
+        d->vp.filters[selected_handle].resample_count = 0;
 
         unsigned int ea_start = GET_MASK(argument, NV1BA0_PIO_VOICE_ON_ENVA);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
@@ -1315,94 +1319,56 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (linear interpolation in place of libsamplerate)
+ * Voice resampling (linear interpolation, no libsamplerate)
  *
- * libsamplerate is stubbed; voice_resample below interpolates linearly
- * between source frames at the pitch's ratio, keeping its position and
- * the last frame across calls in the voice's filter state.
+ * Preserve input/output rate and fractional position across VP frames.
  * ============================================================ */
+
+static int voice_resample_pull(MCPXAPUState *d, uint16_t v, float sample[2])
+{
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    if (filter->resample_read == filter->resample_count) {
+        int count = voice_get_samples(d, v, (float (*)[2])filter->resample_buf,
+                                      NUM_SAMPLES_PER_FRAME);
+        if (count <= 0) return 0;
+        filter->resample_read = 0;
+        filter->resample_count = (unsigned int)count;
+    }
+    sample[0] = filter->resample_buf[filter->resample_read * 2];
+    sample[1] = filter->resample_buf[filter->resample_read * 2 + 1];
+    filter->resample_read++;
+    return 1;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Linear interpolation in place of libsamplerate. `rate` is the output
-     * to source ratio the VP's pitch encodes (libsamplerate's src_ratio):
-     * 1.088 for 44.1 kHz material at the 48 kHz frame rate, so
-     * each output consumes 1/rate source samples. Fetching one source sample
-     * per output, as the stub before did, played everything a semitone and a
-     * half high, 8.8 % too fast -- and drained each stream buffer faster than
-     * the title filled it, which is where the periodic dropouts came from.
-     *
-     * State per voice: the two source samples the output sits between
-     * (rs_last at 0, rs_next at 1) and the output's position rs_pos in
-     * [0,1). Source samples arrive from voice_get_samples in the voice's own
-     * units; a shortfall (the voice ended or its stream ran dry) returns the
-     * outputs that could be made, and a fetch failure with nothing made is
-     * passed through as it was. */
-    MCPXAPUVoiceFilter *f = &d->vp.filters[v];
-    float src[NUM_SAMPLES_PER_FRAME * 4 + 2][2];
-    const int max_src = (int)(sizeof(src) / sizeof(src[0]));
-    float step;
-    int need, got, in, out;
-
-    if (!(rate > 0.0f)) rate = 1.0f;
-    step = 1.0f / rate;
-
-    if (!f->rs_have) {
-        got = voice_get_samples(d, v, src, 2);
-        /* A first fetch that gets one sample returns no output and drops
-         * that sample: the next call fetches two afresh. A voice whose
-         * stream starts one sample at a time loses its first sample. */
-        if (got < 2) return got < 0 ? got : 0;
-        f->rs_last[0] = src[0][0]; f->rs_last[1] = src[0][1];
-        f->rs_next[0] = src[1][0]; f->rs_next[1] = src[1][1];
-        f->rs_pos = 0.0f;
-        f->rs_have = 1;
-    }
-
-    /* Source samples the next requested_num outputs will step past, exactly:
-     * output k sits at rs_pos + k * step, and every whole unit that position
-     * reaches before the last output is a source sample consumed. The last
-     * output's own step is left pending in rs_pos for the next call, so
-     * nothing fetched here goes unused -- fetching floor(rs_pos + n * step)
-     * instead over-read by up to one sample a frame, which was dropped: the
-     * music came out 3 % fast. A step above about 4.2 (rate below 0.24, a
-     * voice pitched more than two octaves up) wants more than the 130-frame
-     * buffer holds over 31 steps; make fewer outputs rather than lose
-     * source, so such a voice comes out short (and late) each frame. */
-    for (;;) {
-        need = (int)floorf(f->rs_pos + (float)(requested_num - 1) * step);
-        if (need <= max_src || requested_num <= 1) break;
-        requested_num /= 2;
-    }
-    if (need > max_src) need = max_src;
-    if (need < 0) need = 0;
-
-    got = need > 0 ? voice_get_samples(d, v, src, need) : 0;
-    if (got < 0) got = 0;
-
-    for (in = 0, out = 0; out < requested_num; out++) {
-        while (f->rs_pos >= 1.0f) {
-            if (in >= got) goto done;
-            f->rs_last[0] = f->rs_next[0]; f->rs_last[1] = f->rs_next[1];
-            f->rs_next[0] = src[in][0];    f->rs_next[1] = src[in][1];
-            in++;
-            f->rs_pos -= 1.0f;
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    int produced = 0;
+    if (!(rate > 0.0f) || !isfinite(rate)) return -1;
+    /* rate is output/input, as in libsamplerate. Keep fractional position
+     * across VP frames: 44.1 kHz voices must not consume 48,000 samples/sec. */
+    while (produced < requested_num) {
+        while (filter->resample_valid < 2) {
+            if (!voice_resample_pull(d, v, filter->resample_pair[filter->resample_valid]))
+                return produced ? produced : -1;
+            filter->resample_valid++;
         }
-        samples[out][0] = f->rs_last[0] + f->rs_pos * (f->rs_next[0] - f->rs_last[0]);
-        samples[out][1] = f->rs_last[1] + f->rs_pos * (f->rs_next[1] - f->rs_last[1]);
-        f->rs_pos += step;
+        if (filter->resample_phase >= 1.0) {
+            memcpy(filter->resample_pair[0], filter->resample_pair[1], sizeof(filter->resample_pair[0]));
+            filter->resample_valid = 1;
+            filter->resample_phase -= 1.0;
+            continue;
+        }
+        for (int channel = 0; channel < 2; channel++) {
+            float left = filter->resample_pair[0][channel];
+            float right = filter->resample_pair[1][channel];
+            samples[produced][channel] = left + (right - left) * (float)filter->resample_phase;
+        }
+        produced++;
+        filter->resample_phase += 1.0 / rate;
     }
-done:
-    if (out == 0 && got == 0) {
-        /* Nothing new and nothing left to interpolate: the voice has stopped
-         * or its stream is empty. voice_process treats 0 as an underrun and
-         * a negative as the end; the voice's active bit says which. */
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        return active ? 0 : -1;
-    }
-    return out;
+    return produced;
 }
 
 /* ============================================================
