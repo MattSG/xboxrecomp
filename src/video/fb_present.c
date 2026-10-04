@@ -33,6 +33,12 @@ static volatile LONG s_pvideo_capture_count;
 static DWORD s_pvideo_next_capture_tick;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+/* A consumed submission remains on screen until the next submission or STOP.
+ * Keep its pixels, since consuming the bank lets the guest reuse its memory. */
+static uint8_t      *s_pvideo_source;
+static size_t        s_pvideo_bytes;
+static unsigned      s_pvideo_bank;
+static uint32_t      s_pvideo_regs[0x1000 / 4];
 
 /* A finished frame, taken at the flip and shown until the next one.
  *
@@ -52,7 +58,15 @@ static void fb_overlay(void)
 {
     uint32_t regs[0x1000 / 4];
     unsigned bank;
+    bool presented = false;
     if (!s_rgb || !nv2a_hook_pvideo_snapshot(regs)) return;
+    if ((regs[NV_PVIDEO_STOP / 4] & 1u) ||
+        (s_pvideo_source &&
+         regs[(NV_PVIDEO_SIZE_IN + s_pvideo_bank * 4) / 4] == UINT32_MAX)) {
+        free(s_pvideo_source);
+        s_pvideo_source = NULL;
+        if (regs[NV_PVIDEO_STOP / 4] & 1u) return;
+    }
     for (bank = 0; bank < 2; ++bank) {
         uint64_t physical = (uint64_t)regs[(NV_PVIDEO_BASE + bank * 4) / 4] +
                             regs[(NV_PVIDEO_OFFSET + bank * 4) / 4];
@@ -65,6 +79,7 @@ static void fb_overlay(void)
         const uint8_t *scan_source;
         uint8_t *snapshot = NULL;
         size_t available;
+        if (!(regs[NV_PVIDEO_BUFFER / 4] & (1u << (bank * 4u)))) continue;
         if (!bytes || physical + bytes > 0x04000000u) continue;
         va = (uintptr_t)(0x80000000u + (uint32_t)physical) +
              (uintptr_t)xbox_GetMemoryOffset();
@@ -75,13 +90,14 @@ static void fb_overlay(void)
         if (bytes > available) continue;
         source = (const uint8_t *)va;
         scan_source = source;
-        if (getenv("RECOMP_PVIDEO_DUMP") && bytes <= SIZE_MAX) {
+        if (bytes <= SIZE_MAX) {
             snapshot = (uint8_t *)malloc((size_t)bytes);
             if (snapshot) {
                 memcpy(snapshot, source, (size_t)bytes);
                 scan_source = snapshot;
             }
         }
+        if (!snapshot) continue;
         if (pvideo_scanout(regs, scan_source, available, s_rgb,
                            s_fb_width, s_fb_height, bank)) {
             const char *capture = getenv("RECOMP_PVIDEO_DUMP");
@@ -122,10 +138,20 @@ static void fb_overlay(void)
                             (unsigned long long)changed);
                 }
             }
+            free(s_pvideo_source);
+            s_pvideo_source = snapshot;
+            snapshot = NULL;
+            s_pvideo_bytes = (size_t)bytes;
+            s_pvideo_bank = bank;
+            memcpy(s_pvideo_regs, regs, sizeof(s_pvideo_regs));
+            presented = true;
             nv2a_hook_pvideo_consume(bank);
         }
         free(snapshot);
     }
+    if (!presented && s_pvideo_source)
+        pvideo_scanout(s_pvideo_regs, s_pvideo_source, s_pvideo_bytes, s_rgb,
+                       s_fb_width, s_fb_height, s_pvideo_bank);
 }
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
@@ -462,6 +488,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     DestroyWindow(hwnd);
     free(s_rgb);
     s_rgb = NULL;
+    free(s_pvideo_source);
+    s_pvideo_source = NULL;
     return 0;
 }
 
