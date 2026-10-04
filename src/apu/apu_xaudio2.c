@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
 
@@ -25,7 +26,10 @@
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+/* The APU submits 256 samples (5.33 ms), not a full 1024-sample slot.
+ * Three slots only covered 16 ms and dropped buffers during scheduler bursts.
+ * Twelve slots cover 64 ms while preserving the FIFO and slot ownership. */
+#define XA2_NUM_BUFS      12
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -34,6 +38,7 @@ static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
 static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
+static FILE                   *g_xa2_pcm_dump = NULL;
 
 int xa2_init(void)
 {
@@ -86,6 +91,14 @@ int xa2_init(void)
     g_xa2_next_buf = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
+    {
+        const char *path = getenv("RECOMP_XA2_PCM_DUMP");
+        if (path && *path) {
+            g_xa2_pcm_dump = fopen(path, "wb");
+            fprintf(stderr, "[XA2] PCM capture %s: %s (s16le stereo 48000 Hz)\n",
+                    g_xa2_pcm_dump ? "opened" : "failed", path);
+        }
+    }
 
     fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
             XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
@@ -100,6 +113,10 @@ fail:
 
 void xa2_shutdown(void)
 {
+    if (g_xa2_pcm_dump) {
+        fclose(g_xa2_pcm_dump);
+        g_xa2_pcm_dump = NULL;
+    }
     if (g_xa2_source) {
         IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
         IXAudio2SourceVoice_FlushSourceBuffers(g_xa2_source);
@@ -150,6 +167,10 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
     if (FAILED(hr)) return 0;
+    if (g_xa2_pcm_dump) {
+        fwrite(g_xa2_bufs[idx], 1, xbuf.AudioBytes, g_xa2_pcm_dump);
+        fflush(g_xa2_pcm_dump);
+    }
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;
