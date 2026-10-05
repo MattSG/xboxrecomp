@@ -1657,6 +1657,31 @@ static uint32_t tex_face_stride(const Texture *t)
 /* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
  * floats. An unusable stage reads white, so a missing texture multiplies
  * through instead of blacking the pixel out. */
+/* Linear ARGB bilinear taps share format, row and addressing decisions.
+ * Resolve those once for the four neighbours rather than invoking the generic
+ * format decoder for every tap. Other formats retain the generic sampler. */
+static int rc_linear32_taps(const Texture *t, uint32_t face, int32_t u, int32_t v,
+                            uint32_t texels[4])
+{
+    uint32_t u0, u1, v0, v1, opaque;
+    const uint8_t *base;
+    const uint32_t *row0, *row1;
+    if (!t->valid || (t->color != 0x12u && t->color != 0x1eu)) return 0;
+    u0 = wrap_coord((uint32_t)u, t->width, t->addr_u);
+    u1 = wrap_coord((uint32_t)(u + 1), t->width, t->addr_u);
+    v0 = wrap_coord((uint32_t)v, t->height, t->addr_v);
+    v1 = wrap_coord((uint32_t)(v + 1), t->height, t->addr_v);
+    base = (const uint8_t *)xbox_GetMemoryOffset() + t->offset + face;
+    row0 = (const uint32_t *)(base + (size_t)v0 * t->pitch);
+    row1 = (const uint32_t *)(base + (size_t)v1 * t->pitch);
+    opaque = t->color == 0x1eu ? 0xff000000u : 0u;
+    texels[0] = row0[u0] | opaque;
+    texels[1] = row0[u1] | opaque;
+    texels[2] = row1[u0] | opaque;
+    texels[3] = row1[u1] | opaque;
+    return 1;
+}
+
 static void rc_texel(const Texture *t, uint32_t face, float u, float v,
                      float out[4])
 {
@@ -1676,12 +1701,29 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
         int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv), k, j;
         wu = fu - (float)iu;
         wv = fv - (float)iv;
-        for (k = 0; k < 4; k++) {
-            if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
-                           (uint32_t)(iv + (k >> 1)), &texel))
-                nv2a_rc_unpack(texel, c[k]);
-            else
-                c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
+        {
+            static NV_TLS int generic = -1;
+            uint32_t taps[4];
+            int linear;
+            if (generic < 0) generic = getenv("RECOMP_TEX_GENERIC") != NULL;
+            if (!generic && wu == 0.0f && wv == 0.0f) {
+                if (sample_tex(t, face, (uint32_t)iu, (uint32_t)iv, &texel))
+                    nv2a_rc_unpack(texel, out);
+                else
+                    out[0] = out[1] = out[2] = out[3] = 1.0f;
+                return;
+            }
+            linear = !generic && rc_linear32_taps(t, face, iu, iv, taps);
+            for (k = 0; k < 4; k++) {
+                if (linear) {
+                    nv2a_rc_unpack(taps[k], c[k]);
+                } else if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
+                                      (uint32_t)(iv + (k >> 1)), &texel)) {
+                    nv2a_rc_unpack(texel, c[k]);
+                } else {
+                    c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
+                }
+            }
         }
         for (j = 0; j < 4; j++)
             out[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
