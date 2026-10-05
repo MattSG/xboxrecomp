@@ -2008,7 +2008,10 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             continue;
                     }
                 }
-                if (zp && s_gpu.depth_mask)
+                /* A disabled depth test suppresses depth writes too. MM3's
+                 * menu background retains its write mask and must not fill
+                 * the depth buffer before the vehicle preview is drawn. */
+                if (zp && s_gpu.depth_test && s_gpu.depth_mask)
                     *zp = z;
                 if (s_gpu.zpass_enable)
                     cnt->zpass++;
