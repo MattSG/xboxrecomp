@@ -464,8 +464,17 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    if (!a->size || !a->stride)
+    if (!a->size) {
+        /* Disabled arrays use the current vertex attribute register. MM3
+         * supplies instance transform rows through SET_VERTEX_DATA4F. */
+        size_t attr = (size_t)(a - s_gpu.attr);
+        if (attr < NV_VERTEX_ATTRS) {
+            memcpy(out, s_gpu.imm_attr[attr], sizeof(float) * 4);
+            return 1;
+        }
         return 0;
+    }
+    /* A zero stride repeats the same enabled array element for every vertex. */
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
          * the buffered payload rather than a guest address -- and 0 is a legal
@@ -2440,6 +2449,14 @@ static void raster_batch(void)
 
     if (s_gpu.idx_count < 3)
         return;
+    /* Array draws leave their final attribute values in the current registers,
+     * which subsequent draws can consume with the corresponding array off. */
+    for (i = 0; i < NV_VERTEX_ATTRS; ++i) {
+        float current[4];
+        if (s_gpu.attr[i].size &&
+            fetch_attr(&s_gpu.attr[i], s_gpu.idx[s_gpu.idx_count - 1], current))
+            memcpy(s_gpu.imm_attr[i], current, sizeof current);
+    }
     static int no_vsh = -1;
     if (no_vsh < 0)
         no_vsh = getenv("RECOMP_NO_VSH") != NULL;
