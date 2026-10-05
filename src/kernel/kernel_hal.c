@@ -167,6 +167,30 @@ void xbox_IrqlDumpHolders(void)
     fflush(stderr);
 }
 
+/* DISPATCH_LEVEL is exclusive, as it is on the Xbox's one processor.
+ *
+ * Counting raised threads only lets a device model decline to *start* an
+ * interrupt. The timer thread drained DPCs without even asking, and nothing
+ * stopped a routine already running from overlapping a thread that raised
+ * after it began. The guest's USB driver raises to keep its DPC out of the URB
+ * lists it is editing; its DPC ran anyway, completed a URB twice -- the second
+ * time calling a "callback" in freed heap -- and the writes into the freed
+ * block surfaced later as a crash in HeapFree at the start of dice.bik.
+ *
+ * Taken on every crossing into DISPATCH_LEVEL or above, by guest threads and
+ * by the host threads that run ISRs and DPCs (xbox_IrqlEnterInterrupt), and
+ * dropped on the crossing back. Recursive, so an ISR that queues work on its
+ * own thread does not deadlock itself. */
+static CRITICAL_SECTION g_dispatch_lock;
+static INIT_ONCE g_dispatch_lock_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_dispatch_lock);
+    return TRUE;
+}
+
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
@@ -175,6 +199,12 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 
     if (now == was)
         return;
+
+    InitOnceExecuteOnce(&g_dispatch_lock_once, dispatch_lock_init, NULL, NULL);
+    if (now)
+        EnterCriticalSection(&g_dispatch_lock);
+    else
+        LeaveCriticalSection(&g_dispatch_lock);
 
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
