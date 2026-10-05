@@ -1146,10 +1146,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    /* Contiguous blocks come from their own arena, not the heap: passing
-     * them to xbox_HeapFree found nothing, so none ever came back. */
-    if (!xbox_ContiguousFree(addr))
-        xbox_HeapFree(addr);
+    xbox_ContiguousFree(addr);
     g_eax = 0;
 }
 
