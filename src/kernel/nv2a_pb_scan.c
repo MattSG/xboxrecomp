@@ -487,7 +487,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
 
-    while (va < end_va && words < 0x100000u) {
+    while ((in_call ? va < end_va : va != end_va) && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)pb_word_ptr(mem, va);
         va += 4;
         words++;
@@ -496,10 +496,8 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                              : (w & 0x1FFFFFFCu);
             (*jumps)++;
-            if (!in_call)
-                break;                        /* the ring: a jump ends it */
             va = pb_contiguous_va(target);
-            end_va = va + 0x400000u;
+            if (in_call) end_va = va + 0x400000u;
             continue;
         }
         if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN */
@@ -523,7 +521,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            for (uint32_t i = 0; i < count && (in_call ? va < end_va : va != end_va); i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
                 if (s_exec_enabled)
@@ -543,9 +541,14 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
 {
     uint32_t words, jumps = 0, unknown = 0;
 
-    if (!pb_walk_enabled() || end_va <= start_va)
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+    static int scan = -1;
+    if (scan < 0)
+        scan = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!(scan || s_exec_enabled) || end_va == start_va)
         return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
+    if (end_va > start_va && end_va - start_va > 0x400000u) /* forward span only */
         end_va = start_va + 0x400000u;
 
     if (s_exec_enabled) {
