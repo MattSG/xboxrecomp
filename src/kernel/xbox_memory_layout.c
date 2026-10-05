@@ -3222,9 +3222,9 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     if ((uint64_t)result + size >
             (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
                 - XBOX_GPU_INSTANCE_DEFAULT) {
-        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
+        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used; aligned=%08X heap_next=%08X alignment=%u esp=%08X)\n",
                 size, g_contig_next - XBOX_CONTIG_BASE,
-                (unsigned)XBOX_CONTIG_SIZE);
+                (unsigned)XBOX_CONTIG_SIZE, result, g_heap_next, alignment, g_esp);
         fflush(stderr);
         LeaveCriticalSection(&g_allocator_lock);
         return 0;
