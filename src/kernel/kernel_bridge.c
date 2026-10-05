@@ -1733,6 +1733,7 @@ static void bridge_AvSetDisplayMode(void)
          * start it on the first display mode -- before that there is nothing
          * to show and no pitch to interpret it with. */
         extern void xbox_FramebufferWindowSet(uint32_t, uint32_t);
+        extern void xbox_FramebufferWindowScanout(uint32_t, uint32_t);
         extern void xbox_FramebufferWindowStart(void);
         uint32_t fb_va = fb;
 
@@ -1748,6 +1749,7 @@ static void bridge_AvSetDisplayMode(void)
             fb_va = XBOX_CONTIG_BASE + fb_va;
 
         xbox_FramebufferWindowSet(fb_va, pitch);
+        xbox_FramebufferWindowScanout(fb_va, pitch);
         xbox_FramebufferWindowStart();
 
         /* Record the resolved address, not the physical one the title passed.

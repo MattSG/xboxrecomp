@@ -54,6 +54,18 @@ static uint32_t      s_pvideo_regs[0x1000 / 4];
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 
+/* A buffer the title pointed the display at itself, read live until it flips
+ * again.
+ *
+ * A flip is not the only way a picture changes. Between flips a title can
+ * set the display mode on a buffer and draw into it with the CPU -- MM3's
+ * loading screen does, streaming Startup.tga into the display D3D persisted
+ * at the end of the intro. The copy from the last flip showed that a quarter
+ * loaded for the whole load. Nothing rasterises into a buffer the title is
+ * showing this way, so reading it live is what the CRTC would scan. */
+static volatile LONG s_scan_va;            /* 0 while flips are in charge */
+static uint32_t      s_scan_pitch;
+
 /* Optional per-submission thumbnails for detecting corruption between screenshots.
  * Each record is a 160x120 BGRA image of the pixels sent to GDI. Keeping this
  * disabled has no file IO; the capture never modifies guest memory. */
@@ -268,6 +280,22 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     }
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
+    /* Presenting the buffer already on display hands nothing over: D3D
+     * persisting its display flips the very buffer it just set the mode on,
+     * and the title then keeps drawing into it with no further flips. */
+    if ((uint32_t)s_scan_va != fb_va)
+        InterlockedExchange(&s_scan_va, 0);
+}
+
+/* Called from AvSetDisplayMode. Before the first flip the window already
+ * reads guest memory live, following the draw target, so this only matters
+ * once flips have taken over. */
+void xbox_FramebufferWindowScanout(uint32_t fb_va, uint32_t pitch)
+{
+    if (s_present_idx < 0 || !fb_va || !pitch)
+        return;
+    s_scan_pitch = pitch;
+    InterlockedExchange(&s_scan_va, (LONG)fb_va);
 }
 
 /* Which keys are down, for the pad stand-in in src/input.
@@ -359,12 +387,13 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 /* The display formats an Xbox front buffer is actually set to. The pitch says
  * how wide a row is in bytes, so pitch/width gives the pixel size; the exact
  * component layout only matters for 16-bit, where 5:6:5 and 1:5:5:5 differ. */
-static void fb_convert(const uint8_t *src, uint32_t bpp)
+static void fb_convert(const uint8_t *src, uint32_t pitch)
 {
+    uint32_t bpp = pitch / s_fb_width;
     uint32_t x, y;
 
     for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * s_fb_pitch;
+        const uint8_t *row = src + (size_t)y * pitch;
         uint32_t *dst = s_rgb + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
@@ -478,7 +507,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_present_idx >= 0 && s_rgb) {
+        if (s_scan_va && s_rgb) {
+            fb_convert((const uint8_t *)((uintptr_t)(uint32_t)s_scan_va +
+                                         xbox_GetMemoryOffset()), s_scan_pitch);
+            fb_overlay();
+            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                          0, 0, (int)s_fb_width, (int)s_fb_height,
+                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+        } else if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
@@ -496,7 +532,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
-            fb_convert(src, s_fb_pitch / s_fb_width);
+            fb_convert(src, s_fb_pitch);
             if (!getenv("RECOMP_FB_VA"))
                 fb_overlay();
             StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
@@ -571,6 +607,7 @@ void xbox_FramebufferWindowStart(void)
 #else
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+void xbox_FramebufferWindowScanout(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
