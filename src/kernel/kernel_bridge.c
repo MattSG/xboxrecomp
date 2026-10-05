@@ -3255,8 +3255,8 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
-    /* MM3 probe: a resource read overwrote the XACT manager at 003591E8
-     * with GUI function addresses. Kernel-mode ReadFile writes escape user
+    /* MM3 probe: a Bink frame-table read overwrote the XACT manager at
+     * 003591E8 with frame offsets. Kernel-mode ReadFile writes escape user
      * hardware watchpoints. Observe its destination before executing it. */
     if (buffer_va <= 0x003591E8u &&
         (uint64_t)buffer_va + length > 0x003591E8u) {
