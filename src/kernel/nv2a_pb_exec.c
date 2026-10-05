@@ -26,6 +26,7 @@
  */
 #include <math.h>
 #include <stdio.h>
+#include "platform/recomp_profile.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2442,7 +2443,7 @@ static void raster_batch_program(void)
     }
 }
 
-static void raster_batch(void)
+static void raster_batch_impl(void)
 {
     uint32_t i;
     uint32_t before = s_gpu.tris_drawn;
@@ -2551,6 +2552,13 @@ static void raster_batch(void)
  * the next whole frame (flip to flip) -- where it drew, with what texture,
  * blend and depth state, and how many pixels it actually wrote. "The frame
  * is black" has many causes and this is what tells them apart. */
+
+static void raster_batch(void)
+{
+    RECOMP_PROFILE_BEGIN("Raster batch");
+    raster_batch_impl();
+    RECOMP_PROFILE_END();
+}
 
 static void frame_trace_flip(void)
 {

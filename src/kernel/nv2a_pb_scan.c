@@ -21,6 +21,7 @@
  * method = w & 0x1FFC.
  */
 #include <stdio.h>
+#include "platform/recomp_profile.h"
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
@@ -245,7 +246,9 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (end_va > start_va && end_va - start_va > 0x400000u) /* forward span only */
         end_va = start_va + 0x400000u;
 
+    RECOMP_PROFILE_BEGIN("GPU submission");
     words = pb_walk(start_va, end_va, 0, &jumps, &unknown);
+    RECOMP_PROFILE_END();
 
     s_tot_words += words;
     s_tot_unknown += unknown;

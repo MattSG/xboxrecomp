@@ -19,6 +19,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <stdio.h>
+#include "platform/recomp_profile.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -280,12 +281,15 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         return;
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
+    RECOMP_PROFILE_BEGIN("Present copy");
     next = (s_present_idx == 0) ? 1 : 0;
     if (!s_present[next]) {
         s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
                                              4);
-        if (!s_present[next])
+        if (!s_present[next]) {
+            RECOMP_PROFILE_END();
             return;
+        }
     }
     bpp = pitch / s_fb_width;
     src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
@@ -315,7 +319,8 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
      * persisting its display flips the very buffer it just set the mode on,
      * and the title then keeps drawing into it with no further flips. */
     if ((uint32_t)s_scan_va != fb_va)
-        InterlockedExchange(&s_scan_va, 0);
+    InterlockedExchange(&s_scan_va, 0);
+    RECOMP_PROFILE_END();
 }
 
 /* Called from AvSetDisplayMode. Before the first flip the window already
@@ -360,6 +365,29 @@ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
 
 void xbox_FramebufferWindowFrameStats(uint32_t draws)
 {
+    static LARGE_INTEGER frequency, previous;
+    static FILE *frame_log;
+    static unsigned samples;
+    LARGE_INTEGER now;
+    if (!frequency.QuadPart) {
+        const char *path = getenv("RECOMP_FRAME_TIMES");
+        QueryPerformanceFrequency(&frequency);
+        if (path) {
+            frame_log = fopen(path, "w");
+            if (frame_log) fprintf(frame_log, "qpc_ms,frame_ms,draws\n");
+        }
+    }
+    QueryPerformanceCounter(&now);
+    if (previous.QuadPart) {
+        double ms = (now.QuadPart - previous.QuadPart) * 1000.0 / frequency.QuadPart;
+        RECOMP_PROFILE_PLOT("Frame interval (ms)", ms);
+        if (frame_log) {
+            fprintf(frame_log, "%.6f,%.6f,%u\n", now.QuadPart * 1000.0 / frequency.QuadPart, ms, draws);
+            if (++samples % 30 == 0) fflush(frame_log);
+        }
+    }
+    previous = now;
+    RECOMP_PROFILE_FRAME();
     InterlockedIncrement(&s_flips);
     InterlockedExchange(&s_frame_draws, (LONG)draws);
 }
