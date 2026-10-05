@@ -120,11 +120,11 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
                     ai == 0xd4c81010u ? 4
                   : ai == 0xd8301010u || ai == 0x18300000u ? 5
                   : ai == 0xd1301010u ? 6 : 0;
-        static NV_RC_TLS int trace;
+        static NV_RC_TLS int trace = -1;
         static NV_RC_TLS unsigned reported;
         if (generic < 0) {
             generic = getenv("RECOMP_RC_GENERIC") != NULL;
-            trace = getenv("RECOMP_RC_TRACE") != NULL;
+        if (trace < 0) trace = getenv("RECOMP_RC_TRACE") != NULL;
         }
         if (trace && rc->final0 == 0x04080900u && !(reported & 1u)) {
             reported |= 1u;
