@@ -1890,6 +1890,21 @@ typedef struct { uint64_t depth_fail, pixels; uint32_t zpass, pixel_max; } XfCou
 static uint32_t rc_texture_inputs(const Nv2aCombiner *rc)
 {
     uint32_t mask = 1u, n = rc->control & 0xffu, stage, shift;
+    /* A one-stage program that writes r0.a without reading its initial value
+     * has no implicit texture-zero dependency. Keep the conservative default
+     * for mux/blue-to-alpha flags, other destinations and longer programs. */
+    if (n == 1u &&
+        (rc->color_ocw[0] == 0xc0u || rc->color_ocw[0] == 0xc00u) &&
+        (rc->alpha_ocw[0] == 0xc0u || rc->alpha_ocw[0] == 0xc00u)) {
+        int reads_initial_alpha = 0;
+        for (shift = 0; shift < 32u; shift += 8u) {
+            uint32_t rgb_input = (rc->color_icw[0] >> shift) & 31u;
+            uint32_t alpha_input = (rc->alpha_icw[0] >> shift) & 31u;
+            if (rgb_input == 0x1cu || alpha_input == 0x1cu)
+                reads_initial_alpha = 1;
+        }
+        if (!reads_initial_alpha) mask = 0u;
+    }
     if (n > 8u) n = 8u;
     for (stage = 0; stage < n; ++stage) {
         for (shift = 0; shift < 32u; shift += 8u) {
