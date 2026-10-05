@@ -3311,11 +3311,16 @@ int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
     }
     if (!lo)
         return 0;
+    /* Freed spans count. Freeing does not move a page; it still holds
+     * what the title last wrote there, and the span is only ever reused in
+     * place. MM3 draws its loading screen from a back buffer that D3D has
+     * just released: with freed spans excluded the GPU read that physical
+     * address from low RAM instead -- the title's own image -- and showed
+     * the code bytes as colour static. */
     {
         uint32_t start = g_contig_allocs[lo - 1].offset;
         uint32_t block_size = g_contig_allocs[lo - 1].size;
-        return InterlockedCompareExchange(&g_contig_allocs[lo - 1].in_use, 0, 0) &&
-            physical_offset >= start &&
+        return physical_offset >= start &&
                (uint64_t)physical_offset + size <=
                    (uint64_t)start + block_size;
     }
