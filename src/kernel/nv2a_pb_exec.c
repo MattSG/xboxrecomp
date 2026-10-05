@@ -226,6 +226,8 @@ typedef struct {
     uint32_t levels;                    /* mip levels, from FORMAT       */
     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
     int      cube;                      /* FORMAT: six faces, not one    */
+    uint32_t swizzle_common_mask;
+    int swizzle_shift;        /* cached log2(min(width,height)); -1 = general */
     int      valid;
 } Texture;
 
@@ -333,6 +335,15 @@ static int tex_size_from_format(uint32_t fmt)
 
 static void tex_update_valid(Texture *t)
 {
+    uint32_t common = t->width < t->height ? t->width : t->height;
+    t->swizzle_shift = -1;
+    if (common && common <= 65536u &&
+        !(t->width & (t->width - 1u)) && !(t->height & (t->height - 1u))) {
+        uint32_t bits = common;
+        t->swizzle_common_mask = common - 1u;
+        t->swizzle_shift = 0;
+        while (bits > 1u) { bits >>= 1; ++t->swizzle_shift; }
+    }
     t->valid = t->offset && t->width && t->height
             && (tex_size_from_format(t->color) || t->pitch);
 }
@@ -815,8 +826,12 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
     int32_t sc = (int32_t)c, n = (int32_t)size;
     if (!size)
         return 0;
-    if (mode == 1)                         /* wrap */
-        return (uint32_t)(((sc % n) + n) % n);
+    if (mode == 1) { /* wrap, including negative bilinear taps */
+        int32_t remainder;
+        if (!(size & (size - 1u))) return c & (size - 1u);
+        remainder = sc % n;
+        return (uint32_t)(remainder < 0 ? remainder + n : remainder);
+    }
     return sc < 0 ? 0u : (sc >= n ? size - 1 : c);   /* clamp, and the rest */
 }
 
@@ -900,7 +915,16 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          * index for every one of them. */
         fmt = linear_twin(fmt);
         p = mem + base;
-        u = swizzle_offset(u, v, t->width, t->height);
+        if (t->swizzle_shift >= 0) {
+            uint32_t common = t->swizzle_common_mask;
+            uint32_t major = t->width > t->height ? u : v;
+            /* Shared coordinate bits interleave; the larger dimension's
+             * remaining bits occupy contiguous positions above them. */
+            u = swizzle_spread(u & common) | (swizzle_spread(v & common) << 1)
+              | ((major & ~common) << t->swizzle_shift);
+        } else {
+            u = swizzle_offset(u, v, t->width, t->height);
+        }
     } else {
         p = mem + base + (size_t)v * t->pitch;
     }
@@ -1772,7 +1796,7 @@ static int alpha_test_pass(float a)
  * pixel loop can run over any subset of rows on any thread. */
 typedef struct {
     uint8_t *mem;
-    uint32_t bpp;
+    uint32_t bpp, texture_inputs;
     const Nv2aVshOutput *va, *vb, *vc;
     const float *a, *b, *c;
     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
@@ -1781,6 +1805,37 @@ typedef struct {
 } XfTri;
 
 typedef struct { uint64_t depth_fail, pixels; uint32_t zpass, pixel_max; } XfCount;
+
+/* Conservatively collect texture registers read by the combiner program.
+ * Stage zero also initializes r0.a. Clip/other shader modes still execute
+ * even when their result is unused, since they may reject the pixel. */
+static uint32_t rc_texture_inputs(const Nv2aCombiner *rc)
+{
+    uint32_t mask = 1u, n = rc->control & 0xffu, stage, shift;
+    if (n > 8u) n = 8u;
+    for (stage = 0; stage < n; ++stage) {
+        for (shift = 0; shift < 32u; shift += 8u) {
+            uint32_t a = (rc->color_icw[stage] >> shift) & 15u;
+            uint32_t b = (rc->alpha_icw[stage] >> shift) & 15u;
+            if (a >= 8u && a <= 11u) mask |= 1u << (a - 8u);
+            if (b >= 8u && b <= 11u) mask |= 1u << (b - 8u);
+        }
+    }
+    if (rc->final0 || rc->final1) {
+        for (shift = 0; shift < 32u; shift += 8u) {
+            uint32_t a = (rc->final0 >> shift) & 15u;
+            uint32_t b = (rc->final1 >> shift) & 15u;
+            if (a >= 8u && a <= 11u) mask |= 1u << (a - 8u);
+            if (shift && b >= 8u && b <= 11u) mask |= 1u << (b - 8u);
+        }
+    }
+    for (stage = 0; stage < 4u; ++stage) {
+        uint32_t mode = (rc->stage_program >> (stage * 5u)) & 31u;
+        if (mode && mode != 1u && mode != 2u && mode != 3u)
+            mask |= 1u << stage;
+    }
+    return mask;
+}
 
 /* Rows y0, y0+step, ... < maxy of triangle T. */
 static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
@@ -1826,7 +1881,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                         fog[0] = T->fogc[0]; fog[1] = T->fogc[1]; fog[2] = T->fogc[2];
                         fog[3] = l0 * T->vfog[0] + l1 * T->vfog[1] + l2 * T->vfog[2];
                         for (st = 0; st < 4 && keep; st++) {
-                            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)) {
+                    if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F) ||
+                        !(T->texture_inputs & (1u << st))) {
                                 t[st][0] = t[st][1] = t[st][2] = 0.0f;
                                 t[st][3] = 1.0f;
                                 continue;
@@ -1990,6 +2046,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     T.bpp = surface_bpp();
     T.textured = s_gpu.texs[0].valid;
     T.use_rc = s_gpu.rc_seen && !no_rc;
+    T.texture_inputs = rc_texture_inputs(&s_gpu.rc);
     T.va = va; T.vb = vb; T.vc = vc;
 
     v[0] = va; v[1] = vb; v[2] = vc;
