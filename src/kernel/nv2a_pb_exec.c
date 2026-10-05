@@ -2585,9 +2585,8 @@ static void draw_primitive(void)
  * The title's own attribute table is saved and put back: these offsets and
  * strides are ours, and it has not stopped using its.
  *
- * ponytail: each attribute is padded to a whole dword. That is exact for the
- * float and D3DCOLOR formats every inline batch actually uses; a packed
- * sub-dword attribute would need the unpadded layout.
+ * Packed SHORT formats occupy two bytes per component, rather than the
+ * four bytes used by FLOAT. Each attribute is padded to a whole dword.
  */
 static void draw_inline_array(void)
 {
@@ -2601,6 +2600,10 @@ static void draw_inline_array(void)
         if (!s_gpu.attr[a].size)
             continue;
         switch (s_gpu.attr[a].type) {
+        /* MM3 fonts pack SHORT positions and texture coordinates. */
+        case 1: /* normalised signed short */
+        case 5: bytes = 2 * s_gpu.attr[a].size; break; /* signed short */
+        case 6: bytes = 4; break; /* packed 11:11:10 normal */
         case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
         case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
         case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
