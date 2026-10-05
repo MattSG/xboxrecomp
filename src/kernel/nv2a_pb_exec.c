@@ -895,11 +895,26 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
         memcpy(raw, blk, bb);
         if (cache[slot].key != key || cache[slot].fmt != fmt
             || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
-            uint32_t i;
-            for (i = 0; i < 16; i++)
-                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
-                                      by * 4 + (i >> 2), t->width,
-                                      &cache[slot].px[i]);
+            d3d8_dxt_decode_block(blk, fmt, cache[slot].px);
+            {
+                static NV_TLS int validate = -1;
+                static NV_TLS unsigned checked, mismatches;
+                if (validate < 0) validate = getenv("RECOMP_DXT_VALIDATE") != NULL;
+                if (validate) {
+                    uint32_t i;
+                    for (i = 0; i < 16; ++i) {
+                        uint32_t reference = 0;
+                        d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
+                                             by * 4 + (i >> 2), t->width, &reference);
+                        if (reference != cache[slot].px[i] && ++mismatches <= 4)
+                            fprintf(stderr, "[DXT_VERIFY] mismatch fmt=%02X pixel=%u new=%08X reference=%08X\n",
+                                    fmt, i, cache[slot].px[i], reference);
+                    }
+                    if (++checked == 1024)
+                        fprintf(stderr, "[DXT_VERIFY] blocks=%u mismatches=%u fmt=%02X\n",
+                                checked, mismatches, fmt);
+                }
+            }
             cache[slot].key = key;
             cache[slot].fmt = fmt;
             cache[slot].raw[0] = raw[0];
@@ -1207,24 +1222,45 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb,
             dst = 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
                 | ((t & 0x001Fu) << 3);
         }
-        for (k = 0; k < 4; k++) {           /* r g b a, 0..1 */
-            int sh = k == 3 ? 24 : 16 - 8 * k;
-            sc[k] = (float)((argb >> sh) & 0xFF) / 255.0f;
-            dc[k] = (float)((dst  >> sh) & 0xFF) / 255.0f;
-        }
-        blend_factor(s_gpu.blend_sfactor, sc, dc, sf);
-        blend_factor(s_gpu.blend_dfactor, sc, dc, df);
-        for (k = 0; k < 4; k++) {
-            float a = sc[k] * sf[k], b = dc[k] * df[k];
-            switch (s_gpu.blend_equation) {
-            case 0x800A: out[k] = a - b; break;               /* SUBTRACT     */
-            case 0x800B: out[k] = b - a; break;               /* REV_SUBTRACT */
-            case 0x8007: out[k] = fminf(sc[k], dc[k]); break; /* MIN          */
-            case 0x8008: out[k] = fmaxf(sc[k], dc[k]); break; /* MAX          */
-            default:     out[k] = a + b; break;               /* ADD          */
+        {
+            static NV_TLS int generic = -1;
+            if (generic < 0) generic = getenv("RECOMP_BLEND_GENERIC") != NULL;
+            if (!generic && s_gpu.blend_equation == 0x8006u &&
+                s_gpu.blend_sfactor == 0x0302u &&
+                s_gpu.blend_dfactor == 0x0303u) {
+                uint32_t alpha = argb >> 24, mixed = 0;
+                unsigned shift;
+                /* Division by the odd denominator 255 never lands exactly on
+                 * a half integer. +127 gives the same rounded byte as the
+                 * normalized float SRC_ALPHA / ONE_MINUS_SRC_ALPHA path. */
+                for (shift = 0; shift < 32; shift += 8) {
+                    uint32_t src = (argb >> shift) & 255u;
+                    uint32_t dest = (dst >> shift) & 255u;
+                    mixed |= ((src * alpha + dest * (255u - alpha) + 127u) / 255u)
+                             << shift;
+                }
+                argb = mixed;
+            } else {
+                for (k = 0; k < 4; k++) {           /* r g b a, 0..1 */
+                    int sh = k == 3 ? 24 : 16 - 8 * k;
+                    sc[k] = (float)((argb >> sh) & 0xFF) / 255.0f;
+                    dc[k] = (float)((dst  >> sh) & 0xFF) / 255.0f;
+                }
+                blend_factor(s_gpu.blend_sfactor, sc, dc, sf);
+                blend_factor(s_gpu.blend_dfactor, sc, dc, df);
+                for (k = 0; k < 4; k++) {
+                    float a = sc[k] * sf[k], b = dc[k] * df[k];
+                    switch (s_gpu.blend_equation) {
+                    case 0x800A: out[k] = a - b; break;               /* SUBTRACT     */
+                    case 0x800B: out[k] = b - a; break;               /* REV_SUBTRACT */
+                    case 0x8007: out[k] = fminf(sc[k], dc[k]); break; /* MIN          */
+                    case 0x8008: out[k] = fmaxf(sc[k], dc[k]); break; /* MAX          */
+                    default:     out[k] = a + b; break;               /* ADD          */
+                    }
+                }
+                argb = pack_color(out);
             }
         }
-        argb = pack_color(out);
     }
 
     if (s_gpu.color_mask != 0x01010101u) {
