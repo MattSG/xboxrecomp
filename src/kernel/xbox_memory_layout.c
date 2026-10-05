@@ -3281,6 +3281,19 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 
     EnterCriticalSection(&g_allocator_lock);
     if (alignment < 4) alignment = 4;
+    if (size >= 16u * 1024u * 1024u) {
+        static unsigned large_reports;
+        if (large_reports++ < 24) {
+            fprintf(stderr, "[HEAP_LARGE] size=%08X alignment=%u esp=%08X heap_next=%08X", size, alignment, g_esp, g_heap_next);
+            if ((uint64_t)g_esp + 128u <= g_memory_size) {
+                const uint32_t *stack = (const uint32_t *)((uintptr_t)g_esp + g_memory_offset);
+                for (unsigned i = 0; i < 32; ++i)
+                    if (stack[i] >= g_xbox_code_lo && stack[i] < g_xbox_code_hi)
+                        fprintf(stderr, " sp+%u=%08X", i*4u, stack[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
 
     /* Enforce minimum allocation size.
      * The Xbox D3D8 code sometimes computes resource sizes from GPU
