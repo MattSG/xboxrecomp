@@ -339,6 +339,73 @@ static inline uint32_t d3d8_format_dxt_block_bytes(uint32_t fmt)
  * 640x480. Cache the last block by index if a textured 3D scene ever runs
  * through here.
  */
+/* Decode one compressed block, sharing its colour and alpha palettes across
+ * all sixteen texels. The sampler caches these results by address and bytes. */
+static inline int d3d8_dxt_decode_block(const uint8_t *block, uint32_t fmt,
+                                       uint32_t out[16])
+{
+    uint32_t bytes = d3d8_format_dxt_block_bytes(fmt);
+    const uint8_t *colour;
+    uint32_t palette[4] = {0, 0, 0, 0};
+    uint32_t alpha_palette[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t c0, c1, indices, i, texel;
+    uint64_t alpha_bits = 0;
+    if (!bytes) return 0;
+    colour = block + (bytes == 16 ? 8 : 0);
+    c0 = (uint32_t)colour[0] | ((uint32_t)colour[1] << 8);
+    c1 = (uint32_t)colour[2] | ((uint32_t)colour[3] << 8);
+    for (i = 0; i < 2; ++i) {
+        uint32_t rgb = i ? c1 : c0;
+        palette[i] = (d3d8_expand_channel((rgb >> 11) & 31u, 5) << 16)
+                   | (d3d8_expand_channel((rgb >> 5) & 63u, 6) << 8)
+                   | d3d8_expand_channel(rgb & 31u, 5);
+    }
+    for (i = 0; i < 3; ++i) {
+        uint32_t shift = i * 8u;
+        uint32_t a = (palette[0] >> shift) & 255u;
+        uint32_t b = (palette[1] >> shift) & 255u;
+        if (c0 > c1 || bytes == 16) {
+            palette[2] |= ((2u * a + b) / 3u) << shift;
+            palette[3] |= ((a + 2u * b) / 3u) << shift;
+        } else {
+            palette[2] |= ((a + b) / 2u) << shift;
+        }
+    }
+    if (fmt == 0x0fu) {
+        uint32_t a0 = block[0], a1 = block[1];
+        alpha_palette[0] = a0;
+        alpha_palette[1] = a1;
+        for (i = 0; i < 6; ++i)
+            alpha_bits |= (uint64_t)block[2 + i] << (8u * i);
+        if (a0 > a1) {
+            for (i = 1; i < 7; ++i)
+                alpha_palette[i + 1] = ((7u - i) * a0 + i * a1) / 7u;
+        } else {
+            for (i = 1; i < 5; ++i)
+                alpha_palette[i + 1] = ((5u - i) * a0 + i * a1) / 5u;
+            alpha_palette[6] = 0;
+            alpha_palette[7] = 255;
+        }
+    }
+    indices = (uint32_t)colour[4] | ((uint32_t)colour[5] << 8)
+            | ((uint32_t)colour[6] << 16) | ((uint32_t)colour[7] << 24);
+    for (texel = 0; texel < 16; ++texel) {
+        uint32_t selector = indices & 3u, alpha = 255u;
+        indices >>= 2;
+        if (fmt == 0x0eu) {
+            uint32_t nibble = block[texel >> 1];
+            alpha = d3d8_expand_channel((texel & 1u) ? nibble >> 4 : nibble & 15u, 4);
+        } else if (fmt == 0x0fu) {
+            alpha = alpha_palette[alpha_bits & 7u];
+            alpha_bits >>= 3;
+        } else if (c0 <= c1 && selector == 3u) {
+            alpha = 0;
+        }
+        out[texel] = (alpha << 24) | palette[selector];
+    }
+    return 1;
+}
+
 static inline int d3d8_dxt_decode_texel(const uint8_t *base, uint32_t fmt,
                                         uint32_t u, uint32_t v,
                                         uint32_t width, uint32_t *argb)
