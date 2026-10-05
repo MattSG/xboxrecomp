@@ -112,10 +112,14 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
         static NV_RC_TLS int generic = -1;
         uint32_t ci = rc->color_icw[0], ai = rc->alpha_icw[0];
         int colour = ci == 0x04200000u || ci == 0xc4200000u ? 1 :
-                     ci == 0x08040000u ? 2 : ci == 0xc8c42000u ? 3 : 0;
+                     ci == 0x08040000u ? 2 : ci == 0xc8c42000u ? 3
+                   : ci == 0x08200000u || ci == 0xc8200000u ? 4
+                   : ci == 0xd1200000u ? 5 : 0;
         int alpha = ai == 0x14200000u || ai == 0xd4201010u ? 1 :
                     ai == 0x18140000u ? 2 : ai == 0xd8d41010u ? 3 :
-                    ai == 0xd4c81010u ? 4 : 0;
+                    ai == 0xd4c81010u ? 4
+                  : ai == 0xd8301010u || ai == 0x18300000u ? 5
+                  : ai == 0xd1301010u ? 6 : 0;
         static NV_RC_TLS int trace;
         static NV_RC_TLS unsigned reported;
         if (generic < 0) {
@@ -148,6 +152,11 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
                 if (!untouched_inputs) break;
             }
             if (untouched_inputs) {
+                if (trace && !(reported & 2u)) {
+                    reported |= 2u;
+                    fprintf(stderr, "[RC_DISPATCH] background fast path active\n");
+                    fflush(stderr);
+                }
                 /* Final A=v0, B=t0, C=t1, D=0, G=v0.a. Writes to other
                  * registers are dead; reject any program that changes the
                  * RGB inputs or v0.a, including blue-to-alpha via v0. */
@@ -172,6 +181,10 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
                             (value < 0.0f ? 0.0f : value);
                 else if (colour == 3)
                     value = t[0][i] * value;
+                else if (colour == 4)
+                    value = t[0][i];
+                else if (colour == 5)
+                    value = (float)(rc->factor0[0] >> 24) / 255.0f;
                 out[i] = clampf(value, 0.0f, 1.0f);
             }
             if (alpha == 1)
@@ -181,9 +194,29 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
                                (v0[3] < 0.0f ? 0.0f : v0[3]), 0.0f, 1.0f);
             else if (alpha == 3)
                 out[3] = clampf(t[0][3] * v0[3], 0.0f, 1.0f);
-            else
+            else if (alpha == 4)
                 out[3] = clampf(v0[3] * t[0][2], 0.0f, 1.0f);
+            else if (alpha == 5)
+                out[3] = clampf(t[0][3], 0.0f, 1.0f);
+            else
+                out[3] = (float)(rc->factor0[0] >> 24) / 255.0f;
             return;
+        }
+        if (trace) {
+            static NV_RC_TLS uint32_t seen[16][8];
+            static NV_RC_TLS unsigned used;
+            uint32_t key[8] = { rc->control, rc->stage_program, ci, ai,
+                               rc->color_ocw[0], rc->alpha_ocw[0],
+                               rc->final0, rc->final1 };
+            unsigned entry;
+            for (entry = 0; entry < used; ++entry)
+                if (!memcmp(seen[entry], key, sizeof key)) break;
+            if (entry == used && used < 16) {
+                memcpy(seen[used++], key, sizeof key);
+                fprintf(stderr, "[RC_GENERIC_PROGRAM] control=%08X stages=%08X ci=%08X ai=%08X co=%08X ao=%08X final=%08X/%08X\n",
+                        key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
+                fflush(stderr);
+            }
         }
     }
 
