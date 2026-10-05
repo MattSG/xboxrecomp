@@ -2618,7 +2618,24 @@ static void draw_primitive(void)
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
                         s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
                         s_xf[2].pos[0], s_xf[2].pos[1], 10);
-            if (s_gpu.rc_seen) {
+        {
+            uint32_t sample;
+                    nv2a_vsh_debug_dump();
+                    const float *scale = nv2a_vsh_constant(58);
+            const float *offset = nv2a_vsh_constant(59);
+            fprintf(stderr, "[FTRACE] viewport scale %g %g %g offset %g %g %g\n",
+                    scale[0], scale[1], scale[2], offset[0], offset[1], offset[2]);
+            for (sample = 0; sample < s_gpu.idx_count && sample < 3; ++sample) {
+                float input[4];
+                const VertexAttr *position = &s_gpu.attr[0];
+                int valid = fetch_attr(position, s_gpu.idx[sample], input);
+                fprintf(stderr, "[FTRACE] input%u idx %u base %08X type %u size %u stride %u valid %d pos %g %g %g %g\n",
+                        sample, s_gpu.idx[sample], position->offset, position->type,
+                        position->size, position->stride, valid,
+                        input[0], input[1], input[2], input[3]);
+            }
+        }
+        if (s_gpu.rc_seen) {
                 int st;
                 fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
                         s_gpu.rc.control & 0xFF, s_gpu.rc.control,

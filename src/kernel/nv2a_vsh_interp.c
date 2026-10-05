@@ -305,6 +305,15 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     return r;
 }
 
+void nv2a_vsh_debug_dump(void)
+{
+    uint32_t c;
+    dump_program(s_start_slot);
+    for (c = 96; c < 112; ++c)
+        fprintf(stderr, "[VSH_MATRIX] c%u %g %g %g %g\n", c,
+                s_const[c][0], s_const[c][1], s_const[c][2], s_const[c][3]);
+}
+
 int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
     static int dump = -1;
