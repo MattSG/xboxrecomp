@@ -193,7 +193,9 @@ static HANDLE g_contig_mapping = NULL;
  * gaps and ordinary RAM can sit below that high-water mark. Publish exact
  * allocations so bus masters resolve only memory the runtime handed out. */
 #define XBOX_CONTIG_MAX_ALLOCS (XBOX_CONTIG_SIZE / 4096u)
-static struct { uint32_t offset, size; } g_contig_allocs[XBOX_CONTIG_MAX_ALLOCS];
+/* Offsets and spans stay sorted and immutable for lock-free DMA lookups.
+ * Freed spans can be reused without inserting or moving table entries. */
+static struct { uint32_t offset, size; volatile LONG in_use; } g_contig_allocs[XBOX_CONTIG_MAX_ALLOCS];
 static volatile LONG g_contig_alloc_count;
 /* How much of the tiled aperture can exist.
  *
@@ -3205,6 +3207,31 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 
     EnterCriticalSection(&g_allocator_lock);
     if (alignment < 4096) alignment = 4096;
+    {
+        LONG best = -1;
+        for (LONG i = 0; i < g_contig_alloc_count; ++i) {
+            uint32_t offset = g_contig_allocs[i].offset;
+            uint32_t span = g_contig_allocs[i].size;
+            if (g_contig_allocs[i].in_use || span < size ||
+                ((XBOX_CONTIG_BASE + offset) & (alignment - 1))) continue;
+            /* Heap addresses remain reserved even after HeapFree, because
+             * the ordinary allocator can reuse them at any time. */
+            if ((uint64_t)offset + span > XBOX_HEAP_BASE && offset < g_heap_next)
+                continue;
+            if (best < 0 || span < g_contig_allocs[best].size) best = i;
+        }
+        if (best >= 0) {
+            result = XBOX_CONTIG_BASE + g_contig_allocs[best].offset;
+            memset((void *)((uintptr_t)result + g_memory_offset), 0,
+                g_contig_allocs[best].size);
+            InterlockedExchange(&g_contig_allocs[best].in_use, 1);
+            if (getenv("RECOMP_CONTIG_TRACE"))
+                fprintf(stderr, "[CONTIG_REUSE] address=%08X requested=%u span=%u\n",
+                    result, size, g_contig_allocs[best].size);
+            LeaveCriticalSection(&g_allocator_lock);
+            return result;
+        }
+    }
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);
 
     /* Low RAM and the contiguous window have separate host backing but share
@@ -3239,6 +3266,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     g_contig_allocs[g_contig_alloc_count].offset = result - XBOX_CONTIG_BASE;
     g_contig_allocs[g_contig_alloc_count].size = size;
+    InterlockedExchange(&g_contig_allocs[g_contig_alloc_count].in_use, 1);
     InterlockedIncrement(&g_contig_alloc_count);
     LeaveCriticalSection(&g_allocator_lock);
     return result;
@@ -3249,6 +3277,24 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
  * a surface offset is physical, and only the window makes it addressable. */
+void xbox_ContiguousFree(uint32_t xbox_va)
+{
+    /* Titles pass either the physical address or its cached/uncached alias. */
+    uint32_t offset = xbox_va & 0x1FFFFFFFu;
+    if (!xbox_va || offset >= XBOX_CONTIG_SIZE) return;
+    EnterCriticalSection(&g_allocator_lock);
+    for (LONG i = 0; i < g_contig_alloc_count; ++i) {
+        if (g_contig_allocs[i].offset == offset && g_contig_allocs[i].in_use) {
+            InterlockedExchange(&g_contig_allocs[i].in_use, 0);
+            if (getenv("RECOMP_CONTIG_TRACE"))
+                fprintf(stderr, "[CONTIG_FREE] address=%08X span=%u\n",
+                    xbox_va, g_contig_allocs[i].size);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_allocator_lock);
+}
+
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
 {
     LONG lo = 0;
@@ -3268,7 +3314,8 @@ int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
     {
         uint32_t start = g_contig_allocs[lo - 1].offset;
         uint32_t block_size = g_contig_allocs[lo - 1].size;
-        return physical_offset >= start &&
+        return InterlockedCompareExchange(&g_contig_allocs[lo - 1].in_use, 0, 0) &&
+            physical_offset >= start &&
                (uint64_t)physical_offset + size <=
                    (uint64_t)start + block_size;
     }
@@ -3331,6 +3378,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     /* Reciprocal ownership rule: a new heap block must not use physical
      * pages already owned by the independently backed contiguous window. */
     for (LONG i = 0; i < g_contig_alloc_count; i++) {
+        if (!g_contig_allocs[i].in_use) continue;
         uint32_t start = g_contig_allocs[i].offset;
         uint32_t end = start + g_contig_allocs[i].size;
         if ((uint64_t)result + size > start && result < end)

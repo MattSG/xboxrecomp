@@ -804,7 +804,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+    xbox_ContiguousFree(addr);
     g_eax = 0;
 }
 
