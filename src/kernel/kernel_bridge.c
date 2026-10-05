@@ -3255,6 +3255,21 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
+    /* MM3 probe: a resource read overwrote the XACT manager at 003591E8
+     * with GUI function addresses. Kernel-mode ReadFile writes escape user
+     * hardware watchpoints. Observe its destination before executing it. */
+    if (buffer_va <= 0x003591E8u &&
+        (uint64_t)buffer_va + length > 0x003591E8u) {
+        fprintf(stderr, "[XACT_READ_DEST] handle=%08X caller=%08X buffer=%08X length=%u esp=%08X eax=%08X ecx=%08X esi=%08X edi=%08X\n",
+                guest_handle, g_xbox_kernel_caller, buffer_va, length,
+                g_esp, g_eax, g_ecx, g_esi, g_edi);
+#ifdef _WIN32
+        static unsigned xact_read_breaks;
+        if (getenv("RECOMP_XACT_READ_BREAK") && xact_read_breaks++ == 0)
+            DebugBreak();
+#endif
+    }
+
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
 
