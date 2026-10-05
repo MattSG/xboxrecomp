@@ -247,14 +247,34 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
         s_fb_pitch = pitch;
 }
 
-/* Vertical anti-aliasing factor of the surface being shown: 2 for 2x2, where
- * the surface has twice the rows as well as twice the columns, and 1 for
- * everything else (2x1 included). Only the pushbuffer executor knows it. */
-static uint32_t s_fb_aa_sy = 1;
+static int fb_dump_pixels(const char *path, const uint32_t *pixels);
 
-void xbox_FramebufferWindowSetAA(uint32_t sy)
+/* Optional bounded capture of the exact completed image, before publication.
+ * RECOMP_PRESENT_CAPTURE=<prefix>; create <prefix>.flag to capture 60 flips. */
+static void fb_capture_present(const uint32_t *pixels)
 {
-    s_fb_aa_sy = sy ? sy : 1;
+    static const char *prefix;
+    static int initialized;
+    static unsigned remaining, frame;
+    char path[1024];
+    FILE *flag;
+    if (!initialized) {
+        prefix = getenv("RECOMP_PRESENT_CAPTURE");
+        initialized = 1;
+    }
+    if (!prefix) return;
+    if (!remaining) {
+        snprintf(path, sizeof path, "%s.flag", prefix);
+        flag = fopen(path, "rb");
+        if (!flag) return;
+        fclose(flag);
+        remove(path);
+        remaining = 60;
+        frame = 0;
+    }
+    snprintf(path, sizeof path, "%s-%03u.bmp", prefix, frame++);
+    fb_dump_pixels(path, pixels);
+    --remaining;
 }
 
 /* Called by the pushbuffer executor when the title flips. */
@@ -302,6 +322,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             memset(dst, 0, (size_t)s_fb_width * 4);
         }
     }
+    fb_capture_present(s_present[next]);
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
     /* Presenting the buffer already on display hands nothing over: D3D
@@ -518,14 +539,14 @@ static void fb_convert(const uint8_t *src, uint32_t pitch)
  * A black window is ambiguous: it means either that the read path is wrong or
  * that the title really did render black. Dumping the same converted pixels
  * the window draws settles which, and does it without a screenshot. */
-int xbox_FramebufferDumpBmp(const char *path)
+static int fb_dump_pixels(const char *path, const uint32_t *pixels)
 {
     FILE *f;
     uint32_t row = ((s_fb_width * 3u) + 3u) & ~3u;
     uint32_t img = row * s_fb_height, total = 54u + img, y, x;
     uint8_t hdr[54], *line;
 
-    if (!s_rgb || !s_fb_va)
+    if (!pixels)
         return -1;
     f = fopen(path, "wb");
     if (!f)
@@ -542,7 +563,7 @@ int xbox_FramebufferDumpBmp(const char *path)
 
     line = (uint8_t *)calloc(1, row);
     for (y = 0; y < s_fb_height; y++) {
-        const uint32_t *src = s_rgb + (size_t)(s_fb_height - 1 - y) * s_fb_width;
+        const uint32_t *src = pixels + (size_t)(s_fb_height - 1 - y) * s_fb_width;
         for (x = 0; x < s_fb_width; x++) {
             line[x * 3 + 0] = (uint8_t)(src[x] & 0xFF);
             line[x * 3 + 1] = (uint8_t)((src[x] >> 8) & 0xFF);
@@ -557,41 +578,9 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
-/* GDI: the frame letterboxed into the client area, like the D3D11
- * presenter; the borders are cleared when the size changes. */
-static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+int xbox_FramebufferDumpBmp(const char *path)
 {
-    static LONG lw, lh;
-    RECT c;
-    LONG cw, ch, w, h;
-    GetClientRect(hwnd, &c);
-    cw = c.right - c.left; ch = c.bottom - c.top;
-    if (cw <= 0 || ch <= 0)
-        return;
-    if (cw != lw || ch != lh) {
-        FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
-        lw = cw; lh = ch;
-    }
-    if ((long long)cw * s_fb_height <= (long long)ch * s_fb_width) {
-        w = cw; h = (LONG)((long long)cw * s_fb_height / s_fb_width);
-    } else {
-        h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
-    }
-    SetStretchBltMode(hdc, HALFTONE);
-    SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
-    StretchDIBits(hdc, (cw - w) / 2, (ch - h) / 2, w, h,
-                  0, 0, (int)s_fb_width, (int)s_fb_height,
-                  s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
-}
-
-/* The converted frame in s_rgb, on screen: D3D11 when it is up (which waits
- * for vsync, so returns 1 when the loop is already paced), else GDI. */
-static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
-{
-    if (gpu_present_active())
-        return gpu_present_frame(s_rgb);
-    gdi_blit(hwnd, hdc, bi);
-    return 0;
+    return fb_dump_pixels(path, s_rgb);
 }
 
 static DWORD WINAPI fb_thread(LPVOID unused)
