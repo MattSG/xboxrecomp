@@ -1150,7 +1150,8 @@ static void blend_factor(uint32_t f, const float s[4], const float d[4],
     }
 }
 
-static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
+static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb,
+                      uint64_t *pixels, uint32_t *pixel_max)
 {
     uint8_t *row;
 
@@ -1159,9 +1160,9 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         return;
     if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
         return;
-    s_gpu.pixels++;
-    if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
-        s_gpu.pixel_max = argb;
+    (*pixels)++;
+    if ((argb & 0x00FFFFFFu) > (*pixel_max & 0x00FFFFFFu))
+        *pixel_max = argb;
     row = s_surface + (size_t)y * s_gpu.pitch;
 
     /* Blending, with the GL factor set and equations the NV2A takes.
@@ -1290,11 +1291,11 @@ static void raster_triangle(const float a[2], const float b[2],
                 if (su < 0.0f) su = 0.0f;
                 if (sv < 0.0f) sv = 0.0f;
                 if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
-                    put_pixel(mem, bpp, x, y, texel);
+                    put_pixel(mem, bpp, x, y, texel, &s_gpu.pixels, &s_gpu.pixel_max);
                     continue;
                 }
             }
-            put_pixel(mem, bpp, x, y, argb);
+            put_pixel(mem, bpp, x, y, argb, &s_gpu.pixels, &s_gpu.pixel_max);
         }
     }
     s_gpu.tris_drawn++;
@@ -1779,7 +1780,7 @@ typedef struct {
     int minx, maxx, miny, maxy, use_rc, textured;
 } XfTri;
 
-typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
+typedef struct { uint64_t depth_fail, pixels; uint32_t zpass, pixel_max; } XfCount;
 
 /* Rows y0, y0+step, ... < maxy of triangle T. */
 static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
@@ -1864,9 +1865,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                     cnt->zpass++;
                 if (!(s_gpu.color_mask & 0x01010101u))
                     continue;              /* colour writes off: depth only */
-                cnt->pixels++;
             }
-            put_pixel(T->mem, T->bpp, x, y, argb);
+            put_pixel(T->mem, T->bpp, x, y, argb, &cnt->pixels, &cnt->pixel_max);
         }
     }
 }
@@ -1881,8 +1881,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  * executor thread, where waking workers would cost more than it saves.
  * RECOMP_RASTER_THREADS=<n> sets the count (1 = off); the default leaves a
  * few cores for the title and the host.
- * ponytail: s_gpu.pixels/pixel_max in put_pixel are unsynchronised stats and
- * may undercount; nothing depends on them. */
+ * Pixel statistics stay in each worker's stack while shading. Merge them
+ * once per triangle so diagnostic counters do not contend across cores. */
 #define NV_RASTER_MAX_THREADS 16
 #define NV_RASTER_MT_MIN_PIXELS 8192
 
@@ -1900,8 +1900,9 @@ static DWORD WINAPI raster_worker(LPVOID arg)
     int k = (int)(intptr_t)arg;
     for (;;) {
         WaitForSingleObject(s_pool.start[k], INFINITE);
-        memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
-        xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
+        XfCount count = {0};
+        xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &count);
+        s_pool.cnt[k] = count;
         if (InterlockedDecrement(&s_pool.pending) == 0)
             SetEvent(s_pool.done);
     }
@@ -1952,12 +1953,16 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
         WaitForSingleObject(s_pool.done, INFINITE);
         total->depth_fail += mine.depth_fail;
         total->pixels += mine.pixels;
-        total->zpass += mine.zpass;
+    total->zpass += mine.zpass;
+    if ((mine.pixel_max & 0x00FFFFFFu) > (total->pixel_max & 0x00FFFFFFu))
+        total->pixel_max = mine.pixel_max;
     }
     for (k = 0; k < n - 1; k++) {
         total->depth_fail += s_pool.cnt[k].depth_fail;
         total->pixels += s_pool.cnt[k].pixels;
         total->zpass += s_pool.cnt[k].zpass;
+        if ((s_pool.cnt[k].pixel_max & 0x00FFFFFFu) > (total->pixel_max & 0x00FFFFFFu))
+            total->pixel_max = s_pool.cnt[k].pixel_max;
     }
 }
 #else
@@ -2063,6 +2068,9 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     xf_rows_parallel(&T, &cnt);
     s_gpu.xf_depth_fail += cnt.depth_fail;
     s_gpu.xf_pixels += cnt.pixels;
+    s_gpu.pixels += cnt.pixels;
+    if ((cnt.pixel_max & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
+        s_gpu.pixel_max = cnt.pixel_max;
     s_gpu.zpass_count += cnt.zpass;
     s_gpu.tris_drawn++;
     note_drawn();
