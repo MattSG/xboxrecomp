@@ -50,7 +50,9 @@ else()
 endif()
 
 if(MSVC)
-    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
+    # RelWithDebInfo defaults to /Ob1. The optimized software rasterizer needs
+    # normal automatic inlining of small per-pixel helpers as well.
+    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /Ob2 /GS- /Gy)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
