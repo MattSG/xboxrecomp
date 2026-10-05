@@ -60,8 +60,7 @@ int  video_dump_frame_bmp(const char *path);
  * the title renders into guest RAM appears there; nothing else scans it out. */
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
-/* Rows per displayed row: 2 for a 2x2 anti-aliased surface, else 1. */
-void xbox_FramebufferWindowSetAA(uint32_t sy);
+void xbox_FramebufferWindowScanout(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
 /* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
  * UTF-16 title (40 chars max); the stats come from each flip. */
