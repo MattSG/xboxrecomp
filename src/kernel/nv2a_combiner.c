@@ -10,6 +10,8 @@
 #include "nv2a_combiner.h"
 
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 /* The rasteriser evaluates pixels on several threads. */
 #if defined(_MSC_VER)
@@ -102,6 +104,89 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
     uint32_t n = rc->control & 0xFF, flags = rc->control >> 8, s;
     int i;
 
+    /* D3D's single-stage UI combiners reduce to diffuse colour or
+     * diffuse * texture. Recognize the exact register program, including
+     * output destinations and direct final-combiner routing; all other
+     * programs retain the general interpreter below. */
+    {
+        static NV_RC_TLS int generic = -1;
+        uint32_t ci = rc->color_icw[0], ai = rc->alpha_icw[0];
+        int colour = ci == 0x04200000u || ci == 0xc4200000u ? 1 :
+                     ci == 0x08040000u ? 2 : ci == 0xc8c42000u ? 3 : 0;
+        int alpha = ai == 0x14200000u || ai == 0xd4201010u ? 1 :
+                    ai == 0x18140000u ? 2 : ai == 0xd8d41010u ? 3 :
+                    ai == 0xd4c81010u ? 4 : 0;
+        static NV_RC_TLS int trace;
+        static NV_RC_TLS unsigned reported;
+        if (generic < 0) {
+            generic = getenv("RECOMP_RC_GENERIC") != NULL;
+            trace = getenv("RECOMP_RC_TRACE") != NULL;
+        }
+        if (trace && rc->final0 == 0x04080900u && !(reported & 1u)) {
+            reported |= 1u;
+            fprintf(stderr, "[RC_DISPATCH] generic=%d n=%u ci=%08X ai=%08X "
+                    "co=%08X ao=%08X final=%08X/%08X\n",
+                    generic, n, ci, ai, rc->color_ocw[0], rc->alpha_ocw[0],
+                    rc->final0, rc->final1);
+            fflush(stderr);
+        }
+        if (!generic && rc->final0 == 0x04080900u &&
+            (rc->final1 >> 8) == 0x000014u) {
+            uint32_t stage, count = n > 8u ? 8u : n;
+            int untouched_inputs = 1;
+            for (stage = 0; stage < count; ++stage) {
+                uint32_t shift;
+                for (shift = 0; shift <= 8u; shift += 4u) {
+                    uint32_t rgb_dst = (rc->color_ocw[stage] >> shift) & 15u;
+                    uint32_t alpha_dst = (rc->alpha_ocw[stage] >> shift) & 15u;
+                    if (rgb_dst == R_V0 || rgb_dst == R_T0 || rgb_dst == R_T0 + 1 ||
+                        alpha_dst == R_V0) {
+                        untouched_inputs = 0;
+                        break;
+                    }
+                }
+                if (!untouched_inputs) break;
+            }
+            if (untouched_inputs) {
+                /* Final A=v0, B=t0, C=t1, D=0, G=v0.a. Writes to other
+                 * registers are dead; reject any program that changes the
+                 * RGB inputs or v0.a, including blue-to-alpha via v0. */
+                for (i = 0; i < 3; ++i) {
+                    float a = v0[i] < 0.0f ? 0.0f : v0[i];
+                    float b = t[0][i] < 0.0f ? 0.0f : t[0][i];
+                    float c = t[1][i] < 0.0f ? 0.0f : t[1][i];
+                    out[i] = clampf(c * (1.0f - a) + b * a, 0.0f, 1.0f);
+                }
+                out[3] = clampf(v0[3], 0.0f, 1.0f);
+                return;
+            }
+        }
+        if (!generic && n == 1u && colour && alpha &&
+            (rc->color_ocw[0] == 0xc0u || rc->color_ocw[0] == 0xc00u) &&
+            (rc->alpha_ocw[0] == 0xc0u || rc->alpha_ocw[0] == 0xc00u) &&
+            rc->final0 == 0x0000000cu && (rc->final1 >> 8) == 0x00001cu) {
+            for (i = 0; i < 3; ++i) {
+                float value = v0[i];
+                if (colour == 2)
+                    value = (t[0][i] < 0.0f ? 0.0f : t[0][i]) *
+                            (value < 0.0f ? 0.0f : value);
+                else if (colour == 3)
+                    value = t[0][i] * value;
+                out[i] = clampf(value, 0.0f, 1.0f);
+            }
+            if (alpha == 1)
+                out[3] = clampf(v0[3], 0.0f, 1.0f);
+            else if (alpha == 2)
+                out[3] = clampf((t[0][3] < 0.0f ? 0.0f : t[0][3]) *
+                               (v0[3] < 0.0f ? 0.0f : v0[3]), 0.0f, 1.0f);
+            else if (alpha == 3)
+                out[3] = clampf(t[0][3] * v0[3], 0.0f, 1.0f);
+            else
+                out[3] = clampf(v0[3] * t[0][2], 0.0f, 1.0f);
+            return;
+        }
+    }
+
     if (n > 8)
         n = 8;
     /* Only the registers a program can read before writing need a value:
@@ -126,6 +211,9 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
         uint32_t icw = rc->color_icw[s], ocw = rc->color_ocw[s];
         uint32_t aicw = rc->alpha_icw[s], aocw = rc->alpha_ocw[s];
         uint32_t fl = ocw >> 12, afl = aocw >> 12;
+        /* No destination means no live result. Constants reload in the
+         * next stage/final combiner, and register zero always remains zero. */
+        if (!((ocw | aocw) & 0xfffu)) continue;
         float A[3], B[3], C[3], D[3], ab[3], cd[3], ms[3];
         float aA, aB, aC, aD, aab, acd, ams;
         int mux_cd;
