@@ -60,6 +60,28 @@ static void fb_overlay(void)
     unsigned bank;
     bool presented = false;
     if (!s_rgb || !nv2a_hook_pvideo_snapshot(regs)) return;
+    {
+        static int trace = -1;
+        static uint32_t previous[9];
+        uint32_t current[9] = {
+            regs[NV_PVIDEO_STOP / 4],
+            regs[NV_PVIDEO_BASE / 4], regs[(NV_PVIDEO_BASE + 4) / 4],
+            regs[NV_PVIDEO_OFFSET / 4], regs[(NV_PVIDEO_OFFSET + 4) / 4],
+            regs[NV_PVIDEO_SIZE_IN / 4], regs[(NV_PVIDEO_SIZE_IN + 4) / 4],
+            s_fb_va, s_fb_pitch
+        };
+        if (trace < 0) trace = getenv("RECOMP_PVIDEO_TRACE") != NULL;
+        if (trace && memcmp(previous, current, sizeof current)) {
+            fprintf(stderr, "[PVIDEO_SCANOUT] fb=%08X pitch=%u present=%ld "
+                    "pending=%08X stop=%08X size=%08X/%08X "
+                    "offset=%08X/%08X retained=%u pixel=%08X\n",
+                    s_fb_va, s_fb_pitch, s_present_idx,
+                    regs[NV_PVIDEO_BUFFER / 4], current[0], current[5], current[6],
+                    current[3], current[4], s_pvideo_source != NULL,
+                    s_rgb[(size_t)s_fb_width * s_fb_height / 2]);
+            memcpy(previous, current, sizeof current);
+        }
+    }
     if ((regs[NV_PVIDEO_STOP / 4] & 1u) ||
         (s_pvideo_source &&
          regs[(NV_PVIDEO_SIZE_IN + s_pvideo_bank * 4) / 4] == UINT32_MAX)) {
