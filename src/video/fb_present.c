@@ -54,6 +54,43 @@ static uint32_t      s_pvideo_regs[0x1000 / 4];
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 
+/* Optional per-submission thumbnails for detecting corruption between screenshots.
+ * Each record is a 160x120 BGRA image of the pixels sent to GDI. Keeping this
+ * disabled has no file IO; the capture never modifies guest memory. */
+static void pvideo_capture_submission(void)
+{
+    static FILE *capture;
+    static int initialized;
+    uint32_t row[160];
+    unsigned x, y;
+    if (!initialized) {
+        const char *path = getenv("RECOMP_PVIDEO_FRAME_AUDIT");
+        initialized = 1;
+        if (path && *path) {
+            capture = fopen(path, "wb");
+            if (!capture)
+                fprintf(stderr, "[PVIDEO_AUDIT] cannot open %s\n", path);
+            else
+                setvbuf(capture, NULL, _IOFBF, 256 * 1024);
+        }
+    }
+    if (!capture) return;
+    for (y = 0; y < 120; ++y) {
+        unsigned sy = (unsigned)((uint64_t)y * s_fb_height / 120);
+        for (x = 0; x < 160; ++x) {
+            unsigned sx = (unsigned)((uint64_t)x * s_fb_width / 160);
+            row[x] = s_rgb[(size_t)sy * s_fb_width + sx];
+        }
+        if (fwrite(row, sizeof row, 1, capture) != 1) {
+            fclose(capture);
+            capture = NULL;
+            fprintf(stderr, "[PVIDEO_AUDIT] capture write failed\n");
+            return;
+        }
+    }
+    fflush(capture);
+}
+
 static void fb_overlay(void)
 {
     uint32_t regs[0x1000 / 4];
@@ -167,6 +204,7 @@ static void fb_overlay(void)
             s_pvideo_bank = bank;
             memcpy(s_pvideo_regs, regs, sizeof(s_pvideo_regs));
             presented = true;
+            pvideo_capture_submission();
             nv2a_hook_pvideo_consume(bank);
         }
         free(snapshot);
