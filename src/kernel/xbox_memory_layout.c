@@ -4238,6 +4238,9 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
                         fprintf(stderr, " sp+%u=%08X", i*4u, stack[i]);
             }
             fprintf(stderr, "\n");
+#ifdef _WIN32
+            if (large_reports == 1 && getenv("RECOMP_HEAP_LARGE_BREAK")) DebugBreak();
+#endif
         }
     }
 
