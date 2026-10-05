@@ -3381,9 +3381,10 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
     /* Reciprocal ownership rule: a new heap block must not use physical
-     * pages already owned by the independently backed contiguous window. */
+     * pages already owned by the independently backed contiguous window.
+     * Freed spans stay owned: bus masters still resolve them to the window
+     * (see xbox_ContiguousRangeAllocated). */
     for (LONG i = 0; i < g_contig_alloc_count; i++) {
-        if (!g_contig_allocs[i].in_use) continue;
         uint32_t start = g_contig_allocs[i].offset;
         uint32_t end = start + g_contig_allocs[i].size;
         if ((uint64_t)result + size > start && result < end)
