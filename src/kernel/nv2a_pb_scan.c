@@ -470,20 +470,18 @@ int nv2a_pb_dma_walk(void)
  * consumed.
  *
  * A CALL runs a subroutine -- a pushbuffer somewhere else in memory -- up to
- * its RETURN, then carries on after the CALL. RenderWare on the Xbox compiles
- * static geometry into pushbuffers and draws it with a CALL, so skipping CALLs
- * loses whole meshes. The NV2A has one level of subroutine, so a CALL inside a
- * call is not followed. A JUMP outside a call ends the segment: the ring's
- * wrap is handled by the caller, which scans the two pieces separately.
- * Addresses are physical, like PUT's, and reach guest memory through the
- * contiguous window. */
-/* Whether the walk is inside a pushbuffer CALL, for the executor: a flip
- * hold is only armed at the top level (nv2a_pb_exec.c). */
-static int s_in_call;
-int nv2a_pb_scan_in_call(void) { return s_in_call; }
+ * its RETURN, then carries on after the CALL. This used to skip CALLs, which
+ * was invisible until a title used them for real: RenderWare on the Xbox
+ * compiles static geometry into pushbuffers and draws it with a CALL, so the
+ * whole race track went missing from Burnout 3's main view while the
+ * geometry it submits inline (environment maps, the HUD) drew fine.
+ * The NV2A has one level of subroutine, so a CALL inside a call is not
+ * followed. Addresses are physical, like PUT's, and reach guest memory the
+ * same way: through the contiguous window. */
+static int s_scan = -1;
 
-static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
-                                uint32_t *jumps, uint32_t *unknown)
+static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+                        uint32_t *jumps, uint32_t *unknown)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
@@ -524,7 +522,11 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
 
             for (uint32_t i = 0; i < count && (in_call ? va < end_va : va != end_va); i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
+                if (s_scan)  /* the inventory is a linear search: survey runs only */
+                    note(subch, m);
+                /* Same walk, two consumers: the survey counts, the executor
+                 * acts. Keeping them on one decode means they can never
+                 * disagree about what the stream said. */
                 if (s_exec_enabled)
                     nv2a_pb_exec_method(subch, m,
                                         *(const uint32_t *)pb_word_ptr(mem, va));
@@ -544,14 +546,17 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    static int scan = -1;
-    if (scan < 0)
-        scan = getenv("RECOMP_PB_SCAN") != NULL;
-    if (!(scan || s_exec_enabled) || end_va == start_va)
+    if (s_scan < 0)
+        s_scan = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!(s_scan || s_exec_enabled) || end_va == start_va)
         return;
     if (end_va > start_va && end_va - start_va > 0x400000u) /* forward span only */
         end_va = start_va + 0x400000u;
 
+    {
+        extern void nv2a_d3d_kick(void);
+        nv2a_d3d_kick();
+    }
     RECOMP_PROFILE_BEGIN("GPU submission");
     words = pb_walk(start_va, end_va, 0, &jumps, &unknown);
     RECOMP_PROFILE_END();

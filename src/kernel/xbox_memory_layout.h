@@ -82,6 +82,8 @@ void xbox_SetMapSize(size_t bytes);
  * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.
  * See the implementation for why reservations must not come from the heap. */
 uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align);
+/* 1 if va lies in memory xbox_ReserveAlloc has handed out (above RAM). */
+int xbox_ReserveRangeAllocated(uint32_t va);
 
 /* Bounds of the guest's executable sections, derived from the XBE at load.
  *

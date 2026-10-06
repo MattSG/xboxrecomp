@@ -992,7 +992,7 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE)
-            xbox_NtClose(h);   /* settles a pending overwrite; drops a dir context */
+            xbox_NtClose(h);
     }
     g_eax = 0; /* STATUS_SUCCESS */
 }
@@ -1282,7 +1282,16 @@ static void bridge_NtAllocateVirtualMemory(void)
      * two. This clamp is enough for a title that reserves generously and
      * commits little, and it fails loudly and later rather than silently and
      * at startup if one does not. */
-    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    /* A large pure reservation goes above RAM first. Taken from the heap it
+     * consumes physical page numbers below 64 MB that the contiguous window
+     * shares: MM3 reserves 16 MB when a race loads, which pushed the heap
+     * past the window's free spans and left the title's vertex and texture
+     * allocations failing for the whole race. */
+    uint32_t xbox_va = 0;
+    if ((alloc_type & 0x2000) && !(alloc_type & 0x1000) && size >= 0x100000u)
+        xbox_va = xbox_ReserveAlloc(size, 4096);
+    if (!xbox_va)
+        xbox_va = xbox_HeapAlloc(size, 4096);
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         /* A pure reservation too big for the heap. Take it from the mapped
          * space above RAM, where it costs no heap and the pages are distinct.
@@ -1574,64 +1583,15 @@ static void bridge_NtFreeVirtualMemory(void)
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
 
-    if (base_ptr && size_ptr) {
-        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
-        uint32_t vm_size = BRIDGE_MEM32(size_ptr);
-        uint32_t vm_status;
-
-        if (guest_vmem_free(&vm_base, &vm_size, free_type, &vm_status)) {
-            if (vm_status == 0) {
-                BRIDGE_MEM32(base_ptr) = vm_base;
-                BRIDGE_MEM32(size_ptr) = vm_size;
-            }
-            g_eax = vm_status;
-            return;
-        }
-    }
-
-    /* Memory NtAllocateVirtualMemory took from the guest heap. The call below
-     * reads the 32-bit guest slots as host pointers and hands them to
-     * VirtualFree, which fails, so none of it ever came back. Under
-     * RECOMP_HEAP_RECLAIM a release returns the block to the heap and a
-     * decommit zeroes the pages it names, since heap memory stays committed. */
-    if (xbox_HeapReclaimEnabled() && base_ptr && size_ptr) {
-        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
-        uint32_t left = xbox_HeapBlockSize(vm_base);
-
-        if (left) {
-            if (free_type & 0x8000) {              /* MEM_RELEASE */
-                if (bridge_heap_interior(vm_base, left)) {
-                    g_eax = BRIDGE_FREE_VM_NOT_AT_BASE;
-                    return;
-                }
-                xbox_HeapFree(vm_base);
-                /* NT writes back what it released: the base and the size. */
-                BRIDGE_MEM32(size_ptr) = left;
-            } else {
-                /* MEM_DECOMMIT keeps the block, but on the console the pages
-                 * are gone and a later MEM_COMMIT (a no-op here) brings them
-                 * back zeroed. Zero them now so it does. */
-                uint32_t vm_size = BRIDGE_MEM32(size_ptr);
-                uint32_t n = (vm_size && vm_size < left) ? vm_size : left;
-                uint32_t page_base = vm_base & ~0xFFFu;
-                uint64_t end = ((uint64_t)vm_base + n + 0xFFFu) & ~(uint64_t)0xFFFu;
-                /* NT decommits whole pages and writes back the rounded range;
-                 * both stay inside the block (a block need not start on a
-                 * page, and then its first page is shared). */
-                if (end > (uint64_t)vm_base + left)
-                    end = (uint64_t)vm_base + left;
-                if (xbox_HeapBlockSize(page_base) != left + (vm_base - page_base))
-                    page_base = vm_base;
-                memset(XBOX_TO_NATIVE(page_base), 0, (size_t)(end - page_base));
-                BRIDGE_MEM32(base_ptr) = page_base;
-                BRIDGE_MEM32(size_ptr) = (uint32_t)(end - page_base);
-            }
-            g_eax = 0;
-            return;
-        }
-    }
-
-    bridge_free_guest_pages(base_ptr, size_ptr, free_type);
+    /* Guest virtual memory comes from the bump allocator above, committed
+     * for good, so there is nothing to give back. Forwarding to VirtualFree
+     * read the 32-bit guest pointer as a native one and failed every time:
+     * MM3 decommits a few pages a frame, and the failures, each a flushed
+     * log line, were a few percent of its game thread.
+     * ponytail: freed ranges are never reused; add a free list to
+     * xbox_ReserveAlloc if a title runs out of address space. */
+    (void)base_ptr; (void)size_ptr; (void)free_type;
+    g_eax = 0;                                          /* STATUS_SUCCESS */
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─

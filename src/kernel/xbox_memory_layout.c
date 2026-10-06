@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+int nv2a_d3d_prof_enabled(void);
+void nv2a_d3d_prof_add(int slot, long long ticks, unsigned verts);
 #include <setjmp.h>
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
@@ -1155,10 +1157,7 @@ static void fence_mirrors_tick(void)
 }
 
 static int s_nv2a_trace = 0;
-/* The per-kick DMA_PUT line, only on an explicit RECOMP_NV2A_TRACE. The
- * executor sets s_nv2a_trace too, and a line plus an fflush per kick is
- * hundreds of stderr writes a second on the thread the title waits on. */
-static int s_nv2a_trace_kicks = 0;
+static int s_nv2a_report = 0;  /* periodic survey/executor report */
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -1383,8 +1382,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 /* Follow the actual ring jump through to PUT. Observed PUT
                  * extrema are submission points, not ring boundaries. */
                 if (last_put && put != last_put) {
+                    LARGE_INTEGER t0, t1;
+                    QueryPerformanceCounter(&t0);
                     nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                  XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
+                    QueryPerformanceCounter(&t1);
+                    if (nv2a_d3d_prof_enabled())
+                        nv2a_d3d_prof_add(7, t1.QuadPart - t0.QuadPart, 0);
                     if (put < last_put && getenv("RECOMP_PB_WRAP_TRACE"))
                         fprintf(stderr, " [NV2A] pushbuffer wrapped (0x%08X -> 0x%08X)\n",
                                 last_put, put);
@@ -1402,7 +1406,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         report_ms = e ? atol(e) : 10000;
                         if (report_ms < 100) report_ms = 100;
                     }
-                    if (s_nv2a_trace && now_ms - last_report > (uint64_t)report_ms) {
+                    if (s_nv2a_report && now_ms - last_report > (uint64_t)report_ms) {
                         last_report = now_ms;
                         nv2a_pb_scan_report();
                     }
@@ -1462,6 +1466,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
+        {
+            /* Loading screens and movies are shown without flips. */
+            extern void nv2a_d3d_tick(void);
+            nv2a_d3d_tick();
+        }
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
@@ -3098,11 +3107,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
         g_nv2a_memory = layout_commit_at((LPVOID)nv2a_native, XBOX_NV2A_SIZE);
         /* The pushbuffer survey rides on the same poll, so either
-         * variable arms it. */
-        s_nv2a_trace_kicks = getenv("RECOMP_NV2A_TRACE") != NULL;
+         * variable arms its report. The per-submission log is only for
+         * tracing: RECOMP_PB_EXEC is on for every real run, and a line
+         * plus a flush per kick cost a fifth of the GPU thread. */
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
-                    || getenv("RECOMP_PB_SCAN") != NULL
-                    || getenv("RECOMP_PB_EXEC") != NULL;
+                    || getenv("RECOMP_PB_SCAN") != NULL;
+        s_nv2a_report = s_nv2a_trace || getenv("RECOMP_PB_EXEC") != NULL;
         if (g_nv2a_memory) {
             DWORD old_protect;
             if (VirtualProtect((char *)g_nv2a_memory + 0x8000, 0x1000,
@@ -3691,6 +3701,11 @@ uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align)
     return base;
 }
 
+int xbox_ReserveRangeAllocated(uint32_t va)
+{
+    return g_reserve_next && va >= (uint32_t)g_xbox_total_ram && va < g_reserve_next;
+}
+
 BOOL xbox_IsXboxAddress(uintptr_t address)
 {
     return (address >= XBOX_BASE_ADDRESS &&
@@ -3964,50 +3979,27 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 #define CONTIG_PAGES      (XBOX_CONTIG_SIZE / CONTIG_PAGE)
 #define CONTIG_USABLE     ((XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT) / CONTIG_PAGE)
 
-/* The last megabyte below 16 MB is kept for requests that must sit there.
- *
- * Some buffers have to be below 16 MB because the GPU addresses them with a
- * 24-bit offset. XDK D3D's EndVisibilityTest allocates its report pages with
- * MmAllocateContiguousMemoryEx(0x1000, 0, 0xFFFFFF, ...), the first time each
- * page of 256 tests is used. The console kernel fills contiguous memory from
- * the top, so low memory is still free when that call comes. This arena fills
- * it from the bottom, so a few minutes into one title the low 16 MB was full (26 MB
- * in use, all of it starting at 0). Every report-page call failed, 700 to 1,900
- * times a run, EndVisibilityTest returned E_OUTOFMEMORY, and
- * GetVisibilityTestResult read its results through a NULL page.
- *
- * Allocating from the top would match the console, but it would move every
- * surface and buffer the logs and tools name by address (a title's back
- * buffers, for one). Keeping one megabyte back
- * changes nothing that is placed below 15 MB. A request whose range ends
- * below 16 MB can use the reserve; any other request skips it. */
-#define CONTIG_LOW_RESERVE_START ((15u << 20) / CONTIG_PAGE)
-#define CONTIG_LOW_RESERVE_END   ((16u << 20) / CONTIG_PAGE)
+/* The table is sorted by offset and covers every span ever handed out, in
+ * use or free; xbox_ContiguousRangeAllocated binary-searches it. Callers hold
+ * g_allocator_lock. */
+static void contig_insert(LONG at, uint32_t offset, uint32_t size, LONG in_use)
+{
+    memmove(&g_contig_allocs[at + 1], &g_contig_allocs[at],
+            (size_t)(g_contig_alloc_count - at) * sizeof g_contig_allocs[0]);
+    g_contig_allocs[at].offset = offset;
+    g_contig_allocs[at].size = size;
+    g_contig_allocs[at].in_use = in_use;
+    InterlockedIncrement(&g_contig_alloc_count);
+}
 
-/* Physical page 0 is never handed out. The real kernel keeps it, and the
- * XDK's USB stack relies on that: XPP carves its host controller structures
- * from a private 0xFE0-byte arena ending at 0x80001000, with no allocation
- * call at all. Handing that page to the
- * title's first MmAllocateContiguousMemory -- XAPI's launch data page --
- * let whichever wrote last win, and the pad enumerated or not depending on
- * timing. Page 0 starts marked CONTIG_RESERVED: no allocation, claim or
- * range request (lowest=0 included) gets it, and the page map still reports
- * it as window memory, which is what a device resolving XPP's physical
- * addresses needs. */
-#define CONTIG_RESERVED   2u
+static void contig_remove(LONG at)
+{
+    memmove(&g_contig_allocs[at], &g_contig_allocs[at + 1],
+            (size_t)(g_contig_alloc_count - at - 1) * sizeof g_contig_allocs[0]);
+    InterlockedDecrement(&g_contig_alloc_count);
+}
 
-static uint8_t  g_contig_used[CONTIG_PAGES] = { CONTIG_RESERVED };
-                                               /* 1 = page belongs to a block */
-static uint32_t g_contig_len[CONTIG_PAGES];    /* pages, at a block's first page */
-static uint32_t g_contig_pages_in_use;
-static uint32_t g_contig_high = CONTIG_PAGE;   /* high-water mark, bytes */
-static uint32_t g_contig_first_free = 1;       /* no free page below this */
-static uint32_t g_contig_allocs, g_contig_frees;
-static uint32_t g_contig_peak_pages;
-static DWORD    g_contig_t0;
-static volatile LONG g_contig_lock;
-
-static void contig_lock(void)
+uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     while (InterlockedCompareExchange(&g_contig_lock, 1, 0) != 0)
         SwitchToThread();
@@ -4024,30 +4016,51 @@ static void contig_lock(void)
 
     EnterCriticalSection(&g_allocator_lock);
     if (alignment < 4096) alignment = 4096;
-    {
-        LONG best = -1;
-        for (LONG i = 0; i < g_contig_alloc_count; ++i) {
-            uint32_t offset = g_contig_allocs[i].offset;
-            uint32_t span = g_contig_allocs[i].size;
-            if (g_contig_allocs[i].in_use || span < size ||
-                ((XBOX_CONTIG_BASE + offset) & (alignment - 1))) continue;
-            /* Heap addresses remain reserved even after HeapFree, because
-             * the ordinary allocator can reuse them at any time. */
-            if ((uint64_t)offset + span > XBOX_HEAP_BASE && offset < g_heap_next)
-                continue;
-            if (best < 0 || span < g_contig_allocs[best].size) best = i;
+    /* Reuse freed pages first-fit by address, carving from the front of the
+     * lowest free extent that fits; freed neighbours are coalesced on free.
+     * Consecutive requests therefore come out adjacent, as they do from the
+     * kernel's page allocator. MM3 depends on it: it builds large vertex
+     * buffers from consecutive 16 KB requests and addresses them as one span.
+     * Best-fit reuse of whole freed blocks scattered those requests, so after
+     * the first load the player car was drawn from 16 KB of mesh followed by
+     * someone else's textures. */
+    for (LONG i = 0; i < g_contig_alloc_count; ++i) {
+        uint32_t offset = g_contig_allocs[i].offset;
+        uint32_t span = g_contig_allocs[i].size;
+        uint32_t start, head, tail, lo = offset;
+        uint64_t hi = (uint64_t)offset + span;
+        if (g_contig_allocs[i].in_use || span < size) continue;
+        /* Heap addresses remain reserved even after HeapFree, because
+         * the ordinary allocator can reuse them at any time: use only the
+         * part of a free extent outside [heap base, heap next). */
+        if (hi > XBOX_HEAP_BASE && lo < g_heap_next) {
+            if (lo < XBOX_HEAP_BASE) hi = XBOX_HEAP_BASE;
+            else if (hi > g_heap_next) lo = g_heap_next;
+            else continue;
         }
-        if (best >= 0) {
-            result = XBOX_CONTIG_BASE + g_contig_allocs[best].offset;
-            memset((void *)((uintptr_t)result + g_memory_offset), 0,
-                g_contig_allocs[best].size);
-            InterlockedExchange(&g_contig_allocs[best].in_use, 1);
-            if (getenv("RECOMP_CONTIG_TRACE"))
-                fprintf(stderr, "[CONTIG_REUSE] address=%08X requested=%u span=%u\n",
-                    result, size, g_contig_allocs[best].size);
-            LeaveCriticalSection(&g_allocator_lock);
-            return result;
+        start = ((XBOX_CONTIG_BASE + lo + alignment - 1) & ~(alignment - 1))
+                - XBOX_CONTIG_BASE;
+        if ((uint64_t)start + size > hi) continue;
+        head = start - offset;
+        tail = offset + span - (start + size);
+        if (g_contig_alloc_count + (head ? 1 : 0) + (tail ? 1 : 0) > XBOX_CONTIG_MAX_ALLOCS)
+            break;
+        if (head) {
+            g_contig_allocs[i].size = head;             /* stays free */
+            contig_insert(++i, start, size, 1);
+        } else {
+            g_contig_allocs[i].size = size;
+            InterlockedExchange(&g_contig_allocs[i].in_use, 1);
         }
+        if (tail)
+            contig_insert(i + 1, start + size, tail, 0);
+        result = XBOX_CONTIG_BASE + start;
+        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+        if (getenv("RECOMP_CONTIG_TRACE"))
+            fprintf(stderr, "[CONTIG_REUSE] address=%08X size=%u extent=%u\n",
+                    result, size, span);
+        LeaveCriticalSection(&g_allocator_lock);
+        return result;
     }
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);
 
@@ -4085,6 +4098,9 @@ static void contig_lock(void)
     g_contig_allocs[g_contig_alloc_count].size = size;
     InterlockedExchange(&g_contig_allocs[g_contig_alloc_count].in_use, 1);
     InterlockedIncrement(&g_contig_alloc_count);
+    if (getenv("RECOMP_CONTIG_TRACE"))
+        fprintf(stderr, "[CONTIG_NEW] address=%08X size=%u esp=%08X ret=%08X\n", result, size,
+                g_esp, *(const uint32_t *)((uintptr_t)g_esp + g_memory_offset));
     LeaveCriticalSection(&g_allocator_lock);
     return result;
 }
@@ -4203,6 +4219,19 @@ void xbox_ContiguousFree(uint32_t xbox_va)
             if (getenv("RECOMP_CONTIG_TRACE"))
                 fprintf(stderr, "[CONTIG_FREE] address=%08X span=%u\n",
                     xbox_va, g_contig_allocs[i].size);
+            /* Coalesce with free neighbours that touch it. */
+            if (i + 1 < g_contig_alloc_count && !g_contig_allocs[i + 1].in_use &&
+                g_contig_allocs[i].offset + g_contig_allocs[i].size ==
+                    g_contig_allocs[i + 1].offset) {
+                g_contig_allocs[i].size += g_contig_allocs[i + 1].size;
+                contig_remove(i + 1);
+            }
+            if (i > 0 && !g_contig_allocs[i - 1].in_use &&
+                g_contig_allocs[i - 1].offset + g_contig_allocs[i - 1].size ==
+                    g_contig_allocs[i].offset) {
+                g_contig_allocs[i - 1].size += g_contig_allocs[i].size;
+                contig_remove(i);
+            }
             break;
         }
     }
@@ -4211,11 +4240,15 @@ void xbox_ContiguousFree(uint32_t xbox_va)
 
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
 {
-    LONG lo = 0;
-    LONG hi = InterlockedCompareExchange(&g_contig_alloc_count, 0, 0);
+    LONG lo = 0, hi, i;
+    uint64_t end, covered;
+    int result = 0;
 
     if (!size)
         size = 1;
+    /* The table is split and coalesced in place; read it under the lock. */
+    EnterCriticalSection(&g_allocator_lock);
+    hi = g_contig_alloc_count;
     while (lo < hi) {
         LONG mid = lo + (hi - lo) / 2;
         if (g_contig_allocs[mid].offset <= physical_offset)
@@ -4223,25 +4256,41 @@ int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
         else
             hi = mid;
     }
-    if (!lo)
-        return 0;
     /* Freed spans count. Freeing does not move a page; it still holds
      * what the title last wrote there, and the span is only ever reused in
      * place. MM3 draws its loading screen from a back buffer that D3D has
      * just released: with freed spans excluded the GPU read that physical
      * address from low RAM instead -- the title's own image -- and showed
-     * the code bytes as colour static. */
-    {
-        uint32_t start = g_contig_allocs[lo - 1].offset;
-        uint32_t block_size = g_contig_allocs[lo - 1].size;
-        return physical_offset >= start &&
-               (uint64_t)physical_offset + size <=
-                   (uint64_t)start + block_size;
+     * the code bytes as colour static. A range may run on through adjacent
+     * spans. */
+    if (lo) {
+        end = (uint64_t)physical_offset + size;
+        i = lo - 1;
+        covered = (uint64_t)g_contig_allocs[i].offset + g_contig_allocs[i].size;
+        while (covered < end && i + 1 < g_contig_alloc_count &&
+               g_contig_allocs[i + 1].offset == covered) {
+            ++i;
+            covered += g_contig_allocs[i].size;
+        }
+        result = physical_offset >= g_contig_allocs[lo - 1].offset && end <= covered;
     }
+    LeaveCriticalSection(&g_allocator_lock);
+    return result;
 }
 
 
-static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
+/* RECOMP_HEAP_WATCH=<hex address>: report heap blocks handed out over it. */
+static void heap_watch(const char *how, uint32_t addr, uint32_t size)
+{
+    static long watch = -2;
+    if (watch == -2) {
+        const char *e = getenv("RECOMP_HEAP_WATCH");
+        watch = e ? (long)strtoul(e, NULL, 16) : -1;
+    }
+    if (watch >= 0 && (uint32_t)watch >= addr && (uint32_t)watch < addr + size)
+        fprintf(stderr, "[HEAP_WATCH] %s %08X..%08X esp=%08X ret=%08X\n", how, addr,
+                addr + size, g_esp, *(const uint32_t *)((uintptr_t)g_esp + g_memory_offset));
+}
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
@@ -4314,6 +4363,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
         g_heap_blocks[i].free = 0;
         result = g_heap_blocks[i].addr;
         memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+        heap_watch("reuse", result, size);
         LeaveCriticalSection(&g_allocator_lock);
         return result;
     }
@@ -4382,6 +4432,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     }
 
     g_heap_alloc_count++;
+    heap_watch("new", result, size);
     /* Rate-limited: a debug title makes thousands of these and the log is a
      * diagnostic, not a transaction record. */
     if (g_heap_alloc_count <= 32 || (g_heap_alloc_count % 512) == 0) {
