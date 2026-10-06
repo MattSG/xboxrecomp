@@ -132,6 +132,33 @@ static void prof_report(void)
     worst = 0;
     last = now;
 }
+/* RECOMP_FRAME_CSV=<path>: one row per flip -- QPC time, flip-to-flip
+ * interval and the part of it spent pacing -- for frame-time percentiles. */
+static void frame_csv(int64_t pace)
+{
+    static FILE *f;
+    static int tried;
+    static int64_t prev;
+    static unsigned rows;
+    static LARGE_INTEGER freq;
+    int64_t now = qpc();
+    if (!tried) {
+        const char *e = getenv("RECOMP_FRAME_CSV");
+        tried = 1;
+        if (e && (f = fopen(e, "w")) != NULL) {
+            setvbuf(f, NULL, _IOFBF, 1 << 16);
+            fprintf(f, "qpc_ms,frame_ms,pace_ms\n");
+        }
+        QueryPerformanceFrequency(&freq);
+    }
+    if (!f) return;
+    if (prev)
+        fprintf(f, "%.3f,%.4f,%.4f\n", now * 1000.0 / freq.QuadPart,
+                (now - prev) * 1000.0 / freq.QuadPart, pace * 1000.0 / freq.QuadPart);
+    if (++rows % 120 == 0) fflush(f);   /* harnesses kill the process */
+    prev = now;
+}
+
 static uint32_t             s_frame = 1;
 /* Bumped at every pushbuffer kick: the CPU can only have written guest memory
  * between kicks, so a surface needs checking at most once per kick. */
@@ -3757,7 +3784,11 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
             s_prof[PROF_PRESENT] += qpc() - t1;
         }
     }
-    pace_vblank();
+    {
+        int64_t t0 = qpc();
+        pace_vblank();
+        frame_csv(qpc() - t0);
+    }
     RECOMP_PROFILE_FRAME();
     prof_report();
     display_config(0);
