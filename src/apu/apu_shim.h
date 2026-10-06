@@ -370,7 +370,7 @@ static struct {
 } g_config = {
     .audio = {
         .volume_limit = 1.0f,
-        .hrtf = true,       /* xemu's default */
+        .hrtf = true,
         .vp = { .num_workers = 1 },
     },
 };
