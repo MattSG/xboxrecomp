@@ -1604,7 +1604,9 @@ static int bind_targets(const NvD3DState *st, int want_depth, Surface **out,
     s_aa_y = aa == 2 ? 2 : 1;
     if (swizzled) {
         w = 1u << ((fmt >> 16) & 0xF);
-        h = 1u << ((fmt >> 20) & 0xF);
+        /* NV097 surface log-height is bits 24..31, after log-width 16..23.
+         * Reading bit 20 collapsed MM3's 0x07070228 water target to one row. */
+        h = 1u << ((fmt >> 24) & 0xF);
         s_aa_x = s_aa_y = 1;
     } else {
         w = (st->clip_x + st->clip_w) * s_aa_x;
