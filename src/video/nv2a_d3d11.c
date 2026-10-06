@@ -467,6 +467,16 @@ static const char s_hlsl[] =
 "  o.t0 = t0; o.t1 = t1; o.t2 = t2; o.t3 = t3;\n"
 "  return o;\n"
 "}\n"
+/* SPEC: a variant specialised to one combiner configuration. The control
+ * words below become constants (SPEC_DECL) so the compiler folds the
+ * interpreter away; the cbuffer keeps its layout under other names. */
+"#ifdef SPEC\n"
+"#define c_icw cb_c_icw\n#define a_icw cb_a_icw\n#define c_ocw cb_c_ocw\n#define a_ocw cb_a_ocw\n"
+"#define fin0 cb_fin0\n#define fin1 cb_fin1\n#define rc_control cb_rc_control\n#define stage_prog cb_stage_prog\n"
+"#define alpha_func cb_alpha_func\n#define ps_flags cb_ps_flags\n#define clip_plane cb_clip_plane\n"
+"#define other_input cb_other_input\n#define dot_map cb_dot_map\n#define tex_info cb_tex_info\n"
+"#define RC_LOOP [unroll]\n"
+"#else\n#define RC_LOOP [loop]\n#endif\n"
 "cbuffer PSC : register(b1) {\n"
 "  uint4 c_icw[2]; uint4 a_icw[2]; uint4 c_ocw[2]; uint4 a_ocw[2];\n"
 "  float4 cf0[8]; float4 cf1[8]; float4 fin_c0; float4 fin_c1;\n"
@@ -479,6 +489,12 @@ static const char s_hlsl[] =
 "  float4 bump_mat[4]; float4 bump_lum[4];\n"
 "  float4 zp0; float4 zp1;\n"
 "};\n"
+"#ifdef SPEC\n"
+"#undef c_icw\n#undef a_icw\n#undef c_ocw\n#undef a_ocw\n#undef fin0\n#undef fin1\n#undef rc_control\n"
+"#undef stage_prog\n#undef alpha_func\n#undef ps_flags\n#undef clip_plane\n#undef other_input\n"
+"#undef dot_map\n#undef tex_info\n"
+"SPEC_DECL\n"
+"#endif\n"
 "Texture2D T2D0:register(t0); Texture2D T2D1:register(t1); Texture2D T2D2:register(t2); Texture2D T2D3:register(t3);\n"
 "TextureCube TC0:register(t4); TextureCube TC1:register(t5); TextureCube TC2:register(t6); TextureCube TC3:register(t7);\n"
 "SamplerState S0:register(s0); SamplerState S1:register(s1); SamplerState S2:register(s2); SamplerState S3:register(s3);\n"
@@ -568,7 +584,7 @@ static const char s_hlsl[] =
 "  } else {\n"
 "    R[12].a = (stage_prog & 31) ? T[0].a : 1.0;\n"
 "    uint nst = min(rc_control & 0xFF, 8); uint fl8 = rc_control >> 8;\n"
-"    [loop] for (uint s = 0; s < nst; s++) {\n"
+"    RC_LOOP for (uint s = 0; s < nst; s++) {\n"
 "      uint icw = U8(c_icw, s), ocw = U8(c_ocw, s), aicw = U8(a_icw, s), aocw = U8(a_ocw, s);\n"
 "      if (((ocw | aocw) & 0xFFF) == 0) continue;\n"
 "      R[1] = cf0[(fl8 & 0x010) ? s : 0]; R[2] = cf1[(fl8 & 0x100) ? s : 0];\n"
@@ -738,6 +754,149 @@ static ID3DBlob *compile_def(const char *entry, const char *target, const D3D_SH
 static ID3DBlob *compile(const char *entry, const char *target)
 {
     return compile_def(entry, target, NULL);
+}
+
+/* ------------------------------------------------- specialised pixel shaders
+ * The ubershader interprets the register combiners per pixel, with dynamic
+ * register indexing the compiler cannot keep in registers -- most of the GPU
+ * time at high resolutions. Each combiner configuration gets its own variant
+ * with the control words as constants, compiled on a worker thread; draws
+ * use the ubershader until it is ready, so output never changes. Only the
+ * control words are keyed; factors and other floats stay in the cbuffer.
+ * RECOMP_PS_SPEC=0 disables this. */
+typedef struct {
+    uint32_t c_icw[8], a_icw[8], c_ocw[8], a_ocw[8];
+    uint32_t fin0, fin1, rc_control, stage_prog, alpha_func, ps_flags;
+    uint32_t clip_plane, other_input, dot_map, variant;
+    uint32_t tex_info[4][2];
+} PsKey;
+
+typedef struct {
+    PsKey key;
+    volatile LONG state;            /* 0 empty, 1 queued, 2 ready, 3 failed */
+    ID3D11PixelShader *ps;          /* valid once state is 2 */
+} PsSpec;
+
+#define PS_SPEC_SLOTS 4096          /* power of two */
+#define PS_SPEC_QUEUE 1024
+static PsSpec *s_spec;
+static PsSpec *s_spec_q[PS_SPEC_QUEUE];
+static unsigned s_spec_head, s_spec_tail;  /* guarded by s_spec_cs */
+static CRITICAL_SECTION s_spec_cs;
+static CONDITION_VARIABLE s_spec_cv;
+static volatile LONG s_spec_ready;
+
+static DWORD WINAPI spec_worker(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        PsSpec *e;
+        const PsKey *k;
+        char decl[2048];
+        ID3DBlob *b;
+        int flat;
+        D3D_SHADER_MACRO m[4];
+        EnterCriticalSection(&s_spec_cs);
+        while (s_spec_head == s_spec_tail)
+            SleepConditionVariableCS(&s_spec_cv, &s_spec_cs, INFINITE);
+        e = s_spec_q[s_spec_tail++ % PS_SPEC_QUEUE];
+        LeaveCriticalSection(&s_spec_cs);
+        k = &e->key;
+        snprintf(decl, sizeof decl,
+            "static const uint4 c_icw[2] = { uint4(%uu,%uu,%uu,%uu), uint4(%uu,%uu,%uu,%uu) };"
+            "static const uint4 a_icw[2] = { uint4(%uu,%uu,%uu,%uu), uint4(%uu,%uu,%uu,%uu) };"
+            "static const uint4 c_ocw[2] = { uint4(%uu,%uu,%uu,%uu), uint4(%uu,%uu,%uu,%uu) };"
+            "static const uint4 a_ocw[2] = { uint4(%uu,%uu,%uu,%uu), uint4(%uu,%uu,%uu,%uu) };"
+            "static const uint fin0 = %uu; static const uint fin1 = %uu;"
+            "static const uint rc_control = %uu; static const uint stage_prog = %uu;"
+            "static const uint alpha_func = %uu; static const uint ps_flags = %uu;"
+            "static const uint clip_plane = %uu; static const uint other_input = %uu;"
+            "static const uint dot_map = %uu;"
+            "static const uint4 tex_info[4] = { uint4(%uu,%uu,0,0), uint4(%uu,%uu,0,0),"
+            " uint4(%uu,%uu,0,0), uint4(%uu,%uu,0,0) };",
+            k->c_icw[0], k->c_icw[1], k->c_icw[2], k->c_icw[3],
+            k->c_icw[4], k->c_icw[5], k->c_icw[6], k->c_icw[7],
+            k->a_icw[0], k->a_icw[1], k->a_icw[2], k->a_icw[3],
+            k->a_icw[4], k->a_icw[5], k->a_icw[6], k->a_icw[7],
+            k->c_ocw[0], k->c_ocw[1], k->c_ocw[2], k->c_ocw[3],
+            k->c_ocw[4], k->c_ocw[5], k->c_ocw[6], k->c_ocw[7],
+            k->a_ocw[0], k->a_ocw[1], k->a_ocw[2], k->a_ocw[3],
+            k->a_ocw[4], k->a_ocw[5], k->a_ocw[6], k->a_ocw[7],
+            k->fin0, k->fin1, k->rc_control, k->stage_prog, k->alpha_func, k->ps_flags,
+            k->clip_plane, k->other_input, k->dot_map,
+            k->tex_info[0][0], k->tex_info[0][1], k->tex_info[1][0], k->tex_info[1][1],
+            k->tex_info[2][0], k->tex_info[2][1], k->tex_info[3][0], k->tex_info[3][1]);
+        flat = k->variant & 1;
+        m[0].Name = "SPEC"; m[0].Definition = "1";
+        m[1].Name = "SPEC_DECL"; m[1].Definition = decl;
+        m[2].Name = flat ? "FLATQ" : NULL; m[2].Definition = flat ? "nointerpolation" : NULL;
+        m[3].Name = NULL; m[3].Definition = NULL;
+        b = compile_def(k->variant & 2 ? "ps_wdepth" : "ps_main", "ps_5_0", m);
+        if (b && SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                                          ID3D10Blob_GetBufferSize(b), NULL, &e->ps))) {
+            LONG n;
+            InterlockedExchange(&e->state, 2);
+            n = InterlockedIncrement(&s_spec_ready);
+            if (!(n & (n - 1)))
+                fprintf(stderr, "[D3D11] %ld specialised pixel shaders\n", (long)n);
+        } else {
+            InterlockedExchange(&e->state, 3);
+        }
+        if (b) ID3D10Blob_Release(b);
+    }
+}
+
+/* The specialised shader for this configuration, or NULL (not ready yet). */
+static ID3D11PixelShader *spec_ps(const PSConsts *pc, uint32_t variant)
+{
+    static int enabled = -1;
+    PsKey k;
+    uint32_t h = 2166136261u, i;
+    const uint8_t *p = (const uint8_t *)&k;
+    PsSpec *e;
+    if (enabled < 0) {
+        const char *v = getenv("RECOMP_PS_SPEC");
+        int threads = 2;
+        enabled = !(v && *v == '0');
+        if (enabled) s_spec = (PsSpec *)calloc(PS_SPEC_SLOTS, sizeof *s_spec);
+        if (!s_spec) enabled = 0;
+        if (enabled) {
+            InitializeCriticalSection(&s_spec_cs);
+            InitializeConditionVariable(&s_spec_cv);
+            while (threads--) {
+                HANDLE t = CreateThread(NULL, 0, spec_worker, NULL, 0, NULL);
+                if (t) { SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(t); }
+            }
+        }
+    }
+    if (!enabled) return NULL;
+    memset(&k, 0, sizeof k);
+    memcpy(k.c_icw, pc->c_icw, sizeof k.c_icw);
+    memcpy(k.a_icw, pc->a_icw, sizeof k.a_icw);
+    memcpy(k.c_ocw, pc->c_ocw, sizeof k.c_ocw);
+    memcpy(k.a_ocw, pc->a_ocw, sizeof k.a_ocw);
+    k.fin0 = pc->fin0; k.fin1 = pc->fin1; k.rc_control = pc->rc_control;
+    k.stage_prog = pc->stage_prog; k.alpha_func = pc->alpha_func; k.ps_flags = pc->ps_flags;
+    k.clip_plane = pc->clip_plane; k.other_input = pc->other_input; k.dot_map = pc->dot_map;
+    k.variant = variant;
+    for (i = 0; i < 4; i++) { k.tex_info[i][0] = pc->tex_info[i][0]; k.tex_info[i][1] = pc->tex_info[i][1]; }
+    for (i = 0; i < sizeof k; i++) h = (h ^ p[i]) * 16777619u;
+    for (i = 0; i < PS_SPEC_SLOTS; i++) {
+        e = &s_spec[(h + i) & (PS_SPEC_SLOTS - 1)];
+        if (!e->state) break;
+        if (!memcmp(&e->key, &k, sizeof k))
+            return InterlockedCompareExchange(&e->state, 0, 0) == 2 ? e->ps : NULL;
+    }
+    if (i == PS_SPEC_SLOTS) return NULL;            /* table full: ubershader */
+    EnterCriticalSection(&s_spec_cs);
+    if (s_spec_head - s_spec_tail < PS_SPEC_QUEUE) {
+        e->key = k;
+        e->state = 1;
+        s_spec_q[s_spec_head++ % PS_SPEC_QUEUE] = e;
+        WakeConditionVariable(&s_spec_cv);
+    }
+    LeaveCriticalSection(&s_spec_cs);
+    return NULL;
 }
 
 static ID3D11Buffer *make_buffer(UINT bytes, UINT bind)
@@ -2150,8 +2309,11 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         topology == NV_D3D_LINES ? D3D11_PRIMITIVE_TOPOLOGY_LINELIST :
         topology == NV_D3D_POINTS ? D3D11_PRIMITIVE_TOPOLOGY_POINTLIST :
         D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_psv[(st->flat_shade ? 1 : 0) |
-                                                 (st->z_perspective && d ? 2 : 0)], NULL, 0);
+    {
+        uint32_t v = (st->flat_shade ? 1u : 0u) | (st->z_perspective && d ? 2u : 0u);
+        ID3D11PixelShader *ps = spec_ps(&pc, v);
+        ID3D11DeviceContext_PSSetShader(s_ctx, ps ? ps : s_psv[v], NULL, 0);
+    }
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &s_cb_ps);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
