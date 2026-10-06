@@ -127,8 +127,47 @@ static float s_scale = 1.0f, s_cur_sx = 1.0f, s_cur_sy = 1.0f;
  * reached from a race (and the race's own loading screen) in 4:3 layout. */
 static volatile LONG s_race_hud;
 static uint32_t s_frame_bg_tex;     /* this frame's background image; reset at flip */
+static int s_frame_tag_window;      /* still in the frame's leading name tags */
 
-void nv2a_d3d_note_race_camera(void) { InterlockedExchange(&s_race_hud, 1); }
+/* Name tags over cars (world-anchored 2D) are the first 2D a race frame
+ * draws, ahead of the HUD; the title names the HUD's first element by its
+ * 4:3 rectangle (nv2a_d3d_set_hud_start). Textures drawn from there on are
+ * learned as HUD textures. In each race frame the leading draws keep their
+ * projected position (hud_split's follow mode) until the HUD start or a
+ * known HUD texture -- so frames without the minimap (zoomed map, pause)
+ * still end the tags at their first HUD element. */
+static float s_hud_start[4];
+static uint32_t s_hud_tex[32];
+static int s_hud_tex_n;
+
+void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1)
+{
+    s_hud_start[0] = x0; s_hud_start[1] = y0; s_hud_start[2] = x1; s_hud_start[3] = y1;
+}
+
+static int world_tag_draw(float lo, float hi, float ylo, float yhi, uint32_t tex)
+{
+    int i;
+    if (!s_hud_start[2])
+        return 0;
+    if (s_frame_tag_window &&
+        fabsf(lo - s_hud_start[0]) < 2.0f && fabsf(ylo - s_hud_start[1]) < 2.0f &&
+        fabsf(hi - s_hud_start[2]) < 2.0f && fabsf(yhi - s_hud_start[3]) < 2.0f)
+        s_frame_tag_window = 0;
+    for (i = 0; i < s_hud_tex_n && s_hud_tex[i] != tex; i++) {}
+    if (s_frame_tag_window && i == s_hud_tex_n)
+        return 1;
+    s_frame_tag_window = 0;
+    if (i == s_hud_tex_n && s_hud_tex_n < 32)
+        s_hud_tex[s_hud_tex_n++] = tex;
+    return 0;
+}
+
+void nv2a_d3d_note_race_camera(void)
+{
+    if (!InterlockedExchange(&s_race_hud, 1))
+        s_hud_tex_n = 0;                 /* a new race may load other textures */
+}
 void nv2a_d3d_note_frontend_camera(void) { InterlockedExchange(&s_race_hud, 0); }
 
 static int nv2a_d3d_hud_active(void)
@@ -1885,7 +1924,7 @@ static uint8_t *ring_map(ID3D11Buffer *b, UINT *pos, UINT cap, UINT bytes,
  * squeeze. */
 #define HUD_GAP 24.0f
 static NvD3DVertex *hud_split(const NvD3DVertex *v, uint32_t nv, const uint32_t *idx,
-                              uint32_t ni, int topology, float gw, float narrow)
+                              uint32_t ni, int topology, float gw, float narrow, int follow)
 {
     static NvD3DVertex *out;
     static uint32_t *root, *piece, cap;
@@ -1956,7 +1995,12 @@ static NvD3DVertex *hud_split(const NvD3DVertex *v, uint32_t nv, const uint32_t 
         uint32_t c = piece[i];
         FIND(c);
         out[i] = v[i];
-        if (box[c][1] <= half) { out[i].pos[0] -= delta; moved = 1; }
+        if (follow) {
+            /* keep the cluster's centre where the title projected it on
+             * the full width; the shader squeezes it to 4:3 about there */
+            out[i].pos[0] += ((box[c][0] + box[c][1]) * 0.5f - half) * (1.0f / narrow - 1.0f);
+            moved = 1;
+        } else if (box[c][1] <= half) { out[i].pos[0] -= delta; moved = 1; }
         else if (box[c][0] >= half) { out[i].pos[0] += delta; moved = 1; }
     }
 #undef FIND
@@ -2043,10 +2087,14 @@ void nv2a_d3d_draw(const NvD3DState *st, int topology,
                     yscale = 1.0f / narrow;
                 } else {
                     squeeze = narrow;
-                    if (nv2a_d3d_hud_active()) {
+                    if (nv2a_d3d_hud_active() && world_tag_draw(lo, hi, ylo, yhi, s_draw_tex_addr)) {
+                        /* a name tag over a car: the title projected it
+                         * through the widened camera, keep that position */
+                        moved = hud_split(v, nv, idx, ni, topology, (float)gw, narrow, 1);
+                    } else if (nv2a_d3d_hud_active()) {
                         if (hi <= (float)gw * 0.5f) shift = narrow - 1.0f;
                         else if (lo >= (float)gw * 0.5f) shift = 1.0f - narrow;
-                        else moved = hud_split(v, nv, idx, ni, topology, (float)gw, narrow);
+                        else moved = hud_split(v, nv, idx, ni, topology, (float)gw, narrow, 0);
                     }
                 }
             }
@@ -2980,6 +3028,7 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
     if (!nv2a_d3d_init())
         return;
     s_frame_bg_tex = 0;
+    s_frame_tag_window = 1;
     s = surface_find(phys(surface_addr));
     if (!s && pitch)
         s = scan_surface(surface_addr, pitch);
@@ -3045,5 +3094,6 @@ void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
 void nv2a_d3d_note_race_camera(void) {}
+void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1) { (void)x0; (void)y0; (void)x1; (void)y1; }
 void nv2a_d3d_note_frontend_camera(void) {}
 #endif

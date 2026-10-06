@@ -100,6 +100,9 @@ float nv2a_d3d_display_aspect(void);
  * projection; the race HUD is placed at the screen edges in between. */
 void nv2a_d3d_note_race_camera(void);
 void nv2a_d3d_note_frontend_camera(void);
+/* The race HUD's first element, as its 4:3 screen rectangle; 2D drawn ahead
+ * of it in a race frame is world-anchored (name tags over cars). */
+void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1);
 
 void nv2a_d3d_draw(const NvD3DState *st, int topology,
                    const NvD3DVertex *v, uint32_t nv,
