@@ -390,7 +390,9 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         if (ilu)
             ires = run_ilu(ilu, c);
 
-        if (mac && mac != 13 && mac_mask) {
+        /* Paired with an ILU op the MAC cannot write R1 -- the ILU owns
+         * it (xemu vsh-prog.c decode_opcode). */
+        if (mac && mac != 13 && mac_mask && !(ilu && tdst == 1)) {
             float *d = tdst == 12 ? opos.v : (tdst < 12 ? temp[tdst].v : NULL);
             if (d) write_masked(d, &mres, mac_mask);
         }
@@ -404,7 +406,9 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             float *d = it == 12 ? opos.v : (it < 12 ? temp[it].v : NULL);
             if (d) write_masked(d, &ires, ilu_mask);
         }
-        if (omask) {
+        /* An output comes only from a unit that ran: a NOP half writes
+         * nothing, not zeros (xemu decode_token). */
+        if (omask && (field(ins, 3, 2, 1) ? ilu : mac)) {
             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
                 if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
