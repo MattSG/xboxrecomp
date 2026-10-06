@@ -79,7 +79,7 @@ static void dsp_ack_init(void)
                 s_dsp_ack_count, s_dsp_ack[0]);
 }
 
-/* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
+/* DOWN-MIX THE SPEAKER MIXBINS, NOT JUST THE FIRST TWO.
  *
  * Default ON. RECOMP_APU_MIXDOWN_ALL=0 restores the previous two-bin read,
  * because this changes audible output for every title and an escape hatch
@@ -138,6 +138,41 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
     (void)d;
 }
 
+/* A small reverb for the effect sends. On hardware the GP's effects image
+ * (I3DL2 reverb and friends) consumes bins 10 and up; that DSP is not
+ * emulated, and a send played dry is a second copy of every voice routed to
+ * it. Freeverb's structure -- four damped combs into two allpasses -- gives
+ * the sends a room tail at the level the title chose for them.
+ * ponytail: one fixed room, not the title's I3DL2 parameters; emulate the GP
+ * image if a title's reverb settings matter. */
+#define RV_COMBS 4
+#define RV_ALLPASS 2
+static const int rv_comb_len[RV_COMBS] = { 1693, 1759, 1623, 1548 };
+static const int rv_ap_len[RV_ALLPASS] = { 605, 480 };
+static float rv_comb_buf[RV_COMBS][1759], rv_comb_lp[RV_COMBS];
+static float rv_ap_buf[RV_ALLPASS][605];
+static int rv_comb_pos[RV_COMBS], rv_ap_pos[RV_ALLPASS];
+
+static float reverb_step(float in)
+{
+    float out = 0.0f;
+    for (int c = 0; c < RV_COMBS; c++) {
+        float y = rv_comb_buf[c][rv_comb_pos[c]];
+        rv_comb_lp[c] = y * 0.8f + rv_comb_lp[c] * 0.2f;      /* damping */
+        rv_comb_buf[c][rv_comb_pos[c]] = in + rv_comb_lp[c] * 0.78f;
+        if (++rv_comb_pos[c] == rv_comb_len[c]) rv_comb_pos[c] = 0;
+        out += y;
+    }
+    out *= 0.25f;
+    for (int a = 0; a < RV_ALLPASS; a++) {
+        float b = rv_ap_buf[a][rv_ap_pos[a]];
+        rv_ap_buf[a][rv_ap_pos[a]] = out + b * 0.5f;
+        out = b - out;
+        if (++rv_ap_pos[a] == rv_ap_len[a]) rv_ap_pos[a] = 0;
+    }
+    return out;
+}
+
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -182,18 +217,28 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * Gating the HRTF submix override was tried first and did not fix
              * it, so the defect is the width of this mixdown and nothing else.
              *
-             * Even bins left, odd bins right, which preserves the stereo
-             * pairing the guest set up -- bins 6/7 and 8/9 arrive with matched
-             * counts. This is not what a real EP does; it is the cheapest
-             * mixdown that stops discarding audio. */
+             * The downmix follows DirectSound's mixbin layout (DSMIXBIN_*):
+             * 0/1 front, 2 centre, 3 LFE, 4/5 rear, 6..9 the crosstalk pairs
+             * 3D voices use. Bins 10 and up are effect sends -- 10 is the
+             * I3DL2 reverb send -- carrying copies of voices already in the
+             * speaker bins for the GP's effects to consume. Summing every bin
+             * (even left, odd right) counted those copies again: in MM3's
+             * races the engine sits in 6/7 and, at the same level, in 10,
+             * which overdrove the left channel into clipping and crackle.
+             * The sends go through reverb_step instead, and LFE joins both
+             * speakers at -6 dB. */
             float left, right;
             if (mcpx_apu_mixdown_all()) {
-                left = 0.0f;
-                right = 0.0f;
-                for (int b = 0; b < NUM_MIXBINS; ++b) {
-                    if (b & 1) right += mixbins[b][i];
-                    else       left  += mixbins[b][i];
-                }
+                float c = 0.7071f * mixbins[2][i] + 0.5f * mixbins[3][i];
+                float send = 0.0f;
+                for (int b = 10; b < NUM_MIXBINS; ++b)
+                    send += mixbins[b][i];
+                /* Freeverb scales its input the same way: the damped combs
+                 * gain about 4.5x, so this leaves the tail near -10 dB of the
+                 * send, I3DL2's default room level. */
+                float wet = reverb_step(send * 0.07f);
+                left  = mixbins[0][i] + mixbins[4][i] + mixbins[6][i] + mixbins[8][i] + c + wet;
+                right = mixbins[1][i] + mixbins[5][i] + mixbins[7][i] + mixbins[9][i] + c + wet;
             } else {
                 left = mixbins[0][i];
                 right = mixbins[1][i];

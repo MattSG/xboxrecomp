@@ -79,6 +79,13 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
         return g_apu_ram_ptr + 0x80000000u + a;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
+    /* A large reservation is placed above RAM (kernel_bridge.c), and
+     * MmGetPhysicalAddress hands its address through unchanged. Those pages
+     * are real and distinct; wrapping them at 64 MB played whatever low RAM
+     * they aliased -- MM3 streams its music and movie audio from one, and
+     * every sound came out as full-scale noise. */
+    if (xbox_ReserveRangeAllocated(a))
+        return g_apu_ram_ptr + a;
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
 
@@ -569,9 +576,16 @@ static void *mcpx_apu_frame_thread(void *arg)
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+        /* Only the sample counter stops the pipeline. FEMETHMODE halts or
+         * traps the front end -- the method processor -- which DirectSound
+         * does around each batch of voice commands; the voice processor runs
+         * on regardless. Gating on it (as xemu does, where a skipped frame
+         * only delays an output pulled by the audio device) turned every
+         * halt into a frame of silence here: in MM3's races up to a sixth of
+         * all frames, heard as constant crackle. Methods and frames are
+         * already serialised by d->lock. */
+        (void)fectl;
+        bool apu_active = xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF;
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */

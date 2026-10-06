@@ -66,6 +66,11 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
+/* The gain each voice last mixed into each of its eight bins, so a change
+ * ramps across the next frame instead of stepping (see voice_process). */
+static float s_gain_prev[MCPX_HW_MAX_VOICES][8];
+static uint8_t s_gain_valid[MCPX_HW_MAX_VOICES];
+
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
@@ -235,6 +240,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         d->vp.filters[selected_handle].resample_valid = 0;
         d->vp.filters[selected_handle].resample_read = 0;
         d->vp.filters[selected_handle].resample_count = 0;
+        s_gain_valid[selected_handle] = 0;
 
         unsigned int ea_start = GET_MASK(argument, NV1BA0_PIO_VOICE_ON_ENVA);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
@@ -771,13 +777,24 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     size_t block_size;
 
     int adpcm_block_index = -1;
-    uint32_t adpcm_block[36 * 2 / 4];
-    int16_t adpcm_decoded[65 * 2];
+    uint32_t adpcm_block[36 * 18 / sizeof(uint32_t)];
+    int16_t adpcm_decoded[65 * 18 * 2];
 
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_NEW_VOICE, 0);
 
     if (paused) return -1;
+
+    /* The MCPX accepts 1..18 input samples per block. The source buffers
+     * above must cover the whole hardware range; accepting the 5-bit field's
+     * remaining values would let a guest descriptor overrun both arrays. */
+    if (samples_per_block > 18) {
+        static int warned = 0;
+        if (!warned++)
+            fprintf(stderr, "[APU] invalid samples-per-block value %u on voice %u\n",
+                    samples_per_block, v);
+        return -1;
+    }
 
     if (stream) {
         if (!persist) {
@@ -836,6 +853,15 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         block_size = container_size;
     }
     block_size *= samples_per_block;
+
+    static int trace = -1;
+    if (trace < 0) trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (adpcm && samples_per_block > 2 && trace) {
+        static volatile LONG reported = 0;
+        if (InterlockedCompareExchange(&reported, 1, 0) == 0)
+            fprintf(stderr, "[APU] ADPCM block exceeds old scratch capacity: voice=%u spb=%u bytes=%zu stereo=%d\n",
+                    v, samples_per_block, block_size, stereo);
+    }
 
     int sample_count = 0;
     for (; (sample_count < num_samples_requested) && (cbo <= ebo);
@@ -1155,16 +1181,22 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* HRTF processing for 3D voices */
+    bool hrtf_stereo = false;
     if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
         uint16_t hrtf_handle =
             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
         if (hrtf_handle != HRTF_NULL_HANDLE) {
             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+            hrtf_stereo = true;
         }
     }
 
-    /* Mix into bins */
+    /* Mix into bins. The volumes are TAR(get) registers: hardware moves the
+     * current level toward them, it does not jump. Applying each frame's
+     * level as a step every 32 samples turned a voice whose volume the title
+     * changes every frame -- MM3's engine follows the revs -- into a buzz of
+     * clicks at the frame rate. Ramp from the last frame's gain instead. */
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
@@ -1174,10 +1206,18 @@ static void voice_process(MCPXAPUState *d,
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
         g *= attenuate(vol[b]) / hr;
+        /* An HRTF'd voice is stereo: its four HRTF bins are the submixes in
+         * the order the title set them (MM3: 6 8 7 9), left pair then right
+         * pair. Reading them as mono put the left ear in every bin. */
+        int ch = (hrtf_stereo && b < 4) ? (b >> 1) : (int)(b % channels);
+        float g0 = s_gain_valid[v] ? s_gain_prev[v][b] : g;
+        float step = (g - g0) / NUM_SAMPLES_PER_FRAME;
+        s_gain_prev[v][b] = g;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            mixbins[bin[b]][i] += g * samples[i][b % channels];
+            mixbins[bin[b]][i] += (g0 + step * (i + 1)) * samples[i][ch];
         }
     }
+    s_gain_valid[v] = 1;
 
     /* VP monitor mix */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
