@@ -1130,6 +1130,9 @@ typedef struct {
     ID3D11ShaderResourceView *ms_srv;
     uint32_t gen, y16_gen;          /* drawn count; when y16 was built */
     ID3D11Texture2D *y16;           /* LU_IMAGE_Y16 view (see y16_ps) */
+    ID3D11Texture2D *mip;           /* mip-mapped copy for reductions */
+    ID3D11ShaderResourceView *mip_srv;
+    uint32_t mip_gen;
     ID3D11ShaderResourceView *y16_srv;
     ID3D11RenderTargetView *y16_rtv;
     ID3D11RenderTargetView *rtv;
@@ -1456,6 +1459,8 @@ static void surface_release(Surface *s)
     if (s->y16_srv) ID3D11ShaderResourceView_Release(s->y16_srv);
     if (s->y16_rtv) ID3D11RenderTargetView_Release(s->y16_rtv);
     if (s->y16) ID3D11Texture2D_Release(s->y16);
+    if (s->mip_srv) ID3D11ShaderResourceView_Release(s->mip_srv);
+    if (s->mip) ID3D11Texture2D_Release(s->mip);
     if (s->tex) ID3D11Texture2D_Release(s->tex);
     free(s->shadow);
     memset(s, 0, sizeof *s);
@@ -2170,7 +2175,7 @@ static D3D11_TEXTURE_ADDRESS_MODE addr_mode(uint32_t m)
     }
 }
 
-static ID3D11SamplerState *sampler(const NvD3DTexture *t, int levels)
+static ID3D11SamplerState *sampler(const NvD3DTexture *t, int levels, int reduce)
 {
     uint32_t minf = (t->filter >> 16) & 0xFF, magf = (t->filter >> 24) & 0xF;
     int bias13 = (int)(t->filter & 0x1FFF);
@@ -2180,6 +2185,7 @@ static ID3D11SamplerState *sampler(const NvD3DTexture *t, int levels)
     key = (uint64_t)minf | ((uint64_t)magf << 8) | ((uint64_t)(t->address & 0xFFF) << 12) |
           ((uint64_t)(bias13 & 0x1FFF) << 24) | ((uint64_t)(levels & 15) << 37) |
           ((uint64_t)((t->control0 >> 6) & 0xFFFFFF) << 41) ^ ((uint64_t)t->border * 0x9E3779B1ull);
+    key ^= (uint64_t)(reduce != 0) << 63;
     slot = state_slot(s_samp_cache, key);
     if (!*slot) {
         D3D11_SAMPLER_DESC d;
@@ -2205,6 +2211,13 @@ static ID3D11SamplerState *sampler(const NvD3DTexture *t, int levels)
             d.MinLOD = (float)((t->control0 >> 18) & 0xFFF) / 256.0f;
             d.MaxLOD = (float)((t->control0 >> 6) & 0xFFF) / 256.0f;
             if (d.MaxLOD < d.MinLOD) d.MaxLOD = D3D11_FLOAT32_MAX;
+        }
+        if (reduce) {
+            /* Over surface_mips: the title's min/mag filter within a level,
+             * levels picked and blended by each tap's footprint. */
+            d.Filter = (D3D11_FILTER)((min_lin ? 0x10 : 0) | (mag_lin ? 0x4 : 0) | 0x1);
+            d.MinLOD = 0;
+            d.MaxLOD = D3D11_FLOAT32_MAX;
         }
         ID3D11Device_CreateSamplerState(s_dev, &d, (ID3D11SamplerState **)slot);
     }
@@ -2283,6 +2296,38 @@ static uint32_t write_mask(const NvD3DState *st, Surface *s)
  * stored widened (its image already spans the wide screen). */
 static int s_draw_textured, s_draw_reads_wide;
 static uint32_t s_draw_tex_addr;
+
+/* A guest pass that reduces a render target (MM3's glare and luminance
+ * downsamples, its reflection map) takes texel-exact taps: at the guest's
+ * resolution four taps cover a 2x2 block, at a host resolution several times
+ * higher they hit isolated texels, and which ones moves with the camera --
+ * lit windows and lamps then flicker through the bloom. Reductions read this
+ * mip-mapped copy, so each tap averages the footprint it stands for. */
+static ID3D11ShaderResourceView *surface_mips(Surface *s)
+{
+    if (!s->mip) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+        s->mip = make_texture(s->iw, s->ih, 0, 1, DXGI_FORMAT_B8G8R8A8_UNORM,
+                              D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+                              D3D11_RESOURCE_MISC_GENERATE_MIPS);
+        if (!s->mip) return NULL;
+        memset(&sd, 0, sizeof sd);
+        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = (UINT)-1;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s->mip, &sd, &s->mip_srv);
+        if (!s->mip_srv) return NULL;
+        s->mip_gen = s->gen - 1;
+    }
+    if (s->mip_gen != s->gen) {
+        surface_resolve(s);
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s->mip, 0, 0, 0, 0,
+                                                  (ID3D11Resource *)s->tex, 0, NULL);
+        ID3D11DeviceContext_GenerateMips(s_ctx, s->mip_srv);
+        s->mip_gen = s->gen;
+    }
+    return s->mip_srv;
+}
 
 /* Bring s's LU_IMAGE_Y16 view up to date (2 x iw by ih); NULL on failure.
  * Unbinds the current targets: call before a draw binds its own. */
@@ -2375,7 +2420,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         uint32_t mode = (st->rc.stage_program >> (n * 5)) & 31;
         ID3D11ShaderResourceView *view = NULL;
         Surface *rt;
-        int kind = K_SWZ, levels = 1;
+        int kind = K_SWZ, levels = 1, reduce = 0;
         pc.tex_scale[n][0] = pc.tex_scale[n][1] = 1.0f;
         pc.tex_scale[n][2] = pc.tex_scale[n][3] = 1.0f;
         if (!st->rc_seen && n == 0)
@@ -2399,6 +2444,11 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             } else if (kind == K_LIN) {
                 pc.tex_scale[n][0] = 1.0f / (float)rt->w;
                 pc.tex_scale[n][1] = 1.0f / (float)rt->h;
+                /* A pass into a smaller target is a reduction; see surface_mips. */
+                if (s && s != rt && s->iw < rt->iw && s->ih < rt->ih) {
+                    ID3D11ShaderResourceView *m = surface_mips(rt);
+                    if (m) { view = m; reduce = 1; }
+                }
             } else {
                 pc.tex_scale[n][0] = (float)t->width / (float)rt->w;
                 pc.tex_scale[n][1] = (float)t->height / (float)rt->h;
@@ -2420,7 +2470,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         }
         if (!view) continue;
         if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
-        smp[n] = sampler(t, levels);
+        smp[n] = sampler(t, levels, reduce);
         pc.tex_info[n][0] = (t->control0 >> 2) & 1;
         pc.tex_info[n][1] = t->filter >> 28;
         memcpy(pc.bump_mat[n], t->bump_mat, sizeof pc.bump_mat[n]);
@@ -3090,8 +3140,10 @@ uint32_t nv2a_d3d_zpass_read(void)
     double px;
     zpass_collect();
     if (was) nv2a_d3d_zpass_enable(1);
-    /* In guest pixels: the host target has scale^2 as many. */
-    px = (double)s_zpass / ((double)s_cur_sx * s_cur_sy);
+    /* In guest pixels: the host target has scale^2 as many, and an MSAA
+     * target counts samples. */
+    px = (double)s_zpass / ((double)s_cur_sx * s_cur_sy *
+                            (s_cur_rt && s_cur_rt->ms ? (double)s_msaa : 1.0));
     return px > 4294967295.0 ? 0xFFFFFFFFu : (uint32_t)px;
 }
 
