@@ -531,7 +531,7 @@ static const char s_hlsl[] =
 "  if (n == 0) return TC0.Sample(S0, d); if (n == 1) return TC1.Sample(S1, d);\n"
 "  if (n == 2) return TC2.Sample(S2, d); return TC3.Sample(S3, d);\n"
 "}\n"
-"float4 shade(PSIn i) {\n"
+"float4 shade(PSIn i, out uint cov) {\n"
 "  float4 tc[4] = { i.t0, i.t1, i.t2, i.t3 };\n"
 "  float4 T[4] = { float4(0,0,0,1), float4(0,0,0,1), float4(0,0,0,1), float4(0,0,0,1) }; float dots[4] = { 0, 0, 0, 0 };\n"
 "  [unroll] for (uint n = 0; n < 4; n++) {\n"
@@ -639,26 +639,39 @@ static const char s_hlsl[] =
 "    } else o = R[12];\n"
 "  }\n"
 "  o = saturate(o);\n"
+"  cov = 0xFFFFFFFFu;\n"
+/* Alpha test. On a multisampled target an inequality test becomes sample
+ * coverage across the one-pixel band around its threshold (e = signed
+ * distance past it, in the 8-bit units the test compares), so cut-out
+ * edges -- foliage, fences -- are antialiased where they were before; the
+ * colour and alpha written stay as they were. Single-sample: the plain test. */
+"  float a8 = o.a * 255.0, fw = max(fwidth(a8), 1e-3);\n"
 "  if (ps_flags & 2) {\n"
-"    int v = (int)(o.a * 255.0 + 0.5), r = (int)(alpha_ref & 0xFF); bool ok = true;\n"
+"    int v = (int)(a8 + 0.5), r = (int)(alpha_ref & 0xFF); bool ok = true; float e = 0;\n"
 "    switch (alpha_func) {\n"
-"    case 0x200: ok = false; break; case 0x201: ok = v < r; break;\n"
-"    case 0x202: ok = v == r; break; case 0x203: ok = v <= r; break;\n"
-"    case 0x204: ok = v > r; break; case 0x205: ok = v != r; break;\n"
-"    case 0x206: ok = v >= r; break; }\n"
-"    if (!ok) discard;\n"
+"    case 0x200: ok = false; break; case 0x201: ok = v < r; e = r - 0.5 - a8; break;\n"
+"    case 0x202: ok = v == r; break; case 0x203: ok = v <= r; e = r + 0.5 - a8; break;\n"
+"    case 0x204: ok = v > r; e = a8 - (r + 0.5); break; case 0x205: ok = v != r; break;\n"
+"    case 0x206: ok = v >= r; e = a8 - (r - 0.5); break; }\n"
+"    uint ns = GetRenderTargetSampleCount();\n"
+"    bool ineq = alpha_func == 0x201 || alpha_func == 0x203 || alpha_func == 0x204 || alpha_func == 0x206;\n"
+"    if (ns > 1 && ineq) {\n"
+"      uint k = (uint)round(saturate(e / fw + 0.5) * ns);\n"
+"      if (k == 0) discard;\n"
+"      cov = k >= 32 ? 0xFFFFFFFFu : (1u << k) - 1u;\n"
+"    } else if (!ok) discard;\n"
 "  }\n"
 "  return o;\n"
 "}\n"
-"float4 ps_main(PSIn i) : SV_Target { return shade(i); }\n"
+"float4 ps_main(PSIn i, out uint cov : SV_Coverage) : SV_Target { return shade(i, cov); }\n"
 /* W-buffering (SET_CONTROL0 Z_PERSPECTIVE, which MM3 uses): the depth
  * buffer holds w, interpolated perspective-correctly (fog.y carries it), in
  * 24-bit fixed point -- linear precision, unlike z/w, so distant decals and
  * foliage do not fight. Polygon offset is applied here as xemu does: the
  * rasteriser's depth bias never reaches a shader-written depth. zp0 = offset
  * factor, units, host pixels per guest pixel x/y; zp1 = 1/(zmax+1), zmax. */
-"void ps_wdepth(PSIn i, out float4 c : SV_Target, out float dep : SV_Depth) {\n"
-"  c = shade(i);\n"
+"void ps_wdepth(PSIn i, out float4 c : SV_Target, out float dep : SV_Depth, out uint cov : SV_Coverage) {\n"
+"  c = shade(i, cov);\n"
 "  float z = i.fog.y;\n"
 "  z += zp0.y + zp0.x * max(abs(ddx(z)) * zp0.z, abs(ddy(z)) * zp0.w);\n"
 "  z = clamp(z, 0.0, zp1.y);\n"
@@ -2381,8 +2394,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     pc.stage_prog = st->rc_seen ? st->rc.stage_program : (st->tex_used & 1);
     pc.alpha_func = st->alpha_func;
     pc.alpha_ref = st->alpha_ref;
-    pc.ps_flags = (st->rc_seen ? 1u : 0u) | (st->alpha_test ? 2u : 0u);
-    pc.clip_plane = st->clip_plane_mode;
+    pc.ps_flags = (st->rc_seen ? 1u : 0u) | (st->alpha_test ? 2u : 0u);    pc.clip_plane = st->clip_plane_mode;
     pc.other_input = st->other_stage_input;
     pc.dot_map = st->dot_rgb_mapping;
     /* SET_FOG_COLOR keeps red in the low byte. */
