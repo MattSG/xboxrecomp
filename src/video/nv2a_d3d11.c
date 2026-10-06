@@ -1875,6 +1875,94 @@ static uint8_t *ring_map(ID3D11Buffer *b, UINT *pos, UINT cap, UINT bytes,
     return (uint8_t *)m->pData + *pos;
 }
 
+/* The race HUD batches sprites from one texture atlas into a single draw
+ * (MM3's speedometer needle shares one with the timer icon on the far
+ * side), so edge placement is decided per cluster: connected primitives form
+ * a piece, pieces on the same line less than HUD_GAP apart join a cluster
+ * (the glyphs of a centred message stay together), and each cluster moves by
+ * its own half of the 4:3 layout. Returns the shifted copy of the vertices,
+ * or NULL when nothing needs to move; the shader then applies only the 4:3
+ * squeeze. */
+#define HUD_GAP 24.0f
+static NvD3DVertex *hud_split(const NvD3DVertex *v, uint32_t nv, const uint32_t *idx,
+                              uint32_t ni, int topology, float gw, float narrow)
+{
+    static NvD3DVertex *out;
+    static uint32_t *root, *piece, cap;
+    static float (*box)[4];             /* per piece: x0 x1 y0 y1 */
+    uint32_t i, k, np = 0, per = topology == NV_D3D_TRIANGLES ? 3 : topology == NV_D3D_LINES ? 2 : 1;
+    float delta = (1.0f - narrow) * gw / (2.0f * narrow), half = gw * 0.5f;
+    int moved = 0;
+    if (nv > cap) {
+        NvD3DVertex *o = realloc(out, (size_t)nv * sizeof *o);
+        uint32_t *r = o ? realloc(root, (size_t)nv * sizeof *r) : NULL;
+        uint32_t *pc = r ? realloc(piece, (size_t)nv * sizeof *pc) : NULL;
+        float (*b)[4] = pc ? realloc(box, (size_t)nv * sizeof *b) : NULL;
+        if (o) out = o;
+        if (r) root = r;
+        if (pc) piece = pc;
+        if (!b) return NULL;
+        box = b;
+        cap = nv;
+    }
+#define FIND(x) do { while (root[x] != x) x = root[x] = root[root[x]]; } while (0)
+    /* pieces: vertices joined by primitives */
+    for (i = 0; i < nv; i++) root[i] = i;
+    for (i = 0; i + per <= ni; i += per)
+        for (k = 1; k < per; k++) {
+            uint32_t a = idx[i], b = idx[i + k];
+            if (a >= nv || b >= nv) return NULL;
+            FIND(a); FIND(b);
+            if (a != b) root[b] = a;
+        }
+    for (i = 0; i < nv; i++) {
+        uint32_t r = i;
+        FIND(r);
+        if (r == i) {
+            piece[i] = np;
+            box[np][0] = box[np][2] = 1e30f;
+            box[np][1] = box[np][3] = -1e30f;
+            np++;
+        }
+    }
+    for (i = 0; i < nv; i++) {
+        uint32_t r = i, n;
+        FIND(r);
+        n = piece[r];
+        piece[i] = n;
+        if (v[i].pos[0] < box[n][0]) box[n][0] = v[i].pos[0];
+        if (v[i].pos[0] > box[n][1]) box[n][1] = v[i].pos[0];
+        if (v[i].pos[1] < box[n][2]) box[n][2] = v[i].pos[1];
+        if (v[i].pos[1] > box[n][3]) box[n][3] = v[i].pos[1];
+    }
+    /* clusters: pieces on one line within HUD_GAP (root[] reused per piece);
+     * ponytail: O(pieces^2), fine for HUD batches of a few hundred glyphs */
+    for (i = 0; i < np; i++) root[i] = i;
+    for (i = 0; i < np; i++)
+        for (k = i + 1; k < np; k++) {
+            uint32_t a = i, b = k;
+            if (box[i][2] > box[k][3] || box[k][2] > box[i][3] ||
+                box[i][0] > box[k][1] + HUD_GAP || box[k][0] > box[i][1] + HUD_GAP)
+                continue;
+            FIND(a); FIND(b);
+            if (a == b) continue;
+            root[b] = a;
+            if (box[b][0] < box[a][0]) box[a][0] = box[b][0];
+            if (box[b][1] > box[a][1]) box[a][1] = box[b][1];
+            if (box[b][2] < box[a][2]) box[a][2] = box[b][2];
+            if (box[b][3] > box[a][3]) box[a][3] = box[b][3];
+        }
+    for (i = 0; i < nv; i++) {
+        uint32_t c = piece[i];
+        FIND(c);
+        out[i] = v[i];
+        if (box[c][1] <= half) { out[i].pos[0] -= delta; moved = 1; }
+        else if (box[c][0] >= half) { out[i].pos[0] += delta; moved = 1; }
+    }
+#undef FIND
+    return moved ? out : NULL;
+}
+
 /* squeeze scales x about the centre, shift moves it (NDC), yscale scales y
  * about the centre; only the pass-through (pre-transformed) shader reads
  * shift and yscale. */
@@ -1906,6 +1994,7 @@ void nv2a_d3d_draw(const NvD3DState *st, int topology,
     D3D11_MAPPED_SUBRESOURCE m;
     uint8_t *p;
     int64_t t_draw;
+    const NvD3DVertex *moved = NULL;
 
     if (!nv2a_d3d_init() || !nv || !ni || vb_bytes > VB_BYTES || ib_bytes > IB_BYTES)
         return;
@@ -1957,6 +2046,7 @@ void nv2a_d3d_draw(const NvD3DState *st, int topology,
                     if (nv2a_d3d_hud_active()) {
                         if (hi <= (float)gw * 0.5f) shift = narrow - 1.0f;
                         else if (lo >= (float)gw * 0.5f) shift = 1.0f - narrow;
+                        else moved = hud_split(v, nv, idx, ni, topology, (float)gw, narrow);
                     }
                 }
             }
@@ -1967,7 +2057,7 @@ void nv2a_d3d_draw(const NvD3DState *st, int topology,
         RECOMP_PROFILE_END();
         return;
     }
-    memcpy(p, v, vb_bytes);
+    memcpy(p, moved ? moved : v, vb_bytes);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
     if (!(p = ring_map(s_ib, &s_ib_pos, IB_BYTES, ib_bytes, &m))) {
         RECOMP_PROFILE_END();
