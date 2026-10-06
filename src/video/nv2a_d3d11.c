@@ -518,10 +518,15 @@ static const char s_hlsl[] =
 "  if (m & 1) t.a = signed_c(t.a); if (m & 2) t.r = signed_c(t.r);\n"
 "  if (m & 4) t.g = signed_c(t.g); if (m & 8) t.b = signed_c(t.b); return t;\n"
 "}\n"
+/* SET_DOT_RGBMAPPING, as xemu's sign1/2/3: 1 MINUS_1_TO_1_D3D is the
+ * biased (x - 128) / 127 that D3D's _bx2 on a texture read produces (255 is
+ * +1), 2 the GL mapping, 3 two's complement. */
 "float3 dotmap(float3 c, uint m) {\n"
-"  if (m == 0) return c;\n"
-"  if (m == 1) return float3(signed_c(c.r), signed_c(c.g), signed_c(c.b));\n"
-"  return c * 2.0 - 1.0;\n"
+"  float3 x = round(saturate(c) * 255.0);\n"
+"  if (m == 1) return (x - 128.0) / 127.0;\n"
+"  if (m == 2) return x >= 128.0 ? (x - 255.5) / 127.5 : (x + 0.5) / 127.5;\n"
+"  if (m == 3) return (x >= 128.0 ? x - 256.0 : x) / 127.0;\n"
+"  return c;\n"
 "}\n"
 "float4 samp2(uint n, float2 uv) {\n"
 "  if (n == 0) return T2D0.Sample(S0, uv); if (n == 1) return T2D1.Sample(S1, uv);\n"
