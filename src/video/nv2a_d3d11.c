@@ -266,6 +266,8 @@ static float widen(void)
 
 static ID3D11VertexShader *s_ub_vs, *s_present_vs, *s_clear_vs;
 static ID3D11PixelShader  *s_psv[4], *s_present_ps, *s_clear_ps;
+static ID3D11VertexShader *s_y16_vs;
+static ID3D11PixelShader  *s_y16_ps[2];      /* [msaa] */
 /* s_raw: the vertex-data ring ub_vs reads (raw view s_raw_srv) */
 static ID3D11Buffer *s_raw, *s_ib, *s_cb_ub, *s_cb_prog, *s_cb_vconst, *s_cb_ps, *s_cb_present, *s_cb_clear;
 static ID3D11ShaderResourceView *s_raw_srv;
@@ -702,7 +704,23 @@ static const char s_hlsl[] =
 "float4 clear_vs(uint id : SV_VertexID) : SV_Position {\n"
 "  float2 c = float2(id & 1, id >> 1); return float4(c.x * 2 - 1, 1 - c.y * 2, cz.x, 1);\n"
 "}\n"
-"float4 clear_ps() : SV_Target { return ccol; }\n";
+"float4 clear_ps() : SV_Target { return ccol; }\n"
+/* A 32-bit colour surface read as LU_IMAGE_Y16: twice as wide, texel 2x the
+ * low 16-bit word of pixel x (G:B), 2x+1 the high one (A:R), as R=G=B, A=1
+ * (xemu's mapping). MSAA surfaces are read at one sample: averaging the bytes
+ * of packed values (MM3 packs depth into G:B for its fog) would corrupt them. */
+"float4 y16_vs(uint id : SV_VertexID) : SV_Position {\n"
+"  float2 c = float2((id << 1) & 2, id & 2); return float4(c * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"}\n"
+"#ifdef Y16_MS\nTexture2DMS<float4> Y16Src : register(t0);\n#else\nTexture2D<float4> Y16Src : register(t0);\n#endif\n"
+"float4 y16_ps(float4 p : SV_Position) : SV_Target {\n"
+"  uint2 q = uint2(p.xy);\n"
+"#ifdef Y16_MS\n  float4 c = Y16Src.Load(int2(q.x >> 1, q.y), 0);\n"
+"#else\n  float4 c = Y16Src.Load(int3(q.x >> 1, q.y, 0));\n#endif\n"
+"  uint4 b = (uint4)round(saturate(c) * 255.0);\n"
+"  float y = (float)((q.x & 1u) ? (b.a << 8 | b.r) : (b.g << 8 | b.b)) / 65535.0;\n"
+"  return float4(y, y, y, 1);\n"
+"}\n";
 
 typedef struct {
     uint32_t c_icw[8], a_icw[8], c_ocw[8], a_ocw[8];
@@ -988,7 +1006,16 @@ int nv2a_d3d_init(void)
     MAKE("present_ps", "ps_5_0", PixelShader, &s_present_ps)
     MAKE("clear_vs", "vs_5_0", VertexShader, &s_clear_vs)
     MAKE("clear_ps", "ps_5_0", PixelShader, &s_clear_ps)
+    MAKE("y16_vs", "vs_5_0", VertexShader, &s_y16_vs)
+    MAKE("y16_ps", "ps_5_0", PixelShader, &s_y16_ps[0])
 #undef MAKE
+    {
+        static const D3D_SHADER_MACRO ms[] = { { "Y16_MS", "1" }, { NULL, NULL } };
+        if (!(b = compile_def("y16_ps", "ps_5_0", ms))) return 0;
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                       ID3D10Blob_GetBufferSize(b), NULL, &s_y16_ps[1]);
+        ID3D10Blob_Release(b);
+    }
 
     {
         D3D11_BUFFER_DESC d;
@@ -1087,11 +1114,17 @@ typedef struct {
     ID3D11Texture2D *tex;           /* single-sample; what srv reads */
     ID3D11Texture2D *ms;            /* MSAA target rtv draws into, or NULL */
     int ms_dirty;                   /* ms drawn since the last resolve */
+    ID3D11ShaderResourceView *ms_srv;
+    uint32_t gen, y16_gen;          /* drawn count; when y16 was built */
+    ID3D11Texture2D *y16;           /* LU_IMAGE_Y16 view (see y16_ps) */
+    ID3D11ShaderResourceView *y16_srv;
+    ID3D11RenderTargetView *y16_rtv;
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv;
     uint8_t *shadow;                /* guest bytes as of the last sync */
     int gpu_dirty;                  /* drawn since guest memory was updated */
     uint32_t synced_frame, used_frame;
+    uint32_t seq;                   /* bind order; see surface_find */
 } Surface;
 
 typedef struct {
@@ -1345,7 +1378,7 @@ static void surface_sync_impl(Surface *s, int force)
             float x0, x1;
             guest_span(s, &x0, &x1);
             if (srv) blit_span(srv, NULL, s->rtv, s->iw, s->ih, -1.0f, x0, x1, 0, 1);
-            s->ms_dirty = 1;
+            s->ms_dirty = 1; s->gen++;
         }
         return;
     }
@@ -1387,7 +1420,7 @@ static void surface_sync_impl(Surface *s, int force)
         float x0, x1;
         guest_span(s, &x0, &x1);
         if (srv && msk) blit_span(srv, msk, s->rtv, s->iw, s->ih, -1.0f, x0, x1, 0, 1);
-        s->ms_dirty = 1;
+        s->ms_dirty = 1; s->gen++;
     }
 }
 
@@ -1406,32 +1439,52 @@ static void surface_release(Surface *s)
     if (s->srv) ID3D11ShaderResourceView_Release(s->srv);
     if (s->rtv) ID3D11RenderTargetView_Release(s->rtv);
     if (s->ms) ID3D11Texture2D_Release(s->ms);
+    if (s->ms_srv) ID3D11ShaderResourceView_Release(s->ms_srv);
+    if (s->y16_srv) ID3D11ShaderResourceView_Release(s->y16_srv);
+    if (s->y16_rtv) ID3D11RenderTargetView_Release(s->y16_rtv);
+    if (s->y16) ID3D11Texture2D_Release(s->y16);
     if (s->tex) ID3D11Texture2D_Release(s->tex);
     free(s->shadow);
     memset(s, 0, sizeof *s);
 }
 
+/* Titles reuse one block of memory as targets of different shapes (MM3's
+ * glare buffer is 640x480 and 320x240 every frame). Each shape keeps its own
+ * host surface; the address resolves to the one bound most recently. */
+static uint32_t s_surf_seq;
+
 static Surface *surface_find(uint32_t p)
 {
+    Surface *best = NULL;
     int i;
     for (i = 0; i < MAX_SURFACES; i++)
-        if (s_surf[i].tex && s_surf[i].phys == p)
-            return &s_surf[i];
-    return NULL;
+        if (s_surf[i].tex && s_surf[i].phys == p && (!best || s_surf[i].seq > best->seq))
+            best = &s_surf[i];
+    return best;
 }
 
 static Surface *surface_get(uint32_t va, uint32_t pitch, uint32_t fmt,
                             uint32_t w, uint32_t h, int swizzled)
 {
     uint32_t p = phys(va), bpp = surface_color_bpp(fmt);
-    Surface *s = surface_find(p), *victim = NULL;
+    Surface *s = NULL, *victim = NULL;
     int i;
-    if (s && s->w >= w && s->h >= h && s->pitch == pitch && s->bpp == bpp &&
-        s->swizzled == swizzled) {
-        s->color_fmt = fmt;
-        s->used_frame = s_frame;
-        return s;
+    for (i = 0; i < MAX_SURFACES; i++) {
+        Surface *c = &s_surf[i];
+        if (c->tex && c->phys == p && c->w >= w && c->h >= h && c->pitch == pitch &&
+            c->bpp == bpp && c->swizzled == swizzled) {
+            c->color_fmt = fmt;
+            c->used_frame = s_frame;
+            c->seq = ++s_surf_seq;
+            return c;
+        }
     }
+    /* Same shape grown in place starts again from guest memory; another
+     * shape at this address gets a surface of its own. */
+    for (i = 0; i < MAX_SURFACES && !s; i++)
+        if (s_surf[i].tex && s_surf[i].phys == p && s_surf[i].pitch == pitch &&
+            s_surf[i].bpp == bpp && s_surf[i].swizzled == swizzled)
+            s = &s_surf[i];
     if (s) {
         /* Grown or reformatted: start again from guest memory. */
         if (w < s->w && s->pitch == pitch) w = s->w;
@@ -1461,15 +1514,18 @@ static Surface *surface_get(uint32_t va, uint32_t pitch, uint32_t fmt,
     /* Render-to-texture (swizzled) targets stay single-sample. */
     if (s_msaa > 1 && !swizzled)
         s->ms = make_texture_ms(s->iw, s->ih, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM,
-                                D3D11_BIND_RENDER_TARGET, 0, s_msaa);
+                                D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, s_msaa);
+    if (s->ms)
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s->ms, NULL, &s->ms_srv);
     ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)(s->ms ? s->ms : s->tex),
                                         NULL, &s->rtv);
     ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s->tex, NULL, &s->srv);
     s->used_frame = s_frame;
+    s->seq = ++s_surf_seq;
     {
         float zero[4] = { 0, 0, 0, 0 };
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s->rtv, zero);
-        s->ms_dirty = 1;
+        s->ms_dirty = 1; s->gen++;
     }
     surface_sync(s, 1);
     if (getenv("RECOMP_D3D_TRACE"))
@@ -1550,7 +1606,7 @@ static int bind_targets(const NvD3DState *st, int want_depth, Surface **out,
         return 0;
     if (s && d && (d->iw != s->iw || d->ih != s->ih))
         d = NULL;
-    if (s) s->ms_dirty = 1;
+    if (s) { s->ms_dirty = 1; s->gen++; }
     if (s != s_cur_rt || d != s_cur_ds) {
         ID3D11RenderTargetView *rtv = s ? s->rtv : NULL;
         unbind_textures();
@@ -2162,6 +2218,43 @@ static uint32_t write_mask(const NvD3DState *st, Surface *s)
 static int s_draw_textured, s_draw_reads_wide;
 static uint32_t s_draw_tex_addr;
 
+/* Bring s's LU_IMAGE_Y16 view up to date (2 x iw by ih); NULL on failure.
+ * Unbinds the current targets: call before a draw binds its own. */
+static ID3D11ShaderResourceView *surface_y16(Surface *s)
+{
+    if (!s->y16) {
+        s->y16 = make_texture(2 * s->iw, s->ih, 1, 1, DXGI_FORMAT_R16G16B16A16_UNORM,
+                              D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0);
+        if (!s->y16) return NULL;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s->y16, NULL, &s->y16_srv);
+        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s->y16, NULL, &s->y16_rtv);
+        s->y16_gen = s->gen - 1;
+    }
+    if (s->y16_gen != s->gen) {
+        ID3D11ShaderResourceView *src = s->ms ? s->ms_srv : s->srv;
+        D3D11_VIEWPORT vp = { 0, 0, (float)(2 * s->iw), (float)s->ih, 0, 1 };
+        D3D11_RECT sc = { 0, 0, (LONG)(2 * s->iw), (LONG)s->ih };
+        unbind_textures();
+        unbind_targets();
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s->y16_rtv, NULL);
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+        ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs_plain);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, s_blend_opaque, NULL, 0xFFFFFFFF);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_y16_vs, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_y16_ps[s->ms ? 1 : 0], NULL, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &src);
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        unbind_targets();
+        unbind_textures();
+        s->y16_gen = s->gen;
+    }
+    return s->y16_srv;
+}
+
 static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
                           uint32_t *out_gw, uint32_t *out_gh, uint32_t *out_zmax)
 {
@@ -2195,6 +2288,15 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         cull = st->cull_face == 0x404 ? 1 : st->cull_face == 0x405 ? 2 : 3;
     if (cull == 3 && topology == NV_D3D_TRIANGLES)
         return 0;                                /* front and back culled */
+    /* Y16 views of 32-bit targets are drawn before this draw's targets go
+     * on; see y16_ps. */
+    for (n = 0; n < 4; n++) {
+        const NvD3DTexture *t = &st->tex[n];
+        Surface *rt;
+        if (t->color != 0x35 || t->cube || !t->addr) continue;
+        rt = surface_find(phys(t->addr));
+        if (rt && rt->bpp == 4) { surface_sync(rt, 0); surface_y16(rt); }
+    }
     if (!bind_targets(st, st->depth_test || st->stencil_test, &s, &d, &gw, &gh))
         return 0;
     zf = (st->surface_format >> 4) & 0xF;
@@ -2224,7 +2326,11 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             surface_resolve(rt);
             /* An MSAA target draws into ms, so its resolved tex is free to read. */
             view = rt == s_cur_rt && !rt->ms ? feedback_copy(rt) : rt->srv;
-            if (kind == K_LIN) {
+            if (t->color == 0x35 && rt->bpp == 4 && rt->y16_srv) {
+                view = rt->y16_srv;             /* each pixel is two texels */
+                pc.tex_scale[n][0] = 1.0f / (float)(2 * rt->w);
+                pc.tex_scale[n][1] = 1.0f / (float)rt->h;
+            } else if (kind == K_LIN) {
                 pc.tex_scale[n][0] = 1.0f / (float)rt->w;
                 pc.tex_scale[n][1] = 1.0f / (float)rt->h;
             } else {
@@ -2806,6 +2912,7 @@ static void writeback_surfaces(void)
         WbSlot *k = &s_wb[i];
         int scaled;
         if (!s->tex || !s->gpu_dirty || s->swizzled || (s->bpp != 2 && s->bpp != 4) ||
+            surface_find(s->phys) != s ||
             !s->shadow || !guest_ok(s->va, (size_t)s->pitch * s->h))
             continue;
         scaled = s->iw != s->w || s->ih != s->h;
@@ -2832,6 +2939,7 @@ static void writeback_surfaces(void)
         uint32_t x, y, rowb;
         int amode, r565;
         if (!s->tex || !s->gpu_dirty || s->swizzled || (s->bpp != 2 && s->bpp != 4) ||
+            surface_find(s->phys) != s ||
             !s->shadow || !k->stage || k->w != s->w || k->h != s->h)
             continue;
         if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)k->stage, 0,
