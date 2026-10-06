@@ -543,6 +543,29 @@ static const char s_hlsl[] =
 "  if (n == 0) return T2D0.Sample(S0, uv); if (n == 1) return T2D1.Sample(S1, uv);\n"
 "  if (n == 2) return T2D2.Sample(S2, uv); return T2D3.Sample(S3, uv);\n"
 "}\n"
+/* A point-sampled tap at a fixed spot of an upscaled render target (MM3's
+ * light flares test their visibility with three such taps of the frame's
+ * alpha). On the NV2A it reads one guest pixel; here that pixel is a block
+ * of host pixels, and a single host texel inside it changes with every
+ * sub-pixel move of the scene -- glows and tail lights flickered. The block
+ * the guest pixel became is averaged instead. g: guest texel coordinates,
+ * inv: 1 / guest size. */
+"float4 ldn(uint n, int2 p) {\n"
+"  if (n == 0) return T2D0.Load(int3(p, 0)); if (n == 1) return T2D1.Load(int3(p, 0));\n"
+"  if (n == 2) return T2D2.Load(int3(p, 0)); return T2D3.Load(int3(p, 0));\n"
+"}\n"
+"float4 tapbox(uint n, float2 g, float2 inv) {\n"
+"  uint w, h;\n"
+"  if (n == 0) T2D0.GetDimensions(w, h); else if (n == 1) T2D1.GetDimensions(w, h);\n"
+"  else if (n == 2) T2D2.GetDimensions(w, h); else T2D3.GetDimensions(w, h);\n"
+"  float2 dim = float2(w, h), sc = dim * inv, gi = floor(g);\n"
+"  int2 a = clamp(int2(floor(gi * sc + 0.5)), 0, int2(dim) - 1);\n"
+"  int2 b = clamp(int2(floor((gi + 1.0) * sc + 0.5)), a + 1, int2(dim));\n"
+"  float4 acc = 0; float cnt = 0;\n"
+"  [loop] for (int y = a.y; y < b.y && y < a.y + 8; y++)\n"
+"    [loop] for (int x = a.x; x < b.x && x < a.x + 8; x++) { acc += ldn(n, int2(x, y)); cnt += 1; }\n"
+"  return acc / max(cnt, 1.0);\n"
+"}\n"
 "float4 sampc(uint n, float3 d) {\n"
 "  if (n == 0) return TC0.Sample(S0, d); if (n == 1) return TC1.Sample(S1, d);\n"
 "  if (n == 2) return TC2.Sample(S2, d); return TC3.Sample(S3, d);\n"
@@ -556,7 +579,11 @@ static const char s_hlsl[] =
 "    uint dm = n ? (dot_map >> ((n - 1) * 4)) & 7 : 0;\n"
 "    float4 c = tc[n]; float4 t = float4(0, 0, 0, 1);\n"
 "    float q = c.w != 0.0 ? c.w : 1.0;\n"
-"    if (mode == 1 || mode == 2) t = samp2(n, c.xy / q * tex_scale[n].xy);\n"
+"    if (mode == 1 || mode == 2) {\n"
+"      float2 g = c.xy / q, d = abs(ddx(g)) + abs(ddy(g));\n"
+"      if (tex_info[n].z != 0u && max(d.x, d.y) < 1e-4) t = tapbox(n, g, tex_scale[n].xy);\n"
+"      else t = samp2(n, g * tex_scale[n].xy);\n"
+"    }\n"
 "    else if (mode == 3) t = sampc(n, c.xyz);\n"
 "    else if (mode == 4) t = saturate(c);\n"
 "    else if (mode == 5) {\n"
@@ -815,7 +842,7 @@ typedef struct {
     uint32_t c_icw[8], a_icw[8], c_ocw[8], a_ocw[8];
     uint32_t fin0, fin1, rc_control, stage_prog, alpha_func, ps_flags;
     uint32_t clip_plane, other_input, dot_map, variant;
-    uint32_t tex_info[4][2];
+    uint32_t tex_info[4][3];
 } PsKey;
 
 typedef struct {
@@ -859,8 +886,8 @@ static DWORD WINAPI spec_worker(LPVOID arg)
             "static const uint alpha_func = %uu; static const uint ps_flags = %uu;"
             "static const uint clip_plane = %uu; static const uint other_input = %uu;"
             "static const uint dot_map = %uu;"
-            "static const uint4 tex_info[4] = { uint4(%uu,%uu,0,0), uint4(%uu,%uu,0,0),"
-            " uint4(%uu,%uu,0,0), uint4(%uu,%uu,0,0) };",
+            "static const uint4 tex_info[4] = { uint4(%uu,%uu,%uu,0), uint4(%uu,%uu,%uu,0),"
+            " uint4(%uu,%uu,%uu,0), uint4(%uu,%uu,%uu,0) };",
             k->c_icw[0], k->c_icw[1], k->c_icw[2], k->c_icw[3],
             k->c_icw[4], k->c_icw[5], k->c_icw[6], k->c_icw[7],
             k->a_icw[0], k->a_icw[1], k->a_icw[2], k->a_icw[3],
@@ -871,8 +898,10 @@ static DWORD WINAPI spec_worker(LPVOID arg)
             k->a_ocw[4], k->a_ocw[5], k->a_ocw[6], k->a_ocw[7],
             k->fin0, k->fin1, k->rc_control, k->stage_prog, k->alpha_func, k->ps_flags,
             k->clip_plane, k->other_input, k->dot_map,
-            k->tex_info[0][0], k->tex_info[0][1], k->tex_info[1][0], k->tex_info[1][1],
-            k->tex_info[2][0], k->tex_info[2][1], k->tex_info[3][0], k->tex_info[3][1]);
+            k->tex_info[0][0], k->tex_info[0][1], k->tex_info[0][2],
+            k->tex_info[1][0], k->tex_info[1][1], k->tex_info[1][2],
+            k->tex_info[2][0], k->tex_info[2][1], k->tex_info[2][2],
+            k->tex_info[3][0], k->tex_info[3][1], k->tex_info[3][2]);
         flat = k->variant & 1;
         m[0].Name = "SPEC"; m[0].Definition = "1";
         m[1].Name = "SPEC_DECL"; m[1].Definition = decl;
@@ -926,7 +955,10 @@ static ID3D11PixelShader *spec_ps(const PSConsts *pc, uint32_t variant)
     k.stage_prog = pc->stage_prog; k.alpha_func = pc->alpha_func; k.ps_flags = pc->ps_flags;
     k.clip_plane = pc->clip_plane; k.other_input = pc->other_input; k.dot_map = pc->dot_map;
     k.variant = variant;
-    for (i = 0; i < 4; i++) { k.tex_info[i][0] = pc->tex_info[i][0]; k.tex_info[i][1] = pc->tex_info[i][1]; }
+    for (i = 0; i < 4; i++) {
+        k.tex_info[i][0] = pc->tex_info[i][0]; k.tex_info[i][1] = pc->tex_info[i][1];
+        k.tex_info[i][2] = pc->tex_info[i][2];
+    }
     for (i = 0; i < sizeof k; i++) h = (h ^ p[i]) * 16777619u;
     for (i = 0; i < PS_SPEC_SLOTS; i++) {
         e = &s_spec[(h + i) & (PS_SPEC_SLOTS - 1)];
@@ -2561,6 +2593,12 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         smp[n] = sampler(t, levels, reduce);
         pc.tex_info[n][0] = (t->control0 >> 2) & 1;
         pc.tex_info[n][1] = t->filter >> 28;
+        /* Point taps of an upscaled linear target average the guest pixel's
+         * host block; see tapbox. */
+        if (rt && kind == K_LIN && t->color != 0x35 && (rt->iw > rt->w || rt->ih > rt->h) &&
+            ((t->filter >> 24) & 0xF) == 1 && !(((t->filter >> 16) & 0xFF) == 2 ||
+            ((t->filter >> 16) & 0xFF) == 4 || ((t->filter >> 16) & 0xFF) == 6))
+            pc.tex_info[n][2] = 1;
         memcpy(pc.bump_mat[n], t->bump_mat, sizeof pc.bump_mat[n]);
         pc.bump_lum[n][0] = t->bump_scale;
         pc.bump_lum[n][1] = t->bump_offset;
