@@ -120,6 +120,22 @@ static float s_scale = 1.0f, s_cur_sx = 1.0f, s_cur_sy = 1.0f;
 #define GUEST_W 640u
 #define GUEST_H 480u
 
+/* Race HUD edge placement is latched: the title builds its race camera's
+ * projection once as a race starts (src/mm3_widescreen.c reports it), and
+ * car select's camera ends it. Frames that draw a full-screen background
+ * image are menus or loading screens and never get it, which keeps menus
+ * reached from a race (and the race's own loading screen) in 4:3 layout. */
+static volatile LONG s_race_hud;
+static uint32_t s_frame_bg_tex;     /* this frame's background image; reset at flip */
+
+void nv2a_d3d_note_race_camera(void) { InterlockedExchange(&s_race_hud, 1); }
+void nv2a_d3d_note_frontend_camera(void) { InterlockedExchange(&s_race_hud, 0); }
+
+static int nv2a_d3d_hud_active(void)
+{
+    return !s_frame_bg_tex && InterlockedCompareExchange(&s_race_hud, 0, 0) != 0;
+}
+
 /* The aspect the image is presented at: RECOMP_ASPECT (e.g. 16:9, 21:9, 1.6,
  * 4:3), else the primary monitor's, never narrower than the title's 4:3.
  * The title's projection is widened to match (src/mm3_widescreen.c). */
@@ -216,7 +232,7 @@ static const char s_hlsl[] =
 "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3; };\n"
 "struct PSIn { float4 pos:SV_Position; float4 d0:COLOR0; float4 d1:COLOR1; float4 fog:FOG;\n"
 "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3; };\n"
-"cbuffer VSC : register(b0) { float4 vs_map; };\n"
+"cbuffer VSC : register(b0) { float4 vs_map; uint4 vs_fogi; float4 vs_fogf; float4 vs_place; };\n"
 "PSIn vs_main(VSIn i) {\n"
 "  PSIn o;\n"
 "  float w = i.pos.w;\n"
@@ -227,7 +243,8 @@ static const char s_hlsl[] =
 /* oPos is screen space after the D3D epilogue's divide; multiplying back by
  * w gives the clip-space position, so the host clipper and perspective-
  * correct interpolation see what the NV2A saw. */
-"  o.pos = float4((i.pos.x * vs_map.x - 1.0) * vs_map.w * w, (1.0 - i.pos.y * vs_map.y) * w,\n"
+"  o.pos = float4(((i.pos.x * vs_map.x - 1.0) * vs_map.w + vs_place.x) * w,\n"
+"                 (1.0 - i.pos.y * vs_map.y) * vs_place.y * w,\n"
 "                 i.pos.z * vs_map.z * w, w);\n"
 "  o.d0 = saturate(i.d0); o.d1 = saturate(i.d1); o.fog = i.fog;\n"
 "  o.t0 = i.t0; o.t1 = i.t1; o.t2 = i.t2; o.t3 = i.t3;\n"
@@ -570,7 +587,7 @@ int nv2a_d3d_init(void)
 
     s_vb = make_buffer(VB_BYTES, D3D11_BIND_VERTEX_BUFFER);
     s_ib = make_buffer(IB_BYTES, D3D11_BIND_INDEX_BUFFER);
-    s_cb_vs = make_buffer(48, D3D11_BIND_CONSTANT_BUFFER);
+    s_cb_vs = make_buffer(64, D3D11_BIND_CONSTANT_BUFFER);
     s_cb_ps = make_buffer(sizeof(PSConsts), D3D11_BIND_CONSTANT_BUFFER);
     s_cb_present = make_buffer(sizeof(PresentConsts), D3D11_BIND_CONSTANT_BUFFER);
     s_cb_clear = make_buffer(32, D3D11_BIND_CONSTANT_BUFFER);
@@ -1677,6 +1694,11 @@ static uint32_t write_mask(const NvD3DState *st, Surface *s)
 /* Everything a draw needs apart from its vertices: targets, textures, the
  * combiner constants, raster and output-merger state, topology. Returns 0 if
  * nothing is to be drawn. */
+/* What the last setup_pipeline bound: any texture, and any render target
+ * stored widened (its image already spans the wide screen). */
+static int s_draw_textured, s_draw_reads_wide;
+static uint32_t s_draw_tex_addr;
+
 static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
                           uint32_t *out_gw, uint32_t *out_gh, uint32_t *out_zmax)
 {
@@ -1688,6 +1710,8 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     ID3D11SamplerState *smp[4] = { 0 };
     int cull = 0, bias = 0;
     float slope = 0, bf[4];
+    s_draw_textured = s_draw_reads_wide = 0;
+    s_draw_tex_addr = 0;
 
     {
         /* Bring-up switches: RECOMP_D3D_SKIP_CMASK / _SKIP_SFACTOR (hex) drop
@@ -1729,6 +1753,9 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             continue;
         tex_format(t->color, &kind);
         rt = !t->cube ? surface_find(phys(t->addr)) : NULL;
+        s_draw_textured = 1;
+        if (!s_draw_tex_addr) s_draw_tex_addr = t->addr;
+        if (rt && rt->sx > rt->sy * 1.001f) s_draw_reads_wide = 1;
         if (rt) {
             surface_sync(rt, 0);
             view = rt == s_cur_rt ? feedback_copy(rt) : rt->srv;
@@ -1848,10 +1875,13 @@ static uint8_t *ring_map(ID3D11Buffer *b, UINT *pos, UINT cap, UINT bytes,
     return (uint8_t *)m->pData + *pos;
 }
 
+/* squeeze scales x about the centre, shift moves it (NDC), yscale scales y
+ * about the centre; only the pass-through (pre-transformed) shader reads
+ * shift and yscale. */
 static void vs_constants(const NvD3DState *st, uint32_t gw, uint32_t gh, uint32_t zmax,
-                         float squeeze)
+                         float squeeze, float shift, float yscale)
 {
-    struct { float map[4]; uint32_t fogi[4]; float fogf[4]; } c;
+    struct { float map[4]; uint32_t fogi[4]; float fogf[4]; float place[4]; } c;
     memset(&c, 0, sizeof c);
     c.map[0] = 2.0f / (float)gw;
     c.map[1] = 2.0f / (float)gh;
@@ -1861,6 +1891,8 @@ static void vs_constants(const NvD3DState *st, uint32_t gw, uint32_t gh, uint32_
     c.fogi[1] = st->fog_mode;
     c.fogf[0] = st->fog_param[0];
     c.fogf[1] = st->fog_param[1];
+    c.place[0] = shift;
+    c.place[1] = yscale;
     upload_cb(s_cb_vs, &c, sizeof c);
 }
 
@@ -1885,25 +1917,51 @@ void nv2a_d3d_draw(const NvD3DState *st, int topology,
         return;
     }
     {
-        /* Widescreen: overlays drawn straight in screen space (w = 1) keep
-         * their 4:3 proportions, centred, unless they span the whole width
-         * (backgrounds, fades, full-screen post passes), which stretch with
-         * the 3D image. */
-        float squeeze = 1.0f;
+        /* Widescreen placement of overlays drawn straight in screen space
+         * (w = 1). Nothing is stretched:
+         *  - draws with no image to distort (fades, fills) and copies of a
+         *    widened render target span the wide surface 1:1;
+         *  - full-screen image backgrounds are zoomed uniformly to cover it,
+         *    cropping a little top and bottom;
+         *  - the race HUD keeps its 4:3 shape and moves to the screen edge
+         *    its half of the 4:3 layout belongs to;
+         *  - everything else keeps its 4:3 proportions, centred. */
+        float squeeze = 1.0f, shift = 0.0f, yscale = 1.0f;
         if (s && s->sx > s->sy * 1.001f) {
-            float lo = 1e30f, hi = -1e30f;
+            float lo = 1e30f, hi = -1e30f, ylo = 1e30f, yhi = -1e30f;
             uint32_t k;
             int flat = 1;
             for (k = 0; k < nv && flat; k++) {
                 if (v[k].pos[3] != 1.0f) flat = 0;
                 if (v[k].pos[0] < lo) lo = v[k].pos[0];
                 if (v[k].pos[0] > hi) hi = v[k].pos[0];
+                if (v[k].pos[1] < ylo) ylo = v[k].pos[1];
+                if (v[k].pos[1] > yhi) yhi = v[k].pos[1];
             }
-            if (flat && !(lo <= 0.5f && hi >= (float)gw - 0.5f))
-                squeeze = s->sy / s->sx;
+            if (flat) {
+                float narrow = s->sy / s->sx;
+                int wide_x = lo <= 0.5f && hi >= (float)gw - 0.5f;
+                int tall = ylo <= 0.5f && yhi >= (float)gh - 0.5f;
+                if (wide_x && (!s_draw_textured || s_draw_reads_wide)) {
+                    /* spans as it is */
+                } else if (tall && (!s_frame_bg_tex || s_draw_tex_addr == s_frame_bg_tex) &&
+                           (wide_x || s_draw_tex_addr == s_frame_bg_tex)) {
+                    /* The frame's background image (and anything else drawn
+                     * with it, like the menus' animated overlay mesh). A
+                     * later full-screen image is content -- the title's logo
+                     * picture -- and stays 4:3 over this background. */
+                    s_frame_bg_tex = s_draw_tex_addr;
+                    yscale = 1.0f / narrow;
+                } else {
+                    squeeze = narrow;
+                    if (nv2a_d3d_hud_active()) {
+                        if (hi <= (float)gw * 0.5f) shift = narrow - 1.0f;
+                        else if (lo >= (float)gw * 0.5f) shift = 1.0f - narrow;
+                    }
+                }
+            }
         }
-        /* The pass-through VS reads only vs_map; fog was evaluated already. */
-        vs_constants(st, gw, gh, zmax, squeeze);
+        vs_constants(st, gw, gh, zmax, squeeze, shift, yscale);
     }
     if (!(p = ring_map(s_vb, &s_vb_pos, VB_BYTES, vb_bytes, &m))) {
         RECOMP_PROFILE_END();
@@ -2189,7 +2247,7 @@ int nv2a_d3d_draw_vsh(const NvD3DState *st, int topology,
         RECOMP_PROFILE_END();
         return 1;
     }
-    vs_constants(st, gw, gh, zmax, 1.0f);
+    vs_constants(st, gw, gh, zmax, 1.0f, 0.0f, 1.0f);
     if (!s_cb_vconst) {
         s_cb_vconst = make_buffer(192 * 16, D3D11_BIND_CONSTANT_BUFFER);
         s_cb_vdef = make_buffer(16 * 16, D3D11_BIND_CONSTANT_BUFFER);
@@ -2831,6 +2889,7 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
     Surface *s;
     if (!nv2a_d3d_init())
         return;
+    s_frame_bg_tex = 0;
     s = surface_find(phys(surface_addr));
     if (!s && pitch)
         s = scan_surface(surface_addr, pitch);
@@ -2894,4 +2953,7 @@ int nv2a_d3d_draw_vsh(const NvD3DState *st, int t, const NvD3DAttrib a[16], cons
 void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
+float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
+void nv2a_d3d_note_race_camera(void) {}
+void nv2a_d3d_note_frontend_camera(void) {}
 #endif
