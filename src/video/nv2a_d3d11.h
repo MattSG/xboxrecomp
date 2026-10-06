@@ -17,16 +17,6 @@
 #include <stdint.h>
 #include "../kernel/nv2a_combiner.h"
 
-/* One vertex as the GPU sees it: oPos already in screen space (x, y in guest
- * pixels, z in depth-buffer units) with the clip-space w kept in pos[3], as
- * the Xbox D3D epilogue leaves it. fog is the evaluated fog factor. */
-typedef struct {
-    float pos[4];
-    float d0[4], d1[4];
-    float fog[4];
-    float tex[4][4];
-} NvD3DVertex;
-
 typedef struct {
     uint32_t addr;          /* guest VA of texel (0,0), resolved */
     uint32_t format;        /* raw SET_TEXTURE_FORMAT */
@@ -62,6 +52,7 @@ typedef struct {
     uint32_t poly_offset_fill;
     float    poly_offset_factor, poly_offset_units;
     uint32_t flat_shade;
+    uint32_t z_perspective;             /* SET_CONTROL0: w-buffering */
     /* Pixel pipeline. */
     Nv2aCombiner rc;
     uint32_t rc_seen;
@@ -76,19 +67,25 @@ typedef struct {
 
 enum { NV_D3D_TRIANGLES = 0, NV_D3D_LINES = 1, NV_D3D_POINTS = 2 };
 
-/* One vertex attribute array, for the GPU vertex-program path. */
+/* One vertex attribute array as the title set it up. */
 typedef struct {
-    uint32_t enabled;        /* fetched from an array (else DEF value) */
+    uint32_t enabled;        /* fetched from an array (else the def value) */
     uint32_t type, size, stride;
-    const uint8_t *data;     /* host address of element 0 */
+    const uint8_t *data;     /* host address of element 0; NULL: unreadable */
 } NvD3DAttrib;
 
-/* Run the title's current vertex program on the GPU over guest indices idx
- * (all within [lo, hi]). Returns 0 if this path cannot take the batch, and
- * the caller transforms it on the CPU instead. */
-int nv2a_d3d_draw_vsh(const NvD3DState *st, int topology,
-                      const NvD3DAttrib attr[16], const float def[16][4],
-                      const uint32_t *idx, uint32_t ni, uint32_t lo, uint32_t hi);
+/* Draw guest indices idx (all within [lo, hi]) entirely on the GPU: the
+ * title's current vertex program (program != 0) or pre-transformed vertices
+ * (position, diffuse 3, specular 4, texcoords 9-12). def holds the values of
+ * attributes not fetched from an array. pos, when given, is each vertex's
+ * screen position by index - lo, for widescreen placement of 2D overlays
+ * (only consulted when the target is widened). */
+void nv2a_d3d_draw_ub(const NvD3DState *st, int topology,
+                      const NvD3DAttrib attr[16], const float def[16][4], int program,
+                      const uint32_t *idx, uint32_t ni, uint32_t lo, uint32_t hi,
+                      const float (*pos)[4]);
+/* Whether display-sized surfaces are widened (pos is worth computing). */
+int nv2a_d3d_widescreen(void);
 
 /* Create the device (no window needed). 0 if D3D11 is unavailable. */
 int  nv2a_d3d_init(void);
@@ -103,10 +100,6 @@ void nv2a_d3d_note_frontend_camera(void);
 /* The race HUD's first element, as its 4:3 screen rectangle; 2D drawn ahead
  * of it in a race frame is world-anchored (name tags over cars). */
 void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1);
-
-void nv2a_d3d_draw(const NvD3DState *st, int topology,
-                   const NvD3DVertex *v, uint32_t nv,
-                   const uint32_t *idx, uint32_t ni);
 
 /* NV097_CLEAR_SURFACE: flags as the method's parameter, rect inclusive. */
 void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,
