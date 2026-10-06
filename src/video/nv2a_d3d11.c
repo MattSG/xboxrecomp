@@ -3932,7 +3932,8 @@ void nv2a_d3d_tick(void)
 {
     DWORD now;
     uint32_t va, pitch;
-    if (s_init_state <= 0)
+    /* CPU scanout and PVIDEO can precede the first pushbuffer flip. */
+    if (s_init_state <= 0 && !nv2a_d3d_init())
         return;
     now = GetTickCount();
     if (now - s_last_present < 16)
