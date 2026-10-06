@@ -455,6 +455,17 @@ static const char s_hlsl[] =
 "  }\n"
 "  float px = P.x;\n"
 "  if (ub_info.z != 0xFFFFFFFFu) px += asfloat(VB.Load(ub_info.z + vid * 4u));\n"
+/* The NV2A rasterises with 4-bit sub-pixel precision, truncating (xemu
+ * roundScreenCoords), so the Xbox D3D screen offset 0.53125 puts a
+ * full-target quad's left/top edge exactly on the centre of pixel 0, and the
+ * top-left rule covers the whole pixel. Upscaled, that edge splits pixel 0's
+ * block of host pixels and leaves its first half unwritten -- MM3's wrapped
+ * water ripple map then showed the unwritten strip as seams across the
+ * water. A coordinate that truncates to that first centre is placed on the
+ * target edge, as the hardware covers it; everything else is unchanged. */
+"  float py = P.y;\n"
+"  if (px >= 0.5 && px < 0.5625) px = 0.0;\n"
+"  if (py >= 0.5 && py < 0.5625) py = 0.0;\n"
 "  /* NV2A clamps raster w away from zero and infinity (xemu clampAwayZeroInf),\n"
 "   * keeping its sign so geometry behind the eye still clips. oPos is screen\n"
 "   * space after the D3D epilogue's divide; multiplying back by w gives the\n"
@@ -464,7 +475,7 @@ static const char s_hlsl[] =
 "  float aw = clamp(abs(w), 5.421011e-20, 1.8446744e19);\n"
 "  w = w < 0 ? -aw : aw;\n"
 "  o.pos = float4(((px * ub_map.x - 1.0) * ub_map.w + ub_place.x) * w,\n"
-"                 (1.0 - P.y * ub_map.y) * ub_place.y * w, P.z * ub_map.z * w, w);\n"
+"                 (1.0 - py * ub_map.y) * ub_place.y * w, P.z * ub_map.z * w, w);\n"
 "  o.d0 = saturate(d0); o.d1 = saturate(d1); o.fog = float4(fog, w, 0, 0);\n"
 "  o.t0 = t0; o.t1 = t1; o.t2 = t2; o.t3 = t3;\n"
 "  return o;\n"
@@ -1138,6 +1149,10 @@ typedef struct {
     ID3D11Texture2D *mip;           /* mip-mapped copy for reductions */
     ID3D11ShaderResourceView *mip_srv;
     uint32_t mip_gen;
+    ID3D11Texture2D *chain;         /* this target plus the levels rendered below it */
+    ID3D11ShaderResourceView *chain_srv;
+    int chain_levels;
+    uint32_t chain_gen[16];
     ID3D11ShaderResourceView *y16_srv;
     ID3D11RenderTargetView *y16_rtv;
     ID3D11RenderTargetView *rtv;
@@ -1466,6 +1481,8 @@ static void surface_release(Surface *s)
     if (s->y16) ID3D11Texture2D_Release(s->y16);
     if (s->mip_srv) ID3D11ShaderResourceView_Release(s->mip_srv);
     if (s->mip) ID3D11Texture2D_Release(s->mip);
+    if (s->chain_srv) ID3D11ShaderResourceView_Release(s->chain_srv);
+    if (s->chain) ID3D11Texture2D_Release(s->chain);
     if (s->tex) ID3D11Texture2D_Release(s->tex);
     free(s->shadow);
     memset(s, 0, sizeof *s);
@@ -2310,6 +2327,66 @@ static uint32_t s_draw_tex_addr;
  * higher they hit isolated texels, and which ones moves with the camera --
  * lit windows and lamps then flicker through the bloom. Reductions read this
  * mip-mapped copy, so each tap averages the footprint it stands for. */
+/* A swizzled render target sampled as a mipmapped texture: titles render
+ * each level of such a texture themselves, one surface per level at the
+ * offsets the texture's layout puts them (MM3's water ripple map: 128, 64,
+ * 32, 16 at 0x682000, 0x692000, 0x696000, 0x697000). Reading only the top
+ * surface sampled a full-size normal map at every distance -- shimmer and
+ * moire out across the water. The levels found are copied into one host
+ * texture, each at its own (scaled) size, as the title's chain; returns the
+ * view and sets *levels, or NULL to fall back to the single surface. */
+static ID3D11ShaderResourceView *surface_chain(Surface *rt, const NvD3DTexture *t, int *levels)
+{
+    Surface *lv[16];
+    uint32_t off = 0, k, n = 0, bpp = rt->bpp;
+    for (k = 0; k < t->levels && k < 16; k++) {
+        uint32_t w = t->width >> k, h = t->height >> k;
+        Surface *c;
+        if (!w) w = 1;
+        if (!h) h = 1;
+        c = k ? surface_find(phys(t->addr) + off) : rt;
+        if (!c || !c->swizzled || c->w != w || c->h != h || c->bpp != bpp || c == s_cur_rt)
+            break;
+        lv[n++] = c;
+        off += w * h * bpp;
+    }
+    if (n < 2) return NULL;
+    if (!rt->chain || rt->chain_levels != (int)n) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+        if (rt->chain_srv) ID3D11ShaderResourceView_Release(rt->chain_srv);
+        if (rt->chain) ID3D11Texture2D_Release(rt->chain);
+        rt->chain_srv = NULL;
+        rt->chain = make_texture(rt->iw, rt->ih, n, 1, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                 D3D11_BIND_SHADER_RESOURCE, 0);
+        if (!rt->chain) return NULL;
+        memset(&sd, 0, sizeof sd);
+        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = n;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)rt->chain, &sd, &rt->chain_srv);
+        if (!rt->chain_srv) return NULL;
+        rt->chain_levels = (int)n;
+        for (k = 0; k < n; k++) rt->chain_gen[k] = lv[k]->gen - 1;
+    }
+    for (k = 0; k < n; k++) {
+        uint32_t dw = rt->iw >> k, dh = rt->ih >> k;
+        D3D11_BOX box;
+        if (!dw) dw = 1;
+        if (!dh) dh = 1;
+        surface_sync(lv[k], 0);
+        if (rt->chain_gen[k] == lv[k]->gen) continue;
+        box.left = box.top = box.front = 0;
+        box.right = lv[k]->iw < dw ? lv[k]->iw : dw;
+        box.bottom = lv[k]->ih < dh ? lv[k]->ih : dh;
+        box.back = 1;
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)rt->chain, k, 0, 0, 0,
+                                                  (ID3D11Resource *)lv[k]->tex, 0, &box);
+        rt->chain_gen[k] = lv[k]->gen;
+    }
+    *levels = (int)n;
+    return rt->chain_srv;
+}
+
 static ID3D11ShaderResourceView *surface_mips(Surface *s)
 {
     if (!s->mip) {
@@ -2459,6 +2536,10 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             } else {
                 pc.tex_scale[n][0] = (float)t->width / (float)rt->w;
                 pc.tex_scale[n][1] = (float)t->height / (float)rt->h;
+                if (t->levels > 1 && rt->swizzled && rt != s_cur_rt) {
+                    ID3D11ShaderResourceView *c = surface_chain(rt, t, &levels);
+                    if (c) view = c;
+                }
             }
         } else {
             TexLayout L;
