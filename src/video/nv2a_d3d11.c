@@ -3287,8 +3287,15 @@ static void display_config(int now)
     if (e && atof(e) >= 0.5 && atof(e) <= 8.0) {
         scale = (float)atof(e);
     } else {
+        /* RECOMP_SUPERSAMPLE=N (1..4) renders N x N host pixels per window
+         * pixel; presentation's bilinear minification averages them back
+         * (an exact 2x2 box at the default N=2). */
+        const char *ss = getenv("RECOMP_SUPERSAMPLE");
+        int n = ss ? atoi(ss) : 2;
         float fit_h = (float)h < (float)w / aspect ? (float)h : (float)w / aspect;
-        scale = fit_h / (float)GUEST_H;
+        if (n < 1) n = 1;
+        if (n > 4) n = 4;
+        scale = fit_h / (float)GUEST_H * (float)n;
         if (scale < 1.0f) scale = 1.0f;
         if (scale > 8.0f) scale = 8.0f;
     }
