@@ -11,7 +11,20 @@ extern ptrdiff_t g_xbox_mem_offset;
 void *recomp_lookup(ULONG a) { (void)a; abort(); }
 void *recomp_lookup_manual(ULONG a) { (void)a; abort(); }
 static uint8_t *mem;
-static guest_fn query;
+static HANDLE open_guest(void) {
+    uint32_t *sp=(uint32_t *)(mem+0x20000);
+    memset(sp,0,64); sp[0]=0xBEEF0001; sp[1]=0x40500; sp[2]=1;
+    sp[3]=0x40000; sp[4]=0x40600; sp[5]=7; sp[6]=1;
+    g_esp=0x20000; recomp_lookup_kernel(*(uint32_t *)(mem+0x10008))();
+    if(g_eax || g_esp!=0x2001C) return INVALID_HANDLE_VALUE;
+    return (HANDLE)(uintptr_t)*(uint32_t *)(mem+0x40500);
+}
+static int close_guest(HANDLE h) {
+    uint32_t *sp=(uint32_t *)(mem+0x20000);
+    sp[0]=0xBEEF0001; sp[1]=(uint32_t)(uintptr_t)h;
+    g_esp=0x20000; recomp_lookup_kernel(*(uint32_t *)(mem+0x10004))();
+    return g_eax==0 && g_esp==0x20008;
+}
 static int invoke(HANDLE h, const char *pattern, unsigned restart, unsigned klass) {
     uint32_t *sp=(uint32_t *)(mem+0x20000);
     memset(sp,0,64); sp[0]=0xBEEF0001;
@@ -24,7 +37,7 @@ static int invoke(HANDLE h, const char *pattern, unsigned restart, unsigned klas
         strcpy((char *)mem+0x32100,pattern);
     }
     memset(mem+0x30000,0xCC,8); memset(mem+0x31000,0xCC,512);
-    g_esp=0x20000; query();
+    g_esp=0x20000; recomp_lookup_kernel(*(uint32_t *)(mem+0x10000))();
     if(g_esp!=0x2002C) { fprintf(stderr,"FAIL directory query stack: %08X expected 0002002C\n",g_esp); return 0; }
     if(*(uint32_t *)(mem+0x30000)!=g_eax) { puts("FAIL I/O status differs"); return 0; }
     return 1;
@@ -39,8 +52,17 @@ int main(void) {
     mem=VirtualAlloc(NULL,16*1024*1024,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE); if(!mem) return 12;
     g_xbox_mem_offset=(ptrdiff_t)mem;
     *(uint32_t *)(mem+0x10000)=0x800000CF;
-    xbox_kernel_set_thunk_address(0x10000,1); xbox_kernel_bridge_init();
-    query=recomp_lookup_kernel(*(uint32_t *)(mem+0x10000));
+    *(uint32_t *)(mem+0x10004)=0x800000BB;
+    *(uint32_t *)(mem+0x10008)=0x800000CA;
+    xbox_kernel_set_thunk_address(0x10000,3); xbox_kernel_bridge_init();
+    xbox_path_init(path,NULL);
+    *(uint32_t *)(mem+0x40000)=0;
+    *(uint32_t *)(mem+0x40004)=0x40100;
+    *(uint32_t *)(mem+0x40008)=0;
+    *(uint16_t *)(mem+0x40100)=3;
+    *(uint16_t *)(mem+0x40102)=4;
+    *(uint32_t *)(mem+0x40104)=0x40200;
+    memcpy(mem+0x40200,"D:\\",4);
     int ok=invoke(h,"Save*",1,1);
     XBOX_FILE_DIRECTORY_INFORMATION *e=(void *)(mem+0x31000);
     if(ok && (g_eax || e->FileNameLength!=8 || memcmp(e->FileName,"SaveSlot",8) || !(e->FileAttributes&16))) {
@@ -50,8 +72,19 @@ int main(void) {
     if(ok) ok=invoke(h,"Save*",1,1) && g_eax==0;
     if(ok) ok=invoke(h,"*",1,1) && g_eax==0 && e->FileNameLength==8 && !memcmp(e->FileName,"SaveSlot",8);
     if(ok) ok=invoke(h,"*",1,2) && g_eax==0xC0000003u;
-    CloseHandle(h); RemoveDirectoryA(child); RemoveDirectoryA(path); VirtualFree(mem,0,MEM_RELEASE);
+    /* Probe and close before EOF, then reopen without RestartScan, as a title's
+     * FindFirstFile does. Reused host handles must not inherit a stale cursor.
+     * Repeating beyond the context table capacity also catches leaked scans
+     * when Windows chooses different handle values. */
+    xbox_NtClose(h);
+    for (unsigned i=0; ok && i<128; ++i) {
+        h=open_guest();
+        if(h==INVALID_HANDLE_VALUE) { ok=0; break; }
+        ok=invoke(h,"Save*",0,1) && g_eax==0 && e->FileNameLength==8 && !memcmp(e->FileName,"SaveSlot",8);
+        if(!ok) fprintf(stderr,"FAIL reopened directory iteration %u status=%08X\n",i,g_eax);
+        if(!close_guest(h)) ok=0;
+    }
+    RemoveDirectoryA(child); RemoveDirectoryA(path); VirtualFree(mem,0,MEM_RELEASE);
     if(!ok) return 1;
-    puts("PASS: Xbox directory ABI, 40-byte cleanup, filter, continuation, restart, dot exclusion, and class rejection"); return 0;
+    puts("PASS: Xbox directory ABI, filter, continuation, restart, close/reopen, dot exclusion, and class rejection"); return 0;
 }
-

@@ -11,6 +11,7 @@
 
 #include "kernel.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* ============================================================================
  * Exported Data Objects
@@ -147,7 +148,11 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     case XC_VIDEO:
         /* NTSC with widescreen and HDTV support enabled */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            /* RECOMP_VIDEO_FLAGS overrides (hex): 1 widescreen, 2 HDTV,
+             * 0x10 letterbox -- the dashboard's video settings. */
+            const char *e = getenv("RECOMP_VIDEO_FLAGS");
+            *(PULONG)Value = e ? (ULONG)strtoul(e, NULL, 16)
+                               : XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

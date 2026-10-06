@@ -38,6 +38,9 @@ static uint32_t s_program[NV2A_VSH_SLOTS][4];
 static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
+/* Bumped on every change, so a consumer that caches a translation of the
+ * program or a copy of the constants knows when to refresh it. */
+static uint32_t s_program_version = 1, s_const_version = 1;
 static uint32_t s_cxt_write;
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
@@ -55,6 +58,7 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
 
 void nv2a_vsh_program_word(uint32_t word)
 {
+    s_program_version++;
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
     if (++s_load_word == 4) {
@@ -63,7 +67,7 @@ void nv2a_vsh_program_word(uint32_t word)
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; s_program_version++; }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -74,6 +78,7 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 
 void nv2a_vsh_constant_word(uint32_t word)
 {
+    s_const_version++;
     if (s_const_load < NV2A_VSH_CONSTANTS)
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
     if (++s_const_word == 4) {
@@ -84,12 +89,14 @@ void nv2a_vsh_constant_word(uint32_t word)
 
 void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
+    s_const_version++;
     if (index < NV2A_VSH_CONSTANTS)
         memcpy(s_const[index], v, sizeof s_const[index]);
 }
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
+    s_program_version++;
     if (slot < NV2A_VSH_SLOTS)
         memcpy(s_program[slot], words, sizeof s_program[slot]);
 }
@@ -164,8 +171,22 @@ const float *nv2a_vsh_constant(uint32_t index)
     return s_const[index < NV2A_VSH_CONSTANTS ? index : 0];
 }
 
+const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4]
+{
+    *start = s_start_slot;
+    *version = s_program_version;
+    return (const uint32_t (*)[4])s_program;
+}
+
+const float (*nv2a_vsh_constants(uint32_t *version))[4]
+{
+    *version = s_const_version;
+    return (const float (*)[4])s_const;
+}
+
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
+    s_const_version++;
     if (index < NV2A_VSH_CONSTANTS && comp < 4)
         memcpy(&s_const[index][comp], &word, 4);
 }

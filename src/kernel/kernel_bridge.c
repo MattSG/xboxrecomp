@@ -673,7 +673,7 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE)
-            CloseHandle(h);
+            xbox_NtClose(h);
     }
     g_eax = 0; /* STATUS_SUCCESS */
 }
@@ -913,7 +913,16 @@ static void bridge_NtAllocateVirtualMemory(void)
      * two. This clamp is enough for a title that reserves generously and
      * commits little, and it fails loudly and later rather than silently and
      * at startup if one does not. */
-    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    /* A large pure reservation goes above RAM first. Taken from the heap it
+     * consumes physical page numbers below 64 MB that the contiguous window
+     * shares: MM3 reserves 16 MB when a race loads, which pushed the heap
+     * past the window's free spans and left the title's vertex and texture
+     * allocations failing for the whole race. */
+    uint32_t xbox_va = 0;
+    if ((alloc_type & 0x2000) && !(alloc_type & 0x1000) && size >= 0x100000u)
+        xbox_va = xbox_ReserveAlloc(size, 4096);
+    if (!xbox_va)
+        xbox_va = xbox_HeapAlloc(size, 4096);
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         /* A pure reservation too big for the heap. Take it from the mapped
          * space above RAM, where it costs no heap and the pages are distinct.
@@ -1039,8 +1048,15 @@ static void bridge_NtFreeVirtualMemory(void)
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
 
-    g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
-        XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
+    /* Guest virtual memory comes from the bump allocator above, committed
+     * for good, so there is nothing to give back. Forwarding to VirtualFree
+     * read the 32-bit guest pointer as a native one and failed every time:
+     * MM3 decommits a few pages a frame, and the failures, each a flushed
+     * log line, were a few percent of its game thread.
+     * ponytail: freed ranges are never reused; add a free list to
+     * xbox_ReserveAlloc if a title runs out of address space. */
+    (void)base_ptr; (void)size_ptr; (void)free_type;
+    g_eax = 0;                                          /* STATUS_SUCCESS */
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─

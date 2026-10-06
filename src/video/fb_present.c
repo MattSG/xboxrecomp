@@ -1,16 +1,16 @@
 /**
- * Show the guest framebuffer in a window.
+ * The framebuffer window: the title's display, on the host.
  *
- * The title renders into its own framebuffer in guest RAM and tells the kernel
- * where it is through AvSetDisplayMode; on hardware the CRTC scans that memory
- * out. Nothing here scans anything out, so however much of the GPU is
- * implemented, none of it is observable. This is the other half: a window that
- * reads that memory and puts it on screen.
+ * The title renders through the NV2A and tells the kernel where its display
+ * buffer is through AvSetDisplayMode; on hardware the CRTC scans that memory
+ * out and the PVIDEO overlay composites movies over it. This file owns the
+ * window the result is shown in -- creation, messages, keys, fullscreen -- and
+ * keeps track of what the display is showing: flips, buffers the title draws
+ * with the CPU instead of flipping, and PVIDEO submissions.
  *
- * Deliberately plain GDI rather than the D3D8 layer. The point is to display
- * whatever the guest actually wrote, so the fewer stages between guest memory
- * and the screen the better -- and it must keep working while the D3D8 layer
- * is busy with something else, such as the FMV player's own window.
+ * The pixels themselves are put on screen by the D3D11 renderer
+ * (nv2a_d3d11.c), which asks this file for the scan-out and overlay state when
+ * it presents.
  *
  * Off unless RECOMP_FB_WINDOW is set.
  */
@@ -23,54 +23,52 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include "pvideo_scanout.h"
+#include "fb_present.h"
+#include "../nv2a/nv2a_regs.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
 extern void nv2a_hook_pvideo_consume(unsigned bank);
 
 static volatile LONG s_fb_running;
-static volatile LONG s_pvideo_capture_count;
-static DWORD s_pvideo_next_capture_tick;
-static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
-static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+static volatile HWND s_hwnd;
+static uint32_t      s_fb_va, s_fb_pitch;
+/* Set by the first flip: from then on flips decide what is shown, except for a
+ * buffer the title points the display at and draws into with the CPU. */
+static volatile LONG s_flipped;
+
+/* A buffer the title pointed the display at itself, read live until it flips
+ * again.
+ *
+ * A flip is not the only way a picture changes. Between flips a title can set
+ * the display mode on a buffer and draw into it with the CPU -- MM3's loading
+ * screen does, streaming Startup.tga into the display D3D persisted at the end
+ * of the intro. Nothing rasterises into a buffer the title is showing this
+ * way, so reading it live is what the CRTC would scan. */
+static volatile LONG s_scan_va;            /* 0 while flips are in charge */
+static uint32_t      s_scan_pitch;
+
 /* A consumed submission remains on screen until the next submission or STOP.
  * Keep its pixels, since consuming the bank lets the guest reuse its memory. */
 static uint8_t      *s_pvideo_source;
 static size_t        s_pvideo_bytes;
 static unsigned      s_pvideo_bank;
 static uint32_t      s_pvideo_regs[0x1000 / 4];
+static uint32_t      s_pvideo_serial;
+static volatile LONG s_pvideo_capture_count;
+static DWORD         s_pvideo_next_capture_tick;
 
-/* A finished frame, taken at the flip and shown until the next one.
- *
- * The window used to convert straight out of guest memory every 16 ms. Even
- * pointed at the buffer the title had just finished, that races the executor
- * drawing the next frame into the other one and, whenever the two swap, puts
- * a half-drawn image on the screen -- which is the flicker. Copying the
- * finished frame once per flip means the window never reads memory the
- * rasteriser is writing, so what it shows cannot be half of anything.
- *
- * Two buffers and an index, swapped after the copy completes, so the window
- * thread is never reading the one being filled. */
-static uint32_t     *s_present[2];
-static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+HWND xbox_FramebufferWindowHandle(void)
+{
+    return s_hwnd;
+}
 
-/* A buffer the title pointed the display at itself, read live until it flips
- * again.
- *
- * A flip is not the only way a picture changes. Between flips a title can
- * set the display mode on a buffer and draw into it with the CPU -- MM3's
- * loading screen does, streaming Startup.tga into the display D3D persisted
- * at the end of the intro. The copy from the last flip showed that a quarter
- * loaded for the whole load. Nothing rasterises into a buffer the title is
- * showing this way, so reading it live is what the CRTC would scan. */
-static volatile LONG s_scan_va;            /* 0 while flips are in charge */
-static uint32_t      s_scan_pitch;
-
-/* Optional per-submission thumbnails for detecting corruption between screenshots.
- * Each record is a 160x120 BGRA image of the pixels sent to GDI. Keeping this
- * disabled has no file IO; the capture never modifies guest memory. */
-static void pvideo_capture_submission(void)
+/* Optional per-submission thumbnails for detecting corruption between
+ * screenshots: each record is a 160x120 BGRA image of the submitted frame.
+ * Keeping this disabled has no file IO; the capture never modifies guest
+ * memory. */
+static void pvideo_capture_submission(const uint8_t *yuy2, unsigned pitch,
+                                      unsigned iw, unsigned ih)
 {
     static FILE *capture;
     static int initialized;
@@ -87,12 +85,14 @@ static void pvideo_capture_submission(void)
                 setvbuf(capture, NULL, _IOFBF, 256 * 1024);
         }
     }
-    if (!capture) return;
+    if (!capture || !iw || !ih) return;
     for (y = 0; y < 120; ++y) {
-        unsigned sy = (unsigned)((uint64_t)y * s_fb_height / 120);
+        const uint8_t *line = yuy2 + (size_t)(y * ih / 120) * pitch;
         for (x = 0; x < 160; ++x) {
-            unsigned sx = (unsigned)((uint64_t)x * s_fb_width / 160);
-            row[x] = s_rgb[(size_t)sy * s_fb_width + sx];
+            unsigned sx = x * iw / 160;
+            int c = line[(sx & ~1u) * 2 + (sx & 1u) * 2] - 16;
+            int l = c < 0 ? 0 : (c > 219 ? 255 : c * 255 / 219);
+            row[x] = 0xFF000000u | (uint32_t)l * 0x010101u;
         }
         if (fwrite(row, sizeof row, 1, capture) != 1) {
             fclose(capture);
@@ -104,31 +104,29 @@ static void pvideo_capture_submission(void)
     fflush(capture);
 }
 
-static void fb_overlay(void)
+/* Take any newly submitted PVIDEO bank: copy its pixels, remember its
+ * registers, and hand the bank back to the title. */
+static void pvideo_poll(void)
 {
     uint32_t regs[0x1000 / 4];
     unsigned bank;
-    bool presented = false;
-    if (!s_rgb || !nv2a_hook_pvideo_snapshot(regs)) return;
+    if (!nv2a_hook_pvideo_snapshot(regs)) return;
     {
         static int trace = -1;
-        static uint32_t previous[9];
-        uint32_t current[9] = {
+        static uint32_t previous[7];
+        uint32_t current[7] = {
             regs[NV_PVIDEO_STOP / 4],
             regs[NV_PVIDEO_BASE / 4], regs[(NV_PVIDEO_BASE + 4) / 4],
             regs[NV_PVIDEO_OFFSET / 4], regs[(NV_PVIDEO_OFFSET + 4) / 4],
             regs[NV_PVIDEO_SIZE_IN / 4], regs[(NV_PVIDEO_SIZE_IN + 4) / 4],
-            s_fb_va, s_fb_pitch
         };
         if (trace < 0) trace = getenv("RECOMP_PVIDEO_TRACE") != NULL;
         if (trace && memcmp(previous, current, sizeof current)) {
-            fprintf(stderr, "[PVIDEO_SCANOUT] fb=%08X pitch=%u present=%ld "
-                    "pending=%08X stop=%08X size=%08X/%08X "
-                    "offset=%08X/%08X retained=%u pixel=%08X\n",
-                    s_fb_va, s_fb_pitch, s_present_idx,
-                    regs[NV_PVIDEO_BUFFER / 4], current[0], current[5], current[6],
-                    current[3], current[4], s_pvideo_source != NULL,
-                    s_rgb[(size_t)s_fb_width * s_fb_height / 2]);
+            fprintf(stderr, "[PVIDEO_SCANOUT] pending=%08X stop=%08X "
+                    "size=%08X/%08X offset=%08X/%08X retained=%u\n",
+                    regs[NV_PVIDEO_BUFFER / 4], current[0], current[5],
+                    current[6], current[3], current[4],
+                    s_pvideo_source != NULL);
             memcpy(previous, current, sizeof current);
         }
     }
@@ -147,9 +145,7 @@ static void fb_overlay(void)
         uint64_t bytes = (uint64_t)pitch * height;
         uintptr_t va;
         MEMORY_BASIC_INFORMATION mapping;
-        const uint8_t *source;
-        const uint8_t *scan_source;
-        uint8_t *snapshot = NULL;
+        uint8_t *snapshot;
         size_t available;
         if (!(regs[NV_PVIDEO_BUFFER / 4] & (1u << (bank * 4u)))) continue;
         if (!bytes || physical + bytes > 0x04000000u) continue;
@@ -160,18 +156,10 @@ static void fb_overlay(void)
             continue;
         available = mapping.RegionSize - (size_t)(va - (uintptr_t)mapping.BaseAddress);
         if (bytes > available) continue;
-        source = (const uint8_t *)va;
-        scan_source = source;
-        if (bytes <= SIZE_MAX) {
-            snapshot = (uint8_t *)malloc((size_t)bytes);
-            if (snapshot) {
-                memcpy(snapshot, source, (size_t)bytes);
-                scan_source = snapshot;
-            }
-        }
+        snapshot = (uint8_t *)malloc((size_t)bytes);
         if (!snapshot) continue;
-        if (pvideo_scanout(regs, scan_source, available, s_rgb,
-                           s_fb_width, s_fb_height, bank)) {
+        memcpy(snapshot, (const void *)va, (size_t)bytes);
+        {
             const char *capture = getenv("RECOMP_PVIDEO_DUMP");
             DWORD now = GetTickCount();
             if (capture && (LONG)(now - s_pvideo_next_capture_tick) >= 0) {
@@ -180,14 +168,8 @@ static void fb_overlay(void)
                 if (frame <= 12) {
                     char path[1024];
                     FILE *f;
-                    int n;
-                    size_t i, changed = 0;
-                    if (snapshot) {
-                        for (i = 0; i < (size_t)bytes; ++i)
-                            changed += snapshot[i] != source[i];
-                    }
-                    n = snprintf(path, sizeof(path), "%s.frame%02ld.bank%u.regs.bin",
-                                 capture, frame, bank);
+                    int n = snprintf(path, sizeof(path), "%s.frame%02ld.bank%u.regs.bin",
+                                     capture, frame, bank);
                     f = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "wb") : NULL;
                     if (f) {
                         fwrite(regs, 1, sizeof(regs), f);
@@ -197,42 +179,71 @@ static void fb_overlay(void)
                                  capture, frame, bank);
                     f = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "wb") : NULL;
                     if (f) {
-                        fwrite(scan_source, 1, (size_t)bytes, f);
+                        fwrite(snapshot, 1, (size_t)bytes, f);
                         fclose(f);
                     }
                     fprintf(stderr,
-                            "  [PVIDEO] captured frame=%ld bank=%u physical=0x%llX format=0x%08X pitch=%u size=%ux%u source=%p bytes=%llu changed=%llu\n",
+                            "  [PVIDEO] captured frame=%ld bank=%u physical=0x%llX format=0x%08X pitch=%u size=%ux%u bytes=%llu\n",
                             frame, bank, (unsigned long long)physical,
                             regs[(NV_PVIDEO_FORMAT + bank * 4) / 4], pitch,
                             regs[(NV_PVIDEO_SIZE_IN + bank * 4) / 4] & 0x7ff,
-                            height, (const void *)source,
-                            (unsigned long long)bytes,
-                            (unsigned long long)changed);
+                            height, (unsigned long long)bytes);
                 }
             }
-            free(s_pvideo_source);
-            s_pvideo_source = snapshot;
-            snapshot = NULL;
-            s_pvideo_bytes = (size_t)bytes;
-            s_pvideo_bank = bank;
-            memcpy(s_pvideo_regs, regs, sizeof(s_pvideo_regs));
-            presented = true;
-            pvideo_capture_submission();
-            nv2a_hook_pvideo_consume(bank);
         }
-        free(snapshot);
+        free(s_pvideo_source);
+        s_pvideo_source = snapshot;
+        s_pvideo_bytes = (size_t)bytes;
+        s_pvideo_bank = bank;
+        memcpy(s_pvideo_regs, regs, sizeof(s_pvideo_regs));
+        s_pvideo_serial++;
+        pvideo_capture_submission(snapshot, pitch,
+                                  regs[(NV_PVIDEO_SIZE_IN + bank * 4) / 4] & 0x7ff,
+                                  height);
+        nv2a_hook_pvideo_consume(bank);
     }
-    if (!presented && s_pvideo_source)
-        pvideo_scanout(s_pvideo_regs, s_pvideo_source, s_pvideo_bytes, s_rgb,
-                       s_fb_width, s_fb_height, s_pvideo_bank);
+}
+
+int xbox_FramebufferOverlay(XboxOverlay *o)
+{
+    const uint32_t *regs = s_pvideo_regs;
+    unsigned bank;
+    uint32_t format;
+    pvideo_poll();
+    if (!s_pvideo_source)
+        return 0;
+    bank = s_pvideo_bank;
+#define PV(reg) regs[((reg) + bank * 4u) / 4u]
+    format = PV(NV_PVIDEO_FORMAT);
+    memset(o, 0, sizeof *o);
+    o->yuy2 = s_pvideo_source;
+    o->pitch = format & NV_PVIDEO_FORMAT_PITCH;
+    o->in_w = PV(NV_PVIDEO_SIZE_IN) & 0x7ff;
+    o->in_h = (PV(NV_PVIDEO_SIZE_IN) >> 16) & 0x7ff;
+    o->out_x = PV(NV_PVIDEO_POINT_OUT) & 0xfff;
+    o->out_y = (PV(NV_PVIDEO_POINT_OUT) >> 16) & 0xfff;
+    o->out_w = PV(NV_PVIDEO_SIZE_OUT) & 0xfff;
+    o->out_h = (PV(NV_PVIDEO_SIZE_OUT) >> 16) & 0xfff;
+    o->start_s = (PV(NV_PVIDEO_POINT_IN) & 0x7fff) << 16;
+    o->start_t = (PV(NV_PVIDEO_POINT_IN) >> 17) << 17;
+    o->ds_dx = PV(NV_PVIDEO_DS_DX);
+    o->dt_dy = PV(NV_PVIDEO_DT_DY);
+    o->color_key_enabled = (format & NV_PVIDEO_FORMAT_DISPLAY) != 0;
+    o->color_key = regs[NV_PVIDEO_COLOR_KEY / 4] & 0xffffffu;
+    o->serial = s_pvideo_serial;
+#undef PV
+    if (!o->in_w || !o->in_h || !o->out_w || !o->out_h || (o->in_w & 1u) ||
+        o->pitch < o->in_w * 2u ||
+        ((format & NV_PVIDEO_FORMAT_COLOR) >> 16) != 1u ||
+        (uint64_t)o->pitch * o->in_h > s_pvideo_bytes)
+        return 0;
+    return 1;
 }
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
-    /* RECOMP_FB_VA pins the window to one guest address instead of following
-     * whichever surface is being drawn into. A black window cannot distinguish
-     * "the read path is broken" from "the title rendered black", and pointing
-     * it at memory known to have content settles that. */
+    /* RECOMP_FB_VA pins the display to one guest address instead of following
+     * whichever surface is being drawn into. */
     const char *pin = getenv("RECOMP_FB_VA");
 
     s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
@@ -240,107 +251,56 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
         s_fb_pitch = pitch;
 }
 
-static int fb_dump_pixels(const char *path, const uint32_t *pixels);
-
-/* Optional bounded capture of the exact completed image, before publication.
- * RECOMP_PRESENT_CAPTURE=<prefix>; create <prefix>.flag to capture 60 flips. */
-static void fb_capture_present(const uint32_t *pixels)
-{
-    static const char *prefix;
-    static int initialized;
-    static unsigned remaining, frame;
-    char path[1024];
-    FILE *flag;
-    if (!initialized) {
-        prefix = getenv("RECOMP_PRESENT_CAPTURE");
-        initialized = 1;
-    }
-    if (!prefix) return;
-    if (!remaining) {
-        snprintf(path, sizeof path, "%s.flag", prefix);
-        flag = fopen(path, "rb");
-        if (!flag) return;
-        fclose(flag);
-        remove(path);
-        remaining = 60;
-        frame = 0;
-    }
-    snprintf(path, sizeof path, "%s-%03u.bmp", prefix, frame++);
-    fb_dump_pixels(path, pixels);
-    --remaining;
-}
-
 /* Called by the pushbuffer executor when the title flips. */
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
-    const uint8_t *src;
-    LONG next;
-    uint32_t bpp, x, y;
-
-    if (!s_fb_running || !fb_va || !pitch)
-        return;
-    if (getenv("RECOMP_FB_VA"))
-        return;                       /* pinned: leave the old path alone */
-    RECOMP_PROFILE_BEGIN("Present copy");
-    next = (s_present_idx == 0) ? 1 : 0;
-    if (!s_present[next]) {
-        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
-                                             4);
-        if (!s_present[next]) {
-            RECOMP_PROFILE_END();
-            return;
-        }
-    }
-    bpp = pitch / s_fb_width;
-    src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
-    for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * pitch;
-        uint32_t *dst = s_present[next] + (size_t)y * s_fb_width;
-
-        if (bpp == 4) {
-            memcpy(dst, row, (size_t)s_fb_width * 4);
-        } else if (bpp == 2) {
-            const uint16_t *p = (const uint16_t *)row;
-            for (x = 0; x < s_fb_width; x++) {
-                uint16_t v = p[x];
-                uint32_t r = (uint32_t)((v >> 11) & 0x1F) * 255u / 31u;
-                uint32_t g = (uint32_t)((v >>  5) & 0x3F) * 255u / 63u;
-                uint32_t b = (uint32_t)( v        & 0x1F) * 255u / 31u;
-                dst[x] = (r << 16) | (g << 8) | b;
-            }
-        } else {
-            memset(dst, 0, (size_t)s_fb_width * 4);
-        }
-    }
-    fb_capture_present(s_present[next]);
-    /* Published only once it is whole. */
-    InterlockedExchange(&s_present_idx, next);
+    (void)pitch;
+    InterlockedExchange(&s_flipped, 1);
     /* Presenting the buffer already on display hands nothing over: D3D
      * persisting its display flips the very buffer it just set the mode on,
      * and the title then keeps drawing into it with no further flips. */
     if ((uint32_t)s_scan_va != fb_va)
-    InterlockedExchange(&s_scan_va, 0);
-    RECOMP_PROFILE_END();
+        InterlockedExchange(&s_scan_va, 0);
 }
 
-/* Called from AvSetDisplayMode. Before the first flip the window already
- * reads guest memory live, following the draw target, so this only matters
- * once flips have taken over. */
+/* Called from AvSetDisplayMode. Before the first flip the display already
+ * reads guest memory live; this only matters once flips have taken over. */
 void xbox_FramebufferWindowScanout(uint32_t fb_va, uint32_t pitch)
 {
-    if (s_present_idx < 0 || !fb_va || !pitch)
+    if (!s_flipped || !fb_va || !pitch)
         return;
     s_scan_pitch = pitch;
     InterlockedExchange(&s_scan_va, (LONG)fb_va);
+}
+
+int xbox_FramebufferScanSource(uint32_t *va, uint32_t *pitch)
+{
+    static int pinned = -1;
+    if (pinned < 0) pinned = getenv("RECOMP_FB_VA") != NULL;
+    if (pinned && s_fb_va) {
+        *va = s_fb_va;
+        *pitch = s_fb_pitch;
+        return 1;
+    }
+    if (s_scan_va) {
+        *va = (uint32_t)s_scan_va;
+        *pitch = s_scan_pitch;
+        return 1;
+    }
+    if (!s_flipped && s_fb_va && s_fb_pitch) {
+        *va = s_fb_va;
+        *pitch = s_fb_pitch;
+        return 1;
+    }
+    return 0;
 }
 
 /* Which keys are down, for the pad stand-in in src/input.
  *
  * GetAsyncKeyState looked like the cheaper way to ask and does not work
  * here: it reads a state Wine keeps for the X server, and a guest process
- * drawing through GDI never sees it change. The window that has the focus
- * is the thing that receives the keys, so that is what has to remember
- * them.
+ * drawing to a window never sees it change. The window that has the focus
+ * is the thing that receives the keys, so that is what has to remember them.
  *
  * Reading this needs no lock. Each entry is written only by the window
  * thread and read only by the USB thread, one byte at a time, and a press
@@ -359,37 +319,18 @@ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
     int i;
     for (i = 0; i < max_chars && i < 47 && name[i]; i++)
         s_title[i] = (wchar_t)name[i];
-    if (i)
-        s_title[i] = 0;
+    s_title[i] = 0;
+}
+
+void xbox_FramebufferNoteFlip(uint32_t draws)
+{
+    InterlockedIncrement(&s_flips);
+    InterlockedExchange(&s_frame_draws, (LONG)draws);
 }
 
 void xbox_FramebufferWindowFrameStats(uint32_t draws)
 {
-    static LARGE_INTEGER frequency, previous;
-    static FILE *frame_log;
-    static unsigned samples;
-    LARGE_INTEGER now;
-    if (!frequency.QuadPart) {
-        const char *path = getenv("RECOMP_FRAME_TIMES");
-        QueryPerformanceFrequency(&frequency);
-        if (path) {
-            frame_log = fopen(path, "w");
-            if (frame_log) fprintf(frame_log, "qpc_ms,frame_ms,draws\n");
-        }
-    }
-    QueryPerformanceCounter(&now);
-    if (previous.QuadPart) {
-        double ms = (now.QuadPart - previous.QuadPart) * 1000.0 / frequency.QuadPart;
-        RECOMP_PROFILE_PLOT("Frame interval (ms)", ms);
-        if (frame_log) {
-            fprintf(frame_log, "%.6f,%.6f,%u\n", now.QuadPart * 1000.0 / frequency.QuadPart, ms, draws);
-            if (++samples % 30 == 0) fflush(frame_log);
-        }
-    }
-    previous = now;
-    RECOMP_PROFILE_FRAME();
-    InterlockedIncrement(&s_flips);
-    InterlockedExchange(&s_frame_draws, (LONG)draws);
+    xbox_FramebufferNoteFlip(draws);
 }
 
 int xbox_FramebufferKeyDown(int vk)
@@ -397,6 +338,33 @@ int xbox_FramebufferKeyDown(int vk)
     if ((unsigned)vk > 255)
         return 0;
     return s_key_down[vk] != 0;
+}
+
+/* Borderless fullscreen on the monitor the window is on, and back. A
+ * borderless window rather than DXGI exclusive mode: no mode switch, no
+ * device loss, and alt-tab behaves. The renderer resizes its swap chain to
+ * whatever the client area becomes. */
+static void fb_toggle_fullscreen(HWND h)
+{
+    static WINDOWPLACEMENT saved = { sizeof(WINDOWPLACEMENT) };
+    LONG style = GetWindowLongA(h, GWL_STYLE);
+    if (style & WS_OVERLAPPEDWINDOW) {
+        MONITORINFO mi = { sizeof mi };
+        if (GetWindowPlacement(h, &saved) &&
+            GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            SetWindowLongA(h, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+            SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        }
+    } else {
+        SetWindowLongA(h, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(h, &saved);
+        SetWindowPos(h, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
 }
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -407,18 +375,21 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
 
+    case WM_ERASEBKGND:
+        return 1;                       /* the swap chain owns every pixel */
+
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if ((w == VK_RETURN && (l & (1 << 29))) || w == VK_F11) {
+            if (!(l & (1 << 30)))       /* not auto-repeat */
+                fb_toggle_fullscreen(h);
+            return 0;
+        }
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
-        /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
-         *
-         * The obvious diagnostic -- sampling which keys are held, once a
-         * second, from the input path -- cannot tell a key that was never
-         * pressed from one that was tapped: a 100 ms press is caught about
-         * one time in ten. That ambiguity is expensive when the only way
-         * to test is to ask someone to press a key and describe what
-         * happened. This answers "did it arrive" on its own. */
+        /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered. Sampling
+         * which keys are held cannot tell a key never pressed from one that
+         * was tapped between samples. */
         if (getenv("RECOMP_KEY_TRACE")) {
             static unsigned n;
             if (n++ < 40) {
@@ -443,93 +414,40 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcA(h, m, w, l);
 }
 
-/* The display formats an Xbox front buffer is actually set to. The pitch says
- * how wide a row is in bytes, so pitch/width gives the pixel size; the exact
- * component layout only matters for 16-bit, where 5:6:5 and 1:5:5:5 differ. */
-static void fb_convert(const uint8_t *src, uint32_t pitch)
+/* The initial client size: RECOMP_WINDOW_SIZE=WxH, else the display aspect
+ * at about two thirds of the work area's height. */
+extern float nv2a_d3d_display_aspect(void);
+
+static void fb_initial_size(int *w, int *h)
 {
-    uint32_t bpp = pitch / s_fb_width;
-    uint32_t x, y;
-
-    for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * pitch;
-        uint32_t *dst = s_rgb + (size_t)y * s_fb_width;
-
-        if (bpp == 4) {
-            memcpy(dst, row, (size_t)s_fb_width * 4);
-        } else if (bpp == 2) {
-            const uint16_t *p = (const uint16_t *)row;
-            for (x = 0; x < s_fb_width; x++) {
-                uint16_t v = p[x];
-                uint32_t r = (uint32_t)((v >> 11) & 0x1F) * 255u / 31u;
-                uint32_t g = (uint32_t)((v >>  5) & 0x3F) * 255u / 63u;
-                uint32_t b = (uint32_t)( v        & 0x1F) * 255u / 31u;
-                dst[x] = (r << 16) | (g << 8) | b;
-            }
-        } else {
-            memset(dst, 0, (size_t)s_fb_width * 4);
-        }
+    const char *e = getenv("RECOMP_WINDOW_SIZE");
+    RECT work;
+    if (e && sscanf(e, "%dx%d", w, h) == 2 && *w >= 64 && *h >= 48)
+        return;
+    if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0) ||
+        work.bottom - work.top < 600) {
+        *h = 720;
+        *w = (int)(720 * nv2a_d3d_display_aspect() + 0.5f);
+        return;
     }
-}
-
-/* Write what the window is currently showing to a 24-bit BMP.
- *
- * A black window is ambiguous: it means either that the read path is wrong or
- * that the title really did render black. Dumping the same converted pixels
- * the window draws settles which, and does it without a screenshot. */
-static int fb_dump_pixels(const char *path, const uint32_t *pixels)
-{
-    FILE *f;
-    uint32_t row = ((s_fb_width * 3u) + 3u) & ~3u;
-    uint32_t img = row * s_fb_height, total = 54u + img, y, x;
-    uint8_t hdr[54], *line;
-
-    if (!pixels)
-        return -1;
-    f = fopen(path, "wb");
-    if (!f)
-        return -1;
-    memset(hdr, 0, sizeof(hdr));
-    hdr[0] = 'B'; hdr[1] = 'M';
-    memcpy(hdr + 2, &total, 4);
-    hdr[10] = 54; hdr[14] = 40;
-    memcpy(hdr + 18, &s_fb_width, 4);
-    memcpy(hdr + 22, &s_fb_height, 4);
-    hdr[26] = 1; hdr[28] = 24;
-    memcpy(hdr + 34, &img, 4);
-    fwrite(hdr, 1, sizeof(hdr), f);
-
-    line = (uint8_t *)calloc(1, row);
-    for (y = 0; y < s_fb_height; y++) {
-        const uint32_t *src = pixels + (size_t)(s_fb_height - 1 - y) * s_fb_width;
-        for (x = 0; x < s_fb_width; x++) {
-            line[x * 3 + 0] = (uint8_t)(src[x] & 0xFF);
-            line[x * 3 + 1] = (uint8_t)((src[x] >> 8) & 0xFF);
-            line[x * 3 + 2] = (uint8_t)((src[x] >> 16) & 0xFF);
-        }
-        fwrite(line, 1, row, f);
+    *h = (work.bottom - work.top) * 2 / 3;
+    *w = (int)(*h * nv2a_d3d_display_aspect() + 0.5f);
+    if (*w > work.right - work.left) {
+        *w = work.right - work.left;
+        *h = (int)(*w / nv2a_d3d_display_aspect() + 0.5f);
     }
-    free(line);
-    fclose(f);
-    fprintf(stderr, "  [FBWIN] wrote %s (%ux%u from 0x%08X)\n",
-            path, s_fb_width, s_fb_height, s_fb_va);
-    return 0;
-}
-
-int xbox_FramebufferDumpBmp(const char *path)
-{
-    return fb_dump_pixels(path, s_rgb);
 }
 
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
-    HDC hdc;
-    BITMAPINFO bi;
     RECT r;
+    int cw, ch;
 
     (void)unused;
-
+    /* Real pixels: without this a scaled desktop hands the swap chain a
+     * smaller client area and stretches it back up blurred. */
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     {
         WNDCLASSA wc;
         memset(&wc, 0, sizeof(wc));
@@ -539,7 +457,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+    fb_initial_size(&cw, &ch);
+    r.left = 0; r.top = 0; r.right = cw; r.bottom = ch;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -550,81 +469,18 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
-    hdc = GetDC(hwnd);
-
-    memset(&bi, 0, sizeof(bi));
-    bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth       = (LONG)s_fb_width;
-    bi.bmiHeader.biHeight      = -(LONG)s_fb_height;   /* top-down */
-    bi.bmiHeader.biPlanes      = 1;
-    bi.bmiHeader.biBitCount    = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-
-    s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
-
-    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
-            s_fb_width, s_fb_height);
+    if (getenv("RECOMP_FULLSCREEN"))
+        fb_toggle_fullscreen(hwnd);
+    s_hwnd = hwnd;
+    fprintf(stderr, "  [FBWIN] framebuffer window open (%dx%d client)\n", cw, ch);
 
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
+        DWORD wait = MsgWaitForMultipleObjects(0, NULL, FALSE, 250, QS_ALLINPUT);
+        (void)wait;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
-        }
-        if (s_scan_va && s_rgb) {
-            fb_convert((const uint8_t *)((uintptr_t)(uint32_t)s_scan_va +
-                                         xbox_GetMemoryOffset()), s_scan_pitch);
-            fb_overlay();
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
-        } else if (s_present_idx >= 0 && s_rgb) {
-            /* A finished frame, published by the flip. Copied into s_rgb so
-             * the dump path and GDI see one consistent image even if the
-             * next flip lands mid-blit. */
-            LONG idx = s_present_idx;
-            if (s_present[idx])
-                memcpy(s_rgb, s_present[idx],
-                       (size_t)s_fb_width * s_fb_height * 4);
-            if (!getenv("RECOMP_FB_VA"))
-                fb_overlay();
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
-        } else if (s_fb_va && s_fb_pitch && s_rgb) {
-            /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
-             * before, which is also what a title that never flips needs. */
-            const uint8_t *src =
-                (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
-            fb_convert(src, s_fb_pitch);
-            if (!getenv("RECOMP_FB_VA"))
-                fb_overlay();
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
-        }
-        {
-            /* One dump a few seconds in, so the title has had time to render
-             * something rather than catching the first blank frame.
-             *
-             * RECOMP_FB_WINDOW_DUMP_EVERY=<frames> dumps repeatedly instead.
-             * This window follows the address AvSetDisplayMode gave, which is
-             * what the CRTC scans and therefore what a person sees; the
-             * pushbuffer executor's own dump follows its draw surface. With
-             * double buffering those are different buffers, and measuring
-             * progress from the executor's dump reports a blank screen while
-             * the window is showing the title's logo. Ask the window. */
-            const char *dump = getenv("RECOMP_FB_DUMP");
-            const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
-            static int frames;
-            int period = every ? atoi(every) : 0;
-            frames++;
-            if (dump && period > 0) {
-                if (frames % period == 0)
-                    xbox_FramebufferDumpBmp(dump);
-            } else if (dump && frames == 600) {
-                xbox_FramebufferDumpBmp(dump);
-            }
         }
         {
             static DWORD t0;
@@ -641,15 +497,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 t0 = now; f0 = f;
             }
         }
-        Sleep(16);
     }
 
-    ReleaseDC(hwnd, hdc);
+    s_hwnd = NULL;
     DestroyWindow(hwnd);
-    free(s_rgb);
-    s_rgb = NULL;
-    free(s_pvideo_source);
-    s_pvideo_source = NULL;
     return 0;
 }
 
@@ -676,4 +527,7 @@ void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
+void xbox_FramebufferNoteFlip(uint32_t draws) { (void)draws; }
+int xbox_FramebufferScanSource(uint32_t *va, uint32_t *pitch) { (void)va; (void)pitch; return 0; }
+int xbox_FramebufferOverlay(XboxOverlay *o) { (void)o; return 0; }
 #endif

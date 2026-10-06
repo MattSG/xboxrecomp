@@ -312,10 +312,13 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     return STATUS_UNSUCCESSFUL;
 }
 
+static void close_dir_context(HANDLE file_handle);
+
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        close_dir_context(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -597,6 +600,23 @@ typedef struct {
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+/* A directory can be closed before its scan reaches STATUS_NO_MORE_FILES.
+ * Retire that scan before Windows can reuse the file handle for another open. */
+static void close_dir_context(HANDLE file_handle)
+{
+    if (!s_dir_cs_init) return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; ++i) {
+        DIR_CONTEXT* ctx = &s_dir_contexts[i];
+        if (ctx->file_handle == file_handle) {
+            if (ctx->find_handle && ctx->find_handle != INVALID_HANDLE_VALUE)
+                FindClose(ctx->find_handle);
+            memset(ctx, 0, sizeof(*ctx));
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
 
 static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 {
