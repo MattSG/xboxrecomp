@@ -96,6 +96,10 @@ int  nv2a_d3d_active(void);
 
 /* Width / height the image is presented at (widescreen). */
 float nv2a_d3d_display_aspect(void);
+/* Called by the title as its race camera, or a frontend camera, sets up its
+ * projection; the race HUD is placed at the screen edges in between. */
+void nv2a_d3d_note_race_camera(void);
+void nv2a_d3d_note_frontend_camera(void);
 
 void nv2a_d3d_draw(const NvD3DState *st, int topology,
                    const NvD3DVertex *v, uint32_t nv,
