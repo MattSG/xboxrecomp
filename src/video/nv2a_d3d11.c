@@ -147,6 +147,9 @@ void nv2a_d3d_kick(void)
  * to the display aspect (see nv2a_d3d_display_aspect). s_cur_sx/sy are the
  * bound target's. */
 static float s_scale = 1.0f, s_cur_sx = 1.0f, s_cur_sy = 1.0f;
+/* Host MSAA sample count for linear render targets and the anisotropy of
+ * linearly filtered textures: RECOMP_MSAA (1/2/4/8), RECOMP_ANISO (1..16). */
+static UINT s_msaa = 4, s_aniso = 16;
 #define GUEST_W 640u
 #define GUEST_H 480u
 
@@ -324,10 +327,14 @@ static uint64_t hash_mem(const uint8_t *p, size_t n)
 /* ---------------------------------------------------------------- shaders */
 
 static const char s_hlsl[] =
-/* FLATQ: nointerpolation for the flat-shaded pixel shader variant */
-"#ifndef FLATQ\n#define FLATQ\n#endif\n"
-"struct PSIn { float4 pos:SV_Position; FLATQ float4 d0:COLOR0; FLATQ float4 d1:COLOR1; float4 fog:FOG;\n"
-"  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3; };\n"
+/* FLATQ: nointerpolation for the flat-shaded pixel shader variant. Under
+ * MSAA the rest interpolate at the centroid: an edge pixel's centre can lie
+ * outside its triangle, and texcoords extrapolated there read past the tile
+ * edge -- bright seams between ground tiles. */
+"#ifndef FLATQ\n#define FLATQ centroid\n#endif\n"
+"struct PSIn { float4 pos:SV_Position; FLATQ float4 d0:COLOR0; FLATQ float4 d1:COLOR1;\n"
+"  centroid float4 fog:FOG; centroid float4 t0:TEXCOORD0; centroid float4 t1:TEXCOORD1;\n"
+"  centroid float4 t2:TEXCOORD2; centroid float4 t3:TEXCOORD3; };\n"
 "cbuffer UBC : register(b0) { uint4 at[16]; float4 DEF[16]; uint4 ub_info; float4 ub_map;\n"
 "  uint4 ub_fogi; float4 ub_fogf; float4 ub_place; };\n"
 "cbuffer UBP : register(b2) { uint4 PROG[136]; };\n"
@@ -886,10 +893,22 @@ int nv2a_d3d_init(void)
     }
     (void)e;
     display_config(1);
+    if ((e = getenv("RECOMP_MSAA")) != NULL) s_msaa = (UINT)atoi(e);
+    if ((e = getenv("RECOMP_ANISO")) != NULL) s_aniso = (UINT)atoi(e);
+    if (s_aniso < 1) s_aniso = 1;
+    if (s_aniso > 16) s_aniso = 16;
+    if (s_msaa > 8) s_msaa = 8;
+    for (; s_msaa > 1; s_msaa /= 2) {
+        UINT qc = 0, qd = 0;
+        ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_B8G8R8A8_UNORM, s_msaa, &qc);
+        ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_D24_UNORM_S8_UINT, s_msaa, &qd);
+        if (qc && qd) break;
+    }
+    if (s_msaa < 1) s_msaa = 1;
     s_init_state = 1;
-    fprintf(stderr, "[D3D11] renderer ready: %ux%u internal, display aspect %.3f\n",
+    fprintf(stderr, "[D3D11] renderer ready: %ux%u internal, display aspect %.3f, %ux MSAA, %ux AF\n",
             (uint32_t)(GUEST_W * s_scale * widen() + 0.5f), (uint32_t)(GUEST_H * s_scale + 0.5f),
-            nv2a_d3d_display_aspect());
+            nv2a_d3d_display_aspect(), s_msaa, s_aniso);
     fflush(stderr);
     return 1;
 }
@@ -906,7 +925,9 @@ typedef struct {
     uint32_t color_fmt;             /* SURFACE_FORMAT colour code */
     float sx, sy;                   /* host pixels per guest pixel */
     int swizzled;
-    ID3D11Texture2D *tex;
+    ID3D11Texture2D *tex;           /* single-sample; what srv reads */
+    ID3D11Texture2D *ms;            /* MSAA target rtv draws into, or NULL */
+    int ms_dirty;                   /* ms drawn since the last resolve */
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv;
     uint8_t *shadow;                /* guest bytes as of the last sync */
@@ -915,7 +936,7 @@ typedef struct {
 } Surface;
 
 typedef struct {
-    uint32_t phys, iw, ih;
+    uint32_t phys, iw, ih, samples;
     ID3D11Texture2D *tex;
     ID3D11DepthStencilView *dsv;
     uint32_t used_frame;
@@ -951,8 +972,8 @@ static int surface_alpha_mode(uint32_t fmt)
     }
 }
 
-static ID3D11Texture2D *make_texture(UINT w, UINT h, UINT levels, UINT array,
-                                     DXGI_FORMAT f, UINT bind, UINT misc)
+static ID3D11Texture2D *make_texture_ms(UINT w, UINT h, UINT levels, UINT array,
+                                        DXGI_FORMAT f, UINT bind, UINT misc, UINT samples)
 {
     D3D11_TEXTURE2D_DESC d;
     ID3D11Texture2D *t = NULL;
@@ -962,13 +983,31 @@ static ID3D11Texture2D *make_texture(UINT w, UINT h, UINT levels, UINT array,
     d.MipLevels = levels;
     d.ArraySize = array;
     d.Format = f;
-    d.SampleDesc.Count = 1;
+    d.SampleDesc.Count = samples;
     d.Usage = D3D11_USAGE_DEFAULT;
     d.BindFlags = bind;
     d.MiscFlags = misc;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &t)))
         return NULL;
     return t;
+}
+
+static ID3D11Texture2D *make_texture(UINT w, UINT h, UINT levels, UINT array,
+                                     DXGI_FORMAT f, UINT bind, UINT misc)
+{
+    return make_texture_ms(w, h, levels, array, f, bind, misc, 1);
+}
+
+/* Bring a surface's single-sample texture up to date with its MSAA target
+ * before anything reads tex/srv. */
+static void surface_resolve(Surface *s)
+{
+    if (s->ms && s->ms_dirty) {
+        ID3D11DeviceContext_ResolveSubresource(s_ctx, (ID3D11Resource *)s->tex, 0,
+                                               (ID3D11Resource *)s->ms, 0,
+                                               DXGI_FORMAT_B8G8R8A8_UNORM);
+        s->ms_dirty = 0;
+    }
 }
 
 static void unbind_targets(void)
@@ -1147,6 +1186,7 @@ static void surface_sync_impl(Surface *s, int force)
             float x0, x1;
             guest_span(s, &x0, &x1);
             if (srv) blit_span(srv, NULL, s->rtv, s->iw, s->ih, -1.0f, x0, x1, 0, 1);
+            s->ms_dirty = 1;
         }
         return;
     }
@@ -1188,6 +1228,7 @@ static void surface_sync_impl(Surface *s, int force)
         float x0, x1;
         guest_span(s, &x0, &x1);
         if (srv && msk) blit_span(srv, msk, s->rtv, s->iw, s->ih, -1.0f, x0, x1, 0, 1);
+        s->ms_dirty = 1;
     }
 }
 
@@ -1205,6 +1246,7 @@ static void surface_release(Surface *s)
     if (s_cur_rt == s) unbind_targets();
     if (s->srv) ID3D11ShaderResourceView_Release(s->srv);
     if (s->rtv) ID3D11RenderTargetView_Release(s->rtv);
+    if (s->ms) ID3D11Texture2D_Release(s->ms);
     if (s->tex) ID3D11Texture2D_Release(s->tex);
     free(s->shadow);
     memset(s, 0, sizeof *s);
@@ -1257,12 +1299,18 @@ static Surface *surface_get(uint32_t va, uint32_t pitch, uint32_t fmt,
     s->tex = make_texture(s->iw, s->ih, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM,
                           D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0);
     if (!s->tex) { fail("surface texture", E_FAIL); memset(s, 0, sizeof *s); return NULL; }
-    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s->tex, NULL, &s->rtv);
+    /* Render-to-texture (swizzled) targets stay single-sample. */
+    if (s_msaa > 1 && !swizzled)
+        s->ms = make_texture_ms(s->iw, s->ih, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                D3D11_BIND_RENDER_TARGET, 0, s_msaa);
+    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)(s->ms ? s->ms : s->tex),
+                                        NULL, &s->rtv);
     ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s->tex, NULL, &s->srv);
     s->used_frame = s_frame;
     {
         float zero[4] = { 0, 0, 0, 0 };
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s->rtv, zero);
+        s->ms_dirty = 1;
     }
     surface_sync(s, 1);
     if (getenv("RECOMP_D3D_TRACE"))
@@ -1271,14 +1319,14 @@ static Surface *surface_get(uint32_t va, uint32_t pitch, uint32_t fmt,
     return s;
 }
 
-static Depth *depth_get(uint32_t va, uint32_t iw, uint32_t ih)
+static Depth *depth_get(uint32_t va, uint32_t iw, uint32_t ih, UINT samples)
 {
     uint32_t p = phys(va);
     Depth *d, *victim = NULL;
     int i;
     for (i = 0; i < MAX_DEPTHS; i++) {
         d = &s_depth[i];
-        if (d->tex && d->phys == p && d->iw == iw && d->ih == ih) {
+        if (d->tex && d->phys == p && d->iw == iw && d->ih == ih && d->samples == samples) {
             d->used_frame = s_frame;
             return d;
         }
@@ -1293,14 +1341,14 @@ static Depth *depth_get(uint32_t va, uint32_t iw, uint32_t ih)
     if (d->dsv) ID3D11DepthStencilView_Release(d->dsv);
     if (d->tex) ID3D11Texture2D_Release(d->tex);
     memset(d, 0, sizeof *d);
-    d->tex = make_texture(iw, ih, 1, 1, DXGI_FORMAT_D24_UNORM_S8_UINT,
-                          D3D11_BIND_DEPTH_STENCIL, 0);
+    d->tex = make_texture_ms(iw, ih, 1, 1, DXGI_FORMAT_D24_UNORM_S8_UINT,
+                             D3D11_BIND_DEPTH_STENCIL, 0, samples);
     if (!d->tex) return NULL;
     ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)d->tex, NULL, &d->dsv);
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, d->dsv,
                                               D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
                                               1.0f, 0);
-    d->phys = p; d->iw = iw; d->ih = ih; d->used_frame = s_frame;
+    d->phys = p; d->iw = iw; d->ih = ih; d->samples = samples; d->used_frame = s_frame;
     return d;
 }
 
@@ -1336,12 +1384,14 @@ static int bind_targets(const NvD3DState *st, int want_depth, Surface **out,
         float wx = (w == GUEST_W && h == GUEST_H) ? s_scale * widen() : s_scale;
         uint32_t iw = s ? s->iw : (uint32_t)(w * wx + 0.5f);
         uint32_t ih = s ? s->ih : (uint32_t)(h * s_scale + 0.5f);
-        d = depth_get(st->zeta_addr, iw, ih);
+        UINT ns = s ? (s->ms ? s_msaa : 1) : (swizzled ? 1 : s_msaa);
+        d = depth_get(st->zeta_addr, iw, ih, ns);
     }
     if (!s && !d)
         return 0;
     if (s && d && (d->iw != s->iw || d->ih != s->ih))
         d = NULL;
+    if (s) s->ms_dirty = 1;
     if (s != s_cur_rt || d != s_cur_ds) {
         ID3D11RenderTargetView *rtv = s ? s->rtv : NULL;
         unbind_textures();
@@ -1860,8 +1910,9 @@ static ID3D11SamplerState *sampler(const NvD3DTexture *t, int levels)
         d.AddressU = addr_mode(t->address & 0xF);
         d.AddressV = addr_mode((t->address >> 8) & 0xF);
         d.AddressW = addr_mode((t->address >> 16) & 0xF);
+        if (min_lin && mag_lin && s_aniso > 1) d.Filter = D3D11_FILTER_ANISOTROPIC;
         d.MipLODBias = (float)bias13 / 256.0f;
-        d.MaxAnisotropy = 1;
+        d.MaxAnisotropy = s_aniso;
         d.ComparisonFunc = D3D11_COMPARISON_NEVER;
         d.BorderColor[0] = ((t->border >> 16) & 0xFF) / 255.0f;
         d.BorderColor[1] = ((t->border >> 8) & 0xFF) / 255.0f;
@@ -2011,7 +2062,9 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         if (rt && rt->sx > rt->sy * 1.001f) s_draw_reads_wide = 1;
         if (rt) {
             surface_sync(rt, 0);
-            view = rt == s_cur_rt ? feedback_copy(rt) : rt->srv;
+            surface_resolve(rt);
+            /* An MSAA target draws into ms, so its resolved tex is free to read. */
+            view = rt == s_cur_rt && !rt->ms ? feedback_copy(rt) : rt->srv;
             if (kind == K_LIN) {
                 pc.tex_scale[n][0] = 1.0f / (float)rt->w;
                 pc.tex_scale[n][1] = 1.0f / (float)rt->h;
@@ -2596,6 +2649,7 @@ static void writeback_surfaces(void)
         scaled = s->iw != s->w || s->ih != s->h;
         if (!wb_slot_ready(k, s->w, s->h, scaled))
             continue;
+        surface_resolve(s);
         if (scaled) {
             float x0, x1;
             guest_span(s, &x0, &x1);
@@ -2885,6 +2939,7 @@ static void composite(ID3D11RenderTargetView *rtv, UINT w, UINT h, Surface *s,
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb_present);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_present_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_present);
+    surface_resolve(s);
     {
         ID3D11ShaderResourceView *views[2] = { s->srv, pc->ovl_flags[0] ? s_ovl_srv : NULL };
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, views);
