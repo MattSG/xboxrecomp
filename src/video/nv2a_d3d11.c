@@ -1862,6 +1862,35 @@ static void tex_evict(void)
     }
 }
 
+/* One mip level below src: a 2x2 box (a dimension already 1 stays 1). */
+static void halve_bgra(const uint32_t *src, uint32_t w, uint32_t h, uint32_t *dst)
+{
+    uint32_t nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1, x, y, c;
+    for (y = 0; y < nh; y++)
+        for (x = 0; x < nw; x++) {
+            uint32_t x0 = w > 1 ? 2 * x : x, y0 = h > 1 ? 2 * y : y;
+            uint32_t x1 = w > 1 ? x0 + 1 : x0, y1 = h > 1 ? y0 + 1 : y0, out = 0;
+            for (c = 0; c < 32; c += 8)
+                out |= ((((src[y0 * w + x0] >> c) & 255) + ((src[y0 * w + x1] >> c) & 255) +
+                         ((src[y1 * w + x0] >> c) & 255) + ((src[y1 * w + x1] >> c) & 255) + 2) / 4) << c;
+            dst[y * nw + x] = out;
+        }
+}
+
+/* Mip levels the host texture gets. Titles shipped short chains to save
+ * memory (MM3: 1024x1024 with 4 levels), so distant surfaces kept sampling
+ * a level far finer than their footprint -- grain and shimmer, with a band
+ * where the chain runs out. A chain the title started is completed down to
+ * 1x1 from its own smallest level; a single level stays single. */
+static int host_levels(const TexLayout *L, const NvD3DTexture *t)
+{
+    int n = 1;
+    uint32_t m = t->width > t->height ? t->width : t->height;
+    if (L->levels < 2) return L->levels;
+    while (m > 1) { m >>= 1; n++; }
+    return n > L->levels ? n : L->levels;
+}
+
 static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t)
 {
     TexLayout L;
@@ -1893,9 +1922,10 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t)
     }
     if (!e) {
         D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+        int hl = host_levels(&L, t);
         e = (TexEntry *)calloc(1, sizeof *e);
         if (!e) return NULL;
-        e->tex = make_texture(t->width, t->height, (UINT)L.levels, (UINT)L.faces,
+        e->tex = make_texture(t->width, t->height, (UINT)hl, (UINT)L.faces,
                               DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_SHADER_RESOURCE,
                               L.faces == 6 ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0);
         if (!e->tex) { free(e); return NULL; }
@@ -1903,10 +1933,10 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t)
         sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         if (L.faces == 6) {
             sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
-            sd.TextureCube.MipLevels = (UINT)L.levels;
+            sd.TextureCube.MipLevels = (UINT)hl;
         } else {
             sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            sd.Texture2D.MipLevels = (UINT)L.levels;
+            sd.Texture2D.MipLevels = (UINT)hl;
         }
         ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex, &sd, &e->srv);
         e->phys = p; e->format = t->format; e->pitch = t->pitch;
@@ -1918,18 +1948,41 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t)
         s_tex_count++;
     }
     {
-        int f, lv;
-        uint32_t *px = scratch_pixels((size_t)t->width * t->height);
+        int f, lv, hl = host_levels(&L, t);
+        uint32_t *px = scratch_pixels((size_t)t->width * t->height), *a = NULL, *b = NULL;
         if (!px) return NULL;
-        for (f = 0; f < L.faces; f++)
+        if (hl > L.levels) {
+            size_t n = (size_t)L.level_w[L.levels - 1] * L.level_h[L.levels - 1];
+            a = (uint32_t *)malloc(n * 4);
+            b = (uint32_t *)malloc(n * 4);
+            if (!a || !b) { free(a); free(b); a = b = NULL; }
+        }
+        for (f = 0; f < L.faces; f++) {
+            uint32_t w, h;
             for (lv = 0; lv < L.levels; lv++) {
                 decode_level(t, &L, guest(t->addr) + f * L.face_stride + L.level_off[lv],
                              lv, pal, px);
                 ID3D11DeviceContext_UpdateSubresource(
                     s_ctx, (ID3D11Resource *)e->tex,
-                    (UINT)lv + (UINT)f * (UINT)L.levels, NULL,
+                    (UINT)lv + (UINT)f * (UINT)hl, NULL,
                     px, L.level_w[lv] * 4, 0);
             }
+            if (hl <= L.levels || !a) continue;
+            w = L.level_w[L.levels - 1]; h = L.level_h[L.levels - 1];
+            memcpy(a, px, (size_t)w * h * 4);
+            for (; lv < hl; lv++) {
+                uint32_t *tmp;
+                halve_bgra(a, w, h, b);
+                if (w > 1) w /= 2;
+                if (h > 1) h /= 2;
+                ID3D11DeviceContext_UpdateSubresource(
+                    s_ctx, (ID3D11Resource *)e->tex,
+                    (UINT)lv + (UINT)f * (UINT)hl, NULL, b, w * 4, 0);
+                tmp = a; a = b; b = tmp;
+            }
+        }
+        free(a);
+        free(b);
     }
     e->hash = h;
     e->pal_hash = ph;
