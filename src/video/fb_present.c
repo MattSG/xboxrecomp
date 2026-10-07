@@ -41,9 +41,7 @@ static volatile LONG s_flipped;
  * again.
  *
  * A flip is not the only way a picture changes. Between flips a title can set
- * the display mode on a buffer and draw into it with the CPU -- MM3's loading
- * screen does, streaming Startup.tga into the display D3D persisted at the end
- * of the intro. Nothing rasterises into a buffer the title is showing this
+ * the display mode on a buffer and draw into it with the CPU. Nothing rasterises into a buffer the title is showing this
  * way, so reading it live is what the CRTC would scan. */
 static volatile LONG s_scan_va;            /* 0 while flips are in charge */
 static uint32_t      s_scan_pitch;

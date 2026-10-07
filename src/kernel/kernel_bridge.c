@@ -1284,7 +1284,7 @@ static void bridge_NtAllocateVirtualMemory(void)
      * at startup if one does not. */
     /* A large pure reservation goes above RAM first. Taken from the heap it
      * consumes physical page numbers below 64 MB that the contiguous window
-     * shares: MM3 reserves 16 MB when a race loads, which pushed the heap
+     * shares: a large reservation can push the heap
      * past the window's free spans and left the title's vertex and texture
      * allocations failing for the whole race. */
     uint32_t xbox_va = 0;
@@ -1583,11 +1583,51 @@ static void bridge_NtFreeVirtualMemory(void)
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
 
-    /* Guest virtual memory comes from the bump allocator above, committed
-     * for good, so there is nothing to give back. Forwarding to VirtualFree
-     * read the 32-bit guest pointer as a native one and failed every time:
-     * MM3 decommits a few pages a frame, and the failures, each a flushed
-     * log line, were a few percent of its game thread.
+    if (base_ptr && size_ptr) {
+        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
+        uint32_t vm_size = BRIDGE_MEM32(size_ptr);
+        uint32_t vm_status;
+
+        if (guest_vmem_free(&vm_base, &vm_size, free_type, &vm_status)) {
+            if (vm_status == 0) {
+                BRIDGE_MEM32(base_ptr) = vm_base;
+                BRIDGE_MEM32(size_ptr) = vm_size;
+            }
+            g_eax = vm_status;
+            return;
+        }
+    }
+
+    /* Memory NtAllocateVirtualMemory took from the guest heap. The call below
+     * reads the 32-bit guest slots as host pointers and hands them to
+     * VirtualFree, which fails, so none of it ever came back. Under
+     * RECOMP_HEAP_RECLAIM a release returns the block to the heap and a
+     * decommit zeroes the pages it names, since heap memory stays committed. */
+    if (xbox_HeapReclaimEnabled() && base_ptr && size_ptr) {
+        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
+        uint32_t left = xbox_HeapBlockSize(vm_base);
+
+        if (left) {
+            if (free_type & 0x8000) {              /* MEM_RELEASE */
+                xbox_HeapFree(vm_base);
+                BRIDGE_MEM32(size_ptr) = 0;
+            } else {
+                /* MEM_DECOMMIT keeps the block, but on the console the pages
+                 * are gone and a later MEM_COMMIT (a no-op here) brings them
+                 * back zeroed. Zero them now so it does. */
+                uint32_t vm_size = BRIDGE_MEM32(size_ptr);
+                uint32_t n = (vm_size && vm_size < left) ? vm_size : left;
+                memset(XBOX_TO_NATIVE(vm_base), 0, n);
+            }
+            g_eax = 0;
+            return;
+        }
+    }
+
+    /* Anything else came from the bump allocator, committed for good, so
+     * there is nothing to give back. Forwarding to VirtualFree read the 32-bit
+     * guest pointer as a native one and failed every time. Repeated failures
+     * also flushed a log line on every decommit.
      * ponytail: freed ranges are never reused; add a free list to
      * xbox_ReserveAlloc if a title runs out of address space. */
     (void)base_ptr; (void)size_ptr; (void)free_type;
@@ -5276,7 +5316,7 @@ static void bridge_ObReferenceObjectByHandle(void)
         g_eax = 0xC0000008u;                 /* STATUS_INVALID_HANDLE */
     } else if (obj_type == XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE) {
         /* A thread handle is a host token, not a guest KTHREAD, and titles
-         * read the object: MM3 polls its startup worker's ExitStatus
+         * read the object: a worker's ExitStatus can be polled
          * (+0x120) until it leaves STATUS_PENDING. Hand out one zeroed guest
          * thread object, signalled (+4) and finished (ExitStatus 0).
          * ponytail: every thread reads as exited; track per-handle objects

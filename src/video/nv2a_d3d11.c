@@ -182,8 +182,8 @@ static int s_sharp = 1;   /* RECOMP_SHARP_POINT=0: point filtering as the title 
 #define GUEST_H 480u
 
 /* HUD edge placement is latched: the title turns it on when its in-game
- * HUD's screen begins (MM3: the race camera, built once as a race starts)
- * and off when it leaves (MM3: car select's camera). Frames that draw a full-screen background
+ * HUD's screen begins
+ * and off when it leaves. Frames that draw a full-screen background
  * image are menus or loading screens and never get it, which keeps menus
  * reached from a race (and the race's own loading screen) in 4:3 layout. */
 static volatile LONG s_edge_hud;
@@ -240,7 +240,7 @@ static int nv2a_d3d_hud_active(void)
 /* The aspect the image is rendered at, never narrower than the title's
  * 4:3: RECOMP_ASPECT (e.g. 16:9, 21:9, 1.6, 4:3), else the game window's
  * client area, following it as the window is resized (see display_config).
- * The title widens its projection to match (MM3: src/mm3_widescreen.c). */
+ * The title widens its projection to match. */
 static volatile float s_aspect;     /* 0 until decided */
 
 static float clamp_aspect(float a)
@@ -463,8 +463,8 @@ static const char s_hlsl[] =
 "      if (mac != 0u && mac != 13u && mm != 0u && td < 13u && !(ilu != 0u && td == 1u))\n"
 "        R[td] = msk(R[td], mr, mm);\n"
 "      if (ilu != 0u && im != 0u) { uint it = mac ? 1u : td; if (it < 13u) R[it] = msk(R[it], ir, im); }\n"
-"      /* ponytail: writes to the constant file (out-to-c[]) are dropped; no\n"
-"       * MM3 program does it. A local copy of C[] would support it. */\n"
+"      /* ponytail: writes to the constant file (out-to-c[]) are dropped;\n"
+"       * a local copy of C[] would support them. */\n"
 "      if (om != 0u && ((ins.w >> 11) & 1u) && (((ins.w >> 2) & 1u) ? ilu : mac) != 0u) {\n"
 "        float4 ov = ((ins.w >> 2) & 1u) ? ir : mr;\n"
 "        if (oa == 0u) R[12] = msk(R[12], ov, om);\n"
@@ -488,7 +488,7 @@ static const char s_hlsl[] =
  * roundScreenCoords), so the Xbox D3D screen offset 0.53125 puts a
  * full-target quad's left/top edge exactly on the centre of pixel 0, and the
  * top-left rule covers the whole pixel. Upscaled, that edge splits pixel 0's
- * block of host pixels and leaves its first half unwritten -- MM3's wrapped
+ * block of host pixels and leaves its first half unwritten -- a wrapped
  * water ripple map then showed the unwritten strip as seams across the
  * water. A coordinate that truncates to that first centre is placed on the
  * target edge, as the hardware covers it; everything else is unchanged. */
@@ -572,8 +572,8 @@ static const char s_hlsl[] =
 "  if (n == 0) return T2D0.Sample(S0, uv); if (n == 1) return T2D1.Sample(S1, uv);\n"
 "  if (n == 2) return T2D2.Sample(S2, uv); return T2D3.Sample(S3, uv);\n"
 "}\n"
-/* A point-sampled tap at a fixed spot of an upscaled render target (MM3's
- * light flares test their visibility with three such taps of the frame's
+/* A point-sampled tap at a fixed spot of an upscaled render target (light
+ * flares test their visibility with three such taps of the frame's
  * alpha). On the NV2A it reads one guest pixel; here that pixel is a block
  * of host pixels, and a single host texel inside it changes with every
  * sub-pixel move of the scene -- glows and tail lights flickered. The block
@@ -758,7 +758,7 @@ static const char s_hlsl[] =
 "  return o;\n"
 "}\n"
 "float4 ps_main(PSIn i, out uint cov : SV_Coverage) : SV_Target { return shade(i, cov); }\n"
-/* W-buffering (SET_CONTROL0 Z_PERSPECTIVE, which MM3 uses): the depth
+/* W-buffering (SET_CONTROL0 Z_PERSPECTIVE): the depth
  * buffer holds w, interpolated perspective-correctly (fog.y carries it), in
  * 24-bit fixed point -- linear precision, unlike z/w, so distant decals and
  * foliage do not fight. Polygon offset is applied here as xemu does: the
@@ -815,7 +815,7 @@ static const char s_hlsl[] =
 /* A 32-bit colour surface read as LU_IMAGE_Y16: twice as wide, texel 2x the
  * low 16-bit word of pixel x (G:B), 2x+1 the high one (A:R), as R=G=B, A=1
  * (xemu's mapping). MSAA surfaces are read at one sample: averaging the bytes
- * of packed values (MM3 packs depth into G:B for its fog) would corrupt them. */
+ * of packed values (such as depth packed into G:B for fog) would corrupt them. */
 "float4 y16_vs(uint id : SV_VertexID) : SV_Position {\n"
 "  float2 c = float2((id << 1) & 2, id & 2); return float4(c * float2(2, -2) + float2(-1, 1), 0, 1);\n"
 "}\n"
@@ -1572,8 +1572,7 @@ static void surface_release(Surface *s)
     memset(s, 0, sizeof *s);
 }
 
-/* Titles reuse one block of memory as targets of different shapes (MM3's
- * glare buffer is 640x480 and 320x240 every frame). Each shape keeps its own
+/* Titles reuse one block of memory as targets of different shapes. Each shape keeps its own
  * host surface; the address resolves to the one bound most recently. */
 static uint32_t s_surf_seq;
 
@@ -1706,7 +1705,7 @@ static int bind_targets(const NvD3DState *st, int want_depth, Surface **out,
     if (swizzled) {
         w = 1u << ((fmt >> 16) & 0xF);
         /* NV097 surface log-height is bits 24..31, after log-width 16..23.
-         * Reading bit 20 collapsed MM3's 0x07070228 water target to one row. */
+         * Reading bit 20 collapsed a 0x07070228 surface to one row. */
         h = 1u << ((fmt >> 24) & 0xF);
         s_aa_x = s_aa_y = 1;
     } else {
@@ -1991,7 +1990,7 @@ static void halve_bgra(const uint32_t *src, uint32_t w, uint32_t h, uint32_t *ds
 }
 
 /* Mip levels the host texture gets. Titles shipped short chains to save
- * memory (MM3: 1024x1024 with 4 levels), so distant surfaces kept sampling
+ * memory (for example, 1024x1024 with 4 levels), so distant surfaces kept sampling
  * a level far finer than their footprint -- grain and shimmer, with a band
  * where the chain runs out. A chain the title started is completed down to
  * 1x1 from its own smallest level; a single level stays single. */
@@ -2285,7 +2284,7 @@ static D3D11_TEXTURE_ADDRESS_MODE addr_mode(uint32_t m)
 
 /* Texture n feeds the combiners only through its blue channel as an alpha
  * input: a coverage mask, not an image (the font idiom -- DXT1 glyph
- * coverage kept in blue; MM3's Meme/Font.psh is r0.a = v0.a * t0.b). */
+ * coverage kept in blue; r0.a = v0.a * t0.b). */
 static int tex_coverage(const Nv2aCombiner *rc, int n)
 {
     int i, k, blue = 0, stages = rc->control & 0xFF;
@@ -2425,16 +2424,15 @@ static uint32_t write_mask(const NvD3DState *st, Surface *s)
 static int s_draw_textured, s_draw_reads_wide;
 static uint32_t s_draw_tex_addr;
 
-/* A guest pass that reduces a render target (MM3's glare and luminance
- * downsamples, its reflection map) takes texel-exact taps: at the guest's
+/* A guest pass that reduces a render target (glare, luminance
+ * or reflection downsamples) takes texel-exact taps: at the guest's
  * resolution four taps cover a 2x2 block, at a host resolution several times
  * higher they hit isolated texels, and which ones moves with the camera --
  * lit windows and lamps then flicker through the bloom. Reductions read this
  * mip-mapped copy, so each tap averages the footprint it stands for. */
 /* A swizzled render target sampled as a mipmapped texture: titles render
  * each level of such a texture themselves, one surface per level at the
- * offsets the texture's layout puts them (MM3's water ripple map: 128, 64,
- * 32, 16 at 0x682000, 0x692000, 0x696000, 0x697000). Reading only the top
+ * offsets the texture's layout puts them. Reading only the top
  * surface sampled a full-size normal map at every distance -- shimmer and
  * moire out across the water. The levels found are copied into one host
  * texture, each at its own (scaled) size, as the title's chain; returns the
@@ -2723,8 +2721,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     if (st->poly_offset_fill && !(st->z_perspective && d)) {
         /* The slope term multiplies the depth change per pixel. At an
          * internal resolution s times the guest's a pixel spans 1/s as much
-         * depth, so the factor scales by s to offset decals (MM3's windows,
-         * factor -0.25) as far as the NV2A does; unscaled they fight. */
+         * depth, so the factor scales by s to offset decals as far as the NV2A does; unscaled they fight. */
         bias = (int)st->poly_offset_units;
         slope = st->poly_offset_factor * s_cur_sy;
     }
@@ -2804,8 +2801,7 @@ static uint8_t *ring_map(ID3D11Buffer *b, UINT *pos, UINT cap, UINT bytes,
 }
 
 /* The race HUD batches sprites from one texture atlas into a single draw
- * (MM3's speedometer needle shares one with the timer icon on the far
- * side), so edge placement is decided per cluster: connected primitives form
+ * (elements can lie on opposite sides of the screen), so edge placement is decided per cluster: connected primitives form
  * a piece, pieces on the same line less than HUD_GAP apart join a cluster
  * (the glyphs of a centred message stay together), and each cluster moves by
  * its own half of the 4:3 layout. pos holds the screen positions by vertex
@@ -3266,8 +3262,7 @@ static int writeback_finish(int wait)
             uint8_t *row = dst + (size_t)y * s->pitch;
             /* A row the CPU changed since the executor last looked holds
              * writes made after this frame was submitted (the title runs
-             * ahead): they win, and the next sync uploads them. MM3 draws
-             * its load-screen briefing with the CPU over the frame before. */
+             * ahead): they win, and the next sync uploads them. */
             if (memcmp(row, s->shadow + (size_t)y * rowb, rowb))
                 continue;
             if (s->bpp == 4) {
