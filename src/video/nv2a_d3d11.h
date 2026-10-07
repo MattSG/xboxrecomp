@@ -93,10 +93,10 @@ int  nv2a_d3d_active(void);
 
 /* Width / height the image is presented at (widescreen). */
 float nv2a_d3d_display_aspect(void);
-/* Called by the title as its race camera, or a frontend camera, sets up its
- * projection; the race HUD is placed at the screen edges in between. */
-void nv2a_d3d_note_race_camera(void);
-void nv2a_d3d_note_frontend_camera(void);
+/* The title turns this on when its in-game HUD's screen begins and off when
+ * it leaves; while on (and the frame draws no full-screen background) the
+ * HUD is placed at the screen edges instead of the centred 4:3 area. */
+void nv2a_d3d_set_edge_hud(int on);
 /* The race HUD's first element, as its 4:3 screen rectangle; 2D drawn ahead
  * of it in a race frame is world-anchored (name tags over cars). */
 void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1);

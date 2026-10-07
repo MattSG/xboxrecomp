@@ -181,12 +181,12 @@ static int s_sharp = 1;   /* RECOMP_SHARP_POINT=0: point filtering as the title 
 #define GUEST_W 640u
 #define GUEST_H 480u
 
-/* Race HUD edge placement is latched: the title builds its race camera's
- * projection once as a race starts (src/mm3_widescreen.c reports it), and
- * car select's camera ends it. Frames that draw a full-screen background
+/* HUD edge placement is latched: the title turns it on when its in-game
+ * HUD's screen begins (MM3: the race camera, built once as a race starts)
+ * and off when it leaves (MM3: car select's camera). Frames that draw a full-screen background
  * image are menus or loading screens and never get it, which keeps menus
  * reached from a race (and the race's own loading screen) in 4:3 layout. */
-static volatile LONG s_race_hud;
+static volatile LONG s_edge_hud;
 static uint32_t s_frame_bg_tex;     /* this frame's background image; reset at flip */
 static int s_frame_tag_window;      /* still in the frame's leading name tags */
 
@@ -224,22 +224,23 @@ static int world_tag_draw(float lo, float hi, float ylo, float yhi, uint32_t tex
     return 0;
 }
 
-void nv2a_d3d_note_race_camera(void)
+void nv2a_d3d_set_edge_hud(int on)
 {
-    if (!InterlockedExchange(&s_race_hud, 1))
-        s_hud_tex_n = 0;                 /* a new race may load other textures */
+    if (!on)
+        InterlockedExchange(&s_edge_hud, 0);
+    else if (!InterlockedExchange(&s_edge_hud, 1))
+        s_hud_tex_n = 0;                 /* a new level may load other textures */
 }
-void nv2a_d3d_note_frontend_camera(void) { InterlockedExchange(&s_race_hud, 0); }
 
 static int nv2a_d3d_hud_active(void)
 {
-    return !s_frame_bg_tex && InterlockedCompareExchange(&s_race_hud, 0, 0) != 0;
+    return !s_frame_bg_tex && InterlockedCompareExchange(&s_edge_hud, 0, 0) != 0;
 }
 
 /* The aspect the image is rendered at, never narrower than the title's
  * 4:3: RECOMP_ASPECT (e.g. 16:9, 21:9, 1.6, 4:3), else the game window's
  * client area, following it as the window is resized (see display_config).
- * The title's projection is widened to match (src/mm3_widescreen.c). */
+ * The title widens its projection to match (MM3: src/mm3_widescreen.c). */
 static volatile float s_aspect;     /* 0 until decided */
 
 static float clamp_aspect(float a)
@@ -3760,7 +3761,7 @@ static void display_config(int now)
     }
     if (!aspect) aspect = clamp_aspect((float)w / (float)h);
     deferred = !now && s_aspect && fabsf(aspect - s_aspect) > 1e-4f &&
-               InterlockedCompareExchange(&s_race_hud, 0, 0);
+               InterlockedCompareExchange(&s_edge_hud, 0, 0);
     if (deferred) aspect = s_aspect;             /* retried every flip */
     if (e && atof(e) >= 0.5 && atof(e) <= 8.0) {
         scale = (float)atof(e);
@@ -3892,7 +3893,6 @@ void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
-void nv2a_d3d_note_race_camera(void) {}
+void nv2a_d3d_set_edge_hud(int on) { (void)on; }
 void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1) { (void)x0; (void)y0; (void)x1; (void)y1; }
-void nv2a_d3d_note_frontend_camera(void) {}
 #endif
