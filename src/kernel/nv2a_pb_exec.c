@@ -480,8 +480,8 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
     if (!a->size) {
-        /* Disabled arrays use the current vertex attribute register. MM3
-         * supplies instance transform rows through SET_VERTEX_DATA4F. */
+        /* Disabled arrays use the current vertex attribute register. Titles
+         * can supply instance transform rows through SET_VERTEX_DATA4F. */
         size_t attr = (size_t)(a - s_gpu.attr);
         if (attr < NV_VERTEX_ATTRS) {
             memcpy(out, s_gpu.imm_attr[attr], sizeof(float) * 4);
@@ -2056,7 +2056,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             continue;
                     }
                 }
-                /* A disabled depth test suppresses depth writes too. MM3's
+                /* A disabled depth test suppresses depth writes too. A
                  * menu background retains its write mask and must not fill
                  * the depth buffer before the vehicle preview is drawn. */
                 if (zp && s_gpu.depth_test && s_gpu.depth_mask)
@@ -3139,7 +3139,7 @@ static void draw_inline_array(void)
         if (!s_gpu.attr[a].size)
             continue;
         switch (s_gpu.attr[a].type) {
-        /* MM3 fonts pack SHORT positions and texture coordinates. */
+        /* Fonts can pack SHORT positions and texture coordinates. */
         case 1: /* normalised signed short */
         case 5: bytes = 2 * s_gpu.attr[a].size; break; /* signed short */
         case 6: bytes = 4; break; /* packed 11:11:10 normal */

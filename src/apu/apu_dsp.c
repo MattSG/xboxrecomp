@@ -222,9 +222,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * 3D voices use. Bins 10 and up are effect sends -- 10 is the
              * I3DL2 reverb send -- carrying copies of voices already in the
              * speaker bins for the GP's effects to consume. Summing every bin
-             * (even left, odd right) counted those copies again: in MM3's
-             * races the engine sits in 6/7 and, at the same level, in 10,
-             * which overdrove the left channel into clipping and crackle.
+             * (even left, odd right) counted those copies again,
+             * overdriving the output into clipping and crackle.
              * The sends go through reverb_step instead, and LFE joins both
              * speakers at -6 dB. */
             float left, right;

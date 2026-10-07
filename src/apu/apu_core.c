@@ -82,8 +82,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
     /* A large reservation is placed above RAM (kernel_bridge.c), and
      * MmGetPhysicalAddress hands its address through unchanged. Those pages
      * are real and distinct; wrapping them at 64 MB played whatever low RAM
-     * they aliased -- MM3 streams its music and movie audio from one, and
-     * every sound came out as full-scale noise. */
+     * they aliased, turning streamed audio into full-scale noise. */
     if (xbox_ReserveRangeAllocated(a))
         return g_apu_ram_ptr + a;
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
@@ -581,8 +580,7 @@ static void *mcpx_apu_frame_thread(void *arg)
          * does around each batch of voice commands; the voice processor runs
          * on regardless. Gating on it (as xemu does, where a skipped frame
          * only delays an output pulled by the audio device) turned every
-         * halt into a frame of silence here: in MM3's races up to a sixth of
-         * all frames, heard as constant crackle. Methods and frames are
+         * halt into a frame of silence here, heard as constant crackle. Methods and frames are
          * already serialised by d->lock. */
         (void)fectl;
         bool apu_active = xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF;

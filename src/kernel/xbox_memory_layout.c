@@ -870,8 +870,7 @@ static void frame_counters_tick(void)
  * read back), with DMA_GET. Claiming them at the top of the tick, before the
  * segment ran, let a title that runs ahead of the executor recycle buffers
  * its queued draws still read. Fences the title has inserted but not yet
- * kicked off still count as done, as they always have here -- MM3's load
- * screen keeps its briefing on screen only if they do. */
+ * kicked off still count as done, as they always have here. */
 static uint32_t s_fence_snap[XBOX_MAX_FENCE_MIRRORS];
 static int s_fence_snap_ok[XBOX_MAX_FENCE_MIRRORS];
 
@@ -3324,7 +3323,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 
     /* The kernel allocates physical pages, not byte-sized fragments. XDK
      * DirectSound keeps its silent samples in the remainder of a small
-     * allocation's page (MM3: 0x98-byte request, samples at +0x22c).
+     * allocation's page.
      * Publishing only the requested bytes made the APU resolve that tail
      * through ordinary RAM instead of the contiguous window. */
     if (!size || size > UINT32_MAX - 0xFFFu)
@@ -3336,7 +3335,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     /* Reuse freed pages first-fit by address, carving from the front of the
      * lowest free extent that fits; freed neighbours are coalesced on free.
      * Consecutive requests therefore come out adjacent, as they do from the
-     * kernel's page allocator. MM3 depends on it: it builds large vertex
+     * kernel's page allocator. Titles can build large vertex
      * buffers from consecutive 16 KB requests and addresses them as one span.
      * Best-fit reuse of whole freed blocks scattered those requests, so after
      * the first load the player car was drawn from 16 KB of mesh followed by
@@ -3384,7 +3383,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     /* Low RAM and the contiguous window have separate host backing but share
      * physical address numbers. Never claim pages already used by the heap:
      * bus masters would otherwise switch a live heap buffer to unrelated
-     * contiguous storage (MM3's third Bink movie lost all audio this way).
+     * contiguous storage, breaking audio DMA reads.
      * Keep freed heap addresses reserved too, since HeapAlloc reuses them. */
     if ((uint64_t)(result - XBOX_CONTIG_BASE) + size > XBOX_HEAP_BASE &&
         result - XBOX_CONTIG_BASE < g_heap_next) {
@@ -3508,7 +3507,7 @@ int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
     }
     /* Freed spans count. Freeing does not move a page; it still holds
      * what the title last wrote there, and the span is only ever reused in
-     * place. MM3 draws its loading screen from a back buffer that D3D has
+     * place. A title can draw a loading screen from a back buffer that D3D has
      * just released: with freed spans excluded the GPU read that physical
      * address from low RAM instead -- the title's own image -- and showed
      * the code bytes as colour static. A range may run on through adjacent

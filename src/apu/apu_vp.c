@@ -148,8 +148,8 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
 
 /* Per voice, as in xemu: the title's VOICE_LOCK waits only while the voice
  * processor is working on that same voice. It used to take d->lock, which
- * the processor holds for a whole frame of every voice -- MM3's game thread
- * spent ~9% of a race frame waiting there. */
+ * the processor holds for a whole frame of every voice, blocking the title
+ * until all voices have been processed. */
 static void voice_spin_lock(MCPXAPUState *d, uint16_t v)
 {
     while (_InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
@@ -1211,7 +1211,7 @@ static void voice_process(MCPXAPUState *d,
     /* Mix into bins. The volumes are TAR(get) registers: hardware moves the
      * current level toward them, it does not jump. Applying each frame's
      * level as a step every 32 samples turned a voice whose volume the title
-     * changes every frame -- MM3's engine follows the revs -- into a buzz of
+     * changes every frame into a buzz of
      * clicks at the frame rate. Ramp from the last frame's gain instead. */
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
@@ -1223,7 +1223,7 @@ static void voice_process(MCPXAPUState *d,
         }
         g *= attenuate(vol[b]) / hr;
         /* An HRTF'd voice is stereo: its four HRTF bins are the submixes in
-         * the order the title set them (MM3: 6 8 7 9), left pair then right
+         * the order the title set them, left pair then right
          * pair. Reading them as mono put the left ear in every bin. */
         int ch = (hrtf_stereo && b < 4) ? (b >> 1) : (int)(b % channels);
         float g0 = s_gain_valid[v] ? s_gain_prev[v][b] : g;
