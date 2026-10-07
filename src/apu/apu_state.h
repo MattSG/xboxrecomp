@@ -472,6 +472,7 @@ struct MCPXAPUState {
 
     QemuThread apu_thread;
     QemuMutex lock;
+    volatile long guest_waiting;   /* guest threads blocked on lock (voice_lock) */
     QemuCond cond;
     QemuCond idle_cond;
     bool pause_requested;

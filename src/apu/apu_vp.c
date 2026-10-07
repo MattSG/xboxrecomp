@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include <intrin.h>
 
 /* #define DEBUG_MCPX */
 
@@ -148,7 +149,9 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    _InterlockedIncrement(&d->guest_waiting);
     qemu_mutex_lock(&d->lock);
+    _InterlockedDecrement(&d->guest_waiting);
 
     uint64_t mask = 1ULL << (v % 64);
     if (lock) {
@@ -1272,6 +1275,15 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+            }
+            /* The frame holds d->lock across every voice; a title waiting in
+             * voice_lock used to wait out the whole frame. Hand over between
+             * voices instead -- the hardware VP runs alongside the CPU, and
+             * locking a voice is the title's own protocol for that. */
+            if (qatomic_read(&d->guest_waiting)) {
+                qemu_mutex_unlock(&d->lock);
+                SwitchToThread();
+                qemu_mutex_lock(&d->lock);
             }
             d->regs[current] = d->regs[next];
         }
