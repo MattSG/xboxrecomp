@@ -3699,11 +3699,7 @@ class Lifter:
                     elif ops[0].mem_size == 8:
                         return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
                     elif ops[0].mem_size == 10:
-                        # The CRT's libm loads its constants this way. Read as
-                        # a float, 1.0L came back as 0.0.
-                        a = _fmt_mem(ops[0])
-                        return [f"fp_push(recomp_f80_load(((uint64_t)MEM32(({a}) + 4) << 32)"
-                                f" | MEM32({a}), MEM16(({a}) + 8))); /* fld tbyte */"]
+                        return [f"fp_push(MEMFP80({_fmt_mem(ops[0])})); /* fld tbyte */"]
                     return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld */"]
                 if ops[0].type == "reg":
                     # fld st(i) pushes a COPY of st(i). Was a no-op comment,
