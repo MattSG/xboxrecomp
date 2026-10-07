@@ -864,8 +864,37 @@ static void frame_counters_tick(void)
     }
 }
 
+/* The fence is the semaphore the GPU releases into: once the executor has
+ * written one release (xbox_Nv2aSemaphoreRelease), the fence says what was
+ * executed, and copying "submitted" over it at the top of each tick would
+ * claim fences the executor has not reached. The copy is for titles whose
+ * fence is never released by a method. */
+static volatile LONG g_semaphore_released;
+
+void xbox_Nv2aSemaphoreRelease(uint32_t offset, uint32_t value)
+{
+    for (int i = 0; i < g_fence_mirror_count; i++) {
+        uint32_t dev, sem;
+        if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4))
+            continue;
+        /* the semaphore DMA object starts at the fence D3D reads */
+        sem = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
+                                     + g_memory_offset) + offset;
+        if (!fence_readable(sem, 4))
+            continue;
+        *(volatile uint32_t *)((uintptr_t)sem + g_memory_offset) = value;
+        InterlockedExchange(&g_semaphore_released, 1);
+    }
+}
+
 static void fence_mirrors_tick(void)
 {
+    if (g_semaphore_released)
+        return;
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -890,6 +919,46 @@ static void fence_mirrors_tick(void)
                 *fence = put;
         }
     }
+}
+
+/*
+ * The GPU-notify event the title's D3D blocks on when the push buffer is far
+ * ahead of the GPU: it patches a NOP in the submitted stream to raise the
+ * notify interrupt, and the interrupt handler sets the event once the GPU
+ * reaches it. Nothing here raises that interrupt, so a wait on the event is
+ * satisfied instead once the executor has consumed everything submitted
+ * (GET == PUT) -- the NOP is in that range, so this can wait longer than the
+ * hardware would, never shorter. Without it, D3D's write-back-cache flush
+ * spin had to stand in as the barrier, serialising the title with the
+ * executor at every kick-off.
+ */
+static uint32_t g_notify_device_ptr, g_notify_event_off;
+
+int xbox_Nv2aNotifyEvent(uint32_t device_ptr_va, uint32_t event_off)
+{
+    g_notify_device_ptr = device_ptr_va;
+    g_notify_event_off = event_off;
+    return 0;
+}
+
+int xbox_Nv2aNotifyWait(uint32_t object_va)
+{
+    volatile uint32_t *put, *get;
+    uint32_t dev;
+    unsigned spins = 0;
+    /* the pointer is in the title image, mapped for as long as it runs */
+    if (!g_notify_device_ptr || !g_nv2a_memory || !g_memory_base)
+        return 0;
+    dev = *(volatile uint32_t *)((uintptr_t)g_notify_device_ptr + g_memory_offset);
+    if (object_va != dev + g_notify_event_off)
+        return 0;
+    put = (volatile uint32_t *)((char *)g_nv2a_memory + NV2A_USER_DMA_PUT);
+    get = (volatile uint32_t *)((char *)g_nv2a_memory + NV2A_USER_DMA_GET);
+    while (*get != *put && !InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if (++spins & 63) YieldProcessor();
+        else SwitchToThread();
+    }
+    return 1;
 }
 
 static int s_nv2a_trace = 0;

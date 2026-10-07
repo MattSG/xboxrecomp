@@ -1434,6 +1434,10 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
 
+    if (xbox_Nv2aNotifyWait(object)) {
+        g_eax = 0;                              /* STATUS_SUCCESS */
+        return;
+    }
     h = ke_shadow_lookup(object);
     if (!h)
         h = bridge_resolve_handle(object);

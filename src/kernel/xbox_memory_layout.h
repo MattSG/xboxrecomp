@@ -195,6 +195,16 @@ int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* The KEVENT at *(device_ptr_va) + event_off is the title D3D's GPU-notify
+ * event; KeWaitForSingleObject on it waits for the executor to consume all
+ * submitted push-buffer instead (see xbox_memory_layout.c). NotifyWait
+ * returns 0 when object_va is not that event. */
+int xbox_Nv2aNotifyEvent(uint32_t device_ptr_va, uint32_t event_off);
+/* BACK_END_WRITE_SEMAPHORE_RELEASE executed: store value at the mirrored
+ * fence + offset, and stop mirroring "submitted" onto it. */
+void xbox_Nv2aSemaphoreRelease(uint32_t offset, uint32_t value);
+int xbox_Nv2aNotifyWait(uint32_t object_va);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

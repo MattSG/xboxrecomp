@@ -171,6 +171,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_FLIP_MODULO             0x0128
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
+#define NV097_SET_SEMAPHORE_OFFSET        0x1D6C
+#define NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
 #define NV097_ARRAY_ELEMENT16             0x1800
 /* Draw a run of vertices straight out of the arrays, with no index list:
  * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
@@ -320,6 +322,7 @@ static struct {
     float    poly_offset_factor, poly_offset_units;
     uint32_t clear_rect_h, clear_rect_v;
     uint32_t other_stage_input, dot_rgb_mapping;
+    uint32_t semaphore_offset;          /* SET_SEMAPHORE_OFFSET */
 } s_gpu;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
@@ -3651,6 +3654,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
         frame_trace_flip();
+        return;
+
+    case NV097_SET_SEMAPHORE_OFFSET:
+        s_gpu.semaphore_offset = param;
+        return;
+
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        /* D3D's fence: the value lands in memory once the GPU gets here. */
+        xbox_Nv2aSemaphoreRelease(s_gpu.semaphore_offset, param);
         return;
 
     case NV097_FLIP_STALL:
