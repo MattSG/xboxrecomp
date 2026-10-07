@@ -146,22 +146,35 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/* Per voice, as in xemu: the title's VOICE_LOCK waits only while the voice
+ * processor is working on that same voice. It used to take d->lock, which
+ * the processor holds for a whole frame of every voice -- MM3's game thread
+ * spent ~9% of a race frame waiting there. */
+static void voice_spin_lock(MCPXAPUState *d, uint16_t v)
+{
+    while (_InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
+        YieldProcessor();
+}
+
+static void voice_spin_unlock(MCPXAPUState *d, uint16_t v)
+{
+    _InterlockedExchange(&d->vp.voice_spin[v], 0);
+}
+
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    _InterlockedIncrement(&d->guest_waiting);
-    qemu_mutex_lock(&d->lock);
-    _InterlockedDecrement(&d->guest_waiting);
+    voice_spin_lock(d, v);
 
     uint64_t mask = 1ULL << (v % 64);
     if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
+        _InterlockedOr64((volatile LONG64 *)&d->vp.voice_locked[v / 64], (LONG64)mask);
     } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
+        _InterlockedAnd64((volatile LONG64 *)&d->vp.voice_locked[v / 64], (LONG64)~mask);
     }
 
+    voice_spin_unlock(d, v);
     qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
@@ -1274,16 +1287,9 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
                 /* Process voice directly (single-threaded) */
+                voice_spin_lock(d, v);
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
-            }
-            /* The frame holds d->lock across every voice; a title waiting in
-             * voice_lock used to wait out the whole frame. Hand over between
-             * voices instead -- the hardware VP runs alongside the CPU, and
-             * locking a voice is the title's own protocol for that. */
-            if (qatomic_read(&d->guest_waiting)) {
-                qemu_mutex_unlock(&d->lock);
-                SwitchToThread();
-                qemu_mutex_lock(&d->lock);
+                voice_spin_unlock(d, v);
             }
             d->regs[current] = d->regs[next];
         }
