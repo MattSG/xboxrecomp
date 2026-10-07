@@ -1128,37 +1128,18 @@ uint32_t xbox_Nv2aFenceWordVa(void)
     return 0;
 }
 
-/* The fence is the semaphore the GPU releases into: once the executor has
- * written one release (xbox_Nv2aSemaphoreRelease), the fence says what was
- * executed, and copying "submitted" over it at the top of each tick would
- * claim fences the executor has not reached. The copy is for titles whose
- * fence is never released by a method. */
-static volatile LONG g_semaphore_released;
+/* What the fence may claim: the fences submitted when a push-buffer segment
+ * starts executing, published once it has executed (and its flip has been
+ * read back), with DMA_GET. Claiming them at the top of the tick, before the
+ * segment ran, let a title that runs ahead of the executor recycle buffers
+ * its queued draws still read. Fences the title has inserted but not yet
+ * kicked off still count as done, as they always have here -- MM3's load
+ * screen keeps its briefing on screen only if they do. */
+static uint32_t s_fence_snap[XBOX_MAX_FENCE_MIRRORS];
+static int s_fence_snap_ok[XBOX_MAX_FENCE_MIRRORS];
 
-void xbox_Nv2aSemaphoreRelease(uint32_t offset, uint32_t value)
+static void fence_mirrors_tick(int publish)
 {
-    for (int i = 0; i < g_fence_mirror_count; i++) {
-        uint32_t dev, sem;
-        if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
-            continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
-                                     + g_memory_offset);
-        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4))
-            continue;
-        /* the semaphore DMA object starts at the fence D3D reads */
-        sem = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
-                                     + g_memory_offset) + offset;
-        if (!fence_readable(sem, 4))
-            continue;
-        *(volatile uint32_t *)((uintptr_t)sem + g_memory_offset) = value;
-        InterlockedExchange(&g_semaphore_released, 1);
-    }
-}
-
-static void fence_mirrors_tick(void)
-{
-    if (g_semaphore_released)
-        return;
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -1179,8 +1160,12 @@ static void fence_mirrors_tick(void)
             uint32_t put =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
-            if (*fence != put)
-                *fence = put;
+            if (!publish) {
+                s_fence_snap[i] = put;
+                s_fence_snap_ok[i] = 1;
+            } else if (s_fence_snap_ok[i] && *fence != s_fence_snap[i]) {
+                *fence = s_fence_snap[i];
+            }
         }
     }
 }
@@ -1286,71 +1271,12 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
-/* The PFB flush kick (NV2A_ACK above), which D3D's KickOff waits on. */
-#define NV2A_ACK_PFB_FLUSH          0x100410u
-/* The vblank's two status bits, which the vblank-ack thread owns. */
-#define NV2A_ACK_PMC_INTR_0         0x000100u
-#define NV2A_ACK_PMC_INTR_PCRTC     (1u << 24)
-#define NV2A_ACK_PCRTC_INTR_0       0x600100u
-#define NV2A_ACK_PCRTC_INTR_VBLANK  (1u << 0)
-
-/* Clear the request bits "hardware" would clear on its own.
- *
- * Also called by the pushbuffer walker between commands. This thread executes
- * the pushbuffer below, and under RECOMP_PB_EXEC one pass can take a whole
- * rendered frame; with the bits cleared only here, every XDK D3D kickoff --
- * which sets 0x100410 bit 16 and spins until it clears -- waited that long,
- * and a level load, thousands of kickoffs long, looked frozen. Clearing them
- * from inside the walk answers the kickoff within a few hundred commands,
- * without a thread of its own spinning on a host core. */
-static void nv2a_ack_busy_bits(int flip_held)
-{
-    volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
-
-    if (!regs)
-        return;
-    for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-        volatile uint32_t *r =
-            (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-        uint32_t mask = NV2A_ACK[i].busy_mask;
-        if (flip_held && NV2A_ACK[i].offset == NV2A_ACK_PFB_FLUSH)
-            continue;
-        /* Once the vblank is delivered its two bits belong to the
-         * vblank-ack thread (kernel_bridge.c), which clears them on the
-         * DPC's ack. Cleared here too, a pass that landed between the
-         * vblank and the DPC's read of PMC_INTR_0 took the vblank away
-         * from the DPC: no ack, no count, and the title's present at
-         * vblank slipped a frame. */
-        if (xbox_VblankAckHeld()) {
-            if (NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0)
-                mask &= ~NV2A_ACK_PMC_INTR_PCRTC;
-            else if (NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0)
-                mask &= ~NV2A_ACK_PCRTC_INTR_VBLANK;
-        }
-        /* Interlocked: the vblank-ack thread and the guest change other
-         * bits of the same word meanwhile. */
-        if (*r & mask)
-            InterlockedAnd((volatile LONG *)r, (LONG)~mask);
-    }
-}
-
-void xbox_Nv2aAckBusyBits(void)
-{
-    nv2a_ack_busy_bits(0);
-}
-
-/* One word of the NV2A register file (offset from the register base), or NULL
- * before it is mapped. The pushbuffer executor writes what the GPU would when
- * it executes a command: PGRAPH state a title reads back, and DMA_GET. */
-volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
-{
-    if (!g_nv2a_memory || offset + 4 > XBOX_NV2A_SIZE)
-        return NULL;
-    return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
-}
+static volatile int s_get_held;
+static uint32_t s_get_held_value;
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
+    extern int nv2a_d3d_writeback_busy(void);
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
@@ -1387,7 +1313,20 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          *
          * The advance now happens after the scan, further down, which is
          * also the only ordering that gives the title real back-pressure. */
-        fence_mirrors_tick();
+        if (!s_get_held) {
+            fence_mirrors_tick(0);
+            /* nothing left to execute: as before, all of it is done */
+            if (*(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET) ==
+                *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT))
+                fence_mirrors_tick(1);
+        }
+        /* What was executed behind a flip becomes visible -- DMA_GET and any
+         * fence release -- once the flip's surfaces are in guest memory. */
+        if (s_get_held && !nv2a_d3d_writeback_busy()) {
+            *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET) = s_get_held_value;
+            fence_mirrors_tick(1);
+            s_get_held = 0;
+        }
         dsp_ack_tick();
         poke_tick();
         counter_mirrors_tick();
@@ -1480,13 +1419,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         nv2a_pb_scan_report();
                     }
                 }
-                /* Consumed, now that it has actually been executed. */
-                {
+                /* Consumed, now that it has actually been executed -- and,
+                 * behind a flip, read back (see above). */
+                if (nv2a_d3d_writeback_busy()) {
+                    s_get_held = 1;
+                    s_get_held_value = put;
+                } else {
                     volatile uint32_t *get =
                         (volatile uint32_t *)((char *)regs
                                               + NV2A_USER_DMA_GET);
                     *get = put;
-                    get_written = put;
+                    fence_mirrors_tick(1);
+                    s_get_held = 0;        /* a held, older GET must not follow */
                 }
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either

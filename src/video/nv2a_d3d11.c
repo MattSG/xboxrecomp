@@ -3181,6 +3181,7 @@ void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,
  * register as a change. One stall per flip; the copies are batched first. */
 typedef struct {
     UINT w, h;
+    int pending;                    /* copied, not yet read back */
     ID3D11Texture2D *stage, *down;
     ID3D11RenderTargetView *down_rtv;
 } WbSlot;
@@ -3214,52 +3215,46 @@ static int wb_slot_ready(WbSlot *k, UINT w, UINT h, int need_down)
     return 1;
 }
 
-static void writeback_surfaces(void)
+/* The copies are queued at the flip; reading them back waited for the GPU to
+ * finish the frame, a stall of every flip. Now the executor goes on with the
+ * next frame and the ack thread completes the read-back once the GPU is done
+ * (nv2a_d3d_writeback_busy), holding back DMA_GET and fence releases until
+ * then -- the title cannot learn the frame is finished before its pixels are
+ * in guest memory. */
+static int s_wb_pending;
+
+static int wb_surface_ok(const Surface *s)
 {
-    static int enabled = -1;
-    int i, any = 0;
-    if (enabled < 0)
-        enabled = !getenv("RECOMP_D3D_NO_WRITEBACK");
-    if (!enabled)
-        return;
+    return s->tex && !s->swizzled && (s->bpp == 2 || s->bpp == 4) &&
+           surface_find(s->phys) == s && s->shadow && guest_ok(s->va, (size_t)s->pitch * s->h);
+}
+
+/* Read back what is ready; wait: block until all of it is. 1 when none left. */
+static int writeback_finish(int wait)
+{
+    int i, left = 0;
+    if (!s_wb_pending)
+        return 1;
     RECOMP_PROFILE_BEGIN("D3D11 write-back");
     for (i = 0; i < MAX_SURFACES; i++) {
-        Surface *s = &s_surf[i];
-        WbSlot *k = &s_wb[i];
-        int scaled;
-        if (!s->tex || !s->gpu_dirty || s->swizzled || (s->bpp != 2 && s->bpp != 4) ||
-            surface_find(s->phys) != s ||
-            !s->shadow || !guest_ok(s->va, (size_t)s->pitch * s->h))
-            continue;
-        scaled = s->iw != s->w || s->ih != s->h;
-        if (!wb_slot_ready(k, s->w, s->h, scaled))
-            continue;
-        surface_resolve(s);
-        if (scaled) {
-            float x0, x1;
-            guest_span(s, &x0, &x1);
-            blit_span(s->srv, NULL, k->down_rtv, s->w, s->h, -1.0f, 0, 1, x0, x1);
-            ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)k->stage,
-                                             (ID3D11Resource *)k->down);
-        } else {
-            ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)k->stage,
-                                             (ID3D11Resource *)s->tex);
-        }
-        any = 1;
-    }
-    for (i = 0; any && i < MAX_SURFACES; i++) {
         Surface *s = &s_surf[i];
         WbSlot *k = &s_wb[i];
         D3D11_MAPPED_SUBRESOURCE m;
         uint8_t *dst;
         uint32_t x, y, rowb;
         int amode, r565;
-        if (!s->tex || !s->gpu_dirty || s->swizzled || (s->bpp != 2 && s->bpp != 4) ||
-            surface_find(s->phys) != s ||
-            !s->shadow || !k->stage || k->w != s->w || k->h != s->h)
+        HRESULT hr;
+        if (!k->pending)
             continue;
-        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)k->stage, 0,
-                                           D3D11_MAP_READ, 0, &m)))
+        if (!wb_surface_ok(s) || k->w != s->w || k->h != s->h) {
+            k->pending = 0;                       /* dropped (resize) */
+            continue;
+        }
+        hr = ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)k->stage, 0, D3D11_MAP_READ,
+                                     wait ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) { left = 1; continue; }
+        k->pending = 0;
+        if (FAILED(hr))
             continue;
         dst = (uint8_t *)guest(s->va);
         rowb = s->w * s->bpp;
@@ -3268,6 +3263,12 @@ static void writeback_surfaces(void)
         for (y = 0; y < s->h; y++) {
             const uint32_t *src = (const uint32_t *)((const uint8_t *)m.pData + (size_t)y * m.RowPitch);
             uint8_t *row = dst + (size_t)y * s->pitch;
+            /* A row the CPU changed since the executor last looked holds
+             * writes made after this frame was submitted (the title runs
+             * ahead): they win, and the next sync uploads them. MM3 draws
+             * its load-screen briefing with the CPU over the frame before. */
+            if (memcmp(row, s->shadow + (size_t)y * rowb, rowb))
+                continue;
             if (s->bpp == 4) {
                 if (amode < 0) {
                     memcpy(row, src, rowb);
@@ -3287,8 +3288,59 @@ static void writeback_surfaces(void)
             memcpy(s->shadow + (size_t)y * rowb, row, rowb);
         }
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)k->stage, 0);
-        s->gpu_dirty = 0;
     }
+    RECOMP_PROFILE_END();
+    s_wb_pending = left;
+    return !left;
+}
+
+int nv2a_d3d_writeback_busy(void)
+{
+    if (!s_wb_pending || writeback_finish(0))
+        return 0;
+    /* Map(DO_NOT_WAIT) never submits anything: with the title waiting on
+     * GET, nothing else would, and the copies sat queued until the next
+     * frame that could not come. */
+    ID3D11DeviceContext_Flush(s_ctx);
+    return 1;
+}
+
+static void writeback_surfaces(void)
+{
+    static int enabled = -1;
+    int i;
+    if (enabled < 0)
+        enabled = !getenv("RECOMP_D3D_NO_WRITEBACK");
+    if (!enabled)
+        return;
+    writeback_finish(1);                          /* the staging slots are reused */
+    RECOMP_PROFILE_BEGIN("D3D11 write-back issue");
+    for (i = 0; i < MAX_SURFACES; i++) {
+        Surface *s = &s_surf[i];
+        WbSlot *k = &s_wb[i];
+        int scaled;
+        if (!s->gpu_dirty || !wb_surface_ok(s))
+            continue;
+        scaled = s->iw != s->w || s->ih != s->h;
+        if (!wb_slot_ready(k, s->w, s->h, scaled))
+            continue;
+        surface_resolve(s);
+        if (scaled) {
+            float x0, x1;
+            guest_span(s, &x0, &x1);
+            blit_span(s->srv, NULL, k->down_rtv, s->w, s->h, -1.0f, 0, 1, x0, x1);
+            ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)k->stage,
+                                             (ID3D11Resource *)k->down);
+        } else {
+            ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)k->stage,
+                                             (ID3D11Resource *)s->tex);
+        }
+        s->gpu_dirty = 0;                        /* later draws dirty it again */
+        k->pending = 1;
+        s_wb_pending = 1;
+    }
+    if (s_wb_pending)
+        ID3D11DeviceContext_Flush(s_ctx);
     RECOMP_PROFILE_END();
 }
 
