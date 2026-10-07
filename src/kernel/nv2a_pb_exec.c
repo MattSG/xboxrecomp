@@ -171,6 +171,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_FLIP_MODULO             0x0128
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
+#define NV097_NO_OPERATION                0x0100
 #define NV097_ARRAY_ELEMENT16             0x1800
 /* Draw a run of vertices straight out of the arrays, with no index list:
  * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
@@ -3651,6 +3652,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
         frame_trace_flip();
+        return;
+
+    case NV097_NO_OPERATION:
+        xbox_Nv2aNop(param);
         return;
 
     case NV097_FLIP_STALL:

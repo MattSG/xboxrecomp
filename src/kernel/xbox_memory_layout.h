@@ -199,7 +199,10 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
  * event; KeWaitForSingleObject on it waits for the executor to consume all
  * submitted push-buffer instead (see xbox_memory_layout.c). NotifyWait
  * returns 0 when object_va is not that event. */
-int xbox_Nv2aNotifyEvent(uint32_t device_ptr_va, uint32_t event_off);
+int xbox_Nv2aNotifyEvent(uint32_t device_ptr_va, uint32_t event_off, uint32_t nop_param);
+/* The executor ran NO_OPERATION with this parameter; the one registered
+ * above is the notify D3D waits for, and ends that wait. */
+void xbox_Nv2aNop(uint32_t param);
 int xbox_Nv2aNotifyWait(uint32_t object_va);
 
 void xbox_MemoryLayoutShutdown(void);

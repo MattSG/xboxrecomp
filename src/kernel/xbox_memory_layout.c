@@ -917,13 +917,22 @@ static void fence_mirrors_tick(int publish)
  * spin had to stand in as the barrier, serialising the title with the
  * executor at every kick-off.
  */
-static uint32_t g_notify_device_ptr, g_notify_event_off;
+static uint32_t g_notify_device_ptr, g_notify_event_off, g_notify_param;
+static volatile LONG g_notify_count;
 
-int xbox_Nv2aNotifyEvent(uint32_t device_ptr_va, uint32_t event_off)
+int xbox_Nv2aNotifyEvent(uint32_t device_ptr_va, uint32_t event_off, uint32_t nop_param)
 {
     g_notify_device_ptr = device_ptr_va;
     g_notify_event_off = event_off;
+    g_notify_param = nop_param;
     return 0;
+}
+
+/* The executor ran NO_OPERATION(param): the notify interrupt, on hardware. */
+void xbox_Nv2aNop(uint32_t param)
+{
+    if (param && param == g_notify_param)
+        InterlockedIncrement(&g_notify_count);
 }
 
 int xbox_Nv2aNotifyWait(uint32_t object_va)
@@ -931,6 +940,7 @@ int xbox_Nv2aNotifyWait(uint32_t object_va)
     volatile uint32_t *put, *get;
     uint32_t dev;
     unsigned spins = 0;
+    LONG notified = g_notify_count;
     /* the pointer is in the title image, mapped for as long as it runs */
     if (!g_notify_device_ptr || !g_nv2a_memory || !g_memory_base)
         return 0;
@@ -939,7 +949,10 @@ int xbox_Nv2aNotifyWait(uint32_t object_va)
         return 0;
     put = (volatile uint32_t *)((char *)g_nv2a_memory + NV2A_USER_DMA_PUT);
     get = (volatile uint32_t *)((char *)g_nv2a_memory + NV2A_USER_DMA_GET);
-    while (*get != *put && !InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+    /* The patched NOP running is the interrupt itself; GET reaching PUT
+     * covers an executor that passed the slot before it was patched. */
+    while (*get != *put && g_notify_count == notified &&
+           !InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         if (++spins & 63) YieldProcessor();
         else SwitchToThread();
     }
