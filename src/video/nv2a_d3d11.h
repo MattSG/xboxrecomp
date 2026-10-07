@@ -119,6 +119,9 @@ uint32_t nv2a_d3d_zpass_read(void);
 
 /* RECOMP_D3D_PROFILE stage accounting (slot 0 = vertex processing). */
 int  nv2a_d3d_prof_enabled(void);
+/* A flip's surfaces are still being read back into guest memory: DMA_GET and
+ * fence releases must wait. Completes whatever the GPU has finished. */
+int  nv2a_d3d_writeback_busy(void);
 void nv2a_d3d_prof_add(int slot, int64_t ticks, uint32_t verts);
 
 /* Called continuously by the pushbuffer thread. Presents what the display is
