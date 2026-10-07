@@ -34,6 +34,7 @@ static guest_page_t *s_pages;   /* one entry per page from s_lo to s_top */
 static uint32_t s_mirror_lo;    /* first address that aliases low memory */
 static uint32_t s_lo;           /* first tracked address: the top of the mirrors */
 static uint32_t s_top;          /* end of what the host let us reserve */
+static int s_placeholder;
 static ptrdiff_t s_offset;      /* host address minus guest address */
 static SRWLOCK s_lock = SRWLOCK_INIT;
 
@@ -48,6 +49,7 @@ int guest_vmem_active(void) { return s_pages != NULL; }
  * fails outright. */
 static size_t host_free_run(uintptr_t host, size_t limit)
 {
+#ifdef _WIN32
     uintptr_t cur = host;
 
     while (cur - host < limit) {
@@ -57,6 +59,12 @@ static size_t host_free_run(uintptr_t host, size_t limit)
         cur = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
     }
     return cur - host < limit ? cur - host : limit;
+#else
+    /* POSIX VirtualQuery only tracks owned mappings. VirtualAlloc's fixed,
+     * non-replacing reservation below is the authoritative availability check. */
+    (void)host;
+    return limit;
+#endif
 }
 
 /* Reserve the host range for [s_lo, s_top). The mirrors are the last thing the
@@ -64,7 +72,8 @@ static size_t host_free_run(uintptr_t host, size_t limit)
  * to still be free; asked for lazily, deep into boot, the range was taken by
  * something else nearly every run. MEM_RESERVE only: commits happen where a
  * title commits, as on the console. */
-int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top)
+int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top,
+                    int placeholder)
 {
     size_t bytes;
     void *host;
@@ -83,9 +92,28 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top)
     s_lo = (uint32_t)mirror_top;
     host = (void *)((uintptr_t)s_lo + (uintptr_t)offset);
 
-    bytes = host_free_run((uintptr_t)host, GUEST_VMEM_TOP - s_lo) & ~(size_t)0xFFFF;
-    if (bytes && !VirtualAlloc(host, bytes, MEM_RESERVE, PAGE_NOACCESS))
-        bytes = 0;
+    s_placeholder = 0;
+#ifdef _WIN32
+    if (placeholder) {
+        typedef PVOID (WINAPI *Alloc2)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, PVOID, ULONG);
+        Alloc2 alloc2 = (Alloc2)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2");
+        bytes = GUEST_VMEM_TOP - s_lo;
+        /* Split only the part that the tracker owns, then replace it without
+         * releasing the address range for another host allocation to claim. */
+        if (!alloc2 || !VirtualFree(host, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) ||
+            !alloc2(GetCurrentProcess(), host, bytes,
+                    MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0))
+            bytes = 0;
+        else
+            s_placeholder = 1;
+    } else
+#endif
+    {
+        (void)placeholder;
+        bytes = host_free_run((uintptr_t)host, GUEST_VMEM_TOP - s_lo) & ~(size_t)0xFFFF;
+        if (bytes && !VirtualAlloc(host, bytes, MEM_RESERVE, PAGE_NOACCESS))
+            bytes = 0;
+    }
     if (!bytes) {
         fprintf(stderr, "  Extended VMA: could not reserve host memory at %p (error %lu);"
                         " the tracker stays off\n", host, GetLastError());
@@ -94,7 +122,11 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top)
     s_top = s_lo + (uint32_t)bytes;
     s_pages = calloc(bytes / VMEM_PAGE, sizeof s_pages[0]);
     if (!s_pages) {
-        VirtualFree(host, 0, MEM_RELEASE);
+        VirtualFree(host, 0, MEM_RELEASE
+#ifdef _WIN32
+                    | (s_placeholder ? MEM_PRESERVE_PLACEHOLDER : 0)
+#endif
+                    );
         fprintf(stderr, "  Extended VMA: out of memory for the page table\n");
         return 0;
     }
@@ -107,7 +139,11 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top)
 void guest_vmem_shutdown(void)
 {
     if (s_pages)
-        VirtualFree((void *)((uintptr_t)s_lo + (uintptr_t)s_offset), 0, MEM_RELEASE);
+        VirtualFree((void *)((uintptr_t)s_lo + (uintptr_t)s_offset), 0, MEM_RELEASE
+#ifdef _WIN32
+                    | (s_placeholder ? MEM_PRESERVE_PLACEHOLDER : 0)
+#endif
+                    );
     free(s_pages);
     s_pages = NULL;
 }

@@ -3873,6 +3873,10 @@ void nv2a_d3d_tick(void)
 #include "nv2a_d3d11.h"
 int  nv2a_d3d_init(void) { return 0; }
 int  nv2a_d3d_active(void) { return 0; }
+int nv2a_d3d_writeback_busy(void) { return 0; }
+int nv2a_d3d_prof_enabled(void) { return 0; }
+void nv2a_d3d_prof_add(int slot, int64_t ticks, uint32_t verts)
+{ (void)slot; (void)ticks; (void)verts; }
 void nv2a_d3d_clear(const NvD3DState *st, uint32_t f, uint32_t c, uint32_t z,
                     uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
 { (void)st; (void)f; (void)c; (void)z; (void)x0; (void)y0; (void)x1; (void)y1; }

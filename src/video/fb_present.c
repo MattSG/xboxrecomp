@@ -15,6 +15,7 @@
  * Off unless RECOMP_FB_WINDOW is set.
  */
 #include <stdint.h>
+#include "fb_present.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -23,7 +24,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include "fb_present.h"
 #include "../nv2a/nv2a_regs.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);

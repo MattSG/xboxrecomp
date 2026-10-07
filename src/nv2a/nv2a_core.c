@@ -504,10 +504,10 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         }
     }
     /* STOP is a command, not storage. The engine waits for BUFFER[0] to
-     * clear after issuing it; xemu clears that bit synchronously. */
-    if (addr == 0x704) {
+     * clear after issuing it; xemu clears both pending banks synchronously. */
+    if (addr == NV_PVIDEO_STOP) {
         if (val & 1)
-            d->pvideo.regs[0x700] &= ~1u;
+            d->pvideo.regs[NV_PVIDEO_BUFFER] = 0;
         d->pvideo.regs[addr] = 0;
         return;
     }

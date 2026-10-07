@@ -3,6 +3,14 @@
 # accessor stubs so the format tables, predicates, swizzle classification and
 # software conversions can be validated without a D3D11 device.
 
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT TARGET platform)
+    cmake_minimum_required(VERSION 3.20)
+    project(d3d8_smoke_tests C)
+    enable_testing()
+    add_subdirectory(../.. runtime)
+    return()
+endif()
+
 if(WIN32)
     add_executable(d3d8_gamma test_gamma.c)
     target_link_libraries(d3d8_gamma PRIVATE xbox_d3d8)
@@ -35,4 +43,7 @@ if(WIN32)
     )
     target_include_directories(d3d8_a8 PRIVATE ../../src/d3d)
     target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+    foreach(check d3d8_gamma d3d8_smoke d3d8_states_smoke d3d8_a8)
+        add_test(NAME ${check} COMMAND ${check})
+    endforeach()
 endif()

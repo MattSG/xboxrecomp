@@ -23,12 +23,7 @@
  *   5. MEM_DECOMMIT then MEM_COMMIT on heap memory gives zeroed pages, as on
  *      the console. Both were no-ops, so the old contents came back.
  *   6. MmFreeContiguousMemory gives a contiguous block back and the next
- *      request of that size reuses it; the default never reuses one.
- *   7. (default too) MmAllocateContiguousMemoryEx's physical range is
- *      honoured. A request limited to the low 16 MB still succeeds once
- *      unconstrained requests have filled up to it -- XDK D3D's visibility
- *      test report pages ask for exactly that, and a bump pointer refused
- *      every one -- and a request for a range above the pointer lands in it.
+ *      request of that size reuses it; contiguous pages are reused in both modes.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -229,6 +224,11 @@ int main(int argc, char **argv)
         }
     }
     printf("mode: %s\n", mode);
+    *G(0x00070000u) = 0x12345678u;
+    *G(0x80070000u) = 0x87654321u;
+    check(*G(0x00070000u) == 0x12345678u &&
+          *G(0xF0070000u) == 0x87654321u,
+          "contiguous and tiled memory stay distinct from RAM mirrors", NULL);
 
     /* 0. A contiguous block and the loaded image share physical numbers
      * unless RECOMP_CONTIG_AVOID_IMAGE keeps the block out of the image. */
@@ -330,13 +330,7 @@ int main(int argc, char **argv)
 
         snprintf(d, sizeof d, "free said %d", xbox_ContiguousFree(c1));
         c2 = xbox_ContiguousAlloc(0x20000, 4096);
-        if (reclaim) {
-            char d2[160];
-            snprintf(d2, sizeof d2, "%s, got 0x%08X, expected 0x%08X", d, c2, c1);
-            check(c1 && c2 == c1, "a freed contiguous block is reused", d2);
-        } else {
-            check(c1 && c2 != c1, "default: contiguous memory is never reused", d);
-        }
+        check(c1 && c2 == c1, "a freed contiguous block is reused in both modes", d);
     }
 
     /* 7. The physical range of MmAllocateContiguousMemoryEx is honoured. */
@@ -468,7 +462,15 @@ int main(int argc, char **argv)
         }
     }
 
+#ifdef _WIN32
+    void *host_base = (void *)((uintptr_t)xbox_GetMemoryOffset());
+#endif
     xbox_MemoryLayoutShutdown();
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION host_info;
+    check(VirtualQuery(host_base, &host_info, sizeof host_info) && host_info.State == MEM_FREE,
+          "shutdown releases the host placeholder reservation", NULL);
+#endif
     free(xbe);
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;

@@ -31,7 +31,9 @@
  * Does nothing unless RECOMP_EXT_VMA is set, or when the mirrors already reach
  * the top of user space (a 128 MB map), where there is nothing above them to
  * track. Returns 1 when the tracker is live. */
-int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top);
+/* placeholder: the layout owns a Windows placeholder above the mirrors. */
+int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top,
+                    int placeholder);
 void guest_vmem_shutdown(void);
 
 /* True once guest_vmem_init has succeeded. */
