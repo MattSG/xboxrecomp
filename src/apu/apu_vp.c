@@ -21,7 +21,11 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#ifdef _MSC_VER
 #include <intrin.h>
+#else
+#include <sched.h>
+#endif
 
 /* #define DEBUG_MCPX */
 
@@ -152,13 +156,22 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
  * until all voices have been processed. */
 static void voice_spin_lock(MCPXAPUState *d, uint16_t v)
 {
+#ifdef _MSC_VER
     while (_InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
         YieldProcessor();
+#else
+    while (__sync_val_compare_and_swap(&d->vp.voice_spin[v], 0, 1))
+        sched_yield();
+#endif
 }
 
 static void voice_spin_unlock(MCPXAPUState *d, uint16_t v)
 {
+#ifdef _MSC_VER
     _InterlockedExchange(&d->vp.voice_spin[v], 0);
+#else
+    __sync_lock_release(&d->vp.voice_spin[v]);
+#endif
 }
 
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
@@ -168,9 +181,17 @@ static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 
     uint64_t mask = 1ULL << (v % 64);
     if (lock) {
+#ifdef _MSC_VER
         _InterlockedOr64((volatile LONG64 *)&d->vp.voice_locked[v / 64], (LONG64)mask);
+#else
+        __sync_fetch_and_or(&d->vp.voice_locked[v / 64], mask);
+#endif
     } else {
+#ifdef _MSC_VER
         _InterlockedAnd64((volatile LONG64 *)&d->vp.voice_locked[v / 64], (LONG64)~mask);
+#else
+        __sync_fetch_and_and(&d->vp.voice_locked[v / 64], ~mask);
+#endif
     }
 
     voice_spin_unlock(d, v);

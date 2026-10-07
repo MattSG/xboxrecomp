@@ -939,7 +939,9 @@ int xbox_Nv2aNotifyWait(uint32_t object_va)
 {
     volatile uint32_t *put, *get;
     uint32_t dev;
+#ifdef _WIN32
     unsigned spins = 0;
+#endif
     LONG notified = g_notify_count;
     /* the pointer is in the title image, mapped for as long as it runs */
     if (!g_notify_device_ptr || !g_nv2a_memory || !g_memory_base)
@@ -953,8 +955,12 @@ int xbox_Nv2aNotifyWait(uint32_t object_va)
      * covers an executor that passed the slot before it was patched. */
     while (*get != *put && g_notify_count == notified &&
            !InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+#ifdef _WIN32
         if (++spins & 63) YieldProcessor();
         else SwitchToThread();
+#else
+        SwitchToThread();
+#endif
     }
     return 1;
 }
@@ -2003,6 +2009,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
 #else
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        if (g_span_size < (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+            g_span_size = (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
@@ -2487,6 +2495,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
+#ifndef _WIN32
+        if (g_span_base)
+            VirtualFree((void *)contig_native, XBOX_CONTIG_SIZE, MEM_RELEASE);
+#endif
         g_contig_mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
             0, (DWORD)XBOX_CONTIG_SIZE, NULL);
@@ -2502,7 +2514,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             ? MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS,
                               0, 0, XBOX_CONTIG_SIZE, (LPVOID)contig_native)
             : NULL;
+#ifdef _WIN32
         g_contig_is_view = g_contig_memory != NULL;
+#endif
         if (!g_contig_memory)
             g_contig_memory = VirtualAlloc(
                 (LPVOID)contig_native,
@@ -2800,6 +2814,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             /* Inside the reservation this hands back the slice we are about
              * to use; outside it (no reservation) this is a no-op on an
              * address we never held. */
+#ifdef _WIN32
             if (g_placeholder_span) {
                 uint64_t map_lo = guest_lo;
                 uint64_t map_hi = guest_hi;
@@ -2820,13 +2835,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 }
                 continue;
             }
+#endif
+            uint64_t map_lo = guest_lo, map_hi = guest_hi;
+            if (map_lo < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE &&
+                XBOX_CONTIG_BASE < map_hi) {
+                if (map_lo < XBOX_CONTIG_BASE) map_hi = XBOX_CONTIG_BASE;
+                else map_lo = (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+            }
+            if (map_lo >= map_hi) {
+                mirrors_ok++;
+                continue;
+            }
+            mirror_base = (uintptr_t)g_memory_base + (uintptr_t)map_lo;
             if (g_span_base)
-                VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
+                VirtualFree((LPVOID)mirror_base, map_hi - map_lo, MEM_RELEASE);
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
-                0, 0,
-                g_memory_size,
+                0, (DWORD)(map_lo - guest_lo),
+                map_hi - map_lo,
                 (LPVOID)mirror_base
             );
             if (g_mirror_views[m]) {
@@ -2844,8 +2871,21 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     /* Guest address space above the mirrors, for titles that ask for a specific
      * high address. RECOMP_EXT_VMA; a no-op without it. Straight after the
      * mirrors, while a fixed host address is still likely to be free. */
+#ifndef _WIN32
+    if (g_span_base && getenv("RECOMP_EXT_VMA")) {
+        uint64_t top = (uint64_t)g_memory_size * (1u + XBOX_NUM_MIRRORS);
+        if (top < GUEST_VMEM_TOP)
+            VirtualFree((void *)((uintptr_t)g_memory_base + top),
+                        GUEST_VMEM_TOP - top, MEM_RELEASE);
+    }
+#endif
     guest_vmem_init(g_memory_offset, g_memory_size,
-                    (uint64_t)g_memory_size * (1u + XBOX_NUM_MIRRORS));
+                    (uint64_t)g_memory_size * (1u + XBOX_NUM_MIRRORS),
+#ifdef _WIN32
+                    g_placeholder_span);
+#else
+                    0);
+#endif
 
     /*
      * Tiled / write-combined aperture at 0xF0000000.
@@ -3047,14 +3087,19 @@ void xbox_MemoryLayoutShutdown(void)
      * of it are already unmapped above; this releases the range itself. */
     if (g_span_base) {
 #ifdef _WIN32
-        if (g_placeholder_span)
-            VirtualFree(g_span_base, g_span_size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
-        else
+        if (g_placeholder_span) {
+            if (!VirtualFree(g_span_base, g_span_size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))
+                fprintf(stderr, "  Placeholder coalesce failed (error %lu)\n", GetLastError());
+            if (!VirtualFree(g_span_base, 0, MEM_RELEASE))
+                fprintf(stderr, "  Placeholder release failed (error %lu)\n", GetLastError());
+        } else
 #endif
         VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
         g_span_base = NULL;
         g_span_size = 0;
+#ifdef _WIN32
         g_placeholder_span = 0;
+#endif
     }
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }
@@ -3478,13 +3523,13 @@ uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va)
     return r;
 }
 
-/* Upstream's RECOMP_HEAP_RECLAIM switches its heap and contiguous arena to
- * reuse freed memory. This fork's allocators always reuse it (first-fit,
- * coalescing, kept adjacent -- see xbox_ContiguousAlloc), so the switch has
- * nothing to change here and the reclaim-only paths stay off. */
+/* Heap splitting and NT release/decommit remain opt-in. Contiguous pages
+ * are always reused, independently of this switch. */
 int xbox_HeapReclaimEnabled(void)
 {
-    return 0;
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("RECOMP_HEAP_RECLAIM") != NULL;
+    return enabled;
 }
 
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
@@ -3583,6 +3628,17 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         }
         if (g_heap_blocks[i].addr & (alignment - 1)) {
             continue;   /* wrong alignment for this request */
+        }
+        if (xbox_HeapReclaimEnabled() && g_heap_blocks[i].size > size) {
+            if (g_heap_block_count == XBOX_HEAP_MAX_BLOCKS)
+                continue;
+            memmove(&g_heap_blocks[i + 2], &g_heap_blocks[i + 1],
+                    (g_heap_block_count - i - 1) * sizeof g_heap_blocks[0]);
+            g_heap_blocks[i + 1].addr = g_heap_blocks[i].addr + size;
+            g_heap_blocks[i + 1].size = g_heap_blocks[i].size - size;
+            g_heap_blocks[i + 1].free = 1;
+            g_heap_blocks[i].size = size;
+            g_heap_block_count++;
         }
         g_heap_blocks[i].free = 0;
         result = g_heap_blocks[i].addr;
@@ -3737,14 +3793,16 @@ void xbox_HeapFree(uint32_t xbox_va)
         if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
             g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
             g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
-            g_heap_blocks[i + 1].size = 0;
-            g_heap_blocks[i + 1].addr = 0;
+            memmove(&g_heap_blocks[i + 1], &g_heap_blocks[i + 2],
+                    (g_heap_block_count - i - 2) * sizeof g_heap_blocks[0]);
+            g_heap_block_count--;
         }
         if (i > 0 && g_heap_blocks[i - 1].free &&
             g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
             g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
-            g_heap_blocks[i].size = 0;
-            g_heap_blocks[i].addr = 0;
+            memmove(&g_heap_blocks[i], &g_heap_blocks[i + 1],
+                    (g_heap_block_count - i - 1) * sizeof g_heap_blocks[0]);
+            g_heap_block_count--;
         }
         LeaveCriticalSection(&g_allocator_lock);
         return;
