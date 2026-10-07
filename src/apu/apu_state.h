@@ -428,8 +428,8 @@ typedef struct MCPXAPUVPState {
     uint8_t hrtf_submix[4];
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
-    volatile uint8_t voice_locked[MCPX_HW_MAX_VOICES];
-    volatile LONG voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
+    uint64_t voice_locked[4];
+    volatile long voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
 
     struct {
         int current_entry;
@@ -475,7 +475,6 @@ struct MCPXAPUState {
 
     QemuThread apu_thread;
     QemuMutex lock;
-    volatile long guest_waiting;   /* guest threads blocked on lock (voice_lock) */
     QemuCond cond;
     QemuCond idle_cond;
     bool pause_requested;
