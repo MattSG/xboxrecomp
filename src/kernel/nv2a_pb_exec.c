@@ -193,6 +193,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_FLIP_MODULO             0x0128
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
+#define NV097_SET_SEMAPHORE_OFFSET        0x1D6C
+#define NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
 #define NV097_ARRAY_ELEMENT16             0x1800
 /* Draw a run of vertices straight out of the arrays, with no index list:
  * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
@@ -346,6 +348,7 @@ static struct {
     float    poly_offset_factor, poly_offset_units;
     uint32_t clear_rect_h, clear_rect_v;
     uint32_t other_stage_input, dot_rgb_mapping;
+    uint32_t semaphore_offset;          /* SET_SEMAPHORE_OFFSET */
 } s_gpu;
 
 /* The last value written to every Kelvin method, as the GPU's register file
@@ -4594,16 +4597,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         frame_trace_flip();
         return;
 
-    case NV097_FLIP_STALL: {
-        /* The flip is measured from the vblank the title swapped in (the
-         * walk's start, s_walk_vbl); the hold's clock starts here, before
-         * the present below: a vsynced present can hold this thread for a
-         * host frame, and that time counts against the hold. */
-        uint64_t stall_ns = xbox_HostNowNs();
-        int clock_ok;
-        uint32_t stall_vbl;
-        (void)flip_clock(stall_ns, &clock_ok);
-        stall_vbl = s_walk_vbl;
+    case NV097_SET_SEMAPHORE_OFFSET:
+        s_gpu.semaphore_offset = param;
+        return;
+
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        /* D3D's fence: the value lands in memory once the GPU gets here. */
+        xbox_Nv2aSemaphoreRelease(s_gpu.semaphore_offset, param);
+        return;
+
+    case NV097_FLIP_STALL:
         if (s_ftrace == 2)
             fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);

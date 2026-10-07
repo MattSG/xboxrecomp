@@ -2001,21 +2001,10 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
 
-    {   /* An event the title built itself (see ke_guest_event). Its
-         * SignalState in guest memory is the truth -- XDK code resets it by
-         * writing 0 there -- so bring the host event in line first. */
-        int type;
-        HANDLE ge = ke_guest_event_prepare(object, &type);
-        if (ge) {
-            g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-                ge, wait_reason, wait_mode,
-                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
-            if (g_eax == 0 && type == 1)               /* synchronization: consumed */
-                BRIDGE_MEM32(object + 4) = 0;
-            return;
-        }
+    if (xbox_Nv2aNotifyWait(object)) {
+        g_eax = 0;                              /* STATUS_SUCCESS */
+        return;
     }
-
     h = ke_shadow_lookup(object);
     if (!h)
         h = bridge_resolve_handle(object);
