@@ -56,6 +56,11 @@ add_subdirectory(src/input)
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
+# Host bring-up: MMIO routing to the APU/USB/NV2A models, window and device
+if(WIN32)
+    add_subdirectory(src/host)
+endif()
+
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
@@ -69,14 +74,7 @@ set(XBOXRECOMP_LIBS
     xbox_nv2a
     xbox_video
 )
-add_library(xboxrecomp INTERFACE)
-if(UNIX AND NOT APPLE)
-    # The archives call each other both ways (the APU reaches the kernel's
-    # memory map, the kernel raises the APU's interrupt). GNU ld scans each
-    # archive once, so it needs the group; MSVC and ld64 rescan on their own.
-    target_link_libraries(xboxrecomp INTERFACE
-        -Wl,--start-group ${XBOXRECOMP_LIBS} -Wl,--end-group)
-else()
-    target_link_libraries(xboxrecomp INTERFACE ${XBOXRECOMP_LIBS})
+if(WIN32)
+    target_link_libraries(xboxrecomp INTERFACE xbox_host)
 endif()
 
