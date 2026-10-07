@@ -22,6 +22,7 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "fpconv.h"
+#include <intrin.h>
 
 /* #define DEBUG_MCPX */
 
@@ -167,9 +168,17 @@ static void voice_spin_unlock(MCPXAPUState *d, uint16_t v)
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    voice_spin_lock(d, v);
-    d->vp.voice_locked[v] = lock;
-    voice_spin_unlock(d, v);
+    _InterlockedIncrement(&d->guest_waiting);
+    qemu_mutex_lock(&d->lock);
+    _InterlockedDecrement(&d->guest_waiting);
+
+    uint64_t mask = 1ULL << (v % 64);
+    if (lock) {
+        d->vp.voice_locked[v / 64] |= mask;
+    } else {
+        d->vp.voice_locked[v / 64] &= ~mask;
+    }
+
     qemu_cond_signal(&d->cond);
 }
 
@@ -1691,6 +1700,15 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 voice_spin_lock(d, v);
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
                 voice_spin_unlock(d, v);
+            }
+            /* The frame holds d->lock across every voice; a title waiting in
+             * voice_lock used to wait out the whole frame. Hand over between
+             * voices instead -- the hardware VP runs alongside the CPU, and
+             * locking a voice is the title's own protocol for that. */
+            if (qatomic_read(&d->guest_waiting)) {
+                qemu_mutex_unlock(&d->lock);
+                SwitchToThread();
+                qemu_mutex_lock(&d->lock);
             }
             d->regs[current] = d->regs[next];
         }
