@@ -104,6 +104,7 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
 | **xbox_input** | Custom | Xbox gamepad → XInput |
 | **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture, plus a window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
+| **xbox_host** | Custom | Host bring-up a title's `main()` would otherwise copy (Windows): `xbox_HostHardwareInit` starts the APU and USB models and routes guest MMIO faults to them and the NV2A; `xbox_HostGraphicsInit` opens the window and D3D device and traps PVIDEO |
 
 ### Building the Libraries
 
@@ -283,7 +284,8 @@ xboxrecomp/
 │   ├── apu/                     # xbox_apu    - MCPX APU emulation (xemu)
 │   ├── nv2a/                    # xbox_nv2a   - NV2A GPU emulation (xemu)
 │   ├── input/                   # xbox_input  - Gamepad → XInput
-│   └── video/                   # xbox_video  - FMV playback + framebuffer window
+│   ├── video/                   # xbox_video  - FMV playback + framebuffer window
+│   └── host/                    # xbox_host   - MMIO routing, window + device bring-up
 ├── include/xbox/                # Public umbrella header (xboxrecomp.h)
 ├── templates/                   # Starter templates for new projects
 │   ├── new-game/                # ** Copy this to start a game project **
