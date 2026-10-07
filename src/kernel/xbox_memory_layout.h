@@ -189,7 +189,8 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
-void xbox_ContiguousFree(uint32_t xbox_va);
+int xbox_ContiguousFree(uint32_t xbox_va);              /* 0: not ours */
+uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va);
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
@@ -452,7 +453,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.
  * Alignment must be a power of 2 (minimum 4).
- * Thread-safe: no (single-threaded recompiled code).
+ * Thread-safe: yes; a lock guards the block table.
  */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
@@ -468,6 +469,13 @@ void xbox_HeapFree(uint32_t xbox_va);
  * the translated address describes the whole guest mapping.
  */
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
+
+/**
+ * True when RECOMP_HEAP_RECLAIM is set: freed heap blocks are split rather than
+ * handed over whole, and NtFreeVirtualMemory returns heap memory to the heap.
+ * Off by default; it changes which address later allocations get.
+ */
+int xbox_HeapReclaimEnabled(void);
 
 /**
  * Get the file mapping handle for the Xbox memory region.

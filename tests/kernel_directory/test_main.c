@@ -1,4 +1,5 @@
-#include "kernel.h"
+#include "../../src/kernel/kernel_file.c"
+/* Include the file backend to inspect its private enumeration ownership. */
 #include "xbox_memory_layout.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -11,19 +12,46 @@ extern ptrdiff_t g_xbox_mem_offset;
 void *recomp_lookup(ULONG a) { (void)a; abort(); }
 void *recomp_lookup_manual(ULONG a) { (void)a; abort(); }
 static uint8_t *mem;
-static HANDLE open_guest(void) {
+static guest_fn query, close_guest, map_status;
+static unsigned active_searches(void) {
+    unsigned count = 0;
+    for (unsigned i = 0; i < MAX_DIR_CONTEXTS; i++)
+        if (s_dir_contexts[i].find_handle && s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+            count++;
+    return count;
+}
+static int guest_close(HANDLE h) {
+    uint32_t *sp = (uint32_t *)(mem + 0x20000);
+    sp[0] = 0xBEEF0001; sp[1] = (uint32_t)(uintptr_t)h;
+    g_esp = 0x20000;
+    close_guest=recomp_lookup_kernel(*(uint32_t *)(mem+0x10004));
+    close_guest();
+    return g_eax == 0 && g_esp == 0x20008;
+}
+static HANDLE guest_open(void) {
     uint32_t *sp=(uint32_t *)(mem+0x20000);
-    memset(sp,0,64); sp[0]=0xBEEF0001; sp[1]=0x40500; sp[2]=1;
-    sp[3]=0x40000; sp[4]=0x40600; sp[5]=7; sp[6]=1;
-    g_esp=0x20000; recomp_lookup_kernel(*(uint32_t *)(mem+0x10008))();
+    memset(sp,0,64);
+    *(uint32_t *)(mem+0x40000)=0;
+    *(uint32_t *)(mem+0x40004)=0x40100;
+    *(uint32_t *)(mem+0x40008)=0;
+    memcpy(mem+0x40200,"D:\\",4);
+    *(uint16_t *)(mem+0x40100)=3;
+    *(uint16_t *)(mem+0x40102)=4;
+    *(uint32_t *)(mem+0x40104)=0x40200;
+    sp[0]=0xBEEF0001; sp[1]=0x40500; sp[2]=1; sp[3]=0x40000;
+    sp[4]=0x40600; sp[5]=7; sp[6]=1;
+    g_esp=0x20000;
+    recomp_lookup_kernel(*(uint32_t *)(mem+0x1000C))();
     if(g_eax || g_esp!=0x2001C) return INVALID_HANDLE_VALUE;
     return (HANDLE)(uintptr_t)*(uint32_t *)(mem+0x40500);
 }
-static int close_guest(HANDLE h) {
-    uint32_t *sp=(uint32_t *)(mem+0x20000);
-    sp[0]=0xBEEF0001; sp[1]=(uint32_t)(uintptr_t)h;
-    g_esp=0x20000; recomp_lookup_kernel(*(uint32_t *)(mem+0x10004))();
-    return g_eax==0 && g_esp==0x20008;
+static int check_status_mapping(uint32_t status, uint32_t error) {
+    uint32_t *sp = (uint32_t *)(mem + 0x20000);
+    sp[0] = 0xBEEF0001; sp[1] = status;
+    g_esp = 0x20000;
+    map_status=recomp_lookup_kernel(*(uint32_t *)(mem+0x10008));
+    map_status();
+    return g_eax == error && g_esp == 0x20008;
 }
 static int invoke(HANDLE h, const char *pattern, unsigned restart, unsigned klass) {
     uint32_t *sp=(uint32_t *)(mem+0x20000);
@@ -37,7 +65,9 @@ static int invoke(HANDLE h, const char *pattern, unsigned restart, unsigned klas
         strcpy((char *)mem+0x32100,pattern);
     }
     memset(mem+0x30000,0xCC,8); memset(mem+0x31000,0xCC,512);
-    g_esp=0x20000; recomp_lookup_kernel(*(uint32_t *)(mem+0x10000))();
+    g_esp=0x20000;
+    query=recomp_lookup_kernel(*(uint32_t *)(mem+0x10000));
+    query();
     if(g_esp!=0x2002C) { fprintf(stderr,"FAIL directory query stack: %08X expected 0002002C\n",g_esp); return 0; }
     if(*(uint32_t *)(mem+0x30000)!=g_eax) { puts("FAIL I/O status differs"); return 0; }
     return 1;
@@ -53,16 +83,13 @@ int main(void) {
     g_xbox_mem_offset=(ptrdiff_t)mem;
     *(uint32_t *)(mem+0x10000)=0x800000CF;
     *(uint32_t *)(mem+0x10004)=0x800000BB;
-    *(uint32_t *)(mem+0x10008)=0x800000CA;
-    xbox_kernel_set_thunk_address(0x10000,3); xbox_kernel_bridge_init();
+    *(uint32_t *)(mem+0x10008)=0x8000012D;
+    *(uint32_t *)(mem+0x1000C)=0x800000CA;
     xbox_path_init(path,NULL);
-    *(uint32_t *)(mem+0x40000)=0;
-    *(uint32_t *)(mem+0x40004)=0x40100;
-    *(uint32_t *)(mem+0x40008)=0;
-    *(uint16_t *)(mem+0x40100)=3;
-    *(uint16_t *)(mem+0x40102)=4;
-    *(uint32_t *)(mem+0x40104)=0x40200;
-    memcpy(mem+0x40200,"D:\\",4);
+    xbox_kernel_set_thunk_address(0x10000,4); xbox_kernel_bridge_init();
+    query=recomp_lookup_kernel(*(uint32_t *)(mem+0x10000));
+    close_guest=recomp_lookup_kernel(*(uint32_t *)(mem+0x10004));
+    map_status=recomp_lookup_kernel(*(uint32_t *)(mem+0x10008));
     int ok=invoke(h,"Save*",1,1);
     XBOX_FILE_DIRECTORY_INFORMATION *e=(void *)(mem+0x31000);
     if(ok && (g_eax || e->FileNameLength!=8 || memcmp(e->FileName,"SaveSlot",8) || !(e->FileAttributes&16))) {
@@ -72,19 +99,37 @@ int main(void) {
     if(ok) ok=invoke(h,"Save*",1,1) && g_eax==0;
     if(ok) ok=invoke(h,"*",1,1) && g_eax==0 && e->FileNameLength==8 && !memcmp(e->FileName,"SaveSlot",8);
     if(ok) ok=invoke(h,"*",1,2) && g_eax==0xC0000003u;
-    /* Probe and close before EOF, then reopen without RestartScan, as a title's
-     * FindFirstFile does. Reused host handles must not inherit a stale cursor.
-     * Repeating beyond the context table capacity also catches leaked scans
-     * when Windows chooses different handle values. */
-    xbox_NtClose(h);
-    for (unsigned i=0; ok && i<128; ++i) {
-        h=open_guest();
-        if(h==INVALID_HANDLE_VALUE) { ok=0; break; }
-        ok=invoke(h,"Save*",0,1) && g_eax==0 && e->FileNameLength==8 && !memcmp(e->FileName,"SaveSlot",8);
-        if(!ok) fprintf(stderr,"FAIL reopened directory iteration %u status=%08X\n",i,g_eax);
-        if(!close_guest(h)) ok=0;
+    if(ok) ok=check_status_mapping(0x80000006u,18) && check_status_mapping(0,0)
+        && check_status_mapping(0xC0000008u,6);
+    if(ok) ok=active_searches()==1 && xbox_NtClose(h)==STATUS_SUCCESS && active_searches()==0;
+    else xbox_NtClose(h);
+    /* Guest NtClose consumes a tagged table token, not a raw Windows handle.
+     * Open through ordinal 202 so this exercises the real bridge contract. */
+    for(unsigned round=0;ok && round<MAX_DIR_CONTEXTS+8;round++) {
+        h=guest_open();
+        if(h==INVALID_HANDLE_VALUE) {ok=0;break;}
+        ok=invoke(h,"Save*",0,1) && g_eax==0 && active_searches()==1;
+        if(!ok) fprintf(stderr,"FAIL guest open round %u: status=%08X searches=%u\n",round,g_eax,active_searches());
+        ok=guest_close(h) && ok && active_searches()==0;
+        if(!ok) fprintf(stderr,"FAIL guest close round %u: searches=%u\n",round,active_searches());
     }
+    for(unsigned round=0;ok && round<MAX_DIR_CONTEXTS+8;round++) {
+        h=CreateFileA(path,FILE_LIST_DIRECTORY,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+            NULL,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,NULL);
+        if(h==INVALID_HANDLE_VALUE) {ok=0;break;}
+        ok=invoke(h,"Save*",0,1) && g_eax==0 && active_searches()==1;
+        ok=xbox_NtClose(h)==STATUS_SUCCESS && ok && active_searches()==0;
+        if(!ok) fprintf(stderr,"FAIL direct close round %u: searches=%u\n",round,active_searches());
+    }
+    h=guest_open();
+    if(ok) ok=invoke(h,"Save*",1,1) && g_eax==0
+        && invoke(h,NULL,0,1) && g_eax==0x80000006u;
+    if(h!=INVALID_HANDLE_VALUE) guest_close(h);
+    h=guest_open();
+    if(ok) ok=active_searches()==0 && invoke(h,"Save*",0,1) && g_eax==0;
+    if(h!=INVALID_HANDLE_VALUE) guest_close(h);
     RemoveDirectoryA(child); RemoveDirectoryA(path); VirtualFree(mem,0,MEM_RELEASE);
     if(!ok) return 1;
-    puts("PASS: Xbox directory ABI, filter, continuation, restart, close/reopen, dot exclusion, and class rejection"); return 0;
+    puts("PASS: directory ABI/filter/restart/status, guest/direct close, 144 slot-reuse cycles and fresh searches"); return 0;
 }
+

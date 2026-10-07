@@ -312,13 +312,12 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     return STATUS_UNSUCCESSFUL;
 }
 
-static void close_dir_context(HANDLE file_handle);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
-        close_dir_context(Handle);
+        xbox_dir_context_drop(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -601,23 +600,6 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
 
-/* A directory can be closed before its scan reaches STATUS_NO_MORE_FILES.
- * Retire that scan before Windows can reuse the file handle for another open. */
-static void close_dir_context(HANDLE file_handle)
-{
-    if (!s_dir_cs_init) return;
-    EnterCriticalSection(&s_dir_cs);
-    for (int i = 0; i < MAX_DIR_CONTEXTS; ++i) {
-        DIR_CONTEXT* ctx = &s_dir_contexts[i];
-        if (ctx->file_handle == file_handle) {
-            if (ctx->find_handle && ctx->find_handle != INVALID_HANDLE_VALUE)
-                FindClose(ctx->find_handle);
-            memset(ctx, 0, sizeof(*ctx));
-        }
-    }
-    LeaveCriticalSection(&s_dir_cs);
-}
-
 static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 {
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
@@ -639,6 +621,28 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
     }
     LeaveCriticalSection(&s_dir_cs);
     return NULL;
+}
+
+/* A closed directory handle takes its enumeration with it. Host handle values
+ * are reused, and a search abandoned part-way (a title that stops at the first
+ * match) otherwise carried on under the next directory opened at the same
+ * value: its first answer was the old search's next entry. */
+void xbox_dir_context_drop(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init)
+        return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].file_handle == FileHandle) {
+            if (s_dir_contexts[i].find_handle &&
+                s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+                FindClose(s_dir_contexts[i].find_handle);
+            s_dir_contexts[i].find_handle = NULL;
+            s_dir_contexts[i].file_handle = NULL;
+            s_dir_contexts[i].first_done = FALSE;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
 }
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(

@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "guest_vmem.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2841,6 +2842,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
     }
 
+    /* Guest address space above the mirrors, for titles that ask for a specific
+     * high address. RECOMP_EXT_VMA; a no-op without it. Straight after the
+     * mirrors, while a fixed host address is still likely to be free. */
+    guest_vmem_init(g_memory_offset, g_memory_size,
+                    (uint64_t)g_memory_size * (1u + XBOX_NUM_MIRRORS));
+
     /*
      * Tiled / write-combined aperture at 0xF0000000.
      *
@@ -3034,6 +3041,8 @@ void xbox_MemoryLayoutShutdown(void)
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
     }
+
+    guest_vmem_shutdown();
 
     /* Whatever is left of the base+mirrors reservation. The views carved out
      * of it are already unmapped above; this releases the range itself. */
@@ -3418,14 +3427,18 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
  * a surface offset is physical, and only the window makes it addressable. */
-void xbox_ContiguousFree(uint32_t xbox_va)
+/* Returns 0 when the address is not a block this arena handed out, so the
+ * caller can try the general heap. */
+int xbox_ContiguousFree(uint32_t xbox_va)
 {
     /* Titles pass either the physical address or its cached/uncached alias. */
     uint32_t offset = xbox_va & 0x1FFFFFFFu;
-    if (!xbox_va || offset >= XBOX_CONTIG_SIZE) return;
+    int found = 0;
+    if (!xbox_va || offset >= XBOX_CONTIG_SIZE) return 0;
     EnterCriticalSection(&g_allocator_lock);
     for (LONG i = 0; i < g_contig_alloc_count; ++i) {
         if (g_contig_allocs[i].offset == offset && g_contig_allocs[i].in_use) {
+            found = 1;
             InterlockedExchange(&g_contig_allocs[i].in_use, 0);
             if (getenv("RECOMP_CONTIG_TRACE"))
                 fprintf(stderr, "[CONTIG_FREE] address=%08X span=%u\n",
@@ -3447,6 +3460,32 @@ void xbox_ContiguousFree(uint32_t xbox_va)
         }
     }
     LeaveCriticalSection(&g_allocator_lock);
+    return found;
+}
+
+/* Size of the in-use block that starts at addr (MmQueryAllocationSize,
+ * XPhysicalSize), 0 if this arena did not hand it out. */
+uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va)
+{
+    uint32_t offset = xbox_va & 0x1FFFFFFFu, r = 0;
+    if (!xbox_va || offset >= XBOX_CONTIG_SIZE) return 0;
+    EnterCriticalSection(&g_allocator_lock);
+    for (LONG i = 0; i < g_contig_alloc_count; ++i)
+        if (g_contig_allocs[i].offset == offset && g_contig_allocs[i].in_use) {
+            r = g_contig_allocs[i].size;
+            break;
+        }
+    LeaveCriticalSection(&g_allocator_lock);
+    return r;
+}
+
+/* Upstream's RECOMP_HEAP_RECLAIM switches its heap and contiguous arena to
+ * reuse freed memory. This fork's allocators always reuse it (first-fit,
+ * coalescing, kept adjacent -- see xbox_ContiguousAlloc), so the switch has
+ * nothing to change here and the reclaim-only paths stay off. */
+int xbox_HeapReclaimEnabled(void)
+{
+    return 0;
 }
 
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
