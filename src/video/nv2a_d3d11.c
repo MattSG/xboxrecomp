@@ -3023,6 +3023,13 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
                  * picture -- and stays 4:3 over this background. */
                 s_frame_bg_tex = s_draw_tex_addr;
                 yscale = 1.0f / narrow;
+            } else if (s_frame_bg_tex && s_draw_textured && !nv2a_d3d_hud_active() &&
+                       (xlo <= 0.5f || xhi >= (float)gw - 0.5f)) {
+                /* A piece of the menu collage bleeding off a 4:3 edge (the
+                 * gauge panels): zoomed with the background it belongs to,
+                 * so it still reaches the screen edge instead of ending in
+                 * a hard cut at the 4:3 boundary. */
+                yscale = 1.0f / narrow;
             } else {
                 squeeze = narrow;
                 if (nv2a_d3d_hud_active() && world_tag_draw(xlo, xhi, ylo, yhi, s_draw_tex_addr)) {
