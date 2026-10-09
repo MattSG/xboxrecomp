@@ -185,7 +185,7 @@ static int s_sharp = 1;   /* RECOMP_SHARP_POINT=0: point filtering as the title 
  * HUD's screen begins
  * and off when it leaves. Frames that draw a full-screen background
  * image are menus or loading screens and never get it, which keeps menus
- * reached from a race (and the race's own loading screen) in 4:3 layout. */
+ * reached from a race out of the race HUD placement path. */
 static volatile LONG s_edge_hud;
 static uint32_t s_frame_bg_tex;     /* this frame's background image; reset at flip */
 static int s_frame_tag_window;      /* still in the frame's leading name tags */
@@ -2988,15 +2988,8 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
         return;
     }
     if (pos && s && s->sx > s->sy * 1.001f) {
-        /* Widescreen placement of overlays drawn straight in screen space
-         * (w = 1). Nothing is stretched:
-         *  - draws with no image to distort (fades, fills) and copies of a
-         *    widened render target span the wide surface 1:1;
-         *  - full-screen image backgrounds are zoomed uniformly to cover it,
-         *    cropping a little top and bottom;
-         *  - the race HUD keeps its 4:3 shape and moves to the screen edge
-         *    its half of the 4:3 layout belongs to;
-         *  - everything else keeps its 4:3 proportions, centred. */
+        /* Menu artwork and controls span the display together. Only the
+         * race HUD retains its proportions and edge placement. */
         float xlo = 1e30f, xhi = -1e30f, ylo = 1e30f, yhi = -1e30f;
         uint32_t k;
         int flat = 1;
@@ -3016,24 +3009,11 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
                 float *d = realloc(dx, (size_t)count * sizeof *d);
                 if (d) { dx = d; dx_cap = count; }
             }
-            if (wide_x && (!s_draw_textured || s_draw_reads_wide)) {
-                /* spans as it is */
-            } else if (tall && (!s_frame_bg_tex || s_draw_tex_addr == s_frame_bg_tex) &&
-                       (wide_x || s_draw_tex_addr == s_frame_bg_tex)) {
-                /* The frame's background image (and anything else drawn
-                 * with it, like the menus' animated overlay mesh). A
-                 * later full-screen image is content -- the title's logo
-                 * picture -- and stays 4:3 over this background. */
+            /* Remember the background only to exclude menus/loading screens
+             * reached during a race from HUD placement. Do not zoom its art. */
+            if (tall && wide_x && s_draw_textured && !s_draw_reads_wide && !s_frame_bg_tex)
                 s_frame_bg_tex = s_draw_tex_addr;
-                yscale = 1.0f / narrow;
-            } else if (s_frame_bg_tex && s_draw_textured && !nv2a_d3d_hud_active() &&
-                       (xlo <= 0.5f || xhi >= (float)gw - 0.5f)) {
-                /* A piece of the menu collage bleeding off a 4:3 edge (the
-                 * gauge panels): zoomed with the background it belongs to,
-                 * so it still reaches the screen edge instead of ending in
-                 * a hard cut at the 4:3 boundary. */
-                yscale = 1.0f / narrow;
-            } else {
+            if (nv2a_d3d_hud_active() && !(wide_x && (!s_draw_textured || s_draw_reads_wide))) {
                 squeeze = narrow;
                 if (nv2a_d3d_hud_active() && world_tag_draw(xlo, xhi, ylo, yhi, s_draw_tex_addr)) {
                     /* a name tag over a car: the title projected it
