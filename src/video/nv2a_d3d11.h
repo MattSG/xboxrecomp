@@ -97,6 +97,13 @@ float nv2a_d3d_display_aspect(void);
  * it leaves; while on (and the frame draws no full-screen background) the
  * HUD is placed at the screen edges instead of the centred 4:3 area. */
 void nv2a_d3d_set_edge_hud(int on);
+/* A title that multiplies its far plane by `scale` (w-buffered, so depth is
+ * w / far) still indexes its authored depth lookups (fog ramps) with the
+ * original fractions. Depth read back as a texture is reported in those:
+ * unchanged in world distance up to `knee` of the original far plane, then
+ * stretched so the rest of the authored ramp ends at the new far plane.
+ * scale 1 (the default) leaves depth untouched. */
+void nv2a_d3d_set_depth_view_remap(float scale, float knee);
 /* The race HUD's first element, as its 4:3 screen rectangle; 2D drawn ahead
  * of it in a race frame is world-anchored (name tags over cars). */
 void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1);
