@@ -231,6 +231,16 @@ void nv2a_d3d_set_edge_hud(int on)
         s_hud_tex_n = 0;                 /* a new level may load other textures */
 }
 
+/* nv2a_d3d_set_depth_view_remap: x = scale, y = knee (see y16d_ps). */
+static float s_zview_remap[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
+
+void nv2a_d3d_set_depth_view_remap(float scale, float knee)
+{
+    if (!(scale >= 1.0f) || !(knee > 0.0f && knee <= 1.0f)) { scale = 1.0f; knee = 1.0f; }
+    s_zview_remap[1] = knee;
+    s_zview_remap[0] = scale;            /* views rebuild on the next depth bind */
+}
+
 static int nv2a_d3d_hud_active(void)
 {
     return !s_frame_bg_tex && InterlockedCompareExchange(&s_edge_hud, 0, 0) != 0;
@@ -296,6 +306,7 @@ static ID3D11VertexShader *s_ub_vs, *s_present_vs, *s_clear_vs;
 static ID3D11PixelShader  *s_psv[4], *s_present_ps, *s_clear_ps;
 static ID3D11VertexShader *s_y16_vs;
 static ID3D11PixelShader  *s_y16_ps[2];      /* [msaa] */
+static ID3D11PixelShader  *s_y16d_ps[2];     /* [msaa], from a depth buffer */
 /* s_raw: the vertex-data ring ub_vs reads (raw view s_raw_srv) */
 static ID3D11Buffer *s_raw, *s_ib, *s_cb_ub, *s_cb_prog, *s_cb_vconst, *s_cb_ps, *s_cb_present, *s_cb_clear;
 static ID3D11ShaderResourceView *s_raw_srv;
@@ -804,6 +815,25 @@ static const char s_hlsl[] =
 "  uint4 b = (uint4)round(saturate(c) * 255.0);\n"
 "  float y = (float)((q.x & 1u) ? (b.a << 8 | b.r) : (b.g << 8 | b.b)) / 65535.0;\n"
 "  return float4(y, y, y, 1);\n"
+"}\n"
+/* The same view of a Z24S8 depth buffer (MM3's fog reads its depth this way).
+ * Guest memory holds z[7:0]:stencil in texel 2x and z[23:8] in 2x+1; a
+ * pixel-centred guest tap lands on 2x+1 exactly, which host-resolution
+ * rounding splits between the two (moire in the fog). Both texels hold
+ * z[23:8]. ponytail: the low word (z[7:0]:stencil) is not readable this way;
+ * keep it for even texels if a title ever reads stencil through Y16.
+ * Host depth is z / 0xFFFFFF (see map[2]). ccol = nv2a_d3d_set_depth_view_remap
+ * (scale s, knee k): d -> d*s below k/s, then linear from k to 1 at d = 1. */
+"#ifdef Y16_MS\nTexture2DMS<float> Y16Z : register(t0);\n#else\nTexture2D<float> Y16Z : register(t0);\n#endif\n"
+"float4 y16d_ps(float4 p : SV_Position) : SV_Target {\n"
+"  uint2 q = uint2(p.xy);\n"
+"#ifdef Y16_MS\n  float d = Y16Z.Load(int2(q.x >> 1, q.y), 0);\n"
+"#else\n  float d = Y16Z.Load(int3(q.x >> 1, q.y, 0));\n#endif\n"
+"  float s = ccol.x, k = ccol.y;\n"
+"  d = saturate(d);\n"
+"  if (s > 1.0) d = d * s <= k ? d * s : k + (d - k / s) * (1.0 - k) / (1.0 - k / s);\n"
+"  float y = (float)((uint)round(saturate(d) * 16777215.0) >> 8) / 65535.0;\n"
+"  return float4(y, y, y, 1);\n"
 "}\n";
 
 typedef struct {
@@ -1100,10 +1130,17 @@ int nv2a_d3d_init(void)
 #undef MAKE
     {
         static const D3D_SHADER_MACRO ms[] = { { "Y16_MS", "1" }, { NULL, NULL } };
+        int v;
         if (!(b = compile_def("y16_ps", "ps_5_0", ms))) return 0;
         ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
                                        ID3D10Blob_GetBufferSize(b), NULL, &s_y16_ps[1]);
         ID3D10Blob_Release(b);
+        for (v = 0; v < 2; v++) {
+            if (!(b = compile_def("y16d_ps", "ps_5_0", v ? ms : NULL))) return 0;
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                           ID3D10Blob_GetBufferSize(b), NULL, &s_y16d_ps[v]);
+            ID3D10Blob_Release(b);
+        }
     }
 
     {
@@ -1227,6 +1264,12 @@ typedef struct {
     uint32_t phys, iw, ih, samples;
     ID3D11Texture2D *tex;
     ID3D11DepthStencilView *dsv;
+    ID3D11ShaderResourceView *zsrv;         /* depth as a texture (for y16) */
+    ID3D11Texture2D *y16;                   /* LU_IMAGE_Y16 view (see y16d_ps) */
+    ID3D11ShaderResourceView *y16_srv;
+    ID3D11RenderTargetView *y16_rtv;
+    uint32_t zf, w, h;                      /* zeta format code, guest size last bound with */
+    uint32_t gen, y16_gen, seq;             /* as Surface */
     uint32_t used_frame;
 } Depth;
 
@@ -1633,6 +1676,29 @@ static Surface *surface_get(uint32_t va, uint32_t pitch, uint32_t fmt,
     return s;
 }
 
+static void depth_release(Depth *d)
+{
+    if (d->y16_rtv) ID3D11RenderTargetView_Release(d->y16_rtv);
+    if (d->y16_srv) ID3D11ShaderResourceView_Release(d->y16_srv);
+    if (d->y16) ID3D11Texture2D_Release(d->y16);
+    if (d->zsrv) ID3D11ShaderResourceView_Release(d->zsrv);
+    if (d->dsv) ID3D11DepthStencilView_Release(d->dsv);
+    if (d->tex) ID3D11Texture2D_Release(d->tex);
+    memset(d, 0, sizeof *d);
+}
+
+/* The Z24S8 depth buffer most recently bound at p, or NULL. */
+static Depth *depth_find(uint32_t p)
+{
+    Depth *best = NULL;
+    int i;
+    for (i = 0; i < MAX_DEPTHS; i++)
+        if (s_depth[i].tex && s_depth[i].phys == p && s_depth[i].zf != 1 &&
+            (!best || s_depth[i].seq > best->seq))
+            best = &s_depth[i];
+    return best;
+}
+
 static Depth *depth_get(uint32_t va, uint32_t iw, uint32_t ih, UINT samples)
 {
     uint32_t p = phys(va);
@@ -1652,13 +1718,24 @@ static Depth *depth_get(uint32_t va, uint32_t iw, uint32_t ih, UINT samples)
             victim = &s_depth[i];
     d = victim;
     if (s_cur_ds == d) unbind_targets();
-    if (d->dsv) ID3D11DepthStencilView_Release(d->dsv);
-    if (d->tex) ID3D11Texture2D_Release(d->tex);
-    memset(d, 0, sizeof *d);
-    d->tex = make_texture_ms(iw, ih, 1, 1, DXGI_FORMAT_D24_UNORM_S8_UINT,
-                             D3D11_BIND_DEPTH_STENCIL, 0, samples);
+    depth_release(d);
+    /* Typeless so the title can read it back as a texture (depth_y16). */
+    d->tex = make_texture_ms(iw, ih, 1, 1, DXGI_FORMAT_R24G8_TYPELESS,
+                             D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 0, samples);
     if (!d->tex) return NULL;
-    ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)d->tex, NULL, &d->dsv);
+    {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+        memset(&dv, 0, sizeof dv);
+        dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dv.ViewDimension = samples > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
+        ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)d->tex, &dv, &d->dsv);
+        memset(&sv, 0, sizeof sv);
+        sv.ViewDimension = samples > 1 ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->tex, &sv, &d->zsrv);
+    }
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, d->dsv,
                                               D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
                                               1.0f, 0);
@@ -1708,6 +1785,7 @@ static int bind_targets(const NvD3DState *st, int want_depth, Surface **out,
     if (s && d && (d->iw != s->iw || d->ih != s->ih))
         d = NULL;
     if (s) { s->ms_dirty = 1; s->gen++; }
+    if (d) { d->gen++; d->seq = ++s_surf_seq; d->zf = (fmt >> 4) & 0xF; d->w = w; d->h = h; }
     if (s != s_cur_rt || d != s_cur_ds) {
         ID3D11RenderTargetView *rtv = s ? s->rtv : NULL;
         unbind_textures();
@@ -2519,6 +2597,49 @@ static ID3D11ShaderResourceView *surface_y16(Surface *s)
     return s->y16_srv;
 }
 
+/* The same for a depth buffer the title reads as LU_IMAGE_Y16 (see y16d_ps). */
+static ID3D11ShaderResourceView *depth_y16(Depth *d)
+{
+    if (!d->zsrv) return NULL;
+    if (!d->y16) {
+        d->y16 = make_texture(2 * d->iw, d->ih, 1, 1, DXGI_FORMAT_R16G16B16A16_UNORM,
+                              D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0);
+        if (!d->y16) return NULL;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->y16, NULL, &d->y16_srv);
+        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)d->y16, NULL, &d->y16_rtv);
+        d->y16_gen = d->gen - 1;
+    }
+    if (d->y16_gen != d->gen) {
+        ID3D11ShaderResourceView *src[1] = { d->zsrv };
+        D3D11_VIEWPORT vp = { 0, 0, (float)(2 * d->iw), (float)d->ih, 0, 1 };
+        D3D11_RECT sc = { 0, 0, (LONG)(2 * d->iw), (LONG)d->ih };
+        unbind_textures();
+        unbind_targets();
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &d->y16_rtv, NULL);
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+        ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs_plain);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, s_blend_opaque, NULL, 0xFFFFFFFF);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_y16_vs, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_y16d_ps[d->samples > 1 ? 1 : 0], NULL, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, src);
+        {
+            float cc[8] = { 0 };
+            memcpy(cc, s_zview_remap, sizeof s_zview_remap);
+            upload_cb(s_cb_clear, cc, sizeof cc);
+            ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_clear);
+        }
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        unbind_targets();
+        unbind_textures();
+        d->y16_gen = d->gen;
+    }
+    return d->y16_srv;
+}
+
 static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
                           uint32_t *out_gw, uint32_t *out_gh, uint32_t *out_zmax)
 {
@@ -2557,7 +2678,11 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     for (n = 0; n < 4; n++) {
         const NvD3DTexture *t = &st->tex[n];
         Surface *rt;
+        Depth *zt;
         if (t->color != 0x35 || t->cube || !t->addr) continue;
+        /* A depth buffer wins over a colour surface at the same address:
+         * MM3 binds one there for colour-masked stencil passes. */
+        if ((zt = depth_find(phys(t->addr))) != NULL) { depth_y16(zt); continue; }
         rt = surface_find(phys(t->addr));
         if (rt && rt->bpp == 4) { surface_sync(rt, 0); surface_y16(rt); }
     }
@@ -2573,6 +2698,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         uint32_t mode = (st->rc.stage_program >> (n * 5)) & 31;
         ID3D11ShaderResourceView *view = NULL;
         Surface *rt;
+        Depth *zt;
         int kind = K_SWZ, levels = 1, reduce = 0;
         pc.tex_scale[n][0] = pc.tex_scale[n][1] = 1.0f;
         pc.tex_scale[n][2] = pc.tex_scale[n][3] = 1.0f;
@@ -2585,7 +2711,12 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         s_draw_textured = 1;
         if (!s_draw_tex_addr) s_draw_tex_addr = t->addr;
         if (rt && rt->sx > rt->sy * 1.001f) s_draw_reads_wide = 1;
-        if (rt) {
+        zt = t->color == 0x35 && !t->cube ? depth_find(phys(t->addr)) : NULL;
+        if (zt && zt->y16_srv) {
+            view = zt->y16_srv;                 /* each pixel is two texels */
+            pc.tex_scale[n][0] = 1.0f / (float)(2 * zt->w);
+            pc.tex_scale[n][1] = 1.0f / (float)zt->h;
+        } else if (rt) {
             surface_sync(rt, 0);
             surface_resolve(rt);
             /* An MSAA target draws into ms, so its resolved tex is free to read. */
@@ -3731,11 +3862,8 @@ static void display_config(int now)
         unbind_textures();
         for (i = 0; i < MAX_SURFACES; i++)
             if (s_surf[i].tex) surface_release(&s_surf[i]);
-        for (i = 0; i < MAX_DEPTHS; i++) {
-            if (s_depth[i].dsv) ID3D11DepthStencilView_Release(s_depth[i].dsv);
-            if (s_depth[i].tex) ID3D11Texture2D_Release(s_depth[i].tex);
-            memset(&s_depth[i], 0, sizeof s_depth[i]);
-        }
+        for (i = 0; i < MAX_DEPTHS; i++)
+            depth_release(&s_depth[i]);
         s_shown = NULL;
     }
     s_scale = scale;
@@ -3843,5 +3971,6 @@ void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
 void nv2a_d3d_set_edge_hud(int on) { (void)on; }
+void nv2a_d3d_set_depth_view_remap(float scale, float knee) { (void)scale; (void)knee; }
 void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1) { (void)x0; (void)y0; (void)x1; (void)y1; }
 #endif
