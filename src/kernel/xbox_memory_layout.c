@@ -616,154 +616,9 @@ static void ac97_arm_write_trap(void)
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
 }
 
-/*
- * Trapped-MMIO dispatch: one call for a title's fault handler.
- *
- * Three models answer hardware registers by faulting on them -- the APU, the
- * AC'97 bus-master page and the USB OHCI controllers -- and each has its own
- * handler. A title's fault handler had to call them one by one, and one whose
- * handler missed a model died at that device's first register access. These
- * route the fault to whichever model owns the address and return 1 when it
- * was serviced, so the caller resumes the thread instead of reporting a
- * crash. They only re-route: each model's own handler does the work.
- */
-#include "apu/apu.h"
-#include "apu/apu_wav.h"
-#include "usb/ohci.h"
-
-#define MMIO_APU_BASE 0xFE800000u   /* what MemoryLayoutInit unmaps for the APU */
-#define MMIO_APU_END  0xFE880000u
-
-extern MCPXAPUState *g_apu_state;   /* apu_mmio_hook.c; NULL until audio is up */
-
-/* The guest VA a host fault address names. Only an address inside the 4 GB
- * guest window names one: truncating the offset to 32 bits would let a host
- * address far above it alias into a device range. */
-static int mmio_fault_va(uintptr_t fault, uint32_t *va)
-{
-    uintptr_t base = (uintptr_t)xbox_GetMemoryOffset();
-    uint64_t rel = (uint64_t)fault - (uint64_t)base;
-
-    if (fault < base || rel >= 0x100000000ull)
-        return 0;
-    *va = (uint32_t)rel;
-    return 1;
-}
-
-#if defined(_WIN32)
-extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
-                                 uint32_t fault_xbox_va, int is_write);
-
-/* Win32: call from the title's VEH for an access violation; on 1, return
- * EXCEPTION_CONTINUE_EXECUTION. APU, then OHCI. The AC'97 page needs no call
- * here: its trap is a VEH of its own, installed first, because it single-steps
- * the write and so has to see the EXCEPTION_SINGLE_STEP that follows. */
-int xbox_VehMmioFault(void *exception_pointers)
-{
-    PEXCEPTION_POINTERS ep = (PEXCEPTION_POINTERS)exception_pointers;
-    uintptr_t fault;
-    uint32_t va;
-
-    if (!ep || ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
-        return 0;
-    fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
-    if (!mmio_fault_va(fault, &va))
-        return 0;
-    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
-        return g_apu_state
-            && apu_hook_handle_mmio(ep->ContextRecord, fault, va,
-                   ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0);
-    if (xbox_OhciOwnsAddress(va))
-        return xbox_OhciHandleMmio(ep->ContextRecord, va);
-    return 0;
-}
-#else
-#if defined(__aarch64__)
-extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
-                                       uint32_t fault_xbox_va, int is_write);
-#endif
-
-/* POSIX: call from the title's SIGBUS/SIGSEGV handler (SA_SIGINFO) with its
- * ucontext_t * and si_addr; on 1, return from the handler and the thread
- * resumes after the emulated instruction. APU, then AC'97, then OHCI. Only
- * arm64 hosts have a decoder; elsewhere nothing is trapped and this returns
- * 0. */
-int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
-{
-#if defined(__aarch64__)
-    uint32_t va;
-
-    if (!mmio_fault_va(fault, &va))
-        return 0;
-    /* The APU decodes the direction from the opcode; is_write is advisory. */
-    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
-        return g_apu_state
-            && apu_hook_handle_mmio_posix(ucv, fault, va, 0);
-    if (xbox_Ac97PosixFault(ucv, fault))
-        return 1;
-    if (xbox_OhciOwnsAddress(va))
-        return xbox_OhciHandleMmio(ucv, va);
-#else
-    (void)ucv; (void)fault;
-#endif
-    return 0;
-}
-#endif
-
-/*
- * Command words the DSP stub completes instantly. A bring-up probe, not a
- * model.
- *
- * The GP and EP DSPs in src/apu are stubs -- effects bypass, encode
- * passthrough -- and a stub that never completes is worse for a title than
- * one that completes at once, because the title cannot get past it at all.
- * DDS9 posts a command and waits for the DSP to clear it:
- *
- *     mov  [ebx], 3            ; ebx = scratch + 0x810
- *   L: cmp  dword [ebx], 0
- *     jne  L
- *
- * Unlike the AC'97 reset bit, this one re-reads every iteration, so clearing
- * it from here is a race this side wins rather than loses.
- *
- * Why an environment variable rather than a registration API: the word's
- * address is reached as *(*(*(this+8)+0x10)) + 0x810 from an object with no
- * global anchor, and the APU never sees that address directly -- it reaches
- * the block through the scatter-gather descriptors the title programmed. So
- * the honest fix is for the GP stub to follow those descriptors, which is DSP
- * work. This exists to answer, in one run and without that work, whether
- * completing the command is in fact all the title is waiting for.
- *
- * RECOMP_DSP_ACK=0x804A8810[,...] -- up to 8 words, zeroed whenever non-zero.
- */
-#define XBOX_MAX_DSP_ACK 8
-static uint32_t g_dsp_ack[XBOX_MAX_DSP_ACK];
-static int g_dsp_ack_count = 0;
-
-static void dsp_ack_init(void)
-{
-    const char *spec = getenv("RECOMP_DSP_ACK");
-    char buf[128], *q, *end;
-
-    if (!spec || !*spec)
-        return;
-    strncpy(buf, spec, sizeof buf - 1);
-    buf[sizeof buf - 1] = 0;
-    for (q = buf; *q && g_dsp_ack_count < XBOX_MAX_DSP_ACK; ) {
-        unsigned long va = strtoul(q, &end, 0);
-        if (end == q)
-            break;
-        g_dsp_ack[g_dsp_ack_count++] = (uint32_t)va;
-        q = (*end == ',') ? end + 1 : end;
-    }
-    if (g_dsp_ack_count)
-        fprintf(stderr, "  DSP ack: %d command word(s) will be completed"
-                        " immediately\n", g_dsp_ack_count);
-}
-
 static int fence_readable(uint32_t va, uint32_t bytes);  /* defined below */
 
-/* Hold a guest global at a value. A bring-up probe, like the DSP ack.
+/* Hold a guest global at a value. A bring-up probe.
  *
  * There is exactly one reason this exists: to answer "is the title waiting on
  * this?" in one run, before spending a day making the thing that would set it
@@ -815,25 +670,6 @@ static void poke_tick(void)
                 ((uintptr_t)g_poke[i].va + g_memory_offset);
             if (*w != g_poke[i].value)
                 *w = g_poke[i].value;
-        }
-    }
-}
-
-static void dsp_ack_tick(void)
-{
-    int i;
-
-    for (i = 0; i < g_dsp_ack_count; i++) {
-        /* fence_readable rather than a bare bounds test: these land in the
-         * contiguous window, which a plain size check against the main map
-         * rejects. */
-        if (!fence_readable(g_dsp_ack[i], 4))
-            continue;
-        {
-            volatile uint32_t *w = (volatile uint32_t *)
-                ((uintptr_t)g_dsp_ack[i] + g_memory_offset);
-            if (*w)
-                *w = 0;
         }
     }
 }
@@ -1345,7 +1181,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             fence_mirrors_tick(1);
             s_get_held = 0;
         }
-        dsp_ack_tick();
+
         poke_tick();
         counter_mirrors_tick();
         frame_counters_tick();
@@ -1509,7 +1345,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 
 static void xbox_Nv2aAckStart(void)
 {
-    dsp_ack_init();
+
     poke_init();
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
@@ -3222,24 +3058,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  *
                  * Enabled by the same variable, because neither half is any
                  * use without the other. */
-                /* Registers and the VP only (0x00000-0x2FFFF). The GP and EP
-                 * windows above them (0x30000-0x7FFFF) are the DSPs' own
-                 * X/Y/P memories, which behave as RAM on hardware and which
-                 * the APU model does not implement -- it drops writes there
-                 * and reads back 0. Trapping them bought nothing, and cost a
-                 * fault on any access the MMIO decoder cannot emulate:
-                 * Burnout 3's DirectSound bulk-copies DSP memory with
-                 * rep movsd, which the lifter lowers to a host memcpy, and
-                 * that faulted at 0xFE830B78 with no way to resume. Plain
-                 * memory keeps what the title writes. */
-                enum { APU_TRAP_BYTES = 0x00030000 };
+                /* Route GP/EP uploads and reset writes to the DSP interpreter. */
+                enum { APU_TRAP_BYTES = 0x00080000 };
                 DWORD old_protect;
                 if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
-                                    " (GP/EP DSP memory left as RAM)\n",
+                                    " (including GP/EP DSP memory)\n",
                             XBOX_MCPX_BASE, XBOX_MCPX_BASE + APU_TRAP_BYTES);
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)

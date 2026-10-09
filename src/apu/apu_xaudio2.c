@@ -50,6 +50,8 @@ static ULONGLONG g_xa2_underrun_logged;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 static FILE                   *g_xa2_pcm_dump = NULL;
+static volatile LONG g_xa2_error;
+static int g_xa2_error_reported;
 
 /* Endpoint loss otherwise looks like a permanently full queue. Keep the
  * callback small; destruction/recovery must happen outside the audio thread. */
@@ -58,7 +60,7 @@ static void STDMETHODCALLTYPE xa2_processing_end(IXAudio2EngineCallback *self) {
 static void STDMETHODCALLTYPE xa2_critical_error(IXAudio2EngineCallback *self, HRESULT error)
 {
     (void)self;
-    fprintf(stderr, "[XA2] Critical engine error: 0x%08lX\n", error);
+    InterlockedExchange(&g_xa2_error, (LONG)error);
 }
 static struct IXAudio2EngineCallbackVtbl g_xa2_callback_vtable = {
     xa2_processing_start, xa2_processing_end, xa2_critical_error
@@ -73,12 +75,8 @@ int xa2_init(void)
 
     if (g_xa2_initialized) return 1;
 
-    g_xa2_buf_samples = xa2_env_int("RECOMP_AUDIO_BUF_SAMPLES",
-                                    XA2_BUF_SAMPLES_DEFAULT,
-                                    XA2_BUF_SAMPLES_MIN, XA2_BUF_SAMPLES_MAX);
-    g_xa2_num_bufs = xa2_env_int("RECOMP_AUDIO_BUF_COUNT", XA2_NUM_BUFS_DEFAULT,
-                                 XA2_NUM_BUFS_MIN, XA2_NUM_BUFS_MAX);
-
+    InterlockedExchange(&g_xa2_error, 0);
+    g_xa2_error_reported = 0;
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
         fprintf(stderr, "[XA2] CoInitializeEx failed: 0x%08lX\n", hr);
@@ -182,12 +180,8 @@ int xa2_is_active(void)
     return g_xa2_initialized;
 }
 
-/* Hand mixed samples to XAudio2. Called from the APU frame thread with one
- * EP period (256 samples) at a time. Samples accumulate in the current device
- * buffer, which is submitted when full, so a call shorter than a buffer is
- * kept, not padded or dropped. Returns 1 if every sample was accepted; 0 if
- * the voice already had every buffer queued when one filled, in which case
- * that buffer is discarded (pacing by queue depth is what prevents it). */
+/* Submit a buffer of mixed samples to XAudio2.
+ * Called from APU frame thread. 1=accepted, 0=queue full, -1=failure. */
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     XAUDIO2_VOICE_STATE state;
@@ -195,7 +189,16 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     int idx, n, ok = 1;
     HRESULT hr;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    if (!samples || num_samples <= 0 || num_samples > XA2_BUF_SAMPLES) return -1;
+    if (!g_xa2_initialized || !g_xa2_source) return -1;
+    LONG engine_error = InterlockedCompareExchange(&g_xa2_error, 0, 0);
+    if (engine_error) {
+        if (!g_xa2_error_reported) {
+            fprintf(stderr, "[XA2] Critical engine error: 0x%08lX\n", engine_error);
+            g_xa2_error_reported = 1;
+        }
+        return -1;
+    }
 
     while (num_samples > 0) {
         idx = g_xa2_next_buf;
@@ -209,10 +212,9 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         if (g_xa2_fill < XA2_BUF_SAMPLES)
             break;
 
-        g_xa2_fill = 0;
-        IXAudio2SourceVoice_GetState(g_xa2_source, &state,
-                                     XAUDIO2_VOICE_NOSAMPLESPLAYED);
-        if ((int)state.BuffersQueued >= XA2_NUM_BUFS) { ok = 0; continue; }
+    idx = g_xa2_next_buf;
+    copy_samples = num_samples;
+    memcpy(g_xa2_bufs[idx], samples, copy_samples * XA2_CHANNELS * sizeof(int16_t));
 
         memset(&xbuf, 0, sizeof(xbuf));
         xbuf.AudioBytes = XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t);
@@ -221,7 +223,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         if (FAILED(hr)) { ok = 0; continue; }
 
     hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
-    if (FAILED(hr)) return 0;
+    if (FAILED(hr)) return -1;
     if (g_xa2_pcm_dump) {
         fwrite(g_xa2_bufs[idx], 1, xbuf.AudioBytes, g_xa2_pcm_dump);
         fflush(g_xa2_pcm_dump);
@@ -242,58 +244,10 @@ int xa2_get_buffer_count(void)
     return XA2_NUM_BUFS;
 }
 
-/* Samples handed over and not yet played: the buffers the voice still
- * holds plus what is staged in the next one. Also the underrun detector:
- * the voice running dry after audio has started is one underrun, counted
- * once per dry spell and reported at most once a second. A drain announced
- * by xa2_expect_drain (the frame thread pausing) is not one. */
-int xa2_queued_samples(void)
-{
-    XAUDIO2_VOICE_STATE state;
-
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
-    IXAudio2SourceVoice_GetState(g_xa2_source, &state,
-                                 XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if (state.BuffersQueued == 0 && g_xa2_frames_written > 0) {
-        if (!g_xa2_dry) {
-            ULONGLONG now = GetTickCount64();
-            g_xa2_dry = 1;
-            g_xa2_underruns++;
-            if (now - g_xa2_underrun_logged >= 1000) {
-                g_xa2_underrun_logged = now;
-                fprintf(stderr, "[XA2] underrun x%u\n", g_xa2_underruns);
-            }
-        }
-    } else {
-        g_xa2_dry = 0;
-    }
-    return (int)state.BuffersQueued * XA2_BUF_SAMPLES + g_xa2_fill;
-}
-
-/* Mark the coming dry spell as already seen; the first call that finds
- * buffers queued again clears it, so later dry spells count as before. */
-void xa2_expect_drain(void)
-{
-    g_xa2_dry = 1;
-}
-
-unsigned xa2_underruns(void)
-{
-    return g_xa2_underruns;
-}
-
-uint64_t xa2_samples_played(void)
-{
-    XAUDIO2_VOICE_STATE state;
-
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
-    IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
-    return state.SamplesPlayed;
-}
-
-#else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */
-
-/* ISO C wants at least one declaration in a translation unit. */
-typedef int apu_xaudio2_posix_unused;
+int  xa2_init(void)                                   { return 0; }
+void xa2_shutdown(void)                               {}
+int  xa2_is_active(void)                              { return 0; }
+int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return -1; }
+int  xa2_get_buffer_size(void)                        { return 0; }
 
 #endif /* _WIN32 */
