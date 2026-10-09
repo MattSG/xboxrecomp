@@ -2133,7 +2133,14 @@ static void **state_slot(StateSlot *tab, uint64_t key)
             return &s->obj;
         }
     }
-    return &tab[i & (STATE_SLOTS - 1)].obj;   /* full: reuse, leaks one object */
+    /* Full: evict the home slot. A bound state keeps its own context ref. */
+    {
+        StateSlot *s = &tab[i & (STATE_SLOTS - 1)];
+        IUnknown_Release((IUnknown *)s->obj);
+        s->obj = NULL;
+        s->key = key;
+        return &s->obj;
+    }
 }
 
 static D3D11_BLEND blend_factor(uint32_t f, int alpha)
@@ -2159,8 +2166,8 @@ static D3D11_BLEND blend_factor(uint32_t f, int alpha)
 static D3D11_BLEND_OP blend_op(uint32_t e)
 {
     switch (e) {
-    case 0x800A: case 0xF005: return D3D11_BLEND_OP_SUBTRACT;
-    case 0x800B: case 0xF006: return D3D11_BLEND_OP_REV_SUBTRACT;
+    case 0x800A: return D3D11_BLEND_OP_SUBTRACT;
+    case 0x800B: case 0xF005: return D3D11_BLEND_OP_REV_SUBTRACT;  /* F005: signed */
     case 0x8007: return D3D11_BLEND_OP_MIN;
     case 0x8008: return D3D11_BLEND_OP_MAX;
     default: return D3D11_BLEND_OP_ADD;
@@ -2308,11 +2315,11 @@ static ID3D11SamplerState *sampler(const NvD3DTexture *t, int levels, int reduce
     uint64_t key;
     void **slot;
     if (bias13 & 0x1000) bias13 -= 0x2000;
-    key = (uint64_t)minf | ((uint64_t)magf << 8) | ((uint64_t)(t->address & 0xFFF) << 12) |
-          ((uint64_t)(bias13 & 0x1FFF) << 24) | ((uint64_t)(levels & 15) << 37) |
-          ((uint64_t)((t->control0 >> 6) & 0xFFFFFF) << 41) ^ ((uint64_t)t->border * 0x9E3779B1ull);
-    key ^= (uint64_t)(reduce != 0) << 63;
-    key ^= (uint64_t)(sharp != 0) << 62;
+    key = (uint64_t)minf | ((uint64_t)magf << 8) | ((uint64_t)(bias13 & 0x1FFF) << 12) |
+          ((uint64_t)(levels & 15) << 25) | ((uint64_t)(reduce != 0) << 29) |
+          ((uint64_t)(sharp != 0) << 30) | ((uint64_t)(t->address & 0xFFFFF) << 31);
+    key ^= ((uint64_t)((t->control0 >> 6) & 0xFFFFFF) * 0xFF51AFD7ED558CCDull) ^
+           ((uint64_t)t->border * 0xC4CEB9FE1A85EC53ull);
     slot = state_slot(s_samp_cache, key);
     if (!*slot) {
         D3D11_SAMPLER_DESC d;

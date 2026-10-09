@@ -2757,12 +2757,20 @@ static void d3d_clear(uint32_t param)
     }
 }
 
+/* A single point or a two-vertex line is a complete primitive. */
+static uint32_t prim_min_vertices(void)
+{
+    if (s_gpu.prim == NV_PRIM_POINTS) return 1;
+    if (s_gpu.prim >= NV_PRIM_LINES && s_gpu.prim <= NV_PRIM_LINE_STRIP) return 2;
+    return 3;
+}
+
 static void raster_batch_impl(void)
 {
     uint32_t i;
     uint32_t before = s_gpu.tris_drawn;
 
-    if (s_gpu.idx_count < 3)
+    if (s_gpu.idx_count < prim_min_vertices())
         return;
     /* Array draws leave their final attribute values in the current registers,
      * which subsequent draws can consume with the corresponding array off. */
@@ -3156,7 +3164,7 @@ static void draw_inline_array(void)
         goto out;
 
     count = (s_gpu.inline_count * 4) / vsize;
-    if (count < 3 || count > NV_MAX_INDICES)
+    if (count < prim_min_vertices() || count > NV_MAX_INDICES)
         goto out;
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
         if (s_gpu.attr[a].size)
@@ -3194,7 +3202,7 @@ static void draw_immediate(void)
     VertexAttr saved[NV_VERTEX_ATTRS];
     uint32_t i;
 
-    if (s_gpu.imm_count < 3)
+    if (s_gpu.imm_count < prim_min_vertices())
         return;
 
     memcpy(saved, s_gpu.attr, sizeof saved);
