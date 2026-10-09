@@ -303,7 +303,7 @@ static struct {
 
 /* Ring of waveOut buffers for double-buffering */
 #define WAVEOUT_NUM_BUFS 4
-#define WAVEOUT_BUF_SAMPLES 2048  /* ~42.7ms at 48kHz, matches 8-frame delivery rate */
+#define WAVEOUT_BUF_SAMPLES 256  /* One real DSP output frame, 5.33ms at 48kHz. */
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
 
 typedef struct {
@@ -384,12 +384,34 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
+    if (qatomic_read(&d->exiting)) return;
     if ((d->ep_frame_div + 1) % 8) {
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
-    if (xa2_is_active()) {
+    /* Retrying a retained frame must not advance native voices again. */
+    if (!d->monitor.frame_mixed) {
+        /* Diagnostic raw s16le stereo 48kHz before native mixing. One record
+         * per newly mixed frame, never per retry; compare with submitted PCM
+         * only after verifying equal counts and no reset/output failures. */
+        static FILE *premix_dump;
+        static bool premix_initialized;
+        if (!premix_initialized) {
+            const char *path = getenv("RECOMP_APU_PREMIX_DUMP");
+            premix_initialized = true;
+            if (path && *path) {
+                premix_dump = fopen(path, "wb");
+                fprintf(stderr, "[APU] Premix PCM capture %s\n", premix_dump ? "opened" : "failed");
+            }
+        }
+        if (premix_dump &&
+            (fwrite(d->monitor.frame_buf, sizeof(d->monitor.frame_buf), 1, premix_dump) != 1 ||
+             fflush(premix_dump))) {
+            fprintf(stderr, "[APU] Premix PCM capture write failed\n");
+            fclose(premix_dump);
+            premix_dump = NULL;
+        }
+
         if (g_audio_muted) {
             memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
         } else {
@@ -411,10 +433,25 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             }
             mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
         }
+        d->monitor.frame_mixed = true;
 
-        xa2_submit_samples((const int16_t *)d->monitor.frame_buf,
-                           MIXER_FRAME_SAMPLES);
+    }
+
+    if (xa2_is_active()) {
+        int submitted;
+        while ((submitted = xa2_submit_samples((const int16_t *)d->monitor.frame_buf,
+                                               MIXER_FRAME_SAMPLES)) == 0) {
+            qemu_mutex_unlock(&d->lock);
+            Sleep(1);
+            qemu_mutex_lock(&d->lock);
+            if (qatomic_read(&d->exiting) || d->pause_requested) return;
+        }
+        if (submitted < 0) {
+            fprintf(stderr, "[APU] XAudio2 output submission failed\n");
+            return;
+        }
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        mcpx_apu_dsp_pcm_consumed(d);
         return;
     }
 
@@ -423,51 +460,25 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     int idx = g_waveout.next_buf;
     WAVEHDR *hdr = &g_waveout.hdrs[idx];
 
-    /* Wait if this buffer is still playing (with timeout) */
-    int wait_loops = 0;
+    /* Keep queued storage immutable until the device completes it. */
     while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
         qemu_mutex_unlock(&d->lock);
         Sleep(1);
         qemu_mutex_lock(&d->lock);
-        if (++wait_loops > 50) break;
+        if (qatomic_read(&d->exiting) || d->pause_requested) return;
     }
 
-    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
-    int16_t *out = (int16_t *)g_waveout.bufs[idx];
-    int remaining = WAVEOUT_BUF_SAMPLES;
-    int out_offset = 0;
-
-    while (remaining > 0) {
-        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-
-        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-        /* Test tone (skip if muted) */
-        if (g_test_tone.active && !g_audio_muted) {
-            for (int i = 0; i < chunk; i++) {
-                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                d->monitor.frame_buf[i][0] = s;
-                d->monitor.frame_buf[i][1] = s;
-                g_test_tone.phase += g_test_tone.phase_inc;
-                if (g_test_tone.phase >= 2.0 * M_PI)
-                    g_test_tone.phase -= 2.0 * M_PI;
-            }
-        }
-
-        /* Mix software voices (skip if muted) */
-        if (!g_audio_muted)
-            mixer_render(d->monitor.frame_buf, chunk);
-
-        /* Copy to waveOut buffer */
-        memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-        out_offset += chunk;
-        remaining -= chunk;
-    }
-
-    /* Submit to waveOut */
+    memcpy(g_waveout.bufs[idx], d->monitor.frame_buf, sizeof(d->monitor.frame_buf));
+    /* Submit to waveOut; retain the output if the device rejects it. */
     hdr->dwFlags &= ~WHDR_DONE;
-    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
+    MMRESULT written = waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
+    if (written != MMSYSERR_NOERROR) {
+        fprintf(stderr, "[APU] waveOutWrite failed (error %u)\n", written);
+        return;
+    }
+    memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
+    mcpx_apu_dsp_pcm_consumed(d);
     g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
     g_waveout.frames_written++;
 }
@@ -565,13 +576,6 @@ static void *mcpx_apu_frame_thread(void *arg)
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
 
-        /* The doorbell ack stands in for the GP DSP, which on hardware runs
-         * whatever the front end is doing. Tying it to se_frame stopped it
-         * whenever FECTL was trapped or halted, and DirectSound then waits
-         * forever to post its next command: Burnout 3 stalls in
-         * sub_002F805E polling the same doorbell it was acked on at init. */
-        mcpx_apu_dsp_ack_poll(d);
-
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -651,14 +655,11 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
     memset(d->regs, 0, sizeof(d->regs));
     mcpx_apu_vp_reset(d);
 
-    if (d->gp.dsp) {
-        memset((void *)d->gp.dsp->core.pram_opcache, 0,
-               sizeof(d->gp.dsp->core.pram_opcache));
-    }
-    if (d->ep.dsp) {
-        memset((void *)d->ep.dsp->core.pram_opcache, 0,
-               sizeof(d->ep.dsp->core.pram_opcache));
-    }
+    if (d->gp.dsp) dsp_reset(d->gp.dsp);
+    if (d->ep.dsp) dsp_reset(d->ep.dsp);
+    memset(d->gp.regs, 0, sizeof(d->gp.regs));
+    memset(d->ep.regs, 0, sizeof(d->ep.regs));
+    d->monitor.ep_pcm_offset = 0;
     d->set_irq = false;
 }
 
@@ -691,7 +692,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     /* Init VP (voice processor) */
     mcpx_apu_vp_init(d);
 
-    /* Init DSP (GP/EP - stubbed) */
+    /* Init DSP interpreters */
     mcpx_apu_dsp_init(d);
 
     /* Init software mixer for DirectSound bridge */
@@ -725,7 +726,7 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     fprintf(stderr, "[APU] Shutting down MCPX APU...\n");
 
     qemu_mutex_lock(&d->lock);
-    mcpx_apu_wait_for_idle(d);
+    /* Thread join below waits for exit; a running guest may never become idle. */
     qatomic_set(&d->exiting, true);
     qemu_cond_signal(&d->cond);
     qemu_mutex_unlock(&d->lock);
@@ -733,6 +734,10 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     qemu_thread_join(&d->apu_thread);
     mcpx_apu_vp_finalize(d);
     mcpx_apu_monitor_finalize(d);
+
+    free(d->gp.dsp);
+    free(d->ep.dsp);
+    free(d->monitor.ep_pcm_queue);
 
     free(d);
     g_state = NULL;
@@ -766,7 +771,11 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
             mcpx_apu_write(d, addr, val, size);
         }
     }
-    /* GP (0x30000) and EP (0x50000) regions ignored for now */
+    else if (addr >= 0x30000 && addr < 0x40000 && is_write) {
+        mcpx_apu_dsp_write(d, true, (uint32_t)addr - 0x30000, val, size);
+    } else if (addr >= 0x50000 && addr < 0x60000 && is_write) {
+        mcpx_apu_dsp_write(d, false, (uint32_t)addr - 0x50000, val, size);
+    }
 }
 
 /* ============================================================
@@ -781,6 +790,10 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        return mcpx_apu_dsp_read(d, true, (uint32_t)addr - 0x30000, size);
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        return mcpx_apu_dsp_read(d, false, (uint32_t)addr - 0x50000, size);
     }
     return 0;
 }

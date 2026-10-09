@@ -41,6 +41,8 @@ static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 static FILE                   *g_xa2_pcm_dump = NULL;
+static volatile LONG g_xa2_error;
+static int g_xa2_error_reported;
 
 /* Endpoint loss otherwise looks like a permanently full queue. Keep the
  * callback small; destruction/recovery must happen outside the audio thread. */
@@ -49,7 +51,7 @@ static void STDMETHODCALLTYPE xa2_processing_end(IXAudio2EngineCallback *self) {
 static void STDMETHODCALLTYPE xa2_critical_error(IXAudio2EngineCallback *self, HRESULT error)
 {
     (void)self;
-    fprintf(stderr, "[XA2] Critical engine error: 0x%08lX\n", error);
+    InterlockedExchange(&g_xa2_error, (LONG)error);
 }
 static struct IXAudio2EngineCallbackVtbl g_xa2_callback_vtable = {
     xa2_processing_start, xa2_processing_end, xa2_critical_error
@@ -64,6 +66,8 @@ int xa2_init(void)
 
     if (g_xa2_initialized) return 1;
 
+    InterlockedExchange(&g_xa2_error, 0);
+    g_xa2_error_reported = 0;
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
         fprintf(stderr, "[XA2] CoInitializeEx failed: 0x%08lX\n", hr);
@@ -165,7 +169,7 @@ int xa2_is_active(void)
 }
 
 /* Submit a buffer of mixed samples to XAudio2.
- * Called from APU frame thread. Returns 1 if buffer was submitted. */
+ * Called from APU frame thread. 1=accepted, 0=queue full, -1=failure. */
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     XAUDIO2_VOICE_STATE state;
@@ -174,13 +178,22 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     int copy_samples;
     HRESULT hr;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    if (!samples || num_samples <= 0 || num_samples > XA2_BUF_SAMPLES) return -1;
+    if (!g_xa2_initialized || !g_xa2_source) return -1;
+    LONG engine_error = InterlockedCompareExchange(&g_xa2_error, 0, 0);
+    if (engine_error) {
+        if (!g_xa2_error_reported) {
+            fprintf(stderr, "[XA2] Critical engine error: 0x%08lX\n", engine_error);
+            g_xa2_error_reported = 1;
+        }
+        return -1;
+    }
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
     if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
 
     idx = g_xa2_next_buf;
-    copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
+    copy_samples = num_samples;
     memcpy(g_xa2_bufs[idx], samples, copy_samples * XA2_CHANNELS * sizeof(int16_t));
 
     memset(&xbuf, 0, sizeof(xbuf));
@@ -188,7 +201,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
 
     hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
-    if (FAILED(hr)) return 0;
+    if (FAILED(hr)) return -1;
     if (g_xa2_pcm_dump) {
         fwrite(g_xa2_bufs[idx], 1, xbuf.AudioBytes, g_xa2_pcm_dump);
         fflush(g_xa2_pcm_dump);
@@ -209,7 +222,7 @@ int xa2_get_buffer_size(void)
 int  xa2_init(void)                                   { return 0; }
 void xa2_shutdown(void)                               {}
 int  xa2_is_active(void)                              { return 0; }
-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
+int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return -1; }
 int  xa2_get_buffer_size(void)                        { return 0; }
 
 #endif /* _WIN32 */

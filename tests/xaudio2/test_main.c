@@ -160,12 +160,18 @@ int main(void)
     CHECK(xa2_init() == 1 && xa2_is_active());
     CHECK(xa2_init() == 1 && com_refs == 1);
     int16_t samples[1024][2];
+    /* Reject invalid submissions without copying, truncating or advancing. */
+    CHECK(xa2_submit_samples(NULL, 256) == -1);
+    CHECK(xa2_submit_samples(&samples[0][0], -1) == -1);
+    CHECK(xa2_submit_samples(&samples[0][0], 0) == -1);
+    CHECK(xa2_submit_samples(&samples[0][0], 1025) == -1);
+    CHECK(queue_count == 0 && g_xa2_next_buf == 0 && g_xa2_frames_written == 0);
     memset(samples, 1, sizeof(samples));
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
     submit_result = E_FAIL;
     for (int i = 0; i < 3; i++) {
         memset(samples, 2 + i, sizeof(samples));
-        CHECK(xa2_submit_samples(&samples[0][0], 1024) == 0);
+        CHECK(xa2_submit_samples(&samples[0][0], 1024) == -1);
         CHECK(g_xa2_next_buf == 1 && g_xa2_frames_written == 1);
         check_queued();
     }
@@ -185,6 +191,12 @@ int main(void)
     queue_count--;
     memset(samples, 9, sizeof(samples));
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+    check_queued();
+    xa2_critical_error(&g_xa2_callback, E_FAIL);
+    CHECK(g_xa2_error == (LONG)E_FAIL && g_xa2_error_reported == 0);
+    CHECK(xa2_submit_samples(&samples[0][0], 1024) == -1);
+    CHECK(g_xa2_error_reported == 1);
+    CHECK(xa2_submit_samples(&samples[0][0], 1024) == -1);
     check_queued();
     xa2_shutdown();
     CHECK(!xa2_is_active() && releases == 1);

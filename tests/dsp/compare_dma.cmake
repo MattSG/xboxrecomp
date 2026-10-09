@@ -1,0 +1,11 @@
+foreach(backend IN ITEMS port reference)
+  execute_process(COMMAND "${${backend}}" "${output}.${backend}.bin" RESULT_VARIABLE result)
+  if(NOT result EQUAL 0)
+    message(FATAL_ERROR "${backend} DMA comparison failed: ${result}")
+  endif()
+endforeach()
+execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${output}.port.bin" "${output}.reference.bin"
+  RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+  message(FATAL_ERROR "Port/reference DMA transfer results differ")
+endif()

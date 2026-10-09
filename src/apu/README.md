@@ -3,25 +3,25 @@
 Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted from [xemu](https://github.com/xemu-project/xemu). The APU is a custom chip with three processors:
 
 - **VP (Voice Processor)** — 256 hardware voices, ADPCM/PCM decode, pitch shifting, envelopes, HRTF 3D audio
-- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass.
-- **EP (Encode Processor)** — DSP for AC3/DTS encoding. Currently **stubbed** — passthrough.
+- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Executes guest-uploaded programs through the adapted xemu interpreter.
+- **EP (Encode Processor)** — DSP for AC3/DTS encoding. Executes guest-uploaded programs through the adapted xemu interpreter; AC3/DTS conformance remains unproven.
 
-Audio output uses Windows `waveOut` at 48kHz stereo 16-bit.
+Native output uses XAudio2 with Windows `waveOut` fallback at 48kHz stereo 16-bit. See [DSP acceptance](dsp/ACCEPTANCE.md) and [provenance/licensing](dsp/PROVENANCE.md) for remaining conformance and audible-gameplay gates.
 
 ## Files
 
-| File | LOC | Purpose |
-|------|-----|---------|
-| `apu.h` | 70 | **Public API** — init, shutdown, MMIO, mixer voices |
-| `apu_state.h` | 525 | APU state struct (VP, GP, EP, DSP core, 256 voices) |
-| `apu_regs.h` | 366 | MCPX APU register definitions and field masks |
-| `apu_core.c` | 762 | MMIO handlers, frame thread, waveOut output, test tone |
-| `apu_vp.c` | 1,247 | Voice Processor — decode, resample, mix, envelopes, HRTF |
-| `apu_dsp.c` | 90 | GP/EP stubs (mixbin 0/1 passthrough) |
-| `apu_mmio_hook.c` | 253 | VEH x86-64 instruction decoder for 0xFE800000+ MMIO |
-| `apu_shim.h` | 431 | QEMU compatibility (threads, atomics, clocks → Win32) |
-| `apu_debug.h` | 104 | Debug logging macros |
-| `fpconv.h` | 70 | IEEE 754 float/int conversion utilities |
+| File | Purpose |
+|------|---------|
+| `apu.h` | **Public API** — init, shutdown, MMIO, mixer voices |
+| `apu_state.h` | APU state struct (VP, GP, EP, DSP core, 256 voices) |
+| `apu_regs.h` | MCPX APU register definitions and field masks |
+| `apu_core.c` | MMIO handlers, frame thread, waveOut output, test tone |
+| `apu_vp.c` | Voice Processor — decode, resample, mix, envelopes, HRTF |
+| `apu_dsp.c` | GP/EP RAM, scatter/gather and FIFO DMA integration |
+| `apu_mmio_hook.c` | VEH x86-64 instruction decoder for 0xFE800000+ MMIO |
+| `apu_shim.h` | QEMU compatibility (threads, atomics, clocks → Win32) |
+| `apu_debug.h` | Debug logging macros |
+| `fpconv.h` | IEEE 754 float/int conversion utilities |
 
 ## Quick Start
 
@@ -61,35 +61,7 @@ mcpx_apu_shutdown(apu);
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────┐
-│                    Xbox Game                     │
-│  DirectSound API calls (IDirectSound8)           │
-└────────────────────┬────────────────────────────┘
-                     │ writes to MMIO registers
-                     ▼
-┌─────────────────────────────────────────────────┐
-│              APU Register Space                  │
-│  0xFE800000 - 0xFE87FFFF (512 KB)               │
-│  Intercepted via VEH (apu_mmio_hook.c)           │
-└────────┬───────────┬───────────┬────────────────┘
-         │           │           │
-         ▼           ▼           ▼
-   ┌──────────┐ ┌─────────┐ ┌─────────┐
-   │    VP    │ │   GP    │ │   EP    │
-   │256 voices│ │  (stub) │ │  (stub) │
-   │ ADPCM/  │ │  effects│ │  encode │
-   │  PCM    │ │  bypass │ │  bypass │
-   └────┬─────┘ └────┬────┘ └────┬────┘
-        │             │           │
-        └──────┬──────┘───────────┘
-               │ mixed samples
-               ▼
-   ┌──────────────────────────────┐
-   │    waveOut (48kHz stereo)    │
-   │  4 × 2048-sample buffers    │
-   └──────────────────────────────┘
-```
+Recompiled guest audio calls reach APU registers through the compatibility/MMIO layer. The native VP supplies mixbins; GP/EP execute uploaded DSP instructions and scratch/FIFO DMA. Completed output feeds the native monitor/mixer and XAudio2 or waveOut. Scheduling uses instruction batches; full MCPX timing conformance remains unproven.
 
 ## Two Audio Paths
 

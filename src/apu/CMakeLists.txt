@@ -2,13 +2,15 @@
 # Extracted from xemu (https://github.com/xemu-project/xemu)
 #
 # Voice Processor (VP): ADPCM/PCM decode, sample mixing, envelopes, filters
-# Global Processor (GP): Stub - effects bypass
-# Encode Processor (EP): Stub - direct mixbin passthrough
+# Global/Encode Processors: DSP56300 interpreter + DMA
 
 add_library(xbox_apu STATIC
     apu_core.c
     apu_vp.c
     apu_dsp.c
+    dsp/dsp.c
+    dsp/dsp_dma.c
+    dsp/interp/dsp_cpu.c
     apu_mmio_hook.c
     apu_xaudio2.c
 )
