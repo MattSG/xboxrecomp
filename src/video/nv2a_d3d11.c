@@ -503,8 +503,8 @@ static const char s_hlsl[] =
  * water. A coordinate that truncates to that first centre is placed on the
  * target edge, as the hardware covers it; everything else is unchanged. */
 "  float py = P.y;\n"
-"  if (px >= 0.5 && px < 0.5625) px = 0.0;\n"
-"  if (py >= 0.5 && py < 0.5625) py = 0.0;\n"
+"  if (ub_place.z != 0.0 && px >= 0.5 && px < 0.5625) px = 0.0;\n"
+"  if (ub_place.z != 0.0 && py >= 0.5 && py < 0.5625) py = 0.0;\n"
 "  /* NV2A clamps raster w away from zero and infinity (xemu clampAwayZeroInf),\n"
 "   * keeping its sign so geometry behind the eye still clips. oPos is screen\n"
 "   * space after the D3D epilogue's divide; multiplying back by w gives the\n"
@@ -822,13 +822,19 @@ static const char s_hlsl[] =
  * rounding splits between the two (moire in the fog). Both texels hold
  * z[23:8]. ponytail: the low word (z[7:0]:stencil) is not readable this way;
  * keep it for even texels if a title ever reads stencil through Y16.
+ * Upscaled, a guest tap at the high word (u = 2x + 1.5) sits a quarter of a
+ * guest pixel right of the pixel the host is shading; read the depth from
+ * that much further left (ccol.z, in host pixels) or a silhouette's last
+ * pixel takes the sky's depth and its haze: a white rim at noon that grows
+ * with the render scale.
  * Host depth is z / 0xFFFFFF (see map[2]). ccol = nv2a_d3d_set_depth_view_remap
  * (scale s, knee k): d -> d*s below k/s, then linear from k to 1 at d = 1. */
 "#ifdef Y16_MS\nTexture2DMS<float> Y16Z : register(t0);\n#else\nTexture2D<float> Y16Z : register(t0);\n#endif\n"
 "float4 y16d_ps(float4 p : SV_Position) : SV_Target {\n"
 "  uint2 q = uint2(p.xy);\n"
-"#ifdef Y16_MS\n  float d = Y16Z.Load(int2(q.x >> 1, q.y), 0);\n"
-"#else\n  float d = Y16Z.Load(int3(q.x >> 1, q.y, 0));\n#endif\n"
+"  int zx = max(0, (int)floor((q.x + 0.5) * 0.5 - ccol.z));\n"
+"#ifdef Y16_MS\n  float d = Y16Z.Load(int2(zx, q.y), 0);\n"
+"#else\n  float d = Y16Z.Load(int3(zx, q.y, 0));\n#endif\n"
 "  float s = ccol.x, k = ccol.y;\n"
 "  d = saturate(d);\n"
 "  if (s > 1.0) d = d * s <= k ? d * s : k + (d - k / s) * (1.0 - k) / (1.0 - k / s);\n"
@@ -856,7 +862,7 @@ typedef struct {
     float map[4];                /* 2/w, 2/h, 1/zmax, squeeze */
     uint32_t fogi[4];
     float fogf[4];
-    float place[4];              /* x shift (NDC), y scale */
+    float place[4];              /* x shift (NDC), y scale, pixel-0 snap */
 } UbConsts;
 
 typedef struct {
@@ -2629,6 +2635,7 @@ static ID3D11ShaderResourceView *depth_y16(Depth *d)
         {
             float cc[8] = { 0 };
             memcpy(cc, s_zview_remap, sizeof s_zview_remap);
+            cc[2] = d->w ? 0.25f * (float)d->iw / (float)d->w : 0.0f;
             upload_cb(s_cb_clear, cc, sizeof cc);
             ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_clear);
         }
@@ -3177,6 +3184,11 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
     uc.fogf[1] = st->fog_param[1];
     uc.place[0] = shift;
     uc.place[1] = yscale;
+    /* Display-sized targets keep the title's edge: moving it moves the
+     * texture coordinates with it, and a texel-exact full-screen read of
+     * the frame (MM3's glare composite) slid half a guest pixel right --
+     * a white rim on the right of every building against a bright sky. */
+    uc.place[2] = s && s->w == GUEST_W && s->h == GUEST_H ? 0.0f : 1.0f;
     upload_cb(s_cb_ub, &uc, sizeof uc);
     {
         ID3D11Buffer *vcb[4] = { s_cb_ub, NULL, s_cb_prog, s_cb_vconst };
