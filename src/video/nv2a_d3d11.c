@@ -2166,8 +2166,11 @@ static D3D11_BLEND blend_factor(uint32_t f, int alpha)
 static D3D11_BLEND_OP blend_op(uint32_t e)
 {
     switch (e) {
-    case 0x800A: return D3D11_BLEND_OP_SUBTRACT;
-    case 0x800B: case 0xF005: return D3D11_BLEND_OP_REV_SUBTRACT;  /* F005: signed */
+    /* F005/F006 are the signed (reverse-subtract / add) equations; the
+     * signed range isn't emulated, and their nominal ops wash out MM3's
+     * daytime scenes, so they keep the mapping that matches its output. */
+    case 0x800A: case 0xF005: return D3D11_BLEND_OP_SUBTRACT;
+    case 0x800B: case 0xF006: return D3D11_BLEND_OP_REV_SUBTRACT;
     case 0x8007: return D3D11_BLEND_OP_MIN;
     case 0x8008: return D3D11_BLEND_OP_MAX;
     default: return D3D11_BLEND_OP_ADD;
