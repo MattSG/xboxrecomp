@@ -2720,7 +2720,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             surface_sync(rt, 0);
             surface_resolve(rt);
             /* An MSAA target draws into ms, so its resolved tex is free to read. */
-            view = rt == s_cur_rt && !rt->ms ? feedback_copy(rt) : rt->srv;
+            view = rt == s && !rt->ms ? feedback_copy(rt) : rt->srv;
             if (t->color == 0x35 && rt->bpp == 4 && rt->y16_srv) {
                 view = rt->y16_srv;             /* each pixel is two texels */
                 pc.tex_scale[n][0] = 1.0f / (float)(2 * rt->w);
@@ -2773,6 +2773,12 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     }
     for (n = 0; n < 4; n++)
         if (!smp[n]) smp[n] = s_linear_clamp;
+
+    /* A sampled surface's CPU upload can blit and unbind this draw's
+     * outputs. Restore targets and viewport before binding its textures. */
+    if ((s != s_cur_rt || d != s_cur_ds) &&
+        !bind_targets(st, st->depth_test || st->stencil_test, &s, &d, &gw, &gh))
+        return 0;
 
     /* Combiners. */
     for (n = 0; n < 8; n++) {
