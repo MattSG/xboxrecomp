@@ -190,6 +190,13 @@ static UINT s_msaa = 4, s_aniso = 16;
 static volatile LONG s_edge_hud;
 static uint32_t s_frame_bg_tex;     /* this frame's background image; reset at flip */
 static int s_frame_tag_window;      /* still in the frame's leading name tags */
+/* The race HUD draws its minimap (the HUD start rect) every frame it is up;
+ * the pause and post-race menus hide it. A frame after one without it is a
+ * menu: its 2D keeps 4:3 proportions, centred, instead of being split to
+ * the screen edges -- edge placement pulled each button's end caps away
+ * from its middle. ponytail: the zoomed map also hides the minimap and so
+ * gets centred too; key on the title's pause state if that matters. */
+static int s_hud_seen, s_hud_prev;
 
 /* Name tags over cars (world-anchored 2D) are the first 2D a race frame
  * draws, ahead of the HUD; the title names the HUD's first element by its
@@ -3112,9 +3119,14 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
              * reached during a race from HUD placement. Do not zoom its art. */
             if (tall && wide_x && s_draw_textured && !s_draw_reads_wide && !s_frame_bg_tex)
                 s_frame_bg_tex = s_draw_tex_addr;
+            if (s_hud_start[2] && fabsf(xlo - s_hud_start[0]) < 2.0f && fabsf(ylo - s_hud_start[1]) < 2.0f &&
+                fabsf(xhi - s_hud_start[2]) < 2.0f && fabsf(yhi - s_hud_start[3]) < 2.0f)
+                s_hud_seen = 1;
             if (nv2a_d3d_hud_active() && !(wide_x && (!s_draw_textured || s_draw_reads_wide))) {
                 squeeze = narrow;
-                if (nv2a_d3d_hud_active() && world_tag_draw(xlo, xhi, ylo, yhi, s_draw_tex_addr)) {
+                if (!s_hud_prev && !s_hud_seen) {
+                    /* a menu over the race: centred 4:3, kept whole */
+                } else if (world_tag_draw(xlo, xhi, ylo, yhi, s_draw_tex_addr)) {
                     /* a name tag over a car: the title projected it
                      * through the widened camera, keep that position */
                     use_dx = count <= dx_cap &&
@@ -3970,6 +3982,8 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
         return;
     s_frame_bg_tex = 0;
     s_frame_tag_window = 1;
+    s_hud_prev = s_hud_seen;
+    s_hud_seen = 0;
     s = surface_find(phys(surface_addr));
     if (!s && pitch)
         s = scan_surface(surface_addr, pitch);
