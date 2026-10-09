@@ -132,6 +132,7 @@ static void prof_report(void)
     worst = 0;
     last = now;
 }
+static void spike_check(int64_t interval, int64_t pace);
 /* RECOMP_FRAME_CSV=<path>: one row per flip -- QPC time, flip-to-flip
  * interval and the part of it spent pacing -- for frame-time percentiles. */
 static void frame_csv(int64_t pace)
@@ -151,7 +152,8 @@ static void frame_csv(int64_t pace)
         }
         QueryPerformanceFrequency(&freq);
     }
-    if (!f) return;
+    spike_check(prev ? now - prev : 0, pace);
+    if (!f) { prev = now; return; }
     if (prev)
         fprintf(f, "%.3f,%.4f,%.4f\n", now * 1000.0 / freq.QuadPart,
                 (now - prev) * 1000.0 / freq.QuadPart, pace * 1000.0 / freq.QuadPart);
@@ -3558,12 +3560,109 @@ static int ensure_swapchain(void)
 
 /* RECOMP_PRESENT_CAPTURE=<prefix>; create <prefix>.flag to capture the next
  * presented images (as many as the flag file's number, default 1). */
+/* Read back a presentable texture and write it as a 24-bit BMP. */
+static void write_bmp(ID3D11Texture2D *bb, const char *path)
+{
+    D3D11_TEXTURE2D_DESC d;
+    ID3D11Texture2D *st = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    FILE *f;
+    ID3D11Texture2D_GetDesc(bb, &d);
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &st))) return;
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)bb);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
+                                         D3D11_MAP_READ, 0, &m))) {
+        uint32_t row = (d.Width * 3 + 3) & ~3u, img = row * d.Height, tot = 54 + img, y, x;
+        uint8_t hdr[54], *line = (uint8_t *)calloc(1, row);
+        f = fopen(path, "wb");
+        if (f && line) {
+            memset(hdr, 0, sizeof hdr);
+            hdr[0] = 'B'; hdr[1] = 'M';
+            memcpy(hdr + 2, &tot, 4);
+            hdr[10] = 54; hdr[14] = 40;
+            memcpy(hdr + 18, &d.Width, 4);
+            memcpy(hdr + 22, &d.Height, 4);
+            hdr[26] = 1; hdr[28] = 24;
+            memcpy(hdr + 34, &img, 4);
+            fwrite(hdr, 1, 54, f);
+            for (y = 0; y < d.Height; y++) {
+                const uint8_t *src = (const uint8_t *)m.pData + (size_t)(d.Height - 1 - y) * m.RowPitch;
+                for (x = 0; x < d.Width; x++) {
+                    line[x * 3] = src[x * 4];
+                    line[x * 3 + 1] = src[x * 4 + 1];
+                    line[x * 3 + 2] = src[x * 4 + 2];
+                }
+                fwrite(line, 1, row, f);
+            }
+            fprintf(stderr, "[D3D11] captured %s\n", path);
+        }
+        if (f) fclose(f);
+        free(line);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+    }
+    ID3D11Texture2D_Release(st);
+}
+
+/* RECOMP_SPIKE_CAPTURE=<prefix>[,ms]: a flip interval over ms (default 50)
+ * is logged as [SPIKE] with how much of it was work rather than pacing, and
+ * the next two presented frames are saved as <prefix>-<spike>-<n>.bmp --
+ * what was on screen as the hitch ended. At most one capture every two
+ * seconds and 200 in a session; every spike is still logged. */
+static const char *s_spike_prefix = (const char *)-1;
+static double s_spike_ms = 50.0;
+static unsigned s_spike_pending, s_spike_id, s_spike_shot;
+
+static void spike_check(int64_t interval, int64_t pace)
+{
+    static LARGE_INTEGER freq;
+    static DWORD last_capture;
+    double ms, work;
+    if (s_spike_prefix == (const char *)-1) {
+        const char *e = getenv("RECOMP_SPIKE_CAPTURE"), *c;
+        s_spike_prefix = NULL;
+        if (e && *e) {
+            static char buf[512];
+            snprintf(buf, sizeof buf, "%s", e);
+            if ((c = strrchr(buf, ',')) != NULL && atof(c + 1) > 0.0) {
+                s_spike_ms = atof(c + 1);
+                buf[c - buf] = 0;
+            }
+            s_spike_prefix = buf;
+            fprintf(stderr, "[SPIKE] capturing frames after flips over %.1f ms to %s-*\n",
+                    s_spike_ms, s_spike_prefix);
+        }
+        QueryPerformanceFrequency(&freq);
+    }
+    if (!s_spike_prefix || !interval) return;
+    ms = interval * 1000.0 / freq.QuadPart;
+    if (ms <= s_spike_ms) return;
+    work = ms - pace * 1000.0 / freq.QuadPart;
+    s_spike_id++;
+    fprintf(stderr, "[SPIKE] #%u frame %u: %.1f ms between flips (%.1f ms not pacing)%s\n",
+            s_spike_id, s_frame, ms, work,
+            s_spike_id <= 200 && GetTickCount() - last_capture >= 2000 ? ", capturing" : "");
+    if (s_spike_id <= 200 && GetTickCount() - last_capture >= 2000) {
+        last_capture = GetTickCount();
+        s_spike_pending = 2;
+        s_spike_shot = 0;
+    }
+}
+
 static void capture_backbuffer(ID3D11Texture2D *bb)
 {
     static const char *prefix = (const char *)-1;
     static unsigned remaining, frame;
     char path[1024];
     FILE *f;
+    if (s_spike_pending && s_spike_prefix && s_spike_prefix != (const char *)-1) {
+        snprintf(path, sizeof path, "%s-%04u-%u.bmp", s_spike_prefix, s_spike_id, s_spike_shot++);
+        write_bmp(bb, path);
+        s_spike_pending--;
+    }
     if (prefix == (const char *)-1) prefix = getenv("RECOMP_PRESENT_CAPTURE");
     if (!prefix) return;
     if (!remaining) {
@@ -3576,50 +3675,8 @@ static void capture_backbuffer(ID3D11Texture2D *bb)
         remove(path);
         remaining = (unsigned)count;
     }
-    {
-        D3D11_TEXTURE2D_DESC d;
-        ID3D11Texture2D *st = NULL;
-        D3D11_MAPPED_SUBRESOURCE m;
-        ID3D11Texture2D_GetDesc(bb, &d);
-        d.Usage = D3D11_USAGE_STAGING;
-        d.BindFlags = 0;
-        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        d.MiscFlags = 0;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &st))) return;
-        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)bb);
-        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
-                                             D3D11_MAP_READ, 0, &m))) {
-            uint32_t row = (d.Width * 3 + 3) & ~3u, img = row * d.Height, tot = 54 + img, y, x;
-            uint8_t hdr[54], *line = (uint8_t *)calloc(1, row);
-            snprintf(path, sizeof path, "%s-%03u.bmp", prefix, frame++);
-            f = fopen(path, "wb");
-            if (f && line) {
-                memset(hdr, 0, sizeof hdr);
-                hdr[0] = 'B'; hdr[1] = 'M';
-                memcpy(hdr + 2, &tot, 4);
-                hdr[10] = 54; hdr[14] = 40;
-                memcpy(hdr + 18, &d.Width, 4);
-                memcpy(hdr + 22, &d.Height, 4);
-                hdr[26] = 1; hdr[28] = 24;
-                memcpy(hdr + 34, &img, 4);
-                fwrite(hdr, 1, 54, f);
-                for (y = 0; y < d.Height; y++) {
-                    const uint8_t *src = (const uint8_t *)m.pData + (size_t)(d.Height - 1 - y) * m.RowPitch;
-                    for (x = 0; x < d.Width; x++) {
-                        line[x * 3] = src[x * 4];
-                        line[x * 3 + 1] = src[x * 4 + 1];
-                        line[x * 3 + 2] = src[x * 4 + 2];
-                    }
-                    fwrite(line, 1, row, f);
-                }
-                fprintf(stderr, "[D3D11] captured %s\n", path);
-            }
-            if (f) fclose(f);
-            free(line);
-            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
-        }
-        ID3D11Texture2D_Release(st);
-    }
+    snprintf(path, sizeof path, "%s-%03u.bmp", prefix, frame++);
+    write_bmp(bb, path);
     remaining--;
 }
 
