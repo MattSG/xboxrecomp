@@ -177,7 +177,6 @@ static float s_scale = 1.0f, s_cur_sx = 1.0f, s_cur_sy = 1.0f;
 /* Host MSAA sample count for linear render targets and the anisotropy of
  * linearly filtered textures: RECOMP_MSAA (1/2/4/8), RECOMP_ANISO (1..16). */
 static UINT s_msaa = 4, s_aniso = 16;
-static int s_sharp = 1;   /* RECOMP_SHARP_POINT=0: point filtering as the title set it */
 #define GUEST_W 640u
 #define GUEST_H 480u
 
@@ -595,26 +594,6 @@ static const char s_hlsl[] =
 "    [loop] for (int x = a.x; x < b.x && x < a.x + 8; x++) { acc += ldn(n, int2(x, y)); cnt += 1; }\n"
 "  return acc / max(cnt, 1.0);\n"
 "}\n"
-/* Sharp bilinear for a point-filtered texture: magnified, each texel stays a
- * solid block but the seam between blocks blends over one host pixel instead
- * of stepping -- the guest's 640x480 menu art drawn several times larger. The
- * sampler is linear (see sampler()); uv is pulled to the texel centre except
- * within half a pixel of a seam. fw: texels per pixel. */
-"float4 sharp(uint n, float2 uv, float2 duv) {\n"
-"  uint w, h;\n"
-"  if (n == 0) T2D0.GetDimensions(w, h); else if (n == 1) T2D1.GetDimensions(w, h);\n"
-"  else if (n == 2) T2D2.GetDimensions(w, h); else T2D3.GetDimensions(w, h);\n"
-"  float2 dim = float2(w, h), p = uv * dim, fw = max(duv * dim, 1e-5), seam = floor(p + 0.5);\n"
-"  return samp2(n, (seam + clamp((p - seam) / fw, -0.5, 0.5)) / dim);\n"
-"}\n"
-/* A coverage mask (see tex_coverage) magnified: the bilinear reconstruction
- * thresholded at half coverage, its edge one host pixel wide -- the glyph
- * outline at host resolution instead of the guest's texel blocks or a blur.
- * The slope never drops below 1, so minified it is plain filtering. */
-"float4 coverage(uint n, float2 uv) {\n"
-"  float4 t = samp2(n, uv), w = sqrt(ddx(t) * ddx(t) + ddy(t) * ddy(t));\n"
-"  return saturate((t - 0.5) * max(1.0 / max(w, 1e-4), 1.0) + 0.5);\n"
-"}\n"
 "float4 sampc(uint n, float3 d) {\n"
 "  if (n == 0) return TC0.Sample(S0, d); if (n == 1) return TC1.Sample(S1, d);\n"
 "  if (n == 2) return TC2.Sample(S2, d); return TC3.Sample(S3, d);\n"
@@ -630,9 +609,7 @@ static const char s_hlsl[] =
 "    float q = c.w != 0.0 ? c.w : 1.0;\n"
 "    if (mode == 1 || mode == 2) {\n"
 "      float2 g = c.xy / q, d = abs(ddx(g)) + abs(ddy(g));\n"
-"      if (tex_info[n].z == 1u && max(d.x, d.y) < 1e-4) t = tapbox(n, g, tex_scale[n].xy);\n"
-"      else if (tex_info[n].z == 2u) t = sharp(n, g * tex_scale[n].xy, d * tex_scale[n].xy);\n"
-"      else if (tex_info[n].z == 3u) t = coverage(n, g * tex_scale[n].xy);\n"
+"      if (tex_info[n].z != 0u && max(d.x, d.y) < 1e-4) t = tapbox(n, g, tex_scale[n].xy);\n"
 "      else t = samp2(n, g * tex_scale[n].xy);\n"
 "    }\n"
 "    else if (mode == 3) t = sampc(n, c.xyz);\n"
@@ -1193,7 +1170,6 @@ int nv2a_d3d_init(void)
     display_config(1);
     if ((e = getenv("RECOMP_MSAA")) != NULL) s_msaa = (UINT)atoi(e);
     if ((e = getenv("RECOMP_ANISO")) != NULL) s_aniso = (UINT)atoi(e);
-    if ((e = getenv("RECOMP_SHARP_POINT")) != NULL) s_sharp = atoi(e) != 0;
     if (s_aniso < 1) s_aniso = 1;
     if (s_aniso > 16) s_aniso = 16;
     if (s_msaa > 8) s_msaa = 8;
@@ -2292,26 +2268,7 @@ static D3D11_TEXTURE_ADDRESS_MODE addr_mode(uint32_t m)
     }
 }
 
-/* Texture n feeds the combiners only through its blue channel as an alpha
- * input: a coverage mask, not an image (the font idiom -- DXT1 glyph
- * coverage kept in blue; r0.a = v0.a * t0.b). */
-static int tex_coverage(const Nv2aCombiner *rc, int n)
-{
-    int i, k, blue = 0, stages = rc->control & 0xFF;
-    for (i = 0; i < stages && i < 8; i++)
-        for (k = 0; k < 32; k += 8) {
-            if (((rc->color_icw[i] >> k) & 0xF) == 8u + n) return 0;
-            if (((rc->alpha_icw[i] >> k) & 0xF) == 8u + n) {
-                if ((rc->alpha_icw[i] >> k) & 0x10) return 0;
-                blue = 1;
-            }
-        }
-    for (k = 0; k < 32; k += 8)
-        if (((rc->final0 >> k) & 0xF) == 8u + n || ((rc->final1 >> k) & 0xF) == 8u + n) return 0;
-    return blue;
-}
-
-static ID3D11SamplerState *sampler(const NvD3DTexture *t, int levels, int reduce, int sharp)
+static ID3D11SamplerState *sampler(const NvD3DTexture *t, int levels, int reduce)
 {
     uint32_t minf = (t->filter >> 16) & 0xFF, magf = (t->filter >> 24) & 0xF;
     int bias13 = (int)(t->filter & 0x1FFF);
@@ -2320,7 +2277,7 @@ static ID3D11SamplerState *sampler(const NvD3DTexture *t, int levels, int reduce
     if (bias13 & 0x1000) bias13 -= 0x2000;
     key = (uint64_t)minf | ((uint64_t)magf << 8) | ((uint64_t)(bias13 & 0x1FFF) << 12) |
           ((uint64_t)(levels & 15) << 25) | ((uint64_t)(reduce != 0) << 29) |
-          ((uint64_t)(sharp != 0) << 30) | ((uint64_t)(t->address & 0xFFFFF) << 31);
+          ((uint64_t)(t->address & 0xFFFFF) << 31);
     key ^= ((uint64_t)((t->control0 >> 6) & 0xFFFFFF) * 0xFF51AFD7ED558CCDull) ^
            ((uint64_t)t->border * 0xC4CEB9FE1A85EC53ull);
     slot = state_slot(s_samp_cache, key);
@@ -2328,7 +2285,7 @@ static ID3D11SamplerState *sampler(const NvD3DTexture *t, int levels, int reduce
         D3D11_SAMPLER_DESC d;
         int min_lin = minf == 2 || minf == 4 || minf == 6;
         int mip_lin = minf == 5 || minf == 6;
-        int mag_lin = magf != 1 || sharp;   /* sharp: the shader keeps the blocks */
+        int mag_lin = magf != 1;
         memset(&d, 0, sizeof d);
         d.Filter = (D3D11_FILTER)((min_lin ? 0x10 : 0) | (mag_lin ? 0x4 : 0) | (mip_lin ? 0x1 : 0));
         d.AddressU = addr_mode(t->address & 0xF);
@@ -2670,11 +2627,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         }
         if (!view) continue;
         if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
-        /* Point-filtered images (menu art) magnified: sharp bilinear; a
-         * font's coverage mask is drawn as outlines. */
-        if (!rt && s_sharp && (mode == 1 || mode == 2) && ((t->filter >> 24) & 0xF) == 1)
-            pc.tex_info[n][2] = tex_coverage(&st->rc, n) ? 3 : 2;
-        smp[n] = sampler(t, levels, reduce, pc.tex_info[n][2] >= 2);
+        smp[n] = sampler(t, levels, reduce);
         pc.tex_info[n][0] = (t->control0 >> 2) & 1;
         pc.tex_info[n][1] = t->filter >> 28;
         /* Point taps of an upscaled linear target average the guest pixel's
