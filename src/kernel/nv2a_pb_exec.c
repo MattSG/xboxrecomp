@@ -500,9 +500,14 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
             return 0;
         p = (const uint8_t *)s_gpu.inline_buf + at;
     } else {
-        if (!a->offset)
+        /* Stay inside the mapped guest windows (nv2a_d3d11.c guest_ok): a
+         * stale array or index read past them and faulted the executor. */
+        uint64_t at = (uint64_t)a->offset + (uint64_t)index * a->stride, end = at + 16;
+        if (!a->offset ||
+            !((at >= 0x10000u && end <= 0x08000000u) ||
+              (at >= XBOX_CONTIG_BASE && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)))
             return 0;
-        p = mem + a->offset + (size_t)index * a->stride;
+        p = mem + at;
     }
 
     switch (a->type) {
