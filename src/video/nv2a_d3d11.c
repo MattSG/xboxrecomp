@@ -215,6 +215,19 @@ static float s_hud_start[4];
 static uint32_t s_hud_tex[32];
 static int s_hud_tex_n;
 
+/* A full-screen quad textured from the race HUD's own atlas is a fade (MM3
+ * dims the screen this way while it resets the car), not a menu background:
+ * taken for one, it put the HUD drawn after it back at 4:3 for the fade --
+ * the speedometer's damage bar jumped left of the gauge. */
+static int hud_texture(uint32_t tex)
+{
+    int i;
+    for (i = 0; i < s_hud_tex_n; i++)
+        if (s_hud_tex[i] == tex)
+            return 1;
+    return 0;
+}
+
 void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1)
 {
     s_hud_start[0] = x0; s_hud_start[1] = y0; s_hud_start[2] = x1; s_hud_start[3] = y1;
@@ -2984,6 +2997,10 @@ static int hud_split(const float (*pos)[4], uint32_t nv, const uint32_t *idx, ui
     for (i = 0; i < np; i++)
         for (k = i + 1; k < np; k++) {
             uint32_t a = i, b = k;
+            /* a full-screen quad overlaps every piece: it stays its own */
+            if ((box[i][0] <= 0.5f && box[i][1] >= gw - 0.5f) ||
+                (box[k][0] <= 0.5f && box[k][1] >= gw - 0.5f))
+                continue;
             if (box[i][2] > box[k][3] || box[k][2] > box[i][3] ||
                 box[i][0] > box[k][1] + HUD_GAP || box[k][0] > box[i][1] + HUD_GAP)
                 continue;
@@ -3003,6 +3020,12 @@ static int hud_split(const float (*pos)[4], uint32_t nv, const uint32_t *idx, ui
             /* keep the cluster's centre where the title projected it on
              * the full width; the shader squeezes it to 4:3 about there */
             dx[i] = ((box[c][0] + box[c][1]) * 0.5f - half) * (1.0f / narrow - 1.0f);
+            moved = 1;
+        } else if (box[c][0] <= 0.5f && box[c][1] >= gw - 0.5f) {
+            /* a full-screen quad in the batch (the fade MM3 draws over
+             * a car reset, in the same call as the needle and damage bar):
+             * undo the 4:3 squeeze so it still covers the whole width */
+            dx[i] = (pos[i][0] - half) * (1.0f / narrow - 1.0f);
             moved = 1;
         } else if (box[c][1] <= half) { dx[i] = -delta; moved = 1; }
         else if (box[c][0] >= half) { dx[i] = delta; moved = 1; }
@@ -3123,7 +3146,8 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
             }
             /* Remember the background only to exclude menus/loading screens
              * reached during a race from HUD placement. Do not zoom its art. */
-            if (tall && wide_x && s_draw_textured && !s_draw_reads_wide && !s_frame_bg_tex)
+            if (tall && wide_x && s_draw_textured && !s_draw_reads_wide && !s_frame_bg_tex &&
+                !hud_texture(s_draw_tex_addr))
                 s_frame_bg_tex = s_draw_tex_addr;
             if (s_hud_start[2] && fabsf(xlo - s_hud_start[0]) < 2.0f && fabsf(ylo - s_hud_start[1]) < 2.0f &&
                 fabsf(xhi - s_hud_start[2]) < 2.0f && fabsf(yhi - s_hud_start[3]) < 2.0f)
