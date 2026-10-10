@@ -182,7 +182,6 @@ extern int  xbox_worker_stack_alloc(void);
 extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern uint32_t xbox_AllocThreadTib(void);
-extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 extern int  xbox_DispatchGateOn(void);
@@ -206,19 +205,20 @@ extern APU_TLS uint32_t g_fs_base;
 
 /* Call the connected service routine while the line is up, from the frame
  * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
- * a worker stack for the call and a TIB of this thread's own. When a guest
- * thread or DPC holds the one-CPU gate, which is when the single-CPU console
- * could not have taken the interrupt beside it, the interrupt is posted and
- * the holder runs it at its next safe point (xbox_IrqPost). The routine
- * acknowledges by writing ISTS, which drops the line through update_irq. */
-
-/* Push the routine's arguments on g_esp and call it at the device IRQL.
- * Returns what it returned, or -1 with nothing connected. */
-static int apu_call_isr(void)
+ * a worker stack for the call and a TIB of this thread's own. The routine acknowledges by
+ * writing ISTS, which drops the line through update_irq. */
+static void apu_deliver_irq(MCPXAPUState *d)
 {
+    static int tib_ready;
     uint32_t kint, routine, context;
     apu_guest_fn fn;
 
+    if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
+        return;
+    /* No hold-off for a thread at raised IRQL: the APU's interrupt preempts
+     * DISPATCH_LEVEL on the console (see xbox_IrqlEnterInterrupt), and
+     * DirectSound spins at DISPATCH_LEVEL until this routine reports a voice
+     * stopped -- held off, every stop cost that spin ~33 ms. */
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
         return -1;
