@@ -98,9 +98,11 @@ void nv2a_d3d_prof_add(int slot, int64_t ticks, uint32_t verts)
     s_prof_verts += verts;
 }
 
+/* The stage timers also run for RECOMP_SPIKE_CAPTURE, which reports each
+ * spike's split; the once-a-second line is RECOMP_D3D_PROFILE's alone. */
 int nv2a_d3d_prof_enabled(void)
 {
-    if (s_prof_on < 0) s_prof_on = getenv("RECOMP_D3D_PROFILE") != NULL;
+    if (s_prof_on < 0) s_prof_on = getenv("RECOMP_D3D_PROFILE") != NULL || getenv("RECOMP_SPIKE_CAPTURE") != NULL;
     return s_prof_on;
 }
 
@@ -110,13 +112,16 @@ static void prof_report(void)
     static LARGE_INTEGER freq;
     int64_t now = qpc();
     int i;
+    static int print = -1;
     if (!nv2a_d3d_prof_enabled()) return;
+    if (print < 0) print = getenv("RECOMP_D3D_PROFILE") != NULL;
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
     frames++;
     if (prev && now - prev > worst) worst = now - prev;
     prev = now;
     if (!last) { last = now; return; }
     if (now - last < freq.QuadPart) return;
+    if (!print) goto reset;
     fprintf(stderr, "[D3D11_PROF] %.1f fps (worst %.1f ms) |",
             frames * (double)freq.QuadPart / (double)(now - last),
             worst * 1000.0 / (double)freq.QuadPart);
@@ -126,6 +131,7 @@ static void prof_report(void)
     fprintf(stderr, " ms/frame | %llu verts %llu draws/frame\n",
             (unsigned long long)(s_prof_verts / frames), (unsigned long long)(s_prof_draws / frames));
     fflush(stderr);
+reset:
     memset(s_prof, 0, sizeof s_prof);
     s_prof_verts = s_prof_draws = 0;
     frames = 0;
@@ -3627,6 +3633,7 @@ static void write_bmp(ID3D11Texture2D *bb, const char *path)
 static const char *s_spike_prefix = (const char *)-1;
 static double s_spike_ms = 50.0;
 static unsigned s_spike_pending, s_spike_id, s_spike_shot;
+static int64_t s_spike_split[PROF_COUNT];
 
 static void spike_check(int64_t interval, int64_t pace)
 {
@@ -3649,6 +3656,15 @@ static void spike_check(int64_t interval, int64_t pace)
         }
         QueryPerformanceFrequency(&freq);
     }
+    {   /* stage time since the previous flip (the 1 s profile reset aside) */
+        static int64_t snap[PROF_COUNT];
+        int i;
+        for (i = 0; i < PROF_COUNT; i++) {
+            int64_t d = s_prof[i] - snap[i];
+            s_spike_split[i] = d >= 0 ? d : s_prof[i];
+            snap[i] = s_prof[i];
+        }
+    }
     if (!s_spike_prefix || !interval) return;
     ms = interval * 1000.0 / freq.QuadPart;
     if (ms <= s_spike_ms) return;
@@ -3657,6 +3673,13 @@ static void spike_check(int64_t interval, int64_t pace)
     fprintf(stderr, "[SPIKE] #%u frame %u: %.1f ms between flips (%.1f ms not pacing)%s\n",
             s_spike_id, s_frame, ms, work,
             s_spike_id <= 200 && GetTickCount() - last_capture >= 2000 ? ", capturing" : "");
+    {
+        int i;
+        fprintf(stderr, "[SPIKE]   ms:");
+        for (i = 0; i < PROF_COUNT; i++)
+            fprintf(stderr, " %s %.1f", s_prof_name[i], s_spike_split[i] * 1000.0 / freq.QuadPart);
+        fprintf(stderr, "\n");
+    }
     if (s_spike_id <= 200 && GetTickCount() - last_capture >= 2000) {
         last_capture = GetTickCount();
         s_spike_pending = 2;
