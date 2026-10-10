@@ -196,6 +196,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
+        if (xbox_io_trace())
         fprintf(stderr, "[NtCreateFile] FAILED path=%ls err=%lu\n",
                 win_path, (unsigned long)err);
         /* Kept for the caller's trace. An NTSTATUS says "it did not open";

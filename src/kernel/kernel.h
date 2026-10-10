@@ -1099,4 +1099,16 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
 }
 #endif
 
+#include <stdlib.h>
+/* Per-operation file/event lines ([PATH], [FILE], [READ], NtCreateEvent):
+ * RECOMP_IO_TRACE=1. Off by default: stderr is the console when the game is
+ * played, and a synchronous write (and flush) per disc read and file probe
+ * stalled the game thread while it streamed the city. */
+static inline int xbox_io_trace(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_IO_TRACE") != NULL;
+    return on;
+}
+
 #endif /* XBOX_KERNEL_H */

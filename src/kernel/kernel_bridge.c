@@ -1511,7 +1511,8 @@ static void bridge_NtCreateEvent(void)
         bridge_write_handle(handle_ptr, local_handle);
     }
 
-    fprintf(stderr, "  [BRIDGE] NtCreateEvent: handle_ptr=0x%08X type=%u init=%u → status=0x%08X handle=0x%08X\n",
+    if (xbox_io_trace())
+        fprintf(stderr, "  [BRIDGE] NtCreateEvent: handle_ptr=0x%08X type=%u init=%u → status=0x%08X handle=0x%08X\n",
             handle_ptr, event_type, initial_state, (uint32_t)status,
             (uint32_t)(uintptr_t)local_handle);
 
@@ -3129,7 +3130,8 @@ static void bridge_NtCreateFile(void)
     {
         extern uint32_t xbox_LastFileError(void);
         uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
-        if (g_eax)
+        if (!xbox_io_trace()) {}
+        else if (g_eax)
             fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s)\n",
                     g_eax, _e,
                     _e == 32u ? " ERROR_SHARING_VIOLATION"
@@ -3457,7 +3459,8 @@ static void bridge_NtReadFile(void)
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
-        if (poff)
+        if (!xbox_io_trace()) {}
+        else if (poff)
             fprintf(stderr, "  [READ] from=0x%08X buf=%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller, buffer_va, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
@@ -3831,6 +3834,7 @@ static void bridge_NtDeviceIoControlFile(void)
             return;
         }
 
+        if (xbox_io_trace())
         fprintf(stderr, "  [FILE] DVD device IOCTL 0x%X (in=%u out=%u) "
                         "-> STATUS_SUCCESS\n", ioctl, in_len, out_len);
         if (out_va && out_len) {
@@ -9497,7 +9501,9 @@ static void kernel_thunk_dispatch_body(void)
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
-        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
+        static int summary = -1;
+        if (summary < 0) summary = getenv("RECOMP_KERNEL_SUMMARY") != NULL;
+        if (summary && now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp,
                     g_esp ? BRIDGE_MEM32(g_esp) : 0);

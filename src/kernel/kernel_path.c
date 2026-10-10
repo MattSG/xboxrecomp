@@ -414,8 +414,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
-        fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
-        fflush(stderr);
+        if (xbox_io_trace()) { fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path); fflush(stderr); }
         return TRUE;
     }
 
@@ -436,8 +435,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 translate:
     if (g_xbox_path_hook)
         g_xbox_path_hook(xbox_path);
-    fprintf(stderr, "  [PATH] %s\n", xbox_path);
-    fflush(stderr);
+    if (xbox_io_trace()) { fprintf(stderr, "  [PATH] %s\n", xbox_path); fflush(stderr); }
     {
         WCHAR remainder_wide[MAX_PATH];
         MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH);

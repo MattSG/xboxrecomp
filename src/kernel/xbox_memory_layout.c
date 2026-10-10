@@ -2500,7 +2500,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * plus a flush per kick cost a fifth of the GPU thread. */
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
                     || getenv("RECOMP_PB_SCAN") != NULL;
-        s_nv2a_report = s_nv2a_trace || getenv("RECOMP_PB_EXEC") != NULL;
+        /* The periodic report used to ride on RECOMP_PB_EXEC, which every
+         * real run sets: ~100 lines and a flush every 10 s on the GPU thread.
+         * It is for bring-up -- on with tracing or any of its own variables. */
+        s_nv2a_report = s_nv2a_trace || getenv("RECOMP_PB_REPORT_MS") || getenv("RECOMP_FB_DUMP")
+                     || getenv("RECOMP_PEEK") || getenv("RECOMP_FIND_NAN") || getenv("RECOMP_FIND_QUAD");
         if (g_nv2a_memory) {
             DWORD old_protect;
             if (VirtualProtect((char *)g_nv2a_memory + 0x8000, 0x1000,
