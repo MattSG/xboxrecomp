@@ -1144,6 +1144,12 @@ static void apu_irq_stats_line(void)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#ifdef _WIN32
+    /* It sleeps between 43 ms bursts and must wake on time: a guest thread
+     * the title raised (KeSetBasePriorityThread) otherwise delays it past
+     * what the output queue holds, and the device plays a gap. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
