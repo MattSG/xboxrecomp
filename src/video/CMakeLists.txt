@@ -4,6 +4,7 @@ add_library(xbox_video STATIC
     video_pump.c
     fb_present.c
     nv2a_d3d11.c
+    spike_sampler.c
 )
 target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -11,5 +12,5 @@ target_include_directories(xbox_video PUBLIC
 )
 target_link_libraries(xbox_video PUBLIC xbox_d3d8)
 if(WIN32)
-    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32)
+    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32 dbghelp winmm)
 endif()
