@@ -32,6 +32,7 @@
  * catch-up plus scheduler jitter. Capacity does not force a full queue;
  * steady-state submission remains one 256-sample buffer every 5.33 ms. */
 #define XA2_NUM_BUFS      64
+#define XA2_CUSHION       8      /* silent buffers queued after running dry */
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -191,6 +192,22 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
     if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    /* The APU produces in real time, so the queue holds only what the last
+     * stall's catch-up left: usually next to nothing, and every hitch after
+     * that ran it dry -- the device played silence, a click each time. Run
+     * dry (or never filled), put XA2_CUSHION buffers of silence in front:
+     * one ~43 ms gap, then slack for the following hitches. */
+    if (state.BuffersQueued == 0) {
+        static const int16_t silence[XA2_BUF_SAMPLES][2];
+        if (g_xa2_frames_written)
+            fprintf(stderr, "[XA2] underrun after %d buffers\n", g_xa2_frames_written);
+        memset(&xbuf, 0, sizeof(xbuf));
+        xbuf.AudioBytes = num_samples * XA2_CHANNELS * sizeof(int16_t);
+        xbuf.pAudioData = (const BYTE *)silence;
+        for (idx = 0; idx < XA2_CUSHION; idx++)
+            if (FAILED(IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL)))
+                break;
+    }
 
     idx = g_xa2_next_buf;
     copy_samples = num_samples;
