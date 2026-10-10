@@ -3634,6 +3634,7 @@ static const char *s_spike_prefix = (const char *)-1;
 static double s_spike_ms = 50.0;
 static unsigned s_spike_pending, s_spike_id, s_spike_shot;
 static int64_t s_spike_split[PROF_COUNT];
+static LONG s_spec_recent;
 
 static void spike_check(int64_t interval, int64_t pace)
 {
@@ -3665,6 +3666,12 @@ static void spike_check(int64_t interval, int64_t pace)
             snap[i] = s_prof[i];
         }
     }
+    {   /* specialised shaders that became ready over the last second */
+        static LONG ring[64]; static unsigned at;
+        LONG now_ready = s_spec_ready;
+        s_spec_recent = now_ready - ring[at % 64];
+        ring[at++ % 64] = now_ready;
+    }
     if (!s_spike_prefix || !interval) return;
     ms = interval * 1000.0 / freq.QuadPart;
     if (ms <= s_spike_ms) return;
@@ -3678,7 +3685,8 @@ static void spike_check(int64_t interval, int64_t pace)
         fprintf(stderr, "[SPIKE]   ms:");
         for (i = 0; i < PROF_COUNT; i++)
             fprintf(stderr, " %s %.1f", s_prof_name[i], s_spike_split[i] * 1000.0 / freq.QuadPart);
-        fprintf(stderr, "\n");
+        fprintf(stderr, " | %ld new shaders in 1 s\n", (long)s_spec_recent);
+        recomp_sampler_report(ms);
     }
     if (s_spike_id <= 200 && GetTickCount() - last_capture >= 2000) {
         last_capture = GetTickCount();

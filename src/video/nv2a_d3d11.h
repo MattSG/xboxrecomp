@@ -129,6 +129,9 @@ int  nv2a_d3d_prof_enabled(void);
 /* A flip's surfaces are still being read back into guest memory: DMA_GET and
  * fence releases must wait. Completes whatever the GPU has finished. */
 int  nv2a_d3d_writeback_busy(void);
+/* spike_sampler.c: the thread whose time a spike report breaks down. */
+void recomp_sampler_watch_current_thread(void);
+void recomp_sampler_report(double ms);
 void nv2a_d3d_prof_add(int slot, int64_t ticks, uint32_t verts);
 
 /* Called continuously by the pushbuffer thread. Presents what the display is

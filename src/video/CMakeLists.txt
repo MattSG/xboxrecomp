@@ -4,6 +4,7 @@ add_library(xbox_video STATIC
     video_pump.c
     fb_present.c
     nv2a_d3d11.c
+    spike_sampler.c
 )
 target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -13,15 +14,5 @@ target_include_directories(xbox_video PUBLIC
 # xbox_nv2a: the window scans out the PVIDEO overlay (nv2a_mmio_hook.c).
 target_link_libraries(xbox_video PUBLIC xbox_d3d8 xbox_input xbox_nv2a)
 if(WIN32)
-    # gpu_present.c: the framebuffer window's D3D11 presenter.
-    target_sources(xbox_video PRIVATE gpu_present.c)
-    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32
-                          d3d11 dxgi dxguid d3dcompiler)
-else()
-    # The framebuffer window on POSIX hosts: SDL2, on the process main thread
-    # (fb_present_sdl.c), which then also pumps the events the game
-    # controllers are read from.
-    find_package(SDL2 REQUIRED)
-    target_sources(xbox_video PRIVATE fb_present_sdl.c)
-    target_link_libraries(xbox_video PUBLIC SDL2::SDL2)
+    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32 dbghelp winmm)
 endif()
