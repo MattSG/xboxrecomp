@@ -183,6 +183,11 @@ void xbox_IrqlDumpHolders(void)
  * own thread does not deadlock itself. */
 static CRITICAL_SECTION g_dispatch_lock;
 static INIT_ONCE g_dispatch_lock_once = INIT_ONCE_STATIC_INIT;
+/* How many times this thread holds g_dispatch_lock, so a lowering never
+ * releases a lock the thread does not own (a device interrupt skips it). */
+static XBOX_THREAD_LOCAL int g_dispatch_owned;
+/* Device interrupts this thread is running without the lock. */
+static XBOX_THREAD_LOCAL int g_isr_unlocked;
 
 static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
@@ -201,10 +206,13 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
         return;
 
     InitOnceExecuteOnce(&g_dispatch_lock_once, dispatch_lock_init, NULL, NULL);
-    if (now)
+    if (now) {
         EnterCriticalSection(&g_dispatch_lock);
-    else
+        g_dispatch_owned++;
+    } else if (g_dispatch_owned) {
+        g_dispatch_owned--;
         LeaveCriticalSection(&g_dispatch_lock);
+    }
 
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
@@ -239,9 +247,35 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  *
  * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
  * DPC, the device level for an ISR -- and code checks: see irql_publish. */
+/* A device interrupt preempts DISPATCH_LEVEL on the console: it does not
+ * wait for g_dispatch_lock. DirectSound raises to DISPATCH_LEVEL to stop a
+ * voice and spins there until the APU's interrupt reports it stopped; the
+ * interrupt, waiting for the lock that spinning thread held, ran only after
+ * DirectSound's 0.5 s timeout -- MM3 froze for half a second now and then.
+ * A DPC is what must not overlap a raised thread (the USB double completion
+ * above), so a DPC run from such an interrupt takes the lock for its run.
+ * Return values carry these two cases in bits 8 and 9 for the leave. */
+#define IRQL_ISR_UNLOCKED 0x100
+#define IRQL_DPC_LOCKED   0x200
+
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
+    if (level > DISPATCH_LEVEL && g_current_irql < DISPATCH_LEVEL) {
+        InterlockedIncrement(&g_irql_raised_count);    /* devices still hold off */
+        g_isr_unlocked++;
+        g_current_irql = (KIRQL)level;
+        irql_publish();
+        return saved | IRQL_ISR_UNLOCKED;
+    }
+    if (level == DISPATCH_LEVEL && g_isr_unlocked && !g_dispatch_owned) {
+        InitOnceExecuteOnce(&g_dispatch_lock_once, dispatch_lock_init, NULL, NULL);
+        EnterCriticalSection(&g_dispatch_lock);
+        g_dispatch_owned++;
+        g_current_irql = (KIRQL)level;
+        irql_publish();
+        return saved | IRQL_DPC_LOCKED;
+    }
     if (g_current_irql != (KIRQL)level) {
         irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
         g_current_irql = (KIRQL)level;
@@ -252,6 +286,20 @@ int xbox_IrqlEnterInterrupt(int level)
 
 void xbox_IrqlLeaveInterrupt(int saved)
 {
+    if (saved & IRQL_ISR_UNLOCKED) {
+        g_isr_unlocked--;
+        InterlockedDecrement(&g_irql_raised_count);
+        g_current_irql = (KIRQL)(saved & 0xFF);
+        irql_publish();
+        return;
+    }
+    if (saved & IRQL_DPC_LOCKED) {
+        g_dispatch_owned--;
+        LeaveCriticalSection(&g_dispatch_lock);
+        g_current_irql = (KIRQL)(saved & 0xFF);
+        irql_publish();
+        return;
+    }
     if (g_current_irql != (KIRQL)saved) {
         irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
         g_current_irql = (KIRQL)saved;
