@@ -534,6 +534,11 @@ static const char s_hlsl[] =
 "  float py = P.y;\n"
 "  if (ub_place.z != 0.0 && px >= 0.5 && px < 0.5625) px = 0.0;\n"
 "  if (ub_place.z != 0.0 && py >= 0.5 && py < 0.5625) py = 0.0;\n"
+"  if (ub_place.w != 0.0) {\n"
+"    bool flat = abs(P.w - 1.0) < 1e-6;\n"
+"    if (!flat || (frac(px) >= 0.5 && frac(px) < 0.5625)) px -= ub_place.w;\n"
+"    if (!flat || (frac(py) >= 0.5 && frac(py) < 0.5625)) py -= ub_place.w;\n"
+"  }\n"
 "  /* NV2A clamps raster w away from zero and infinity (xemu clampAwayZeroInf),\n"
 "   * keeping its sign so geometry behind the eye still clips. oPos is screen\n"
 "   * space after the D3D epilogue's divide; multiplying back by w gives the\n"
@@ -3280,6 +3285,15 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
      * the frame (MM3's glare composite) slid half a guest pixel right --
      * a white rim on the right of every building against a bright sky. */
     uc.place[2] = s && s->w == GUEST_W && s->h == GUEST_H ? 0.0f : 1.0f;
+    /* Display-sized targets instead take the D3D screen-space offset
+     * (0.53125) back off: all 3D geometry and the screen-space (w = 1)
+     * coordinates that carry it. A translation, so the title's texel-exact
+     * reads of its own frame stay aligned, and full-
+     * screen quads' left/top edges land on 0. Left there, pixel 0 was never
+     * covered and the top row and left column showed the scene without the
+     * haze and glare passes, a bright strip. Menus drawn on whole pixels
+     * and 3D geometry are untouched. */
+    uc.place[3] = uc.place[2] == 0.0f ? 0.53125f : 0.0f;
     upload_cb(s_cb_ub, &uc, sizeof uc);
     {
         ID3D11Buffer *vcb[4] = { s_cb_ub, NULL, s_cb_prog, s_cb_vconst };
