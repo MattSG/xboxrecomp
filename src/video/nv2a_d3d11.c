@@ -607,7 +607,18 @@ static const char s_hlsl[] =
 "  if (m == 3) return (x >= 128.0 ? x - 256.0 : x) / 127.0;\n"
 "  return c;\n"
 "}\n"
+"float4 bspline0(float2 uv) {\n"
+"  float2 sz; T2D0.GetDimensions(sz.x, sz.y);\n"
+"  float2 p = uv * sz - 0.5, f = frac(p), f2 = f * f, f3 = f2 * f;\n"
+"  float2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0, w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;\n"
+"  float2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0, w3 = f3 / 6.0;\n"
+"  float2 s0 = w0 + w1, s1 = w2 + w3; p -= f;\n"
+"  float2 c0 = (p - 0.5 + w1 / s0) / sz, c1 = (p + 1.5 + w3 / s1) / sz;\n"
+"  return s0.y * (s0.x * T2D0.SampleLevel(S0, c0, 0) + s1.x * T2D0.SampleLevel(S0, float2(c1.x, c0.y), 0)) +\n"
+"         s1.y * (s0.x * T2D0.SampleLevel(S0, float2(c0.x, c1.y), 0) + s1.x * T2D0.SampleLevel(S0, c1, 0));\n"
+"}\n"
 "float4 samp2(uint n, float2 uv) {\n"
+"  if (n == 0 && (ps_flags & 4)) return bspline0(uv);\n"
 "  if (n == 0) return T2D0.Sample(S0, uv); if (n == 1) return T2D1.Sample(S1, uv);\n"
 "  if (n == 2) return T2D2.Sample(S2, uv); return T2D3.Sample(S3, uv);\n"
 "}\n"
@@ -2523,6 +2534,7 @@ static uint32_t write_mask(const NvD3DState *st, Surface *s)
  * stored widened (its image already spans the wide screen). */
 static int s_draw_textured, s_draw_reads_wide;
 static uint32_t s_draw_tex_addr;
+static int s_draw_bspline;              /* stage 0 B-spline (see bspline0) */
 
 /* A guest pass that reduces a render target (glare, luminance
  * or reflection downsamples) takes texel-exact taps: at the guest's
@@ -2710,6 +2722,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     float slope = 0, bf[4];
     s_draw_textured = s_draw_reads_wide = 0;
     s_draw_tex_addr = 0;
+    s_draw_bspline = 0;
 
     {
         /* Bring-up switches: RECOMP_D3D_SKIP_CMASK / _SKIP_SFACTOR (hex) drop
@@ -2816,6 +2829,14 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         if (!view) continue;
         if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
         smp[n] = sampler(t, levels, reduce);
+        /* MM3's horizon panorama: a 256x256 strip around the whole horizon,
+         * drawn without depth test through destination alpha (where the
+         * haze pass left sky). Magnified ten times and more, bilinear shows
+         * its DXT texels as blocks and its skyline alpha as steps; a cubic
+         * B-spline reconstructs it smoothly. */
+        if (n == 0 && levels > 4 && !st->depth_test && st->blend_enable &&
+            st->blend_sfactor == 0x304 && st->blend_dfactor == 0x305)
+            s_draw_bspline = 1;
         pc.tex_info[n][0] = (t->control0 >> 2) & 1;
         pc.tex_info[n][1] = t->filter >> 28;
         /* Point taps of an upscaled linear target average the guest pixel's
@@ -2854,7 +2875,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     pc.stage_prog = st->rc_seen ? st->rc.stage_program : (st->tex_used & 1);
     pc.alpha_func = st->alpha_func;
     pc.alpha_ref = st->alpha_ref;
-    pc.ps_flags = (st->rc_seen ? 1u : 0u) | (st->alpha_test ? 2u : 0u);    pc.clip_plane = st->clip_plane_mode;
+    pc.ps_flags = (st->rc_seen ? 1u : 0u) | (st->alpha_test ? 2u : 0u) | (s_draw_bspline ? 4u : 0u);    pc.clip_plane = st->clip_plane_mode;
     pc.other_input = st->other_stage_input;
     pc.dot_map = st->dot_rgb_mapping;
     /* SET_FOG_COLOR keeps red in the low byte. */
