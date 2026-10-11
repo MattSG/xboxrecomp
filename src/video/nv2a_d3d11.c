@@ -261,6 +261,7 @@ void nv2a_d3d_set_edge_hud(int on)
 
 /* nv2a_d3d_set_depth_view_remap: x = scale, y = knee (see y16d_ps). */
 static float s_zview_remap[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
+static int s_depth_hazed;               /* depth read as Y16 this frame */
 
 void nv2a_d3d_set_depth_view_remap(float scale, float knee)
 {
@@ -779,12 +780,28 @@ static const char s_hlsl[] =
  * 24-bit fixed point -- linear precision, unlike z/w, so distant decals and
  * foliage do not fight. Polygon offset is applied here as xemu does: the
  * rasteriser's depth bias never reaches a shader-written depth. zp0 = offset
- * factor, units, host pixels per guest pixel x/y; zp1 = 1/(zmax+1), zmax. */
+ * factor, units, host pixels per guest pixel x/y; zp1 = 1/(zmax+1), zmax,
+ * view remap scale (0 = off), knee. Draws after the title has read the
+ * depth buffer for its haze pass (foliage, in MM3) miss that haze; with the
+ * far plane extended they lose MSAA coverage by the fraction y16d_ps hazes
+ * their depth (dithered without MSAA), so the hazed scene shows through
+ * instead of them standing crisp in front of it. The sky dome, at the far
+ * plane, is left alone. */
 "void ps_wdepth(PSIn i, out float4 c : SV_Target, out float dep : SV_Depth, out uint cov : SV_Coverage) {\n"
 "  c = shade(i, cov);\n"
 "  float z = i.fog.y;\n"
 "  z += zp0.y + zp0.x * max(abs(ddx(z)) * zp0.z, abs(ddy(z)) * zp0.w);\n"
 "  z = clamp(z, 0.0, zp1.y);\n"
+"  if (zp1.z > 0.0) {\n"
+"    float x = z * zp1.x * zp1.z, k = zp1.w;\n"
+"    if (x > k && x < 0.98 * zp1.z) {\n"
+"      float b = 1.0 - exp((k - x) / (1.0 - k));\n"
+"      float r = frac(52.9829189 * frac(dot(i.pos.xy, float2(0.06711056, 0.00583715))));\n"
+"      uint ns = GetRenderTargetSampleCount(), kk = (uint)floor((1.0 - b) * ns + r);\n"
+"      if (kk == 0) discard;\n"
+"      if (ns > 1 && kk < ns) cov &= (1u << kk) - 1u;\n"
+"    }\n"
+"  }\n"
 "  dep = asfloat(asuint(floor(z) * zp1.x) + 1u);\n"
 "}\n"
 /* Presentation and uploads: a textured rectangle, optionally with the PVIDEO
@@ -2639,6 +2656,7 @@ static ID3D11ShaderResourceView *surface_y16(Surface *s)
 static ID3D11ShaderResourceView *depth_y16(Depth *d)
 {
     if (!d->zsrv) return NULL;
+    s_depth_hazed = 1;
     if (!d->y16) {
         d->y16 = make_texture(2 * d->iw, d->ih, 1, 1, DXGI_FORMAT_R16G16B16A16_UNORM,
                               D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0);
@@ -2854,6 +2872,10 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         pc.zp0[3] = s_cur_sy;
         pc.zp1[0] = 1.0f / ((float)zm + 1.0f);
         pc.zp1[1] = (float)zm;
+        if (s_depth_hazed && st->depth_test && st->depth_mask && s_zview_remap[0] > 1.0f) {
+            pc.zp1[2] = s_zview_remap[0];
+            pc.zp1[3] = s_zview_remap[1];
+        }
     }
     upload_cb(s_cb_ps, &pc, sizeof pc);
 
@@ -4040,6 +4062,7 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
     if (!nv2a_d3d_init())
         return;
     s_frame_bg_tex = 0;
+    s_depth_hazed = 0;
     s_frame_tag_window = 1;
     s_hud_prev = s_hud_seen;
     s_hud_seen = 0;
