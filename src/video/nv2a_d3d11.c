@@ -800,7 +800,11 @@ static const char s_hlsl[] =
  * view remap scale (0 = off), knee. Draws after the title has read the
  * depth buffer for its haze pass (foliage, in MM3) miss that haze; with the
  * far plane extended they lose MSAA coverage by the fraction y16d_ps hazes
- * their depth (dithered without MSAA), so the hazed scene shows through
+ * their depth, so the hazed scene shows through. The sample count is spread
+ * over each 2x2 block of host pixels with a Bayer order (floor((c + i/4))
+ * over i = 0..3 sums to floor(4c)), so at the default 2x supersample every
+ * window pixel gets the exact fraction: a screen-noise dither left a visible
+ * pattern on distant trees that shimmered white as they moved.
  * instead of them standing crisp in front of it. The sky dome, at the far
  * plane, is left alone. */
 "void ps_wdepth(PSIn i, out float4 c : SV_Target, out float dep : SV_Depth, out uint cov : SV_Coverage) {\n"
@@ -812,7 +816,8 @@ static const char s_hlsl[] =
 "    float x = z * zp1.x * zp1.z, k = zp1.w;\n"
 "    if (x > k && x < 0.98 * zp1.z) {\n"
 "      float b = 1.0 - exp((k - x) / (1.0 - k));\n"
-"      float r = frac(52.9829189 * frac(dot(i.pos.xy, float2(0.06711056, 0.00583715))));\n"
+"      uint2 q = uint2(i.pos.xy) & 1u;\n"
+"      float r = (float)(q.x * 2u + (q.x ^ q.y)) * 0.25;\n"
 "      uint ns = GetRenderTargetSampleCount(), kk = (uint)floor((1.0 - b) * ns + r);\n"
 "      if (kk == 0) discard;\n"
 "      if (ns > 1 && kk < ns) cov &= (1u << kk) - 1u;\n"
