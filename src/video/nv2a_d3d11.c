@@ -856,7 +856,11 @@ static const char s_hlsl[] =
  * pixel takes the sky's depth and its haze: a white rim at noon that grows
  * with the render scale.
  * Host depth is z / 0xFFFFFF (see map[2]). ccol = nv2a_d3d_set_depth_view_remap
- * (scale s, knee k): d -> d*s below k/s, then linear from k to 1 at d = 1. */
+ * (scale s, knee k): x = d*s is depth in units of the original far plane;
+ * below k it is x, above it the band k..1 fills exponentially with the
+ * original slope at k (63% at the old far plane, 99.6% at twice it), so
+ * geometry the title never meant to show fades into the sky colour instead
+ * of standing crisp in a stretched band. d = 1 (sky) stays 1. */
 "#ifdef Y16_MS\nTexture2DMS<float> Y16Z : register(t0);\n#else\nTexture2D<float> Y16Z : register(t0);\n#endif\n"
 "float4 y16d_ps(float4 p : SV_Position) : SV_Target {\n"
 "  uint2 q = uint2(p.xy);\n"
@@ -865,7 +869,7 @@ static const char s_hlsl[] =
 "#else\n  float d = Y16Z.Load(int3(zx, q.y, 0));\n#endif\n"
 "  float s = ccol.x, k = ccol.y;\n"
 "  d = saturate(d);\n"
-"  if (s > 1.0) d = d * s <= k ? d * s : k + (d - k / s) * (1.0 - k) / (1.0 - k / s);\n"
+"  if (s > 1.0 && d < 1.0) { float x = d * s; d = x <= k ? x : k + (1.0 - k) * (1.0 - exp((k - x) / (1.0 - k))); }\n"
 "  float y = (float)((uint)round(saturate(d) * 16777215.0) >> 8) / 65535.0;\n"
 "  return float4(y, y, y, 1);\n"
 "}\n";
