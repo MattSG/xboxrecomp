@@ -33,6 +33,23 @@ extern void nv2a_hook_pvideo_consume(unsigned bank);
 static volatile LONG s_fb_running;
 static void (*s_close_handler)(void);
 static volatile HWND s_hwnd;
+static XboxHostOverlay s_host_overlay;
+
+void xbox_FramebufferSetHostOverlay(const XboxHostOverlay *overlay)
+{
+    if (overlay) s_host_overlay = *overlay;
+}
+
+void xbox_FramebufferRenderHostOverlay(void *device, void *context, void *target)
+{
+    if (s_host_overlay.render)
+        s_host_overlay.render((void *)s_hwnd, device, context, target);
+}
+
+int xbox_FramebufferHostInputCaptured(void)
+{
+    return s_host_overlay.capture && s_host_overlay.capture();
+}
 static uint32_t      s_fb_va, s_fb_pitch;
 /* Set by the first flip: from then on flips decide what is shown, except for a
  * buffer the title points the display at and draws into with the CPU. */
@@ -416,15 +433,12 @@ static void fb_toggle_fullscreen(HWND h)
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
-    /* First press only (bit 30: the key was already down), and with Alt held
-     * (bit 29) for Enter; neither reaches the key table. */
-    if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))
-        || (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30)))) {
-        fb_toggle_fullscreen(h);
-        return 0;
+    int consumed = s_host_overlay.message && s_host_overlay.message(h, m, w, l);
+    if (consumed && m != WM_KILLFOCUS && m != WM_ACTIVATEAPP &&
+        m != WM_CLOSE && m != WM_DESTROY) {
+        memset((void *)s_key_down, 0, sizeof s_key_down);
+        return m == WM_SYSKEYDOWN || m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
     }
-    if (m == WM_SYSKEYDOWN && w == VK_RETURN)
-        return 0;                       /* auto-repeat of Alt+Enter */
     switch (m) {
     case WM_CLOSE:
         if (s_close_handler)

@@ -97,6 +97,7 @@ static BOOL keyboard_mm3_layout(void)
  * Declared rather than included so src/input does not depend on the video
  * module's include path. */
 extern int xbox_FramebufferKeyDown(int vk);
+extern int xbox_FramebufferHostInputCaptured(void);
 
 static BOOL key_down(int vk)
 {
@@ -418,6 +419,16 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
+
+    if (xbox_FramebufferHostInputCaptured()) {
+        static volatile LONG capture_packet;
+        DWORD connected = XInputGetState(dwPort, &xi_state);
+        if (connected != ERROR_SUCCESS && !(dwPort == 0 && keyboard_enabled()))
+            return connected;
+        memset(pState, 0, sizeof *pState);
+        pState->dwPacketNumber = (DWORD)InterlockedIncrement(&capture_packet);
+        return ERROR_SUCCESS;
+    }
 
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {

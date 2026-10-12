@@ -4847,7 +4847,7 @@ static void present_surface(Surface *s)
                 return; /* The guest flip still receives its fallback wait. */
             }
             composite(rtv, s_swap_w, s_swap_h, s, &pc, 1);
-            keep_image(bb);
+            xbox_FramebufferRenderHostOverlay(s_dev, s_ctx, rtv);
             if (!getenv("RECOMP_CAPTURE_SURFACE"))
                 capture_backbuffer(bb);
             if (vsync < 0) vsync = getenv("RECOMP_VSYNC") ? atoi(getenv("RECOMP_VSYNC")) : 0;
