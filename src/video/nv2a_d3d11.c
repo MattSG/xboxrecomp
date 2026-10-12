@@ -3887,6 +3887,7 @@ static void present_surface(Surface *s)
             static int vsync = -1;
             ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &rtv);
             composite(rtv, s_swap_w, s_swap_h, s, &pc, 1);
+            xbox_FramebufferRenderHostOverlay(s_dev, s_ctx, rtv);
             if (!getenv("RECOMP_CAPTURE_SURFACE"))
                 capture_backbuffer(bb);
             if (vsync < 0) vsync = getenv("RECOMP_VSYNC") ? atoi(getenv("RECOMP_VSYNC")) : 0;
