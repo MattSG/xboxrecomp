@@ -12,8 +12,8 @@
 #include <string.h>
 #include "apu_xaudio2.h"
 
-/* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl2.c provides
- * the same xa2_* functions over SDL2. */
+/* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
+ * stubbed to report inactive; real audio output via SDL2 comes later. */
 #if defined(_WIN32)
 
 #define COBJMACROS
@@ -37,17 +37,8 @@
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
 static IXAudio2SourceVoice    *g_xa2_source = NULL;
-/* One slot more than can be queued: with every buffer on the voice, the
- * next one is staged in a slot the voice does not hold. With only
- * XA2_NUM_BUFS slots the staging buffer was the oldest queued one, and
- * filling it overwrote audio the device had not played yet. */
-#define XA2_RING (XA2_NUM_BUFS + 1)
-static int16_t                 g_xa2_bufs[XA2_NUM_BUFS_MAX + 1][XA2_BUF_SAMPLES_MAX][2];
+static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
 static int                     g_xa2_next_buf = 0;
-static int                     g_xa2_fill = 0;  /* samples staged in bufs[next_buf] */
-static unsigned  g_xa2_underruns;
-static int       g_xa2_dry;
-static ULONGLONG g_xa2_underrun_logged;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 static FILE                   *g_xa2_pcm_dump = NULL;
@@ -125,8 +116,6 @@ int xa2_init(void)
     }
 
     g_xa2_next_buf = 0;
-    g_xa2_fill = 0;
-    g_xa2_dry = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
     {
@@ -138,9 +127,8 @@ int xa2_init(void)
         }
     }
 
-    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)\n",
-            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES,
-            1000.0 * XA2_NUM_BUFS * XA2_BUF_SAMPLES / XA2_SAMPLE_RATE);
+    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
+            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
     return 1;
 
 fail:
@@ -187,7 +175,8 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     XAUDIO2_VOICE_STATE state;
     XAUDIO2_BUFFER xbuf;
-    int idx, n, ok = 1;
+    int idx;
+    int copy_samples;
     HRESULT hr;
 
     if (!samples || num_samples <= 0 || num_samples > XA2_BUF_SAMPLES) return -1;
@@ -233,11 +222,9 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     copy_samples = num_samples;
     memcpy(g_xa2_bufs[idx], samples, copy_samples * XA2_CHANNELS * sizeof(int16_t));
 
-        memset(&xbuf, 0, sizeof(xbuf));
-        xbuf.AudioBytes = XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t);
-        xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
-        hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
-        if (FAILED(hr)) { ok = 0; continue; }
+    memset(&xbuf, 0, sizeof(xbuf));
+    xbuf.AudioBytes = copy_samples * XA2_CHANNELS * sizeof(int16_t);
+    xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
 
     hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
     if (FAILED(hr)) return -1;
@@ -256,10 +243,7 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-int xa2_get_buffer_count(void)
-{
-    return XA2_NUM_BUFS;
-}
+#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
 
 int  xa2_init(void)                                   { return 0; }
 void xa2_shutdown(void)                               {}

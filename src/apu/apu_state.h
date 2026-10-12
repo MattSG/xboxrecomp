@@ -276,8 +276,6 @@ typedef struct MCPXAPUVoiceFilter {
     unsigned int resample_count;
     sv_filter svf[2];
     HrtfFilter hrtf;
-    float gain_prev[8];     /* each bin's gain at the end of the last frame */
-    bool gain_valid;
 } MCPXAPUVoiceFilter;
 
 typedef struct VoiceWorkItem {
@@ -379,19 +377,11 @@ struct MCPXAPUState {
 
     uint32_t regs[0x20000];
 
-    /* The sequencer's sample counter (what XGSCNT reads back). Resets when
-     * the title writes XGSCNT; advances 48 kHz while the sequencer runs. */
-    uint64_t sample_count;
-
     int ep_frame_div;
     int sleep_acc_us;
     int frame_count;
     int64_t frame_count_time_ms;
     int64_t next_frame_time_us;
-    int pace_q_seen;            /* device queue at the last pacing decision */
-    int64_t pace_drain_us;      /* when that queue last fell or sat below high */
-    bool pace_stalled;          /* device stopped consuming: host-clock pacing,
-                                 * periods dropped (mcpx_apu_pace_step) */
 
     struct {
         struct {
@@ -434,7 +424,6 @@ void mcpx_apu_vp_reset(MCPXAPUState *d);
 
 /* DSP functions */
 void mcpx_apu_dsp_init(MCPXAPUState *d);
-void mcpx_apu_dsp_finalize(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_pcm_consumed(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
@@ -446,12 +435,3 @@ extern MCPXAPUState *g_state;
 extern struct McpxApuDebug g_dbg, g_dbg_cache;
 extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];
-
-/* RECOMP_APU_TRACE: idle-voice traps against the frames that ran. Traps are
- * counted under the APU lock, the rest by the frame thread. */
-typedef struct {
-    unsigned traps;             /* front-end traps latched (fe_method) */
-    unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
-    unsigned fe_trapped_frames; /* frames that found FECTL trapped */
-} ApuIrqStats;
-extern ApuIrqStats apu_irq_stats;

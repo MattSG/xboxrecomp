@@ -178,15 +178,8 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
 /* Advance those counters now, because a swap really completed. Called by the
  * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
- * stands down, so the count follows what was actually drawn. A counter the
- * title is seen to move itself is no longer bumped by either. */
+ * stands down, so the count follows what was actually drawn. */
 void xbox_Nv2aFrameCounterFlip(void);
-/* A word of the NV2A register file (offset from the register base); NULL until
- * the aperture is mapped. */
-volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
-/* Registered counters the title turned out to move itself (its vblank DPC),
- * which the toolkit has stopped bumping; for the [GPU] report. */
-uint32_t xbox_Nv2aFrameCountersOwned(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
@@ -196,7 +189,8 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
-void xbox_ContiguousFree(uint32_t xbox_va);
+int xbox_ContiguousFree(uint32_t xbox_va);              /* 0: not ours */
+uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va);
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
@@ -236,19 +230,6 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 size_t xbox_GetMappedSize(void);
 void xbox_ProtectMirrorsForDebug(void);
 
-/* Trapped hardware registers (APU, AC'97 bus master, USB OHCI). A title's
- * fault handler calls one of these first and resumes the thread when it
- * returns 1; only 0 is a crash. void * keeps windows.h and ucontext.h out of
- * here.
- *   xbox_VehMmioFault   Win32 VEH: the PEXCEPTION_POINTERS.
- *   xbox_PosixMmioFault POSIX SIGBUS/SIGSEGV handler: its ucontext_t * and
- *                       si_addr. Always 0 on a host with no decoder. */
-#if defined(_WIN32)
-int xbox_VehMmioFault(void *exception_pointers);
-#else
-int xbox_PosixMmioFault(void *ucv, uintptr_t fault);
-#endif
-
 /* Dump the guest call stack and abort if the title has not exited within
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
  * does nothing unless that variable is set. */
@@ -270,11 +251,7 @@ void xbox_WatchInit(void);
 /** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
  *  These are kernel exports that are DATA, not functions. The game reads
  *  their thunk entries and dereferences them to access the data. */
-/* Runtime, not a constant: the toolkit's own guest-side structures (this one,
- * the fake TIB/TLS data and the main stack) live in a region that starts above
- * the title image -- see g_xbox_region_base below. 0x00740000 for any image
- * that ends below 0x00700000. */
-#define XBOX_KERNEL_DATA_BASE   (g_xbox_region_base + XBOX_REGION_KDATA_OFF)
+#define XBOX_KERNEL_DATA_BASE   0x00740000
 #define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
 
 /* Offsets within the kernel data area */
@@ -359,33 +336,7 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
-/* The toolkit region: scratch structures, then the main stack, then the heap.
- *
- * These used to be fixed -- scratch at 0x00700000, stack at 0x00780000, heap
- * at 0x00F80000 -- which is right only while the title's image ends below
- * 0x00700000. A title whose 70-odd sections run past 0x03000000 had the
- * stack, the kernel data exports and the heap inside its .data/BSS, and the
- * first zeroed heap allocation wiped its globals.
- *
- * xbox_MemoryLayoutInit now places the region at the first 64 KB boundary
- * above the highest loaded section, never below 0x00700000, so a title that
- * fit before sees exactly the old addresses. Offsets inside the region are
- * the old ones relative to 0x00700000. Valid once xbox_MemoryLayoutInit has
- * loaded the sections; nothing reads them earlier. */
-#define XBOX_REGION_MIN         0x00700000u
-#define XBOX_REGION_KDATA_OFF   0x00040000u  /* kernel data exports */
-#define XBOX_REGION_TLS_OFF     0x00060000u  /* fake TLS structure (fs:[0x28]) */
-#define XBOX_REGION_PRCB_OFF    0x00061000u  /* zeroed KPCR Prcb stand-in */
-#define XBOX_REGION_TLSBLK_OFF  0x00070000u  /* image TLS block */
-#define XBOX_REGION_STACK_OFF   0x00080000u  /* main stack */
-extern uint32_t g_xbox_region_base;
-extern uint32_t g_xbox_stack_base;
-extern uint32_t g_xbox_stack_size;
-
-/* 8 MB, unless that would leave less than 16 MB of heap -- then it shrinks,
- * to no less than 1 MB (hardware gives the main thread the XBE's stack
- * commit, typically 64 KB). */
-#define XBOX_STACK_SIZE     g_xbox_stack_size
+#define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
 /** Base VA of the stack area (above last XBE section). */
 /* Where the fake TIB lives -- the linear address fs: is based at.
@@ -423,7 +374,7 @@ extern uint32_t g_xbox_stack_size;
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 
-#define XBOX_STACK_BASE     g_xbox_stack_base
+#define XBOX_STACK_BASE     0x00780000
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
@@ -449,7 +400,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * adding it changes nothing for them.
  */
 #define XBOX_WORKER_STACK_SIZE   (256 * 1024)
-#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 for small images */
+#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 */
 #define XBOX_WORKER_STACK_COUNT  16                          /* 4 MB total */
 #define XBOX_WORKER_STACK_END    (XBOX_WORKER_STACK_BASE + \
                                   XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT)
@@ -463,7 +414,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * ================================================================ */
 
 /** Base VA of the dynamic heap area (above stack). */
-#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 for small images */
+#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 */
 
 /** Exclusive top of the dynamic heap: the end of RAM for this run. Runtime,
  *  not a macro, because RAM size is now configurable (retail 64 MB vs devkit

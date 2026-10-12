@@ -284,17 +284,6 @@ void mcpx_apu_dsp_write(MCPXAPUState *d, bool gp, uint32_t addr, uint64_t value,
     qemu_mutex_unlock(&d->lock);
 }
 
-/* Called after the frame thread is joined. Only mcpx_apu_reset_locked
- * (currently uncalled) reads this state, and it would run on that thread.
- * Safe to call twice. */
-void mcpx_apu_dsp_finalize(MCPXAPUState *d)
-{
-    free(d->gp.dsp);
-    free(d->ep.dsp);
-    d->gp.dsp = NULL;
-    d->ep.dsp = NULL;
-}
-
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
 {
     d->gp.realtime = d->ep.realtime = true;

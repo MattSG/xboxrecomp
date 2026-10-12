@@ -86,15 +86,14 @@ The Xbox stack lives in Xbox memory. `g_esp` is an Xbox virtual address pointing
     MEM32(sp) = _pv;                   \
 } while(0)
 
-// Pop: read value, increment ESP, then write dst
+// Pop: read value, then increment ESP
 #define POP32(sp, dst) do {            \
-    uint32_t _pv = MEM32(sp);          \
+    (dst) = MEM32(sp);                 \
     (sp) += 4;                         \
-    (dst) = _pv;                       \
 } while(0)
 ```
 
-Note that `PUSH32` evaluates the value *before* decrementing `sp`. This matches x86 semantics where `push [esp+N]` reads the operand at the old ESP before adjusting. `POP32` writes `dst` *after* incrementing `sp`, so `pop esp` leaves ESP equal to the popped value, as on x86.
+Note that `PUSH32` evaluates the value *before* decrementing `sp`. This matches x86 semantics where `push [esp+N]` reads the operand at the old ESP before adjusting.
 
 The stack is initialized to `XBOX_STACK_TOP` (0x00F7FFF0) -- the top of an 8 MB region allocated in Xbox memory space.
 
