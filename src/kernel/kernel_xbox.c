@@ -12,6 +12,7 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 /* ============================================================================
  * Exported Data Objects
@@ -207,6 +208,36 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         }
         break;
 
+    case 0x101: /* XC_FACTORY_ETHERNET_ADDR */
+        /* A console's MAC: RECOMP_NET_MAC, else Microsoft's 00:50:F2 and
+         * three bytes from this PC's name and the peer port, so consoles
+         * playing each other -- two on one PC included -- never share one
+         * (system link and the NAT's address both key on it). */
+        if (ValueLength >= 6) {
+            uint8_t *mac = (uint8_t *)Value;
+            const char *env = getenv("RECOMP_NET_MAC");
+            unsigned v[6];
+            if (env && sscanf(env, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
+                for (int i = 0; i < 6; i++)
+                    mac[i] = (uint8_t)v[i];
+            } else {
+                char name[64] = "xbox";
+                DWORD n = sizeof name;
+                const char *port = getenv("RECOMP_NET_PORT");
+                uint32_t h = 2166136261u;
+                GetComputerNameA(name, &n);
+                for (const char *p = name; *p; p++)
+                    h = (h ^ (uint8_t)*p) * 16777619u;
+                for (const char *p = port ? port : ""; *p; p++)
+                    h = (h ^ (uint8_t)*p) * 16777619u;
+                mac[0] = 0x00; mac[1] = 0x50; mac[2] = 0xF2;
+                mac[3] = (uint8_t)(h >> 16); mac[4] = (uint8_t)(h >> 8); mac[5] = (uint8_t)h;
+            }
+            if (Type) *Type = 3; /* REG_BINARY */
+            if (ResultLength) *ResultLength = 6;
+        }
+        break;
+
     default:
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
             "ExQueryNonVolatileSetting: unhandled index 0x%02X", ValueIndex);
@@ -244,8 +275,9 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
 ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
 {
     (void)Verify;
-    /* Return link up, 100 Mbps, full duplex */
-    return 0x01; /* XNET_ETHERNET_LINK_ACTIVE */
+    /* Link up, 100 Mbps, full duplex: XNET_ETHERNET_LINK_ACTIVE |
+     * _100MBPS | _FULL_DUPLEX, the bits the kernel reads off the PHY. */
+    return 0x01 | 0x02 | 0x08;
 }
 
 NTSTATUS __stdcall xbox_PhyInitialize(BOOLEAN ForceReset, PVOID Param2)

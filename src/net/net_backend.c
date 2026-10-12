@@ -1,0 +1,556 @@
+/*
+ * net_backend.c -- where the Xbox adapter's Ethernet frames go.
+ *
+ * NAT, the way xemu's default ("user", libslirp) network works, but through
+ * the host's own sockets: the guest sees a router at 10.0.2.2 that answers
+ * ARP and DHCP, a DNS server at 10.0.2.3 that forwards to the host's (or
+ * RECOMP_NET_DNS), and UDP to anywhere, each guest port carried by a host
+ * socket. Xbox Live -- Kerberos and the security gateway -- is UDP, so this
+ * is what a service like Insignia needs; its DNS goes in RECOMP_NET_DNS or
+ * in the console's own network settings, which reach their server the same
+ * way as any other UDP.
+ *
+ * ponytail: no TCP or ICMP through the NAT. Xbox Live titles talk UDP; add a
+ * TCP relay if a title's service is found using it.
+ *
+ * Peers, the way xemu's "udp" netdev tunnels frames: with RECOMP_NET_PEERS
+ * (host:port,...) every frame that is not for the router -- broadcasts,
+ * system link discovery, ARP for another console -- also goes to each peer
+ * as a UDP datagram on RECOMP_NET_PORT, and frames peers send are delivered
+ * to the guest. A peer that sends first is learned, so only one side needs
+ * the other's address. Each console's address comes from its MAC, so two of
+ * them behind the same 10.0.2.0/24 never collide.
+ */
+#include "net.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <windows.h>
+
+#define FRAME_MAX   1536
+#define QUEUE_LEN   256
+#define MAX_NAT     64
+#define MAX_PEERS   8
+#define TUNNEL_MAGIC 0x4E4C4258u   /* "XBLN" */
+
+static const uint8_t k_router_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x35, 0x02};
+static const uint8_t k_bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+#define NET_PREFIX  0x0A000200u     /* 10.0.2.0/24 */
+#define ROUTER_IP   (NET_PREFIX | 2)
+#define DNS_IP      (NET_PREFIX | 3)
+
+/* RECOMP_NET_TRACE: the first frames each way, one line each. */
+static void trace_frame(const char *dir, const uint8_t *f, uint32_t n)
+{
+    static int on = -1;
+    static volatile LONG count;
+    if (on < 0)
+        on = getenv("RECOMP_NET_TRACE") != NULL;
+    if (!on || n < 14 || InterlockedIncrement(&count) > 300)
+        return;
+    unsigned type = (unsigned)(f[12] << 8 | f[13]);
+    if (type == 0x0800 && n >= 34) {
+        const uint8_t *ip = f + 14, *l4 = ip + (ip[0] & 15) * 4;
+        fprintf(stderr, "  [NET] %s %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto %u len %u\n", dir,
+                ip[12], ip[13], ip[14], ip[15], (unsigned)(l4[0] << 8 | l4[1]),
+                ip[16], ip[17], ip[18], ip[19], (unsigned)(l4[2] << 8 | l4[3]), ip[9], n);
+    } else {
+        fprintf(stderr, "  [NET] %s type %04X to %02X:%02X:%02X:%02X:%02X:%02X len %u\n", dir, type,
+                f[0], f[1], f[2], f[3], f[4], f[5], n);
+    }
+    fflush(stderr);
+}
+
+/* ---- the queue of frames for the guest --------------------------------- */
+
+static struct {
+    SRWLOCK lock;
+    HANDLE event;
+    uint8_t data[QUEUE_LEN][FRAME_MAX];
+    uint32_t len[QUEUE_LEN];
+    unsigned head, tail;   /* head: next out; tail: next in */
+} q = {SRWLOCK_INIT};
+
+static void deliver(const uint8_t *f, uint32_t n)
+{
+    if (n > FRAME_MAX)
+        return;
+    trace_frame("in ", f, n);
+    AcquireSRWLockExclusive(&q.lock);
+    if (q.tail - q.head < QUEUE_LEN) {
+        memcpy(q.data[q.tail % QUEUE_LEN], f, n);
+        q.len[q.tail % QUEUE_LEN] = n;
+        q.tail++;
+    }
+    ReleaseSRWLockExclusive(&q.lock);
+    SetEvent(q.event);
+}
+
+uint32_t net_backend_peek(uint8_t *buf, uint32_t cap)
+{
+    uint32_t n = 0;
+    AcquireSRWLockShared(&q.lock);
+    if (q.head != q.tail && q.len[q.head % QUEUE_LEN] <= cap) {
+        n = q.len[q.head % QUEUE_LEN];
+        memcpy(buf, q.data[q.head % QUEUE_LEN], n);
+    }
+    ReleaseSRWLockShared(&q.lock);
+    return n;
+}
+
+void net_backend_pop(void)
+{
+    AcquireSRWLockExclusive(&q.lock);
+    if (q.head != q.tail)
+        q.head++;
+    ReleaseSRWLockExclusive(&q.lock);
+}
+
+void net_backend_wait(unsigned ms)
+{
+    WaitForSingleObject(q.event, ms);
+}
+
+/* ---- state ------------------------------------------------------------- */
+
+static struct {
+    SRWLOCK lock;
+    uint8_t guest_mac[6];
+    int have_mac;
+    uint32_t guest_ip;              /* host order */
+    uint32_t dns_upstream;          /* network order */
+    SOCKET dns;
+    uint16_t dns_guest_port;
+    struct { SOCKET s; uint16_t guest_port; DWORD used; } nat[MAX_NAT];
+    SOCKET tunnel;
+    struct sockaddr_in peer[MAX_PEERS];
+    int npeers;
+    unsigned out, in;
+} st = {SRWLOCK_INIT};
+
+/* ---- packet building --------------------------------------------------- */
+
+static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
+static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static void wr32(uint8_t *p, uint32_t v) { wr16(p, (uint16_t)(v >> 16)); wr16(p + 2, (uint16_t)v); }
+
+static uint32_t sum16(const uint8_t *p, uint32_t n, uint32_t acc)
+{
+    for (; n > 1; p += 2, n -= 2)
+        acc += rd16(p);
+    if (n)
+        acc += (uint32_t)p[0] << 8;
+    return acc;
+}
+
+static uint16_t fold(uint32_t acc)
+{
+    while (acc >> 16)
+        acc = (acc & 0xFFFF) + (acc >> 16);
+    return (uint16_t)~acc;
+}
+
+/* An Ethernet/IPv4/UDP frame to the guest. */
+static void send_udp_to_guest(const uint8_t dst_mac[6], uint32_t src_ip, uint16_t sport,
+                              uint32_t dst_ip, uint16_t dport, const uint8_t *data, uint32_t n)
+{
+    uint8_t f[FRAME_MAX];
+    if (14 + 20 + 8 + n > sizeof f)
+        return;
+    memcpy(f, dst_mac, 6);
+    memcpy(f + 6, k_router_mac, 6);
+    wr16(f + 12, 0x0800);
+    uint8_t *ip = f + 14, *udp = ip + 20;
+    memset(ip, 0, 20);
+    ip[0] = 0x45;
+    wr16(ip + 2, (uint16_t)(20 + 8 + n));
+    ip[8] = 64;
+    ip[9] = 17;
+    wr32(ip + 12, src_ip);
+    wr32(ip + 16, dst_ip);
+    wr16(ip + 10, fold(sum16(ip, 20, 0)));
+    wr16(udp, sport);
+    wr16(udp + 2, dport);
+    wr16(udp + 4, (uint16_t)(8 + n));
+    wr16(udp + 6, 0);
+    memcpy(udp + 8, data, n);
+    {   /* checksum over the pseudo-header */
+        uint32_t acc = sum16(ip + 12, 8, 17 + 8 + n);
+        uint16_t c = fold(sum16(udp, 8 + n, acc));
+        wr16(udp + 6, c ? c : 0xFFFF);
+    }
+    deliver(f, 14 + 20 + 8 + n);
+}
+
+/* The guest's address: 10.0.2.16-215 from its MAC, so consoles never collide. */
+static void learn_mac(const uint8_t mac[6])
+{
+    if (st.have_mac)
+        return;
+    memcpy(st.guest_mac, mac, 6);
+    st.have_mac = 1;
+    st.guest_ip = NET_PREFIX | (16 + ((mac[3] ^ mac[4] * 7 ^ mac[5] * 13) % 200));
+    fprintf(stderr, "  NET: guest %02X:%02X:%02X:%02X:%02X:%02X gets 10.0.2.%u\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], st.guest_ip & 0xFF);
+    fflush(stderr);
+}
+
+/* ---- ARP and DHCP ------------------------------------------------------ */
+
+static void arp(const uint8_t *f, uint32_t n)
+{
+    if (n < 42 || rd16(f + 20) != 1)         /* requests only */
+        return;
+    uint32_t target = rd32(f + 38);
+    if (target != ROUTER_IP && target != DNS_IP)
+        return;
+    uint8_t r[42];
+    memcpy(r, f + 6, 6);
+    memcpy(r + 6, k_router_mac, 6);
+    wr16(r + 12, 0x0806);
+    wr16(r + 14, 1); wr16(r + 16, 0x0800); r[18] = 6; r[19] = 4;
+    wr16(r + 20, 2);
+    memcpy(r + 22, k_router_mac, 6);
+    wr32(r + 28, target);
+    memcpy(r + 32, f + 22, 6);
+    memcpy(r + 38, f + 28, 4);
+    deliver(r, sizeof r);
+}
+
+static void dhcp(const uint8_t *bootp, uint32_t n)
+{
+    if (n < 240 || bootp[0] != 1 || rd32(bootp + 236) != 0x63825363u)
+        return;
+    int type = 0;
+    for (uint32_t i = 240; i + 1 < n && bootp[i] != 255;) {
+        if (bootp[i] == 0) { i++; continue; }
+        if (bootp[i] == 53 && i + 2 < n)
+            type = bootp[i + 2];
+        i += 2 + bootp[i + 1];
+    }
+    if (type != 1 && type != 3)              /* DISCOVER, REQUEST */
+        return;
+    learn_mac(bootp + 28);
+    uint8_t r[300];
+    memset(r, 0, sizeof r);
+    r[0] = 2; r[1] = 1; r[2] = 6;
+    memcpy(r + 4, bootp + 4, 4);             /* xid */
+    memcpy(r + 10, bootp + 10, 2);           /* flags */
+    wr32(r + 16, st.guest_ip);               /* yiaddr */
+    wr32(r + 20, ROUTER_IP);                 /* siaddr */
+    memcpy(r + 28, bootp + 28, 16);          /* chaddr */
+    wr32(r + 236, 0x63825363u);
+    uint8_t *o = r + 240;
+    *o++ = 53; *o++ = 1; *o++ = (uint8_t)(type == 1 ? 2 : 5);   /* OFFER / ACK */
+    *o++ = 54; *o++ = 4; wr32(o, ROUTER_IP); o += 4;
+    *o++ = 51; *o++ = 4; wr32(o, 86400); o += 4;
+    *o++ = 1;  *o++ = 4; wr32(o, 0xFFFFFF00u); o += 4;
+    *o++ = 3;  *o++ = 4; wr32(o, ROUTER_IP); o += 4;
+    *o++ = 6;  *o++ = 4; wr32(o, DNS_IP); o += 4;
+    *o++ = 255;
+    send_udp_to_guest(k_bcast, ROUTER_IP, 67, 0xFFFFFFFFu, 68, r, (uint32_t)(o - r));
+    fprintf(stderr, "  NET: DHCP %s 10.0.2.%u\n", type == 1 ? "offer" : "ack", st.guest_ip & 0xFF);
+    fflush(stderr);
+}
+
+/* ---- UDP through host sockets ------------------------------------------ */
+
+static SOCKET udp_socket(uint16_t port)
+{
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    struct sockaddr_in a;
+    u_long nb = 1;
+    BOOL yes = TRUE;
+    if (s == INVALID_SOCKET)
+        return s;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    if (bind(s, (struct sockaddr *)&a, sizeof a) != 0 && port) {
+        a.sin_port = 0;                      /* taken: any port */
+        bind(s, (struct sockaddr *)&a, sizeof a);
+    }
+    ioctlsocket(s, FIONBIO, &nb);
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *)&yes, sizeof yes);
+    {   /* an ICMP port-unreachable must not turn into an error on the next read */
+        BOOL off = FALSE;
+        DWORD ret;
+        WSAIoctl(s, _WSAIOW(IOC_VENDOR, 12) /* SIO_UDP_CONNRESET */, &off, sizeof off,
+                 NULL, 0, &ret, NULL, NULL);
+    }
+    return s;
+}
+
+/* The host socket carrying a guest port, made on first use. */
+static SOCKET nat_socket(uint16_t guest_port)
+{
+    int free_i = -1, oldest = 0;
+    SOCKET s;
+    AcquireSRWLockExclusive(&st.lock);
+    for (int i = 0; i < MAX_NAT; i++) {
+        if (st.nat[i].s && st.nat[i].guest_port == guest_port) {
+            st.nat[i].used = GetTickCount();
+            s = st.nat[i].s;
+            ReleaseSRWLockExclusive(&st.lock);
+            return s;
+        }
+        if (!st.nat[i].s && free_i < 0)
+            free_i = i;
+        if (st.nat[i].used < st.nat[oldest].used)
+            oldest = i;
+    }
+    if (free_i < 0) {   /* full: reuse the least recently used */
+        closesocket(st.nat[oldest].s);
+        free_i = oldest;
+    }
+    s = udp_socket(guest_port);
+    st.nat[free_i].s = s == INVALID_SOCKET ? 0 : s;
+    st.nat[free_i].guest_port = guest_port;
+    st.nat[free_i].used = GetTickCount();
+    ReleaseSRWLockExclusive(&st.lock);
+    return s;
+}
+
+static void udp_out(const uint8_t *ip, const uint8_t *udp, uint32_t len)
+{
+    uint32_t dst = rd32(ip + 16);
+    uint16_t sport = rd16(udp), dport = rd16(udp + 2);
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof to);
+    to.sin_family = AF_INET;
+    if (dst == DNS_IP && dport == 53) {
+        if (!st.dns_upstream)
+            return;
+        st.dns_guest_port = sport;
+        to.sin_addr.s_addr = st.dns_upstream;
+        to.sin_port = htons(53);
+        sendto(st.dns, (const char *)udp + 8, (int)len - 8, 0, (struct sockaddr *)&to, sizeof to);
+        return;
+    }
+    /* The LAN, broadcasts included: peers carry those as frames. A socket
+     * would rewrite system link's 0.0.0.1 source and hear its own echo. */
+    if ((dst & 0xFFFFFF00u) == NET_PREFIX || dst == 0xFFFFFFFFu)
+        return;
+    SOCKET s = nat_socket(sport);
+    if (s == INVALID_SOCKET || !s)
+        return;
+    to.sin_addr.s_addr = htonl(dst);
+    to.sin_port = htons(dport);
+    sendto(s, (const char *)udp + 8, (int)len - 8, 0, (struct sockaddr *)&to, sizeof to);
+}
+
+/* A frame for the router: ARP, DHCP, or IPv4 to route. */
+static void to_router(const uint8_t *f, uint32_t n)
+{
+    uint16_t type = rd16(f + 12);
+    if (type == 0x0806) {
+        arp(f, n);
+        return;
+    }
+    if (type != 0x0800 || n < 14 + 20)
+        return;
+    const uint8_t *ip = f + 14;
+    uint32_t ihl = (ip[0] & 15) * 4u, total = rd16(ip + 2);
+    if (total > n - 14 || ihl < 20 || total < ihl)
+        return;
+    if (ip[9] != 17 || total < ihl + 8)      /* UDP only */
+        return;
+    const uint8_t *udp = ip + ihl;
+    uint32_t ulen = rd16(udp + 4);
+    if (ulen < 8 || ulen > total - ihl)
+        return;
+    if (rd16(udp + 2) == 67) {
+        dhcp(udp + 8, ulen - 8);
+        return;
+    }
+    learn_mac(f + 6);
+    udp_out(ip, udp, ulen);
+}
+
+/* ---- peers ------------------------------------------------------------- */
+
+static void to_peers(const uint8_t *f, uint32_t n)
+{
+    uint8_t buf[4 + FRAME_MAX];
+    if (st.tunnel == INVALID_SOCKET || n > FRAME_MAX)
+        return;
+    wr32(buf, TUNNEL_MAGIC);
+    memcpy(buf + 4, f, n);
+    for (int i = 0; i < st.npeers; i++)
+        sendto(st.tunnel, (const char *)buf, (int)n + 4, 0, (struct sockaddr *)&st.peer[i],
+               sizeof st.peer[i]);
+}
+
+static void add_peer(const struct sockaddr_in *a)
+{
+    for (int i = 0; i < st.npeers; i++)
+        if (st.peer[i].sin_addr.s_addr == a->sin_addr.s_addr && st.peer[i].sin_port == a->sin_port)
+            return;
+    if (st.npeers < MAX_PEERS) {
+        st.peer[st.npeers++] = *a;
+        fprintf(stderr, "  NET: peer %s:%u\n", inet_ntoa(a->sin_addr), ntohs(a->sin_port));
+        fflush(stderr);
+    }
+}
+
+void net_backend_send(const uint8_t *f, uint32_t n)
+{
+    if (n < 14)
+        return;
+    trace_frame("out", f, n);
+    st.out++;
+    if (!memcmp(f, k_router_mac, 6)) {
+        to_router(f, n);
+        return;
+    }
+    if (!memcmp(f, k_bcast, 6))
+        to_router(f, n);                     /* ARP for the router, DHCP */
+    to_peers(f, n);
+}
+
+/* ---- the receive thread ------------------------------------------------ */
+
+static DWORD WINAPI net_thread(LPVOID unused)
+{
+    static uint8_t buf[4 + FRAME_MAX];
+    (void)unused;
+    for (;;) {
+        fd_set rd;
+        SOCKET socks[MAX_NAT];
+        uint16_t ports[MAX_NAT];
+        int nn = 0;
+        struct timeval tv = {0, 5000};
+        FD_ZERO(&rd);
+        if (st.dns != INVALID_SOCKET) FD_SET(st.dns, &rd);
+        if (st.tunnel != INVALID_SOCKET) FD_SET(st.tunnel, &rd);
+        AcquireSRWLockShared(&st.lock);
+        for (int i = 0; i < MAX_NAT; i++)
+            if (st.nat[i].s) {
+                socks[nn] = st.nat[i].s;
+                ports[nn++] = st.nat[i].guest_port;
+                FD_SET(st.nat[i].s, &rd);
+            }
+        ReleaseSRWLockShared(&st.lock);
+        if (rd.fd_count == 0) {
+            Sleep(5);
+            continue;
+        }
+        if (select(0, &rd, NULL, NULL, &tv) <= 0)
+            continue;
+        struct sockaddr_in from;
+        int fl = sizeof from, n;
+        if (st.dns != INVALID_SOCKET && FD_ISSET(st.dns, &rd)) {
+            while ((n = recvfrom(st.dns, (char *)buf, FRAME_MAX - 64, 0, (struct sockaddr *)&from, &fl)) > 0) {
+                send_udp_to_guest(st.guest_mac, DNS_IP, 53, st.guest_ip, st.dns_guest_port, buf, (uint32_t)n);
+                fl = sizeof from;
+            }
+        }
+        if (st.tunnel != INVALID_SOCKET && FD_ISSET(st.tunnel, &rd)) {
+            fl = sizeof from;
+            while ((n = recvfrom(st.tunnel, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &fl)) > 0) {
+                if (n > 4 + 14 && rd32(buf) == TUNNEL_MAGIC) {
+                    add_peer(&from);
+                    deliver(buf + 4, (uint32_t)n - 4);
+                    st.in++;
+                }
+                fl = sizeof from;
+            }
+        }
+        for (int i = 0; i < nn; i++) {
+            if (!FD_ISSET(socks[i], &rd))
+                continue;
+            fl = sizeof from;
+            while ((n = recvfrom(socks[i], (char *)buf, FRAME_MAX - 64, 0, (struct sockaddr *)&from, &fl)) > 0) {
+                send_udp_to_guest(st.guest_mac, ntohl(from.sin_addr.s_addr), ntohs(from.sin_port),
+                                  st.guest_ip, ports[i], buf, (uint32_t)n);
+                st.in++;
+                fl = sizeof from;
+            }
+        }
+    }
+}
+
+/* The host's first DNS server, unless RECOMP_NET_DNS names one. */
+static uint32_t upstream_dns(void)
+{
+    const char *env = getenv("RECOMP_NET_DNS");
+    struct in_addr a;
+    if (env && *env && inet_pton(AF_INET, env, &a) == 1)
+        return a.s_addr;
+    ULONG size = 0;
+    GetNetworkParams(NULL, &size);
+    FIXED_INFO *info = (FIXED_INFO *)malloc(size);
+    uint32_t r = 0;
+    if (info && GetNetworkParams(info, &size) == NO_ERROR &&
+        inet_pton(AF_INET, info->DnsServerList.IpAddress.String, &a) == 1)
+        r = a.s_addr;
+    free(info);
+    return r;
+}
+
+int net_backend_init(const char *mode)
+{
+    WSADATA wsa;
+    (void)mode;   /* "nat" (or "1"): the only mode; peers come on top */
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        return 0;
+    q.event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    st.dns = udp_socket(0);
+    st.dns_upstream = upstream_dns();
+    st.tunnel = INVALID_SOCKET;
+    st.guest_ip = NET_PREFIX | 15;
+
+    const char *peers = getenv("RECOMP_NET_PEERS");
+    const char *port = getenv("RECOMP_NET_PORT");
+    if ((peers && *peers) || (port && *port)) {
+        uint16_t p = (uint16_t)(port && *port ? atoi(port) : 3075);
+        st.tunnel = udp_socket(p);
+        char list[512];
+        snprintf(list, sizeof list, "%s", peers ? peers : "");
+        for (char *tok = strtok(list, ", "); tok; tok = strtok(NULL, ", ")) {
+            char *colon = strrchr(tok, ':');
+            struct addrinfo hints = {0}, *res = NULL;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_DGRAM;
+            if (colon)
+                *colon = 0;
+            if (getaddrinfo(tok, colon ? colon + 1 : "3075", &hints, &res) == 0 && res) {
+                add_peer((struct sockaddr_in *)res->ai_addr);
+                freeaddrinfo(res);
+            } else {
+                fprintf(stderr, "  NET: cannot resolve peer %s\n", tok);
+            }
+        }
+        {
+            struct sockaddr_in me;
+            int l = sizeof me;
+            getsockname(st.tunnel, (struct sockaddr *)&me, &l);
+            fprintf(stderr, "  NET: peer tunnel on UDP %u\n", ntohs(me.sin_port));
+        }
+    }
+    {
+        struct in_addr a;
+        a.s_addr = st.dns_upstream;
+        fprintf(stderr, "  NET: NAT 10.0.2.0/24, DNS via %s\n", st.dns_upstream ? inet_ntoa(a) : "(none)");
+        fflush(stderr);
+    }
+    HANDLE th = CreateThread(NULL, 0, net_thread, NULL, 0, NULL);
+    if (!th)
+        return 0;
+    CloseHandle(th);
+    return 1;
+}
+
+#else
+int net_backend_init(const char *mode) { (void)mode; return 0; }
+void net_backend_send(const uint8_t *f, uint32_t n) { (void)f; (void)n; }
+uint32_t net_backend_peek(uint8_t *b, uint32_t c) { (void)b; (void)c; return 0; }
+void net_backend_pop(void) {}
+void net_backend_wait(unsigned ms) { (void)ms; }
+#endif
