@@ -38,6 +38,19 @@ int main(void)
     keyboard_state(&s);
     if (s.Gamepad.wButtons & XBOX_GAMEPAD_DPAD_LEFT) { puts("FAIL: menu keys outside a menu"); return 10; }
     if (s.Gamepad.sThumbLX != -32767) { puts("FAIL: A lost its binding outside a menu"); return 11; }
-    puts("PASS: RECOMP_KEYMAP rebinds keys and mouse buttons; menu keys only in menus");
+    /* RECOMP_PADMAP: shoulders swapped, A on the right trigger, Start on A. */
+    {
+        XINPUT_GAMEPAD g = {0};
+        XBOX_GAMEPAD out;
+        _putenv_s("RECOMP_PADMAP", "BLACK:RB,WHITE:LB,A:RT,START:A");
+        g.wButtons = XINPUT_GAMEPAD_RIGHT_SHOULDER | XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B;
+        g.bRightTrigger = 200;
+        pad_buttons(&g, &out);
+        if (out.bAnalogButtons[XBOX_BUTTON_BLACK] != 255 || out.bAnalogButtons[XBOX_BUTTON_WHITE]) { puts("FAIL: shoulders not swapped"); return 12; }
+        if (out.bAnalogButtons[XBOX_BUTTON_A] != 200) { puts("FAIL: A not on the right trigger"); return 13; }
+        if (!(out.wButtons & XBOX_GAMEPAD_START)) { puts("FAIL: Start not on A"); return 14; }
+        if (out.bAnalogButtons[XBOX_BUTTON_B] != 255) { puts("FAIL: B lost its own button"); return 15; }
+    }
+    puts("PASS: RECOMP_KEYMAP rebinds keys and mouse buttons; menu keys only in menus; RECOMP_PADMAP remaps the pad");
     return 0;
 }

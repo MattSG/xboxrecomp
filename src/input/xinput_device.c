@@ -269,6 +269,73 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++packet;
 }
 
+/* RECOMP_PADMAP: which controller button drives each Xbox input, as
+ * NAME:SOURCE,... (BLACK:RB,WHITE:LB). Xbox inputs and sources share these
+ * names, except that the pad's shoulders are LB/RB and the Xbox's are
+ * BLACK/WHITE; unnamed inputs keep their own button. A trigger used as a
+ * button counts past a third of its travel. */
+enum { PAD_SOURCES = 16 };
+static const char *const k_pad_sources[PAD_SOURCES] = {
+    "A", "B", "X", "Y", "LB", "RB", "START", "BACK", "LS", "RS",
+    "UP", "DOWN", "LEFT", "RIGHT", "LT", "RT"};
+static const char *const k_pad_inputs[PAD_SOURCES] = {
+    "A", "B", "X", "Y", "BLACK", "WHITE", "START", "BACK", "LS", "RS",
+    "UP", "DOWN", "LEFT", "RIGHT", "LT", "RT"};
+static const WORD k_source_bits[14] = {
+    XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+    XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_START,
+    XINPUT_GAMEPAD_BACK, XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_THUMB,
+    XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT,
+    XINPUT_GAMEPAD_DPAD_RIGHT};
+
+static const int *pad_map(void)
+{
+    static int map[PAD_SOURCES] = {-1};
+    if (map[0] < 0) {
+        const char *env = getenv("RECOMP_PADMAP");
+        for (int i = 0; i < PAD_SOURCES; i++)
+            map[i] = i;
+        while (env && *env) {
+            char name[16], src[16];
+            if (sscanf(env, "%15[^:]:%15[^,]", name, src) == 2)
+                for (int i = 0; i < PAD_SOURCES; i++)
+                    if (!_stricmp(name, k_pad_inputs[i]))
+                        for (int j = 0; j < PAD_SOURCES; j++)
+                            if (!_stricmp(src, k_pad_sources[j]))
+                                map[i] = j;
+            env = strchr(env, ',');
+            env = env ? env + 1 : NULL;
+        }
+    }
+    return map;
+}
+
+static BYTE pad_source(const XINPUT_GAMEPAD *g, int source)
+{
+    if (source == 14) return g->bLeftTrigger;
+    if (source == 15) return g->bRightTrigger;
+    return (g->wButtons & k_source_bits[source]) ? 255 : 0;
+}
+
+/* The Xbox buttons from an XInput pad, through RECOMP_PADMAP. */
+static void pad_buttons(const XINPUT_GAMEPAD *g, XBOX_GAMEPAD *out)
+{
+    static const int analog[8] = {XBOX_BUTTON_A, XBOX_BUTTON_B, XBOX_BUTTON_X, XBOX_BUTTON_Y,
+                                  XBOX_BUTTON_BLACK, XBOX_BUTTON_WHITE, -1, -1};
+    static const WORD digital[8] = {XBOX_GAMEPAD_START, XBOX_GAMEPAD_BACK, XBOX_GAMEPAD_LEFT_THUMB,
+                                    XBOX_GAMEPAD_RIGHT_THUMB, XBOX_GAMEPAD_DPAD_UP, XBOX_GAMEPAD_DPAD_DOWN,
+                                    XBOX_GAMEPAD_DPAD_LEFT, XBOX_GAMEPAD_DPAD_RIGHT};
+    const int *map = pad_map();
+    out->wButtons = 0;
+    for (int i = 0; i < 6; i++)
+        out->bAnalogButtons[analog[i]] = pad_source(g, map[i]);
+    for (int i = 0; i < 8; i++)
+        if (pad_source(g, map[6 + i]) > 85)
+            out->wButtons |= digital[i];
+    out->bAnalogButtons[XBOX_BUTTON_LTRIGGER] = pad_source(g, map[14]);
+    out->bAnalogButtons[XBOX_BUTTON_RTRIGGER] = pad_source(g, map[15]);
+}
+
 void xbox_InputInit(void)
 {
     for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
@@ -301,22 +368,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
     pState->dwPacketNumber = xi_state.dwPacketNumber;
-    pState->Gamepad.wButtons = xi_state.Gamepad.wButtons & 0x00FF;
-
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
+    pad_buttons(&xi_state.Gamepad, &pState->Gamepad);
 
     pState->Gamepad.sThumbLX = xi_state.Gamepad.sThumbLX;
     pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
