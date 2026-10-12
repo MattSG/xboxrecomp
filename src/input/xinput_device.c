@@ -218,14 +218,28 @@ static WORD menu_hover(BOOL nav_keys, BOOL *click)
     }
     /* One row per pulse, the next only once the highlight is seen to have
      * moved (titles fade it over a few hundred ms), or after 700 ms. */
-    if (on > 0 && rows && (rows != pulsed_rows || now - pulsed_at > 700) && now >= pulse_until + 30) {
+    if (on == 1 && rows && (rows != pulsed_rows || now - pulsed_at > 700) && now >= pulse_until + 30) {
         bit = rows > 0 ? XBOX_GAMEPAD_DPAD_DOWN : XBOX_GAMEPAD_DPAD_UP;
         pulse_until = now + 50;     /* a few title polls held, then let go */
         pulsed_at = now;
         pulsed_rows = rows;
     }
+    /* A strip that scrolls (on == 2) moves on a click, not on hover: that
+     * many presses left or right, and no A. */
+    {
+        static int sideways;
+        if (down && !was_down && on == 2) {
+            sideways = rows;
+            down = 0;               /* the click is spent on the move */
+        }
+        if (sideways && now >= pulse_until + 120) {
+            bit = sideways > 0 ? XBOX_GAMEPAD_DPAD_RIGHT : XBOX_GAMEPAD_DPAD_LEFT;
+            sideways += sideways > 0 ? -1 : 1;
+            pulse_until = now + 50;
+        }
+    }
     if (down && !was_down) click_at = now;
-    was_down = down;
+    was_down = key_down(VK_LBUTTON);
     /* Off an item the click goes straight through; on one it waits for the
      * focus, or 800 ms where the highlight cannot be found. */
     if (click_at && (on == 0 || (on > 0 && !rows) || now - click_at > 800)) {
