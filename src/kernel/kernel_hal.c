@@ -739,12 +739,14 @@ VOID __stdcall xbox_HalDisableSystemInterrupt(ULONG BusInterruptLevel, KIRQL Irq
     (void)Irql;
 }
 
+/* The vector is the bus level, as the bridged entry answers
+ * (bridge_HalGetInterruptVector): device models find their routine by it,
+ * and 0 for every device put the NIC's on the same vector as everyone's. */
 ULONG __stdcall xbox_HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql)
 {
-    (void)BusInterruptLevel;
     if (Irql)
-        *Irql = PASSIVE_LEVEL;
-    return 0;
+        *Irql = (KIRQL)BusInterruptLevel;
+    return BusInterruptLevel;
 }
 
 /* ============================================================================

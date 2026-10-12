@@ -10,6 +10,7 @@
 #include "nv2a_mmio_hook.h"
 #include "nv2a_state.h"
 #include "ohci.h"
+#include "net.h"
 #include "xbox_host.h"
 
 /* The trapped APU span, matching what MemoryLayoutInit unmaps: the APU's own
@@ -44,6 +45,9 @@ static LONG CALLBACK mmio_handler(PEXCEPTION_POINTERS info)
     fault_address = info->ExceptionRecord->ExceptionInformation[1];
     guest_address = (uint32_t)(fault_address - (uintptr_t)g_xbox_mem_offset);
     is_write = info->ExceptionRecord->ExceptionInformation[0] ? 1 : 0;
+    if (xbox_NicOwnsAddress(guest_address))
+        return xbox_NicHandleMmio(info->ContextRecord, guest_address)
+            ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
     if (xbox_OhciOwnsAddress(guest_address))
         return xbox_OhciHandleMmio(info->ContextRecord, guest_address)
             ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
@@ -86,6 +90,7 @@ int xbox_HostHardwareInit(void)
     /* XAPI is linked into the title and drives the controllers' registers
      * itself; without them it reads zeroed MCPX RAM and never finds a pad. */
     xbox_OhciInit();
+    xbox_NicInit();
     fprintf(stderr, "[HOST] MMIO routed (APU %s, USB)\n",
             g_apu_state ? "up" : "off");
     return 1;

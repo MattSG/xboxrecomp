@@ -3378,13 +3378,16 @@ static void bridge_KeInitializeDpc(void)
      * makes this memset write through NULL inside the bridge. The export
      * returns void, so refusing is doing nothing -- which is what the real
      * kernel does with an object it cannot write. */
-    if (!bridge_buf_ok(dpc_va, 32, "KeInitializeDpc")) {
+    if (!bridge_buf_ok(dpc_va, 28, "KeInitializeDpc")) {
         g_eax = 0;
         return;
     }
 
-    /* Zero the structure (32 bytes) */
-    memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
+    /* Zero the structure: an Xbox KDPC is 28 bytes (Type, Inserted, pad,
+     * DpcListEntry, DeferredRoutine, DeferredContext, SystemArgument1/2).
+     * Writing 32 cleared the next field -- XNet keeps its interrupt vector
+     * right after its DPC, and lost it to 0. */
+    memset(XBOX_TO_NATIVE(dpc_va), 0, 28);
 
     /* Set Type (0x13 = DpcObject) and fields */
     BRIDGE_MEM16(dpc_va + 0) = 0x13;   /* Type */

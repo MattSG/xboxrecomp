@@ -12,6 +12,7 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 /* ============================================================================
  * Exported Data Objects
@@ -283,52 +284,35 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         }
         break;
 
-    case XC_TZ_STD_NAME:
-    case XC_TZ_DLT_NAME:
-        if (ValueLength >= 4) {
-            memcpy(Value, ValueIndex == XC_TZ_STD_NAME ? s_tz.std_name : s_tz.dlt_name, 4);
-            if (Type) *Type = 3;                 /* REG_BINARY */
-            if (ResultLength) *ResultLength = 4;
+    case 0x101: /* XC_FACTORY_ETHERNET_ADDR */
+        /* A console's MAC: RECOMP_NET_MAC, else Microsoft's 00:50:F2 and
+         * three bytes from this PC's name and the peer port, so consoles
+         * playing each other -- two on one PC included -- never share one
+         * (system link and the NAT's address both key on it). */
+        if (ValueLength >= 6) {
+            uint8_t *mac = (uint8_t *)Value;
+            const char *env = getenv("RECOMP_NET_MAC");
+            unsigned v[6];
+            if (env && sscanf(env, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
+                for (int i = 0; i < 6; i++)
+                    mac[i] = (uint8_t)v[i];
+            } else {
+                char name[64] = "xbox";
+                DWORD n = sizeof name;
+                const char *port = getenv("RECOMP_NET_PORT");
+                uint32_t h = 2166136261u;
+                GetComputerNameA(name, &n);
+                for (const char *p = name; *p; p++)
+                    h = (h ^ (uint8_t)*p) * 16777619u;
+                for (const char *p = port ? port : ""; *p; p++)
+                    h = (h ^ (uint8_t)*p) * 16777619u;
+                mac[0] = 0x00; mac[1] = 0x50; mac[2] = 0xF2;
+                mac[3] = (uint8_t)(h >> 16); mac[4] = (uint8_t)(h >> 8); mac[5] = (uint8_t)h;
+            }
+            if (Type) *Type = 3; /* REG_BINARY */
+            if (ResultLength) *ResultLength = 6;
         }
         break;
-
-    case XC_TZ_STD_DATE:
-    case XC_TZ_DLT_DATE:
-        if (ValueLength >= 4) {
-            memcpy(Value, ValueIndex == XC_TZ_STD_DATE ? &s_tz.std_date : &s_tz.dlt_date, 4);
-            if (Type) *Type = 4;
-            if (ResultLength) *ResultLength = 4;
-        }
-        break;
-
-    case XC_MAX_OS: {
-        /* The whole user-settings block (EEPROM 0x60..), which XAPI reads in
-         * one go: checksum, bias, std/dlt names, 8 reserved, std/dlt dates,
-         * 8 reserved, std/dlt bias, language, video, audio, parental x3,
-         * online x4, misc, DVD region -- the same values as the single
-         * queries above. Answering it with zeroes put every title in UTC. */
-        uint8_t blk[0x60];
-        memset(blk, 0, sizeof blk);
-        memcpy(blk + 0x04, &s_tz.bias, 4);
-        memcpy(blk + 0x08, s_tz.std_name, 4);
-        memcpy(blk + 0x0C, s_tz.dlt_name, 4);
-        memcpy(blk + 0x18, &s_tz.std_date, 4);
-        memcpy(blk + 0x1C, &s_tz.dlt_date, 4);
-        memcpy(blk + 0x28, &s_tz.std_bias, 4);
-        memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
-        { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
-        { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
-        /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
-        { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */
-        if (Type) *Type = 3;
-        if (ResultLength) *ResultLength = sizeof blk;
-        if (ValueLength < sizeof blk)
-            return 0xC0000023L;                       /* STATUS_BUFFER_TOO_SMALL */
-        memcpy(Value, blk, sizeof blk);
-        if (ValueLength > sizeof blk)
-            memset((uint8_t *)Value + sizeof blk, 0, ValueLength - sizeof blk);
-        break;
-    }
 
     default:
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
@@ -367,8 +351,9 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
 ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
 {
     (void)Verify;
-    /* Return link up, 100 Mbps, full duplex */
-    return 0x01; /* XNET_ETHERNET_LINK_ACTIVE */
+    /* Link up, 100 Mbps, full duplex: XNET_ETHERNET_LINK_ACTIVE |
+     * _100MBPS | _FULL_DUPLEX, the bits the kernel reads off the PHY. */
+    return 0x01 | 0x02 | 0x08;
 }
 
 NTSTATUS __stdcall xbox_PhyInitialize(BOOLEAN ForceReset, PVOID Param2)
