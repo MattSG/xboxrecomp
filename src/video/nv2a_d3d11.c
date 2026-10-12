@@ -804,6 +804,15 @@ static const char s_hlsl[] =
 "      if (show) c = OvlTex.Sample(LinS, (ovl_walk.xy + d * ovl_walk.zw) / ovl_in.xy);\n"
 "    }\n"
 "  }\n"
+/* Loading (force_alpha.y > 0, a phase): a turning arc in the bottom-right
+ * corner while the title has stopped flipping; .zw is the target's size. */
+"  if (force_alpha.y > 0) {\n"
+"    float s = force_alpha.w / 720.0;\n"
+"    float2 d = i.pos.xy - (force_alpha.zw - 40.0 * s);\n"
+"    float ring = saturate(2.0 * s - abs(length(d) - 13.0 * s));\n"
+"    float a = frac(atan2(d.y, d.x) / 6.2831853 - force_alpha.y);\n"
+"    c.rgb = lerp(c.rgb, float3(0.91, 0.64, 0.24), ring * smoothstep(0.15, 1.0, a));\n"
+"  }\n"
 "  return force_alpha.x >= 0 ? float4(c.rgb, force_alpha.x) : c;\n"
 "}\n"
 "cbuffer CC : register(b0) { float4 ccol; float4 cz; };\n"
@@ -3720,6 +3729,9 @@ static void capture_backbuffer(ID3D11Texture2D *bb)
     remaining--;
 }
 
+/* Above 0 while a load keeps the last frame up: the spinner's phase. */
+static float s_loading;
+
 /* Draw surface `s` (with the overlay described in *pc) into a w x h target,
  * letterboxed to the display aspect when asked. */
 static void composite(ID3D11RenderTargetView *rtv, UINT w, UINT h, Surface *s,
@@ -3753,6 +3765,9 @@ static void composite(ID3D11RenderTargetView *rtv, UINT w, UINT h, Surface *s,
     pc->src_size[0] = (float)s->w; pc->src_size[1] = (float)s->h;
     pc->src_size[2] = (float)s->iw; pc->src_size[3] = (float)s->ih;
     pc->force_alpha[0] = 1.0f;
+    pc->force_alpha[1] = letterbox ? s_loading : 0.0f;   /* the window only */
+    pc->force_alpha[2] = (float)w;
+    pc->force_alpha[3] = (float)h;
     if (pc->ovl_flags[0] && s->sx > s->sy * 1.001f) {
         pc->ovl_in[2] = s->sx / s->sy;
         pc->ovl_in[3] = (float)s->w * 0.5f;
@@ -4065,20 +4080,32 @@ void nv2a_d3d_tick(void)
     now = GetTickCount();
     if (now - s_last_present < 16)
         return;
+    /* A stop in flipping after the title has started, with no movie, is a
+     * load (a level takes ~5 s, shown by CPU scanout or not at all): the
+     * frame gets a turning arc so it does not look hung. With
+     * RECOMP_LOADING_SPINNER=0 it stays still, as on the console. */
+    static int spinner = -1;
+    XboxOverlay ovl;
+    if (spinner < 0)
+        spinner = !getenv("RECOMP_LOADING_SPINNER") || atoi(getenv("RECOMP_LOADING_SPINNER")) != 0;
+    int movie = xbox_FramebufferOverlay(&ovl);
+    s_loading = spinner && !movie && s_last_flip && now - s_last_flip > 700
+              ? 1.0f + (float)(now % 1000) / 1000.0f : 0.0f;
     if (xbox_FramebufferScanSource(&va, &pitch)) {
         Surface *s = scan_surface(va, pitch);
         present_surface(s);
+        s_loading = 0.0f;
         s_frame++;
         return;
     }
     /* Movies keep running while the title stops flipping. */
     if (s_shown && now - s_last_flip > 50) {
-        XboxOverlay ovl;
-        if (xbox_FramebufferOverlay(&ovl))
+        if (movie || (s_loading > 0.0f && now - s_last_present >= 33))
             present_surface(s_shown);
         else
             s_last_present = now;
     }
+    s_loading = 0.0f;
 }
 
 #else
