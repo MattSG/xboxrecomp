@@ -1242,7 +1242,7 @@ static void voice_process(MCPXAPUState *d,
         }
         g *= attenuate(vol[b]) / hr;
         /* Bin channel follows xemu (b % channels). Splitting HRTF bins into
-         * left/right ear pairs fed the GP crosstalk bins (MM3: 6 8 7 9)
+         * left/right ear pairs fed the GP crosstalk bins (one title: 6 8 7 9)
          * distinct ears: gameplay went out of phase (L/R corr -0.73), +8 dB
          * and clipped against xemu with use_dsp (+0.95). */
         int ch = (int)(b % channels);

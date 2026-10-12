@@ -188,75 +188,13 @@ static UINT s_msaa = 4, s_aniso = 16;
 #define GUEST_W 640u
 #define GUEST_H 480u
 
-/* HUD edge placement is latched: the title turns it on when its in-game
- * HUD's screen begins
- * and off when it leaves. Frames that draw a full-screen background
- * image are menus or loading screens and never get it, which keeps menus
- * reached from a race out of the race HUD placement path. */
-static volatile LONG s_edge_hud;
-static uint32_t s_frame_bg_tex;     /* this frame's background image; reset at flip */
-static int s_frame_tag_window;      /* still in the frame's leading name tags */
-/* The race HUD draws its minimap (the HUD start rect) every frame it is up;
- * the pause and post-race menus hide it. A frame after one without it is a
- * menu: its 2D keeps 4:3 proportions, centred, instead of being split to
- * the screen edges -- edge placement pulled each button's end caps away
- * from its middle. ponytail: the zoomed map also hides the minimap and so
- * gets centred too; key on the title's pause state if that matters. */
-static int s_hud_seen, s_hud_prev;
+/* A title's placement of screen-space 2D on a widened target (header). */
+static NvOverlayHooks s_overlay;
 
-/* Name tags over cars (world-anchored 2D) are the first 2D a race frame
- * draws, ahead of the HUD; the title names the HUD's first element by its
- * 4:3 rectangle (nv2a_d3d_set_hud_start). Textures drawn from there on are
- * learned as HUD textures. In each race frame the leading draws keep their
- * projected position (hud_split's follow mode) until the HUD start or a
- * known HUD texture -- so frames without the minimap (zoomed map, pause)
- * still end the tags at their first HUD element. */
-static float s_hud_start[4];
-static uint32_t s_hud_tex[32];
-static int s_hud_tex_n;
-
-/* A full-screen quad textured from the race HUD's own atlas is a fade (MM3
- * dims the screen this way while it resets the car), not a menu background:
- * taken for one, it put the HUD drawn after it back at 4:3 for the fade --
- * the speedometer's damage bar jumped left of the gauge. */
-static int hud_texture(uint32_t tex)
+void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks)
 {
-    int i;
-    for (i = 0; i < s_hud_tex_n; i++)
-        if (s_hud_tex[i] == tex)
-            return 1;
-    return 0;
-}
-
-void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1)
-{
-    s_hud_start[0] = x0; s_hud_start[1] = y0; s_hud_start[2] = x1; s_hud_start[3] = y1;
-}
-
-static int world_tag_draw(float lo, float hi, float ylo, float yhi, uint32_t tex)
-{
-    int i;
-    if (!s_hud_start[2])
-        return 0;
-    if (s_frame_tag_window &&
-        fabsf(lo - s_hud_start[0]) < 2.0f && fabsf(ylo - s_hud_start[1]) < 2.0f &&
-        fabsf(hi - s_hud_start[2]) < 2.0f && fabsf(yhi - s_hud_start[3]) < 2.0f)
-        s_frame_tag_window = 0;
-    for (i = 0; i < s_hud_tex_n && s_hud_tex[i] != tex; i++) {}
-    if (s_frame_tag_window && i == s_hud_tex_n)
-        return 1;
-    s_frame_tag_window = 0;
-    if (i == s_hud_tex_n && s_hud_tex_n < 32)
-        s_hud_tex[s_hud_tex_n++] = tex;
-    return 0;
-}
-
-void nv2a_d3d_set_edge_hud(int on)
-{
-    if (!on)
-        InterlockedExchange(&s_edge_hud, 0);
-    else if (!InterlockedExchange(&s_edge_hud, 1))
-        s_hud_tex_n = 0;                 /* a new level may load other textures */
+    memset(&s_overlay, 0, sizeof s_overlay);
+    if (hooks) s_overlay = *hooks;
 }
 
 /* nv2a_d3d_set_depth_view_remap: x = scale, y = knee (see y16d_ps). */
@@ -268,11 +206,6 @@ void nv2a_d3d_set_depth_view_remap(float scale, float knee)
     if (!(scale >= 1.0f) || !(knee > 0.0f && knee <= 1.0f)) { scale = 1.0f; knee = 1.0f; }
     s_zview_remap[1] = knee;
     s_zview_remap[0] = scale;            /* views rebuild on the next depth bind */
-}
-
-static int nv2a_d3d_hud_active(void)
-{
-    return !s_frame_bg_tex && InterlockedCompareExchange(&s_edge_hud, 0, 0) != 0;
 }
 
 /* The aspect the image is rendered at, never narrower than the title's
@@ -583,6 +516,7 @@ static const char s_hlsl[] =
 "#endif\n"
 "Texture2D T2D0:register(t0); Texture2D T2D1:register(t1); Texture2D T2D2:register(t2); Texture2D T2D3:register(t3);\n"
 "TextureCube TC0:register(t4); TextureCube TC1:register(t5); TextureCube TC2:register(t6); TextureCube TC3:register(t7);\n"
+"Texture2D FBK:register(t8); static float2 g_pos;\n"
 "SamplerState S0:register(s0); SamplerState S1:register(s1); SamplerState S2:register(s2); SamplerState S3:register(s3);\n"
 "uint U8(uint4 a[2], uint s) { return a[s >> 2][s & 3]; }\n"
 "float map_in(float x, uint b) {\n"
@@ -612,18 +546,28 @@ static const char s_hlsl[] =
 "  if (m == 3) return (x >= 128.0 ? x - 256.0 : x) / 127.0;\n"
 "  return c;\n"
 "}\n"
-"float4 bspline0(float2 uv) {\n"
-"  float2 sz; T2D0.GetDimensions(sz.x, sz.y);\n"
+"float4 bspline0(float2 uv, float lod) {\n"
+"  float2 sz; float nl; T2D0.GetDimensions(0, sz.x, sz.y, nl); lod = min(lod, nl - 1.0); sz = max(floor(sz / exp2(lod)), 1.0);\n"
 "  float2 p = uv * sz - 0.5, f = frac(p), f2 = f * f, f3 = f2 * f;\n"
 "  float2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0, w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;\n"
 "  float2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0, w3 = f3 / 6.0;\n"
 "  float2 s0 = w0 + w1, s1 = w2 + w3; p -= f;\n"
 "  float2 c0 = (p - 0.5 + w1 / s0) / sz, c1 = (p + 1.5 + w3 / s1) / sz;\n"
-"  return s0.y * (s0.x * T2D0.SampleLevel(S0, c0, 0) + s1.x * T2D0.SampleLevel(S0, float2(c1.x, c0.y), 0)) +\n"
-"         s1.y * (s0.x * T2D0.SampleLevel(S0, float2(c0.x, c1.y), 0) + s1.x * T2D0.SampleLevel(S0, c1, 0));\n"
+"  return s0.y * (s0.x * T2D0.SampleLevel(S0, c0, lod) + s1.x * T2D0.SampleLevel(S0, float2(c1.x, c0.y), lod)) +\n"
+"         s1.y * (s0.x * T2D0.SampleLevel(S0, float2(c0.x, c1.y), lod) + s1.x * T2D0.SampleLevel(S0, c1, lod));\n"
 "}\n"
 "float4 samp2(uint n, float2 uv) {\n"
-"  if (n == 0 && (ps_flags & 4)) return bspline0(uv);\n"
+"  if (n == 0 && (ps_flags & 4)) {\n"
+"    float4 c = bspline0(uv, 0.0);\n"
+"    float f = (float)((ps_flags >> 8) & 255u) / 100.0, dv = ddy(uv.y);\n"
+"    if (f > 0.0 && abs(dv) > 1e-7) {\n"
+"      float2 fs; FBK.GetDimensions(fs.x, fs.y);\n"
+"      float y0 = clamp(g_pos.y - uv.y / dv - 3.0 * fs.y / 900.0, 0.0, fs.y - 1.0);\n"
+"      float3 sky = 0;\n"
+"      [unroll] for (int k = -4; k <= 4; k++) sky += FBK.Load(int3(clamp(g_pos.x + k * fs.x / 200.0, 0.0, fs.x - 1.0), y0, 0)).rgb;\n"
+"      c.rgb = lerp(c.rgb, sky / 9.0, f);\n"
+"    }\n"
+"    return c; }\n"
 "  if (n == 0) return T2D0.Sample(S0, uv); if (n == 1) return T2D1.Sample(S1, uv);\n"
 "  if (n == 2) return T2D2.Sample(S2, uv); return T2D3.Sample(S3, uv);\n"
 "}\n"
@@ -655,6 +599,7 @@ static const char s_hlsl[] =
 "  if (n == 2) return TC2.Sample(S2, d); return TC3.Sample(S3, d);\n"
 "}\n"
 "float4 shade(PSIn i, out uint cov) {\n"
+"  g_pos = i.pos.xy;\n"
 "  float4 tc[4] = { i.t0, i.t1, i.t2, i.t3 };\n"
 "  float4 T[4] = { float4(0,0,0,1), float4(0,0,0,1), float4(0,0,0,1), float4(0,0,0,1) }; float dots[4] = { 0, 0, 0, 0 };\n"
 "  [unroll] for (uint n = 0; n < 4; n++) {\n"
@@ -798,7 +743,7 @@ static const char s_hlsl[] =
  * rasteriser's depth bias never reaches a shader-written depth. zp0 = offset
  * factor, units, host pixels per guest pixel x/y; zp1 = 1/(zmax+1), zmax,
  * view remap scale (0 = off), knee. Draws after the title has read the
- * depth buffer for its haze pass (foliage, in MM3) miss that haze; with the
+ * depth buffer for its haze pass (foliage, in one title) miss that haze; with the
  * far plane extended they lose MSAA coverage by the fraction y16d_ps hazes
  * their depth, so the hazed scene shows through. The sample count is spread
  * over each 2x2 block of host pixels with a Bayer order (floor((c + i/4))
@@ -882,7 +827,7 @@ static const char s_hlsl[] =
 "  float y = (float)((q.x & 1u) ? (b.a << 8 | b.r) : (b.g << 8 | b.b)) / 65535.0;\n"
 "  return float4(y, y, y, 1);\n"
 "}\n"
-/* The same view of a Z24S8 depth buffer (MM3's fog reads its depth this way).
+/* The same view of a Z24S8 depth buffer (fog passes read depth this way).
  * Guest memory holds z[7:0]:stencil in texel 2x and z[23:8] in 2x+1; a
  * pixel-centred guest tap lands on 2x+1 exactly, which host-resolution
  * rounding splits between the two (moire in the fog). Both texels hold
@@ -2297,7 +2242,7 @@ static D3D11_BLEND_OP blend_op(uint32_t e)
 {
     switch (e) {
     /* F005/F006 are the signed (reverse-subtract / add) equations; the
-     * signed range isn't emulated, and their nominal ops wash out MM3's
+     * signed range isn't emulated, and their nominal ops wash out a title's
      * daytime scenes, so they keep the mapping that matches its output. */
     case 0x800A: case 0xF005: return D3D11_BLEND_OP_SUBTRACT;
     case 0x800B: case 0xF006: return D3D11_BLEND_OP_REV_SUBTRACT;
@@ -2545,6 +2490,9 @@ static uint32_t write_mask(const NvD3DState *st, Surface *s)
 static int s_draw_textured, s_draw_reads_wide;
 static uint32_t s_draw_tex_addr;
 static int s_draw_bspline;              /* stage 0 B-spline (see bspline0) */
+/* Stage 0 is sampled with a cubic B-spline in draws blended with this pair
+ * and drawn without depth test (nv2a_d3d_set_bspline_blend); 0: never. */
+static uint32_t s_bspline_sf, s_bspline_df;
 
 /* A guest pass that reduces a render target (glare, luminance
  * or reflection downsamples) takes texel-exact taps: at the guest's
@@ -2761,7 +2709,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         Depth *zt;
         if (t->color != 0x35 || t->cube || !t->addr) continue;
         /* A depth buffer wins over a colour surface at the same address:
-         * MM3 binds one there for colour-masked stencil passes. */
+         * titles bind one there for colour-masked stencil passes. */
         if ((zt = depth_find(phys(t->addr))) != NULL) { depth_y16(zt); continue; }
         rt = surface_find(phys(t->addr));
         if (rt && rt->bpp == 4) { surface_sync(rt, 0); surface_y16(rt); }
@@ -2839,13 +2787,12 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         if (!view) continue;
         if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
         smp[n] = sampler(t, levels, reduce);
-        /* MM3's horizon panorama: a 256x256 strip around the whole horizon,
-         * drawn without depth test through destination alpha (where the
-         * haze pass left sky). Magnified ten times and more, bilinear shows
-         * its DXT texels as blocks and its skyline alpha as steps; a cubic
+        /* A texture the title magnifies far past its resolution (the game
+         * names it by its blending, nv2a_d3d_set_bspline_blend): bilinear
+         * shows DXT texels as blocks and alpha edges as steps; a cubic
          * B-spline reconstructs it smoothly. */
-        if (n == 0 && levels > 4 && !st->depth_test && st->blend_enable &&
-            st->blend_sfactor == 0x304 && st->blend_dfactor == 0x305)
+        if (n == 0 && levels > 4 && s_bspline_sf && !st->depth_test && st->blend_enable &&
+            st->blend_sfactor == s_bspline_sf && st->blend_dfactor == s_bspline_df)
             s_draw_bspline = 1;
         pc.tex_info[n][0] = (t->control0 >> 2) & 1;
         pc.tex_info[n][1] = t->filter >> 28;
@@ -2885,7 +2832,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     pc.stage_prog = st->rc_seen ? st->rc.stage_program : (st->tex_used & 1);
     pc.alpha_func = st->alpha_func;
     pc.alpha_ref = st->alpha_ref;
-    pc.ps_flags = (st->rc_seen ? 1u : 0u) | (st->alpha_test ? 2u : 0u) | (s_draw_bspline ? 4u : 0u);    pc.clip_plane = st->clip_plane_mode;
+    pc.ps_flags = (st->rc_seen ? 1u : 0u) | (st->alpha_test ? 2u : 0u) | (s_draw_bspline ? 4u | ((uint32_t)(getenv("TMP_PANO_MIP") ? atoi(getenv("TMP_PANO_MIP")) : 0) << 8) : 0u);    pc.clip_plane = st->clip_plane_mode;
     pc.other_input = st->other_stage_input;
     pc.dot_map = st->dot_rgb_mapping;
     /* SET_FOG_COLOR keeps red in the low byte. */
@@ -2928,6 +2875,13 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     }
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &s_cb_ps);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srv);
+    {   /* The horizon panorama reads the frame drawn so far (see bspline0). */
+        ID3D11ShaderResourceView *fb = NULL;
+        if (s_draw_bspline && s) {
+            if (s->ms) { surface_resolve(s); fb = s->srv; } else fb = feedback_copy(s);
+        }
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 8, 1, &fb);
+    }
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
     ID3D11DeviceContext_RSSetState(s_ctx, rs_state(cull == 3 ? 0 : cull,
                                                    st->front_face == 0x901, bias, slope));
@@ -2992,105 +2946,6 @@ static uint8_t *ring_map(ID3D11Buffer *b, UINT *pos, UINT cap, UINT bytes,
     return (uint8_t *)m->pData + *pos;
 }
 
-/* The race HUD batches sprites from one texture atlas into a single draw
- * (elements can lie on opposite sides of the screen), so edge placement is decided per cluster: connected primitives form
- * a piece, pieces on the same line less than HUD_GAP apart join a cluster
- * (the glyphs of a centred message stay together), and each cluster moves by
- * its own half of the 4:3 layout. pos holds the screen positions by vertex
- * (index - sub); fills dx with each vertex's x shift in guest pixels and
- * returns 0 when nothing moves, leaving only the shader's 4:3 squeeze. */
-#define HUD_GAP 24.0f
-static int hud_split(const float (*pos)[4], uint32_t nv, const uint32_t *idx, uint32_t sub,
-                     uint32_t ni, int topology, float gw, float narrow, int follow, float *dx)
-{
-    static uint32_t *root, *piece, cap;
-    static float (*box)[4];             /* per piece: x0 x1 y0 y1 */
-    uint32_t i, k, np = 0, per = topology == NV_D3D_TRIANGLES ? 3 : topology == NV_D3D_LINES ? 2 : 1;
-    float delta = (1.0f - narrow) * gw / (2.0f * narrow), half = gw * 0.5f;
-    int moved = 0;
-    if (nv > cap) {
-        uint32_t *r = realloc(root, (size_t)nv * sizeof *r);
-        uint32_t *pc = r ? realloc(piece, (size_t)nv * sizeof *pc) : NULL;
-        float (*b)[4] = pc ? realloc(box, (size_t)nv * sizeof *b) : NULL;
-        if (r) root = r;
-        if (pc) piece = pc;
-        if (!b) return 0;
-        box = b;
-        cap = nv;
-    }
-#define FIND(x) do { while (root[x] != x) x = root[x] = root[root[x]]; } while (0)
-    /* pieces: vertices joined by primitives */
-    for (i = 0; i < nv; i++) root[i] = i;
-    for (i = 0; i + per <= ni; i += per)
-        for (k = 1; k < per; k++) {
-            uint32_t a = idx[i] - sub, b = idx[i + k] - sub;
-            if (a >= nv || b >= nv) return 0;
-            FIND(a); FIND(b);
-            if (a != b) root[b] = a;
-        }
-    for (i = 0; i < nv; i++) {
-        uint32_t r = i;
-        FIND(r);
-        if (r == i) {
-            piece[i] = np;
-            box[np][0] = box[np][2] = 1e30f;
-            box[np][1] = box[np][3] = -1e30f;
-            np++;
-        }
-    }
-    for (i = 0; i < nv; i++) {
-        uint32_t r = i, n;
-        FIND(r);
-        n = piece[r];
-        piece[i] = n;
-        if (pos[i][0] < box[n][0]) box[n][0] = pos[i][0];
-        if (pos[i][0] > box[n][1]) box[n][1] = pos[i][0];
-        if (pos[i][1] < box[n][2]) box[n][2] = pos[i][1];
-        if (pos[i][1] > box[n][3]) box[n][3] = pos[i][1];
-    }
-    /* clusters: pieces on one line within HUD_GAP (root[] reused per piece);
-     * ponytail: O(pieces^2), fine for HUD batches of a few hundred glyphs */
-    for (i = 0; i < np; i++) root[i] = i;
-    for (i = 0; i < np; i++)
-        for (k = i + 1; k < np; k++) {
-            uint32_t a = i, b = k;
-            /* a full-screen quad overlaps every piece: it stays its own */
-            if ((box[i][0] <= 0.5f && box[i][1] >= gw - 0.5f) ||
-                (box[k][0] <= 0.5f && box[k][1] >= gw - 0.5f))
-                continue;
-            if (box[i][2] > box[k][3] || box[k][2] > box[i][3] ||
-                box[i][0] > box[k][1] + HUD_GAP || box[k][0] > box[i][1] + HUD_GAP)
-                continue;
-            FIND(a); FIND(b);
-            if (a == b) continue;
-            root[b] = a;
-            if (box[b][0] < box[a][0]) box[a][0] = box[b][0];
-            if (box[b][1] > box[a][1]) box[a][1] = box[b][1];
-            if (box[b][2] < box[a][2]) box[a][2] = box[b][2];
-            if (box[b][3] > box[a][3]) box[a][3] = box[b][3];
-        }
-    for (i = 0; i < nv; i++) {
-        uint32_t c = piece[i];
-        FIND(c);
-        dx[i] = 0.0f;
-        if (follow) {
-            /* keep the cluster's centre where the title projected it on
-             * the full width; the shader squeezes it to 4:3 about there */
-            dx[i] = ((box[c][0] + box[c][1]) * 0.5f - half) * (1.0f / narrow - 1.0f);
-            moved = 1;
-        } else if (box[c][0] <= 0.5f && box[c][1] >= gw - 0.5f) {
-            /* a full-screen quad in the batch (the fade MM3 draws over
-             * a car reset, in the same call as the needle and damage bar):
-             * undo the 4:3 squeeze so it still covers the whole width */
-            dx[i] = (pos[i][0] - half) * (1.0f / narrow - 1.0f);
-            moved = 1;
-        } else if (box[c][1] <= half) { dx[i] = -delta; moved = 1; }
-        else if (box[c][0] >= half) { dx[i] = delta; moved = 1; }
-    }
-#undef FIND
-    return moved;
-}
-
 /* ---------------------------------------------- vertex processing on the GPU
  *
  * Every draw runs ub_vs: it pulls the title's raw vertex arrays from a byte
@@ -3122,6 +2977,73 @@ int nv2a_d3d_widescreen(void)
     return widen() > 1.001f;
 }
 
+/* Menu pointing (RECOMP_MENU_KEYS): each frame's textured screen-space quads,
+ * in guest pixels, with the colour their vertices leave the vertex stage
+ * with, and where the last frame landed in the window. What is a button and
+ * which one has the focus is the title's business (nv2a_d3d_menu_rects). */
+typedef NvMenuRect MenuRect;
+#define MENU_RECTS 1024
+static MenuRect s_mr_frame[MENU_RECTS], s_mr_shown[MENU_RECTS];
+static int s_mr_frame_n, s_mr_shown_n;
+static float s_present_rect[4];                  /* x0, y0, w, h as client fractions */
+static SRWLOCK s_mr_lock = SRWLOCK_INIT;
+static volatile LONG s_mr_on;
+static const uint32_t *s_mr_tints;               /* the current draw's, see header */
+
+void nv2a_d3d_collect_menu_rects(int on)
+{
+    InterlockedExchange(&s_mr_on, on != 0);
+}
+
+int nv2a_d3d_menu_rects_on(void)
+{
+    return InterlockedCompareExchange(&s_mr_on, 0, 0) != 0;
+}
+
+void nv2a_d3d_set_menu_tints(const uint32_t *tints)
+{
+    s_mr_tints = tints;
+}
+
+int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4])
+{
+    int n;
+    AcquireSRWLockShared(&s_mr_lock);
+    n = s_mr_shown_n < max ? s_mr_shown_n : max;
+    memcpy(out, s_mr_shown, (size_t)n * sizeof *out);
+    memcpy(present, s_present_rect, sizeof s_present_rect);
+    ReleaseSRWLockShared(&s_mr_lock);
+    return n;
+}
+
+void nv2a_d3d_set_bspline_blend(uint32_t sfactor, uint32_t dfactor)
+{
+    s_bspline_sf = sfactor;
+    s_bspline_df = dfactor;
+}
+
+/* One rect per triangle: either half of an axis-aligned quad spans the
+ * whole quad, so batched quads come apart without knowing how they pair. */
+static void note_menu_rects(const float (*pos)[4], const uint32_t *idx, uint32_t ni, uint32_t lo)
+{
+    uint32_t group = ni % 3 == 0 ? 3 : ni, k, j;
+    for (k = 0; k + group <= ni && s_mr_frame_n < MENU_RECTS; k += group) {
+        MenuRect r = { 1e30f, 1e30f, -1e30f, -1e30f, s_draw_tex_addr,
+                       s_mr_tints ? s_mr_tints[idx[k] - lo] : 0xFFFFFFFFu };
+        for (j = k; j < k + group; j++) {
+            const float *v = pos[idx[j] - lo];
+            if (v[3] != 1.0f) return;
+            if (v[0] < r.x0) r.x0 = v[0];
+            if (v[0] > r.x1) r.x1 = v[0];
+            if (v[1] < r.y0) r.y0 = v[1];
+            if (v[1] > r.y1) r.y1 = v[1];
+        }
+        if (s_mr_frame_n && !memcmp(&s_mr_frame[s_mr_frame_n - 1], &r, sizeof r))
+            continue;                            /* the quad's other half */
+        s_mr_frame[s_mr_frame_n++] = r;
+    }
+}
+
 void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr[16],
                       const float def[16][4], int program, const uint32_t *idx, uint32_t ni,
                       uint32_t lo, uint32_t hi, const float (*pos)[4])
@@ -3141,6 +3063,9 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
     int64_t t_draw;
 
     if (!nv2a_d3d_init() || !ni || hi < lo || ib_bytes > IB_BYTES)
+        return;
+    if (getenv("TMP_NOPANO") && !st->depth_test && st->blend_enable && st->blend_sfactor == 0x304 &&
+        st->blend_dfactor == 0x305 && st->tex[0].width == 256 && st->tex[0].height == 256) /* TMPPANO */
         return;
     memset(&uc, 0, sizeof uc);
     memcpy(uc.def, def, sizeof uc.def);
@@ -3179,9 +3104,11 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
         RECOMP_PROFILE_END();
         return;
     }
-    if (pos && s && s->sx > s->sy * 1.001f) {
-        /* Menu artwork and controls span the display together. Only the
-         * race HUD retains its proportions and edge placement. */
+    if (pos && s_draw_textured && nv2a_d3d_menu_rects_on())
+        note_menu_rects(pos, idx, ni, lo);
+    if (pos && s && s->sx > s->sy * 1.001f && s_overlay.place) {
+        /* Screen-space 2D on a widened target spans the display unless the
+         * title's overlay hooks place it otherwise. */
         float xlo = 1e30f, xhi = -1e30f, ylo = 1e30f, yhi = -1e30f;
         uint32_t k;
         int flat = 1;
@@ -3194,37 +3121,17 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
             if (v[1] > yhi) yhi = v[1];
         }
         if (flat) {
-            float narrow = s->sy / s->sx;
-            int wide_x = xlo <= 0.5f && xhi >= (float)gw - 0.5f;
-            int tall = ylo <= 0.5f && yhi >= (float)gh - 0.5f;
+            NvOverlayDraw d;
             if (count > dx_cap) {
-                float *d = realloc(dx, (size_t)count * sizeof *d);
-                if (d) { dx = d; dx_cap = count; }
+                float *nd = realloc(dx, (size_t)count * sizeof *nd);
+                if (nd) { dx = nd; dx_cap = count; }
             }
-            /* Remember the background only to exclude menus/loading screens
-             * reached during a race from HUD placement. Do not zoom its art. */
-            if (tall && wide_x && s_draw_textured && !s_draw_reads_wide && !s_frame_bg_tex &&
-                !hud_texture(s_draw_tex_addr))
-                s_frame_bg_tex = s_draw_tex_addr;
-            if (s_hud_start[2] && fabsf(xlo - s_hud_start[0]) < 2.0f && fabsf(ylo - s_hud_start[1]) < 2.0f &&
-                fabsf(xhi - s_hud_start[2]) < 2.0f && fabsf(yhi - s_hud_start[3]) < 2.0f)
-                s_hud_seen = 1;
-            if (nv2a_d3d_hud_active() && !(wide_x && (!s_draw_textured || s_draw_reads_wide))) {
-                squeeze = narrow;
-                if (!s_hud_prev && !s_hud_seen) {
-                    /* a menu over the race: centred 4:3, kept whole */
-                } else if (world_tag_draw(xlo, xhi, ylo, yhi, s_draw_tex_addr)) {
-                    /* a name tag over a car: the title projected it
-                     * through the widened camera, keep that position */
-                    use_dx = count <= dx_cap &&
-                             hud_split(pos, count, idx, lo, ni, topology, (float)gw, narrow, 1, dx);
-                } else if (nv2a_d3d_hud_active()) {
-                    if (xhi <= (float)gw * 0.5f) shift = narrow - 1.0f;
-                    else if (xlo >= (float)gw * 0.5f) shift = 1.0f - narrow;
-                    else use_dx = count <= dx_cap &&
-                                  hud_split(pos, count, idx, lo, ni, topology, (float)gw, narrow, 0, dx);
-                }
-            }
+            d.pos = pos; d.idx = idx; d.ni = ni; d.lo = lo; d.count = count;
+            d.per = topology == NV_D3D_TRIANGLES ? 3 : topology == NV_D3D_LINES ? 2 : 1;
+            d.gw = (float)gw; d.gh = (float)gh; d.narrow = s->sy / s->sx;
+            d.x0 = xlo; d.y0 = ylo; d.x1 = xhi; d.y1 = yhi;
+            d.tex = s_draw_tex_addr; d.textured = s_draw_textured; d.reads_wide = s_draw_reads_wide;
+            use_dx = s_overlay.place(&d, count <= dx_cap ? dx : NULL, &squeeze, &shift);
         }
     }
 
@@ -3287,7 +3194,7 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
     uc.place[1] = yscale;
     /* Display-sized targets keep the title's edge: moving it moves the
      * texture coordinates with it, and a texel-exact full-screen read of
-     * the frame (MM3's glare composite) slid half a guest pixel right --
+     * the frame (a glare composite) slid half a guest pixel right --
      * a white rim on the right of every building against a bright sky. */
     uc.place[2] = s && s->w == GUEST_W && s->h == GUEST_H ? 0.0f : 1.0f;
     /* Display-sized targets instead take the D3D screen-space offset
@@ -3831,6 +3738,12 @@ static void composite(ID3D11RenderTargetView *rtv, UINT w, UINT h, Surface *s,
         x0 = ((float)w - target_w) * 0.5f;
         y0 = ((float)h - target_h) * 0.5f;
     }
+    if (letterbox) {
+        AcquireSRWLockExclusive(&s_mr_lock);
+        s_present_rect[0] = x0 / w; s_present_rect[1] = y0 / h;
+        s_present_rect[2] = target_w / w; s_present_rect[3] = target_h / h;
+        ReleaseSRWLockExclusive(&s_mr_lock);
+    }
     pc->dst_rect[0] = x0 / w * 2 - 1;
     pc->dst_rect[1] = 1 - y0 / h * 2;
     pc->dst_rect[2] = (x0 + target_w) / w * 2 - 1;
@@ -4024,8 +3937,8 @@ static void pace_vblank(void)
  * the monitor's native resolution and shape). A resize applies once it has
  * settled for RESIZE_SETTLE_MS, by dropping every host surface; they are
  * rebuilt at the new size from guest memory, which the flip just updated.
- * The race camera's projection is built once per race, so an aspect change
- * waits until no race camera is active rather than stretch the race view. */
+ * A title whose projection is built once per scene can ask that an aspect
+ * change wait (NvOverlayHooks.hold_aspect) rather than stretch the view. */
 #define RESIZE_SETTLE_MS 300
 static void display_config(int now)
 {
@@ -4045,7 +3958,7 @@ static void display_config(int now)
     }
     if (!aspect) aspect = clamp_aspect((float)w / (float)h);
     deferred = !now && s_aspect && fabsf(aspect - s_aspect) > 1e-4f &&
-               InterlockedCompareExchange(&s_edge_hud, 0, 0);
+               s_overlay.hold_aspect && s_overlay.hold_aspect();
     if (deferred) aspect = s_aspect;             /* retried every flip */
     if (e && atof(e) >= 0.5 && atof(e) <= 8.0) {
         scale = (float)atof(e);
@@ -4101,11 +4014,15 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
     Surface *s;
     if (!nv2a_d3d_init())
         return;
-    s_frame_bg_tex = 0;
+    if (s_overlay.frame) s_overlay.frame();
+    if (s_mr_frame_n || s_mr_shown_n) {
+        AcquireSRWLockExclusive(&s_mr_lock);
+        memcpy(s_mr_shown, s_mr_frame, (size_t)s_mr_frame_n * sizeof *s_mr_frame);
+        s_mr_shown_n = s_mr_frame_n;
+        ReleaseSRWLockExclusive(&s_mr_lock);
+        s_mr_frame_n = 0;
+    }
     s_depth_hazed = 0;
-    s_frame_tag_window = 1;
-    s_hud_prev = s_hud_seen;
-    s_hud_seen = 0;
     s = surface_find(phys(surface_addr));
     if (!s && pitch)
         s = scan_surface(surface_addr, pitch);
@@ -4178,11 +4095,16 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int t, const NvD3DAttrib a[16], cons
                       const float (*pos)[4])
 { (void)st; (void)t; (void)a; (void)d; (void)pr; (void)i; (void)n; (void)lo; (void)hi; (void)pos; }
 int nv2a_d3d_widescreen(void) { return 0; }
+void nv2a_d3d_collect_menu_rects(int on) { (void)on; }
+int nv2a_d3d_menu_rects_on(void) { return 0; }
+void nv2a_d3d_set_menu_tints(const uint32_t *tints) { (void)tints; }
+int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4])
+{ (void)out; (void)max; present[0] = present[1] = present[2] = present[3] = 0; return 0; }
+void nv2a_d3d_set_bspline_blend(uint32_t sfactor, uint32_t dfactor) { (void)sfactor; (void)dfactor; }
+void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks) { (void)hooks; }
 void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
-void nv2a_d3d_set_edge_hud(int on) { (void)on; }
 void nv2a_d3d_set_depth_view_remap(float scale, float knee) { (void)scale; (void)knee; }
-void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1) { (void)x0; (void)y0; (void)x1; (void)y1; }
 #endif

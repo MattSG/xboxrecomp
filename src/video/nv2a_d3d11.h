@@ -86,6 +86,23 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology,
                       const float (*pos)[4]);
 /* Whether display-sized surfaces are widened (pos is worth computing). */
 int nv2a_d3d_widescreen(void);
+/* Menu pointing: while on, each frame's textured screen-space quads are
+ * recorded (pos is then worth computing too). */
+typedef struct {
+    float x0, y0, x1, y1;   /* guest pixels */
+    uint32_t tex;           /* stage 0 texture address */
+    uint32_t argb;          /* first vertex's colour out of the vertex stage */
+} NvMenuRect;
+void nv2a_d3d_collect_menu_rects(int on);
+int nv2a_d3d_menu_rects_on(void);
+/* The last shown frame's quads (up to max), and where it landed in the
+ * window: x0, y0, w, h as fractions of the client area. */
+int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4]);
+/* Sample stage 0 with a cubic B-spline in depth-test-off draws blended with
+ * this source/destination factor pair (a title's magnified sky); 0, 0: off. */
+void nv2a_d3d_set_bspline_blend(uint32_t sfactor, uint32_t dfactor);
+/* Each vertex's final colour (by index - lo) for the next draw, or NULL. */
+void nv2a_d3d_set_menu_tints(const uint32_t *tints);
 
 /* Create the device (no window needed). 0 if D3D11 is unavailable. */
 int  nv2a_d3d_init(void);
@@ -93,10 +110,28 @@ int  nv2a_d3d_active(void);
 
 /* Width / height the image is presented at (widescreen). */
 float nv2a_d3d_display_aspect(void);
-/* The title turns this on when its in-game HUD's screen begins and off when
- * it leaves; while on (and the frame draws no full-screen background) the
- * HUD is placed at the screen edges instead of the centred 4:3 area. */
-void nv2a_d3d_set_edge_hud(int on);
+/* Screen-space (w = 1) 2D on a widened target spans the display. A title's
+ * hooks can place it otherwise: place() may set *squeeze (the target's 4:3
+ * width fraction keeps 4:3 proportions about the centre), *shift (moves it
+ * that far, in squeezed widths, toward an edge), or fill dx (guest pixels
+ * per vertex, indexed by vertex - lo; NULL when unavailable) and return 1. */
+typedef struct {
+    const float (*pos)[4];  /* screen position by vertex - lo */
+    const uint32_t *idx;
+    uint32_t ni, lo, count; /* indices; vertices lo .. lo + count - 1 */
+    uint32_t per;           /* indices per primitive: 3, 2 or 1 */
+    float gw, gh;           /* target size in guest pixels */
+    float narrow;           /* 4:3 width over the target's width */
+    float x0, y0, x1, y1;   /* the draw's bounds */
+    uint32_t tex;           /* stage 0 texture address */
+    int textured, reads_wide;   /* samples a texture; samples a widened target */
+} NvOverlayDraw;
+typedef struct {
+    void (*frame)(void);    /* at each flip, before the next frame's draws */
+    int (*place)(const NvOverlayDraw *d, float *dx, float *squeeze, float *shift);
+    int (*hold_aspect)(void);   /* nonzero: defer an aspect change */
+} NvOverlayHooks;
+void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks);
 /* A title that multiplies its far plane by `scale` (w-buffered, so depth is
  * w / far) still indexes its authored depth lookups (fog ramps) with the
  * original fractions. Depth read back as a texture is reported in those:
@@ -104,9 +139,6 @@ void nv2a_d3d_set_edge_hud(int on);
  * stretched so the rest of the authored ramp ends at the new far plane.
  * scale 1 (the default) leaves depth untouched. */
 void nv2a_d3d_set_depth_view_remap(float scale, float knee);
-/* The race HUD's first element, as its 4:3 screen rectangle; 2D drawn ahead
- * of it in a race frame is world-anchored (name tags over cars). */
-void nv2a_d3d_set_hud_start(float x0, float y0, float x1, float y1);
 
 /* NV097_CLEAR_SURFACE: flags as the method's parameter, rect inclusive. */
 void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,

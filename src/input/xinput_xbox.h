@@ -94,6 +94,13 @@ void xbox_InputInit(void);
  */
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
+/* RECOMP_MENU_KEYS applies only while in_menu() returns nonzero (Windows). */
+void xbox_InputSetMenuProbe(int (*in_menu)(void));
+/* Menu pointing: pointer(x, y) for a client-area fraction returns 0 off any
+ * item, 1 on one (*offset rows below the focused item, negative above), -1
+ * on one whose focus cannot be told yet. Without it, clicks are just A/B. */
+void xbox_InputSetMenuPointer(int (*pointer)(float x, float y, int *offset));
+
 /**
  * Set controller vibration.
  */
