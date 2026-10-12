@@ -288,7 +288,7 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  * wait for g_dispatch_lock. DirectSound raises to DISPATCH_LEVEL to stop a
  * voice and spins there until the APU's interrupt reports it stopped; the
  * interrupt, waiting for the lock that spinning thread held, ran only after
- * DirectSound's 0.5 s timeout -- MM3 froze for half a second now and then.
+ * DirectSound's 0.5 s timeout -- a title froze for half a second now and then.
  * A DPC is what must not overlap a raised thread (the USB double completion
  * above), so a DPC run from such an interrupt takes the lock for its run.
  * Return values carry these two cases in bits 8 and 9 for the leave. */

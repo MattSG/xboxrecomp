@@ -59,8 +59,249 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 
-/* The keyboard on port 0 (RECOMP_KEYBOARD=1) comes from keyboard.c, shared
- * with the SDL backend; the GDI window in fb_present.c records the keys. */
+/* ---- keyboard, when there is no pad --------------------------------------
+ *
+ * A title that waits on PRESS START is unreachable on a machine with no
+ * controller plugged in, which is most machines someone brings this up on.
+ * The whole point of a recompilation is to be able to look at the thing
+ * running, and a build nobody can press a button in cannot be looked at.
+ *
+ * Off by default, because a keyboard silently acting as player 1 is
+ * surprising when a real pad is what you meant to use. RECOMP_KEYBOARD=1
+ * turns it on. It only ever answers for port 0, and is merged on top of a
+ * pad connected there, so a real controller keeps working.
+ *
+ * The keys are the ones a Dreamcast or Saturn emulator would pick, which is
+ * the closest thing to a convention here:
+ *
+ *   arrows        d-pad             Enter      START
+ *   Z X A S       A B X Y           Backspace  BACK
+ *   Q E           white black       1 3        triggers
+ *   numpad 8/2/4/6 left thumb       I/K/J/L    right thumb
+ *
+ * Keys come from the framebuffer window, which only receives them while it
+ * has the focus, so typing in another window does not drive the game.
+ */
+static BOOL keyboard_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_KEYBOARD");
+        on = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return on ? TRUE : FALSE;
+}
+
+/* The framebuffer window records what is held; see src/video/fb_present.c.
+ *
+ * GetAsyncKeyState was the first attempt and reads nothing here -- under
+ * Wine it answers about a state a GDI-drawing guest never touches. Going
+ * through the window is also the better gate: a window only receives keys
+ * while it has the focus, so there is no separate focus check to get wrong
+ * and no way for typing in another application to drive the game.
+ *
+ * Declared rather than included so src/input does not depend on the video
+ * module's include path. */
+extern int xbox_FramebufferKeyDown(int vk);
+
+static BOOL key_down(int vk)
+{
+    return xbox_FramebufferKeyDown(vk) ? TRUE : FALSE;
+}
+
+/* The bindable inputs, in RECOMP_KEYMAP's names, with the default keys
+ * above. RECOMP_KEYMAP=NAME:VK,... (VK in hex) rebinds any of them; mouse
+ * buttons are virtual keys too (1 left, 2 right, 4 middle, 5/6 side). */
+enum { K_A, K_B, K_X, K_Y, K_WHITE, K_BLACK, K_LT, K_RT, K_START, K_BACK,
+       K_UP, K_DOWN, K_LEFT, K_RIGHT, K_LS, K_RS,
+       K_LX_NEG, K_LX_POS, K_LY_NEG, K_LY_POS, K_RX_NEG, K_RX_POS, K_RY_NEG, K_RY_POS,
+       K_COUNT };
+static const char *const s_key_names[K_COUNT] = {
+    "A", "B", "X", "Y", "WHITE", "BLACK", "LT", "RT", "START", "BACK",
+    "UP", "DOWN", "LEFT", "RIGHT", "LS", "RS",
+    "LX-", "LX+", "LY-", "LY+", "RX-", "RX+", "RY-", "RY+" };
+static int s_keys[K_COUNT] = {
+    'Z', 'X', 'A', 'S', 'Q', 'E', '1', '3', VK_RETURN, VK_BACK,
+    VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_SHIFT, VK_CONTROL,
+    VK_NUMPAD4, VK_NUMPAD6, VK_NUMPAD2, VK_NUMPAD8, 'J', 'L', 'K', 'I' };
+
+static void load_keymap(void)
+{
+    static int loaded;
+    const char *p = getenv("RECOMP_KEYMAP");
+    if (loaded || !p)
+        return;
+    loaded = 1;
+    while (*p) {
+        size_t len = strcspn(p, ":");
+        int i;
+        if (!p[len])
+            break;
+        for (i = 0; i < K_COUNT; i++)
+            if (strlen(s_key_names[i]) == len && !strncmp(p, s_key_names[i], len))
+                s_keys[i] = (int)strtoul(p + len + 1, NULL, 16) & 0xFF;
+        p += strcspn(p, ",");
+        if (*p)
+            p++;
+    }
+}
+
+/* RECOMP_MENU_KEYS=1: while the title reports a menu (xbox_InputSetMenuProbe;
+ * with no probe, always) the arrows, W/A/S/D and the left-stick keys move
+ * the D-pad, Space or a left click is A and Esc or a right click is B. Those
+ * keys leave their own bindings alone meanwhile, so A in a menu is left, not X. */
+static int (*s_in_menu)(void);
+static BOOL s_menu;
+
+void xbox_InputSetMenuProbe(int (*in_menu)(void))
+{
+    s_in_menu = in_menu;
+}
+
+static const struct { int arrow, letter, stick; WORD bit; } s_menu_dirs[4] = {
+    { VK_UP, 'W', K_LY_POS, XBOX_GAMEPAD_DPAD_UP },
+    { VK_DOWN, 'S', K_LY_NEG, XBOX_GAMEPAD_DPAD_DOWN },
+    { VK_LEFT, 'A', K_LX_NEG, XBOX_GAMEPAD_DPAD_LEFT },
+    { VK_RIGHT, 'D', K_LX_POS, XBOX_GAMEPAD_DPAD_RIGHT } };
+
+static BOOL menu_key(int vk)
+{
+    int i;
+    for (i = 0; i < 4; i++)
+        if (vk == s_menu_dirs[i].arrow || vk == s_menu_dirs[i].letter || vk == s_keys[s_menu_dirs[i].stick])
+            return TRUE;
+    return vk == VK_SPACE || vk == VK_LBUTTON || vk == VK_ESCAPE || vk == VK_RBUTTON;
+}
+
+static BOOL menu_keys_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_MENU_KEYS");
+        on = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return on ? TRUE : FALSE;
+}
+
+/* Pointing at a menu item moves the focus there: D-pad pulses, a row at a
+ * time, until the title's pointer function (xbox_InputSetMenuPointer) sees
+ * the focus under the pointer. Only after the pointer moves, so it never
+ * fights the keys. A left click is held back until the focus has arrived,
+ * then sent as A; *click says when. */
+extern int xbox_FramebufferMouse(float *x, float *y);
+extern void nv2a_d3d_collect_menu_rects(int on);
+static int (*s_menu_pointer)(float x, float y, int *offset);
+
+void xbox_InputSetMenuPointer(int (*pointer)(float x, float y, int *offset))
+{
+    s_menu_pointer = pointer;
+}
+
+static WORD menu_hover(BOOL nav_keys, BOOL *click)
+{
+    static int seen_moves, active, was_down, pulsed_rows;
+    static ULONGLONG pulse_until, pulsed_at, click_at, a_until;
+    static WORD bit;
+    ULONGLONG now = GetTickCount64();
+    float x, y;
+    int moves = xbox_FramebufferMouse(&x, &y), rows = 0, on = 0, down = key_down(VK_LBUTTON);
+    if (moves != seen_moves) { seen_moves = moves; active = 1; }
+    if (nav_keys) active = 0;
+    if (active) {
+        /* Trust a reading only once three polls agree: the highlight
+         * animates, and a frame caught mid-way can point anywhere. */
+        static int last_on, last_rows, same;
+        on = s_menu_pointer ? s_menu_pointer(x, y, &rows) : 0;
+        same = on == last_on && rows == last_rows ? same + 1 : 0;
+        last_on = on; last_rows = rows;
+        if (same < 2 && on > 0) on = -1;
+    }
+    /* One row per pulse, the next only once the highlight is seen to have
+     * moved (titles fade it over a few hundred ms), or after 700 ms. */
+    if (on > 0 && rows && (rows != pulsed_rows || now - pulsed_at > 700) && now >= pulse_until + 30) {
+        bit = rows > 0 ? XBOX_GAMEPAD_DPAD_DOWN : XBOX_GAMEPAD_DPAD_UP;
+        pulse_until = now + 50;     /* a few title polls held, then let go */
+        pulsed_at = now;
+        pulsed_rows = rows;
+    }
+    if (down && !was_down) click_at = now;
+    was_down = down;
+    /* Off an item the click goes straight through; on one it waits for the
+     * focus, or 800 ms where the highlight cannot be found. */
+    if (click_at && (on == 0 || (on > 0 && !rows) || now - click_at > 800)) {
+        click_at = 0;
+        a_until = now + 80;
+    }
+    *click = now < a_until;
+    return now < pulse_until ? bit : 0;
+}
+
+static BOOL bound_down(int k)
+{
+    return s_keys[k] && key_down(s_keys[k]) && !(s_menu && menu_key(s_keys[k]));
+}
+
+/* A thumb axis from two keys, at the full deflection a digital key implies. */
+static SHORT axis_from_keys(int negative, int positive)
+{
+    int v = 0;
+    if (bound_down(negative)) v -= 32767;
+    if (bound_down(positive)) v += 32767;
+    return (SHORT)v;
+}
+
+static void keyboard_state(XBOX_INPUT_STATE *pState)
+{
+    static DWORD packet;
+    static const int analog[8] = { K_A, K_B, K_X, K_Y, K_BLACK, K_WHITE, K_LT, K_RT };
+    WORD b = 0, nav = 0;
+    BOOL hover_click = FALSE;
+    int i;
+
+    load_keymap();
+    memset(pState, 0, sizeof(*pState));
+    s_menu = menu_keys_enabled() && (!s_in_menu || s_in_menu());
+    if (menu_keys_enabled() && s_menu_pointer)
+        nv2a_d3d_collect_menu_rects(s_menu);
+
+    if (bound_down(K_UP))    b |= XBOX_GAMEPAD_DPAD_UP;
+    if (bound_down(K_DOWN))  b |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (bound_down(K_LEFT))  b |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (bound_down(K_RIGHT)) b |= XBOX_GAMEPAD_DPAD_RIGHT;
+    if (bound_down(K_START)) b |= XBOX_GAMEPAD_START;
+    if (bound_down(K_BACK))  b |= XBOX_GAMEPAD_BACK;
+    if (bound_down(K_LS))    b |= XBOX_GAMEPAD_LEFT_THUMB;
+    if (bound_down(K_RS))    b |= XBOX_GAMEPAD_RIGHT_THUMB;
+    if (s_menu) {
+        for (i = 0; i < 4; i++)
+            if (key_down(s_menu_dirs[i].arrow) || key_down(s_menu_dirs[i].letter) ||
+                (s_keys[s_menu_dirs[i].stick] && key_down(s_keys[s_menu_dirs[i].stick])))
+                nav |= s_menu_dirs[i].bit;
+        b |= nav | menu_hover(nav != 0, &hover_click);
+    }
+    pState->Gamepad.wButtons = b;
+
+    /* Analog on the console, so a key is 255 rather than a flag -- a title
+     * that reads these as a pressure never sees a press if they are 1.
+     * Indexed by XBOX_BUTTON_A..RTRIGGER. */
+    for (i = 0; i < 8; i++)
+        pState->Gamepad.bAnalogButtons[i] = bound_down(analog[i]) ? 255 : 0;
+    if (s_menu && (key_down(VK_SPACE) || hover_click))
+        pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+    if (s_menu && (key_down(VK_ESCAPE) || key_down(VK_RBUTTON)))
+        pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
+
+    /* W/A/S/D would collide with the face buttons above, so the left thumb
+     * shares the arrow keys' row on the numeric pad instead. */
+    pState->Gamepad.sThumbLX = axis_from_keys(K_LX_NEG, K_LX_POS);
+    pState->Gamepad.sThumbLY = axis_from_keys(K_LY_NEG, K_LY_POS);
+    pState->Gamepad.sThumbRX = axis_from_keys(K_RX_NEG, K_RX_POS);
+    pState->Gamepad.sThumbRY = axis_from_keys(K_RY_NEG, K_RY_POS);
+
+    /* The title's input layer looks for button edges, so the packet number
+     * has to move whenever the state does or a press is never noticed. */
+    pState->dwPacketNumber = ++packet;
+}
 
 void xbox_InputInit(void)
 {

@@ -359,6 +359,18 @@ static void fb_toggle_fullscreen(HWND h)
     }
 }
 
+static volatile float s_mouse_x, s_mouse_y;
+static volatile LONG s_mouse_moves;
+
+/* The pointer as a fraction of the client area (the window's DPI and the
+ * swap chain's pixels need not agree); returns how often it has moved. */
+int xbox_FramebufferMouse(float *x, float *y)
+{
+    *x = s_mouse_x;
+    *y = s_mouse_y;
+    return (int)s_mouse_moves;
+}
+
 /* Borderless fullscreen on the monitor the window is on, and back. A
  * borderless window rather than DXGI exclusive mode: no mode switch, no
  * device loss, and alt-tab behaves. The renderer resizes its swap chain to
@@ -460,24 +472,35 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
-    /* Mouse buttons go in the same table, for bindings that name them.
-     * Capturing the mouse while one is down delivers its release even
-     * outside the window. */
-    case WM_LBUTTONDOWN: case WM_LBUTTONUP:
-    case WM_RBUTTONDOWN: case WM_RBUTTONUP:
-    case WM_MBUTTONDOWN: case WM_MBUTTONUP:
-    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
-        {
-            int down = 0;
-            int vk = xbox_InputWin32MouseVk(m, (uint32_t)w, &down);
-            if (vk)
-                xbox_InputKeySet(vk, down);
-            if (down)
-                SetCapture(h);
-            else if (!(w & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2)))
-                ReleaseCapture();
+    /* Where the pointer is, for menu hover (xinput_device.c). */
+    case WM_MOUSEMOVE: {
+        /* Windows also sends this when the window appears or activates
+         * under a resting pointer; only a real change of place is a move. */
+        static LPARAM last = -1;
+        RECT rc;
+        if (GetClientRect(h, &rc) && rc.right > 0 && rc.bottom > 0) {
+            s_mouse_x = (float)(short)LOWORD(l) / (float)rc.right;
+            s_mouse_y = (float)(short)HIWORD(l) / (float)rc.bottom;
         }
-        return m == WM_XBUTTONDOWN || m == WM_XBUTTONUP ? TRUE : 0;
+        if (last != -1 && l != last)
+            InterlockedIncrement(&s_mouse_moves);
+        last = l;
+        return 0;
+    }
+
+    /* Mouse buttons are virtual keys too, so RECOMP_KEYMAP can bind them. */
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+        s_key_down[VK_LBUTTON] = m == WM_LBUTTONDOWN;
+        return 0;
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+        s_key_down[VK_RBUTTON] = m == WM_RBUTTONDOWN;
+        return 0;
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+        s_key_down[VK_MBUTTON] = m == WM_MBUTTONDOWN;
+        return 0;
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+        s_key_down[GET_XBUTTON_WPARAM(w) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2] = m == WM_XBUTTONDOWN;
+        return TRUE;
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
@@ -598,6 +621,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va
 void xbox_FramebufferWindowScanout(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
+int xbox_FramebufferMouse(float *x, float *y) { *x = *y = 0; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void xbox_FramebufferNoteFlip(uint32_t draws) { (void)draws; }
