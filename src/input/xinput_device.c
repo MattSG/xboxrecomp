@@ -24,6 +24,20 @@
 
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+static DWORD g_packet_bias[XBOX_MAX_CONTROLLERS];
+static BOOL g_capture_active[XBOX_MAX_CONTROLLERS];
+
+static DWORD finish_state(DWORD port, XBOX_INPUT_STATE *state)
+{
+    state->dwPacketNumber += g_packet_bias[port];
+    if (g_capture_active[port] && state->dwPacketNumber == g_last_packet[port]) {
+        ++g_packet_bias[port];
+        ++state->dwPacketNumber;
+    }
+    g_capture_active[port] = FALSE;
+    g_last_packet[port] = state->dwPacketNumber;
+    return ERROR_SUCCESS;
+}
 
 /* ---- keyboard, when there is no pad --------------------------------------
  *
@@ -369,12 +383,15 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     if (xbox_FramebufferHostInputCaptured()) {
-        static volatile LONG capture_packet;
         DWORD connected = XInputGetState(dwPort, &xi_state);
         if (connected != ERROR_SUCCESS && !(dwPort == 0 && keyboard_enabled()))
             return connected;
         memset(pState, 0, sizeof *pState);
-        pState->dwPacketNumber = (DWORD)InterlockedIncrement(&capture_packet);
+        /* Neutralization must be a new packet, even when the physical pad
+         * has not changed. Keep subsequent physical packets in sequence. */
+        ++g_packet_bias[dwPort];
+        g_capture_active[dwPort] = TRUE;
+        pState->dwPacketNumber = ++g_last_packet[dwPort];
         return ERROR_SUCCESS;
     }
 
@@ -383,13 +400,12 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
-            return ERROR_SUCCESS;
+            return finish_state(dwPort, pState);
         }
         return result;
     }
 
     g_controller_connected[dwPort] = TRUE;
-    g_last_packet[dwPort] = xi_state.dwPacketNumber;
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
     pState->dwPacketNumber = xi_state.dwPacketNumber;
@@ -429,7 +445,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         pState->dwPacketNumber = kb.dwPacketNumber;
     }
 
-    return ERROR_SUCCESS;
+    return finish_state(dwPort, pState);
 }
 
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
