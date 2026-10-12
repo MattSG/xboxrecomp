@@ -3895,6 +3895,11 @@ static void pace_vblank(void)
     static int64_t next;
     static HANDLE timer;
     int64_t now, period;
+    extern int xbox_FramebufferPaused(void);
+    while (xbox_FramebufferPaused()) {   /* in the background: hold the vblank */
+        Sleep(50);
+        next = 0;                        /* and start a new cadence after */
+    }
     if (limit < 0) {
         const char *e = getenv("RECOMP_FPS_LIMIT");
         limit = e ? atoi(e) : 60;

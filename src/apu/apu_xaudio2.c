@@ -201,6 +201,15 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         return -1;
     }
 
+    {   /* Paused in the background (fb_present.c): quiet, not a held note. */
+        extern int xbox_FramebufferPaused(void);
+        static int muted;
+        int paused = xbox_FramebufferPaused();
+        if (paused != muted && g_xa2_master) {
+            g_xa2_master->lpVtbl->SetVolume(g_xa2_master, paused ? 0.0f : 1.0f, XAUDIO2_COMMIT_NOW);
+            muted = paused;
+        }
+    }
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
     if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
     /* The APU produces in real time, so the queue holds only what the last

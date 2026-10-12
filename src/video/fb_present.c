@@ -331,10 +331,20 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
     xbox_FramebufferNoteFlip(draws);
 }
 
-/* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
- * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
- * gpu_present.c; both presenters letterbox to any size.) */
-static void fb_toggle_fullscreen(HWND h)
+/* RECOMP_PAUSE_UNFOCUSED: while another window is in front the executor
+ * holds the next vblank (the title waits on the GPU, so it stops) and the
+ * audio goes quiet. */
+static volatile LONG s_inactive;
+
+int xbox_FramebufferPaused(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_PAUSE_UNFOCUSED") && atoi(getenv("RECOMP_PAUSE_UNFOCUSED")) != 0;
+    return on && s_inactive;
+}
+
+int xbox_FramebufferKeyDown(int vk)
 {
     static int full;
     static RECT saved;
@@ -506,6 +516,9 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
         return 0;
+    case WM_ACTIVATEAPP:
+        InterlockedExchange(&s_inactive, w ? 0 : 1);
+        break;
     }
     return DefWindowProcA(h, m, w, l);
 }
@@ -550,6 +563,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpfnWndProc   = fb_wndproc;
         wc.hInstance     = GetModuleHandleA(NULL);
         wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+        wc.hIcon         = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1)); /* the title's, if it has one */
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
@@ -622,6 +636,7 @@ void xbox_FramebufferWindowScanout(uint32_t fb_va, uint32_t pitch) { (void)fb_va
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 int xbox_FramebufferMouse(float *x, float *y) { *x = *y = 0; return 0; }
+int xbox_FramebufferPaused(void) { return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void xbox_FramebufferNoteFlip(uint32_t draws) { (void)draws; }
