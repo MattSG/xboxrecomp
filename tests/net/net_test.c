@@ -136,6 +136,23 @@ int main(void)
         if (n != 60 || rd16(r + 12) != 0x88B5) { puts("FAIL: tunnel frame not delivered"); return 11; }
     }
 
+    /* Xbox Live's names are answered here, as Insignia's (the address needs
+     * the host's DNS, so only the reply itself is required). */
+    {
+        static const uint8_t qry[] = {0xAB, 0xCD, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+            4, 'm', 'a', 'c', 's', 8, 'x', 'b', 'o', 'x', 'l', 'i', 'v', 'e', 3, 'c', 'o', 'm', 0,
+            0, 1, 0, 1};
+        n = udp_frame(f, k_router_mac, yiaddr, DNS_IP, 1053, 53, qry, sizeof qry);
+        net_backend_send(f, n);
+        n = next_frame(r, 500);
+        const uint8_t *d = r + 42;
+        if (n < 42 + sizeof qry || rd16(d) != 0xABCD || rd16(d + 2) != 0x8180 || rd16(r + 36) != 1053) {
+            puts("FAIL: no Insignia DNS answer"); return 12;
+        }
+        if (rd16(d + 6))
+            printf("macs.xboxlive.com -> %u.%u.%u.%u\n", d[n - 46], d[n - 45], d[n - 44], d[n - 43]);
+    }
+
     puts("net: ok");
     return 0;
 }
