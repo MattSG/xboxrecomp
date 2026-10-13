@@ -170,4 +170,8 @@ void nv2a_d3d_prof_add(int slot, int64_t ticks, uint32_t verts);
  * scanning when the title is not flipping (loading screens, movies). */
 void nv2a_d3d_tick(void);
 
+/* Shows the last flipped frame again, paced like a flip, and returns once it
+ * is shown: a title thread's frame with nothing new to draw. */
+void nv2a_d3d_repeat_frame(void);
+
 #endif
