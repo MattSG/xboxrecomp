@@ -87,6 +87,33 @@ void nv2a_vsh_constant_word(uint32_t word)
     }
 }
 
+/* Everything uploaded, for a caller that runs another frame in between
+ * and must hand back the one in progress as it was. */
+typedef struct {
+    uint32_t program[NV2A_VSH_SLOTS][4];
+    float    c[NV2A_VSH_CONSTANTS][4];
+    uint32_t load_slot, load_word, start_slot, const_load, const_word, cxt_write;
+} VshState;
+size_t nv2a_vsh_state_size(void) { return sizeof(VshState); }
+void nv2a_vsh_state_save(void *out)
+{
+    VshState *v = (VshState *)out;
+    memcpy(v->program, s_program, sizeof s_program);
+    memcpy(v->c, s_const, sizeof s_const);
+    v->load_slot = s_load_slot; v->load_word = s_load_word; v->start_slot = s_start_slot;
+    v->const_load = s_const_load; v->const_word = s_const_word; v->cxt_write = s_cxt_write;
+}
+void nv2a_vsh_state_restore(const void *in)
+{
+    const VshState *v = (const VshState *)in;
+    memcpy(s_program, v->program, sizeof s_program);
+    memcpy(s_const, v->c, sizeof s_const);
+    s_load_slot = v->load_slot; s_load_word = v->load_word; s_start_slot = v->start_slot;
+    s_const_load = v->const_load; s_const_word = v->const_word; s_cxt_write = v->cxt_write;
+    s_program_version++;
+    s_const_version++;
+}
+
 void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
     s_const_version++;
