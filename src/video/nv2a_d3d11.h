@@ -174,4 +174,9 @@ void nv2a_d3d_tick(void);
  * is shown: a title thread's frame with nothing new to draw. */
 void nv2a_d3d_repeat_frame(void);
 
+/* A frame between the title's own: the executor's last recorded frame with
+ * its vertex-program constants part way (t) from the frame before. need_new:
+ * wait for the frame the title has just drawn. Returns once shown. */
+void nv2a_d3d_interp_frame(float t, int need_new);
+
 #endif

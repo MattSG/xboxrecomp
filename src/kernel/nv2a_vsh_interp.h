@@ -20,6 +20,7 @@
 #ifndef XBOXRECOMP_NV2A_VSH_INTERP_H
 #define XBOXRECOMP_NV2A_VSH_INTERP_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define NV2A_VSH_SLOTS      136     /* program memory, 128-bit instructions */
@@ -42,6 +43,9 @@ void nv2a_vsh_program_word(uint32_t word);            /* _PROGRAM(i)        */
 void nv2a_vsh_set_start_slot(uint32_t slot);          /* _PROGRAM_START     */
 void nv2a_vsh_set_constant_load(uint32_t index);      /* _CONSTANT_LOAD     */
 void nv2a_vsh_constant_word(uint32_t word);           /* _CONSTANT(i)       */
+size_t nv2a_vsh_state_size(void);
+void nv2a_vsh_state_save(void *out);
+void nv2a_vsh_state_restore(const void *in);
 void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
 
 /* Run the program from the start slot on one vertex. Inputs are the ten

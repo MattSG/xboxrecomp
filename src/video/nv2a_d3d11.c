@@ -4081,7 +4081,9 @@ static Surface *scan_surface(uint32_t va, uint32_t pitch)
     return s;
 }
 
-void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
+/* show 0: the frame is finished (written back, counted) but not put on
+ * screen -- an interpolating executor shows replays of it instead. */
+void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
 {
     Surface *s;
     if (!nv2a_d3d_init())
@@ -4104,13 +4106,14 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
         int64_t t0 = s_prof_on > 0 ? qpc() : 0, t1;
         writeback_surfaces();
         t1 = s_prof_on > 0 ? qpc() : 0;
-        present_surface(s);
+        if (show)
+            present_surface(s);
         if (s_prof_on > 0) {
             s_prof[PROF_WRITEBACK] += t1 - t0;
             s_prof[PROF_PRESENT] += qpc() - t1;
         }
     }
-    {
+    if (show) {
         int64_t t0 = qpc();
         pace_vblank();
         frame_csv(qpc() - t0);
@@ -4120,6 +4123,11 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
     display_config(0);
     rdoc_poll();
     s_frame++;
+}
+
+void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
+{
+    nv2a_d3d_flip_present(surface_addr, pitch, 1);
 }
 
 /* The last flipped frame shown again, paced like a flip: for a title that
@@ -4137,6 +4145,26 @@ void nv2a_d3d_repeat_frame(void)
         SwitchToThread();
 }
 
+/* A frame drawn by the executor from the last one it recorded, part way
+ * (t) from the frame before (nv2a_pb_replay). need_new: only once a frame
+ * finished after this call has been recorded -- the title has just drawn
+ * one. Asked from the title's thread, which waits as for a flip. */
+static volatile LONG s_interp_req, s_interp_need;
+static volatile float s_interp_t;
+static long s_interp_seen;
+
+void nv2a_d3d_interp_frame(float t, int need_new)
+{
+    extern void nv2a_pb_interp_enable(int);
+    extern long nv2a_pb_frames_done(void);
+    nv2a_pb_interp_enable(1);
+    s_interp_t = t;
+    InterlockedExchange(&s_interp_need, need_new);
+    InterlockedExchange(&s_interp_req, 1);
+    while (InterlockedCompareExchange(&s_interp_req, 1, 1))
+        SwitchToThread();
+}
+
 void nv2a_d3d_tick(void)
 {
     DWORD now;
@@ -4144,6 +4172,25 @@ void nv2a_d3d_tick(void)
     /* CPU scanout and PVIDEO can precede the first pushbuffer flip. */
     if (s_init_state <= 0 && !nv2a_d3d_init())
         return;
+    if (s_interp_req) {
+        extern long nv2a_pb_frames_done(void);
+        extern int nv2a_pb_replay(float);
+        static DWORD waiting;
+        long done = nv2a_pb_frames_done();
+        /* Its frame not in yet: wait, at most 100 ms. A replay can fall
+         * between commands of the next frame (nv2a_pb_replay keeps them). */
+        if (s_interp_need && done == s_interp_seen) {
+            if (!waiting) waiting = GetTickCount();
+            if (GetTickCount() - waiting < 100) return;
+        }
+        waiting = 0;
+        s_interp_seen = done;
+        { static int rp; if (++rp % 600 == 0) fprintf(stderr, "[INTERP] replays %d t %.2f\n", rp, s_interp_t); }   /* DIAG */
+        if (!nv2a_pb_replay(s_interp_t) && !present_kept())   /* nothing recorded yet */
+            present_surface(s_shown);
+        InterlockedExchange(&s_interp_req, 0);
+        return;
+    }
     if (s_repeat) {
         int64_t t0;
         if (!present_kept())
@@ -4199,6 +4246,8 @@ void nv2a_d3d_clear(const NvD3DState *st, uint32_t f, uint32_t c, uint32_t z,
 { (void)st; (void)f; (void)c; (void)z; (void)x0; (void)y0; (void)x1; (void)y1; }
 void nv2a_d3d_flip(uint32_t a, uint32_t p) { (void)a; (void)p; }
 void nv2a_d3d_tick(void) {}
+void nv2a_d3d_flip_present(uint32_t a, uint32_t p, int show) { (void)a; (void)p; (void)show; }
+void nv2a_d3d_interp_frame(float t, int need_new) { (void)t; (void)need_new; }
 void nv2a_d3d_repeat_frame(void) {}
 void nv2a_d3d_kick(void) {}
 void nv2a_d3d_draw_ub(const NvD3DState *st, int t, const NvD3DAttrib a[16], const float d[16][4],
