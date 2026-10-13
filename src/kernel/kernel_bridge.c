@@ -314,14 +314,25 @@ static void kernel_data_init(void)
     /* IoDeviceObjectType (ordinal 71) - type object (stub: 0) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE) = 0;
 
-    /* XboxHDKey (ordinal 323) - 16 bytes of zeros (no key) */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset), 0, 16);
-
-    /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
-
-    /* XboxLANKey (ordinals 326, 355) - 16 bytes of zeros */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), 0, 16);
+    /* XboxHDKey (323), XboxSignatureKey (325), XboxLANKey (326, 355): zeros,
+     * or a console's own from RECOMP_XBOX_HDKEY / _SIGKEY / _LANKEY (32 hex
+     * digits each). A real kernel decrypts them from the EEPROM; Xbox Live
+     * accounts are bound to the HD key, so an account made on another
+     * console (or xemu) signs in only with that console's key. */
+    {
+        static const struct { uint32_t off; const char *env; } k[] = {
+            { KDATA_HD_KEY, "RECOMP_XBOX_HDKEY" },
+            { KDATA_SIGNATURE_KEY, "RECOMP_XBOX_SIGKEY" },
+            { KDATA_LAN_KEY, "RECOMP_XBOX_LANKEY" },
+        };
+        for (int i = 0; i < 3; i++) {
+            uint8_t *p = (uint8_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + k[i].off) + g_xbox_mem_offset);
+            const char *v = getenv(k[i].env);
+            memset(p, 0, 16);
+            for (int b = 0; v && b < 16 && sscanf(v + 2 * b, "%2hhx", &p[b]) == 1; b++)
+                ;
+        }
+    }
 
     /* XboxAlternateSignatureKeys (ordinals 327, 356) - 256 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), 0, 256);
