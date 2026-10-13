@@ -2757,7 +2757,29 @@ static void bridge_RtlNtStatusToDosError(void)
      * ERROR_INVALID_ADDRESS; any other answer makes it give up. */
     case 0xC0000018: g_eax = 487; break;        /* STATUS_CONFLICTING_ADDRESSES → ERROR_INVALID_ADDRESS */
 
-    default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
+    case 0xC0000001: g_eax = 31; break;         /* STATUS_UNSUCCESSFUL → ERROR_GEN_FAILURE */
+
+    default:
+        /* HRESULT_FROM_WIN32 codes (facility 7) carry the Win32 error in
+         * their low word, and the kernel hands it back. XNet's sockets keep
+         * their errors that way: 0x80072733 is WSAEWOULDBLOCK, what a
+         * non-blocking recvfrom with nothing to read reports. */
+        if ((status & 0x7FFF0000u) == 0x00070000u) {
+            g_eax = status & 0xFFFFu;
+            break;
+        }
+        g_eax = 317;                             /* ERROR_MR_MID_NOT_FOUND (generic) */
+        {   /* name each unmapped status once: a caller may be branching on it */
+            static uint32_t seen[32];
+            int i;
+            for (i = 0; i < 32 && seen[i] && seen[i] != status; i++) {}
+            if (i < 32 && !seen[i]) {
+                seen[i] = status;
+                fprintf(stderr, "  [KERNEL] RtlNtStatusToDosError: unmapped 0x%08X\n", status);
+                fflush(stderr);
+            }
+        }
+        break;
     }
 }
 

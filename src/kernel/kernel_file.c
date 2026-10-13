@@ -178,11 +178,20 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
+    /* The Xbox has one process, so a title's exclusive share mode only ever
+     * meant "not within this title". On the host a second copy of the game
+     * (system-link testing) reads the same disc files: read-only opens share
+     * reads, or the first copy locks the second out of D:. */
+    DWORD share = xbox_share_to_win32(ShareAccess);
+    if (!(xbox_access_to_win32(DesiredAccess) & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA |
+          FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | DELETE)))
+        share |= FILE_SHARE_READ;
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
+            share, NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
         if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
@@ -190,7 +199,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL,
+            share, NULL,
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
     }
 
