@@ -4177,12 +4177,11 @@ void nv2a_d3d_tick(void)
         extern int nv2a_pb_replay(float);
         static DWORD waiting;
         long done = nv2a_pb_frames_done();
-        /* Its frame not in yet: wait, at most 100 ms. A replay can fall
-         * between commands of the next frame (nv2a_pb_replay keeps them). */
-        if (s_interp_need && done == s_interp_seen) {
-            if (!waiting) waiting = GetTickCount();
-            if (GetTickCount() - waiting < 100) return;
-        }
+        /* The frame the title just drew may not have reached the executor
+         * yet (a present is not always kicked at once): the latest one that
+         * has is drawn. A replay can fall between commands of the next frame
+         * (nv2a_pb_replay keeps them). */
+        (void)waiting;
         waiting = 0;
         s_interp_seen = done;
         { static int rp; if (++rp % 600 == 0) fprintf(stderr, "[INTERP] replays %d t %.2f\n", rp, s_interp_t); }   /* DIAG */

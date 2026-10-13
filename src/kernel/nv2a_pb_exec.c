@@ -2705,6 +2705,11 @@ static int d3d_screen_pos(uint32_t guest_idx, int program, float out[4])
 
 /* The batch, drawn by the GPU: its vertex program (program) or its
  * pre-transformed vertices, straight from the title's arrays. */
+/* Interpolation (see nv2a_pb_replay): a recorded frame keeps a copy of each
+ * draw's vertices, since by the time it is drawn again the title may be
+ * filling the same buffers for the next one; a replayed draw reads them. */
+static void pb_draw_vertices(NvD3DAttrib attr[NV_VERTEX_ATTRS], uint32_t lo, uint32_t hi);
+
 static void d3d_draw_batch(int program)
 {
     NvD3DAttrib attr[NV_VERTEX_ATTRS];
@@ -2728,15 +2733,16 @@ static void d3d_draw_batch(int program)
                      : s_gpu.inline_active ? (const uint8_t *)s_gpu.inline_buf + a->offset
                      : a->offset ? mem + a->offset : NULL;
     }
-    memcpy(def, s_gpu.imm_attr, sizeof def);
-    /* Pre-transformed batches with no diffuse at all are white. */
-    if (!program && !s_gpu.attr[3].size && !s_gpu.attr[3].offset)
-        def[3][0] = def[3][1] = def[3][2] = def[3][3] = 1.0f;
     lo = hi = s_gpu.idx[0];
     for (i = 1; i < n; i++) {
         if (s_gpu.idx[i] < lo) lo = s_gpu.idx[i];
         if (s_gpu.idx[i] > hi) hi = s_gpu.idx[i];
     }
+    pb_draw_vertices(attr, lo, hi);
+    memcpy(def, s_gpu.imm_attr, sizeof def);
+    /* Pre-transformed batches with no diffuse at all are white. */
+    if (!program && !s_gpu.attr[3].size && !s_gpu.attr[3].offset)
+        def[3][0] = def[3][1] = def[3][2] = def[3][3] = 1.0f;
     if (!grow((void **)&s_di, &s_di_cap, n * 6 + 6, sizeof *s_di))
         return;
     ni = build_list(n, s_gpu.idx, s_di, &topo);
@@ -3479,6 +3485,8 @@ typedef struct {
     PbSeg *seg; uint32_t nseg, capseg;
     float *prev; uint8_t *has;                         /* per constant word: partner */
     uint32_t capprev;
+    uint8_t *vdata; uint32_t nvdata, capvdata;         /* each draw's vertices, copied */
+    uint32_t (*voff)[NV_VERTEX_ATTRS]; uint32_t ndraw, capdraw;  /* +1; 0: not copied */
 } PbFrame;
 static PbFrame s_frames[3];                            /* recording, last, previous */
 static PbFrame *s_rec_f = &s_frames[0], *s_last_f = &s_frames[1], *s_prev_f = &s_frames[2];
@@ -3487,6 +3495,7 @@ static volatile LONG s_interp_ms;                     /* last request, GetTickCo
  * which ask for none, show their own frames. */
 static int interp_on(void) { LONG ms = s_interp_ms; return ms && GetTickCount() - (DWORD)ms < 250; }
 static int s_replaying;
+static uint32_t s_replay_draw;                         /* draws replayed so far */
 static volatile LONG s_frames_done;                    /* frames finished recording */
 
 static int pb_grow(void **p, uint32_t *cap, uint32_t need, size_t elem)
@@ -3586,6 +3595,7 @@ static void pb_frame_done(void)
     s_last_f = s_rec_f;
     s_rec_f = t;
     s_rec_f->ncmd = 0;
+    s_rec_f->nvdata = s_rec_f->ndraw = 0;
     pb_segment(s_last_f);
     DWORD gap = now - last_ms;
     if (now - last_ms > 200)          /* after a pause: nothing to come from */
@@ -3605,6 +3615,33 @@ void nv2a_pb_interp_enable(int on)
 }
 
 long nv2a_pb_frames_done(void) { return s_frames_done; }
+
+static void pb_draw_vertices(NvD3DAttrib attr[NV_VERTEX_ATTRS], uint32_t lo, uint32_t hi)
+{
+    uint32_t i;
+    if (s_replaying) {
+        PbFrame *f = s_last_f;
+        uint32_t d = s_replay_draw++;
+        if (d >= f->ndraw) return;
+        for (i = 0; i < NV_VERTEX_ATTRS; i++)
+            if (f->voff[d][i])
+                attr[i].data = f->vdata + (f->voff[d][i] - 1) - (size_t)lo * attr[i].stride;
+        return;
+    }
+    if (!interp_on()) return;
+    PbFrame *f = s_rec_f;
+    if (!pb_grow((void **)&f->voff, &f->capdraw, f->ndraw + 1, sizeof *f->voff)) return;
+    memset(f->voff[f->ndraw], 0, sizeof *f->voff);
+    for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+        uint32_t st = attr[i].stride, len = st ? (hi - lo + 1) * st : 16;
+        if (!attr[i].enabled || !attr[i].data || s_gpu.inline_active || len > (64u << 20)) continue;
+        if (!pb_grow((void **)&f->vdata, &f->capvdata, f->nvdata + len + 16, 1)) break;
+        memcpy(f->vdata + f->nvdata, attr[i].data + (size_t)lo * st, len);
+        f->voff[f->ndraw][i] = f->nvdata + 1;
+        f->nvdata = (f->nvdata + len + 15) & ~15u;
+    }
+    f->ndraw++;
+}
 
 /* The executor as a frame in progress left it, around a replay: the state
  * every method sets, the texture registers, the vertex programs and
@@ -3659,6 +3696,7 @@ int nv2a_pb_replay(float t)
     pb_state(&saved, 1);
     if (!saved.head || !saved.mid || !saved.tail || !saved.vsh || !saved.idx || !saved.inl) return 0;
     s_replaying = 1;
+    s_replay_draw = 0;
     for (i = 0; i < f->ncmd; i++) {
         uint32_t sm = f->cmd[i].sm, m = sm & 0xFFFF, p = f->cmd[i].param;
         if (!(sm >> 16) && m >= 0x0B80 && m < 0x0C00) {
