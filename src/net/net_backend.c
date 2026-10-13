@@ -44,14 +44,15 @@ static const uint8_t k_bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 #define ROUTER_IP   (NET_PREFIX | 2)
 #define DNS_IP      (NET_PREFIX | 3)
 
-/* RECOMP_NET_TRACE: the first frames each way, one line each. */
+/* RECOMP_NET_TRACE: the first frames each way, one line each; =u skips
+ * broadcasts, which otherwise use up the budget before a join starts. */
 static void trace_frame(const char *dir, const uint8_t *f, uint32_t n)
 {
     static int on = -1;
     static volatile LONG count;
     if (on < 0)
-        on = getenv("RECOMP_NET_TRACE") != NULL;
-    if (!on || n < 14 || InterlockedIncrement(&count) > 300)
+        on = getenv("RECOMP_NET_TRACE") ? 1 + (getenv("RECOMP_NET_TRACE")[0] == 'u') : 0;
+    if (!on || n < 14 || (on == 2 && (f[0] & 1)) || InterlockedIncrement(&count) > 300)
         return;
     unsigned type = (unsigned)(f[12] << 8 | f[13]);
     if (type == 0x0800 && n >= 34) {

@@ -198,6 +198,50 @@ int main(int argc, char **argv)
         puts("  (2^31 call-counter check skipped; run with 'wrap' to include it)");
     }
 
+    /* XNet's secure LAN key exchange: Diffie-Hellman (Oakley group 1) and
+     * 3DES-CBC. Both were stubs, so system link joins never authenticated. */
+    {
+        static const ULONG x[24] = {0x52E6B438u,0xF2A74DE4u,0x269E0D37u,0x6513270Eu,0xA6A3A450u};
+        static const ULONG p[24] = {0xFFFFFFFFu,0xFFFFFFFFu,0xA63A3620u,0xF44C42E9u,0x625E7EC6u,
+            0xE485B576u,0x6D51C245u,0x4FE1356Du,0xF25F1437u,0x302B0A6Du,0xCD3A431Bu,0xEF9519B3u,
+            0x8E3404DDu,0x514A0879u,0x3B139B22u,0x020BBEA6u,0x8A67CC74u,0x29024E08u,0x80DC1CD1u,
+            0xC4C6628Bu,0x2168C234u,0xC90FDAA2u,0xFFFFFFFFu,0xFFFFFFFFu};
+        static const ULONG want[24] = {0x5BFC9A40u,0x120F66C2u,0xA50FD791u,0xDF04292Cu,0x2F465E6Bu,
+            0xD2C159CDu,0x7BA6E2EEu,0x51A1E9E0u,0x1CADAFCBu,0x5BFB66B7u,0x5DDA6E18u,0x7B0DE322u,
+            0x7721E7F3u,0x42159C99u,0x613292F6u,0x61F70A07u,0xB3239620u,0xFD246058u,0x1AFB5E17u,
+            0x1CDF9A38u,0x58AE590Fu,0x315848D6u,0x08F9E148u,0x5A288908u};
+        ULONG g[24] = {2}, r[24];
+        check(xbox_XcModExp(r, g, (PULONG)x, (PULONG)p, 24) == 1 && !memcmp(r, want, sizeof r),
+              "XcModExp: 2^x mod the Oakley group 1 prime", "differs from Python's pow()");
+
+        /* FIPS 81 / the classic DES vector, then 3DES with K1=K2=K3 == DES. */
+        static const UCHAR key[24] = {0x13,0x34,0x57,0x79,0x9B,0xBC,0xDF,0xF1, 0x13,0x34,0x57,0x79,
+                                      0x9B,0xBC,0xDF,0xF1, 0x13,0x34,0x57,0x79,0x9B,0xBC,0xDF,0xF1};
+        static const UCHAR pt[8] = {0x01,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF};
+        static const UCHAR ct[8] = {0x85,0xE8,0x13,0x54,0x0F,0x0A,0xB4,0x05};
+        UCHAR table[384], out[8], back[8];
+        xbox_XcKeyTable(0, table, key);
+        xbox_XcBlockCrypt(0, out, (PVOID)pt, table, 1);
+        xbox_XcBlockCrypt(0, back, out, table, 0);
+        check(!memcmp(out, ct, 8) && !memcmp(back, pt, 8), "XcBlockCrypt: DES known answer",
+              "wrong ciphertext or round trip");
+        xbox_XcKeyTable(1, table, key);
+        xbox_XcBlockCrypt(1, out, (PVOID)pt, table, 1);
+        check(!memcmp(out, ct, 8), "XcBlockCrypt: 3DES with equal keys is DES", "differs");
+
+        UCHAR msg[24] = "secure system link data", enc[24], dec[24], iv[8] = {1,2,3,4,5,6,7,8}, iv2[8];
+        memcpy(iv2, iv, 8);
+        xbox_XcBlockCryptCBC(1, 24, enc, msg, table, 1, iv);
+        memcpy(dec, enc, 24);
+        xbox_XcBlockCryptCBC(1, 24, dec, dec, table, 0, iv2);   /* in place, like XNet */
+        check(!memcmp(dec, msg, 24) && !memcmp(iv, iv2, 8) && memcmp(enc + 8, enc + 16, 8),
+              "XcBlockCryptCBC: 3DES round trip", "plaintext or feedback differs");
+
+        UCHAR par[2] = {0x00, 0x13};
+        xbox_XcDESKeyParity(par, 2);
+        check(par[0] == 0x01 && par[1] == 0x13, "XcDESKeyParity: odd parity", "wrong low bits");
+    }
+
     VirtualFree(mem, 0, MEM_RELEASE);
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;
