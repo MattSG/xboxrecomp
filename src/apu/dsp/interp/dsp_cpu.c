@@ -45,6 +45,15 @@
 #define SIGN_PLUS  0
 #define SIGN_MINUS 1
 
+/* The checked instruction fetch is hot even with automatic inlining enabled.
+ * Preserve its assertions and Debug call boundary; only optimized MSVC builds
+ * need an explicit request to inline this helper. */
+#if defined(_MSC_VER) && !defined(_DEBUG)
+#define DSP_PREAD_INLINE __forceinline
+#else
+#define DSP_PREAD_INLINE
+#endif
+
 /**********************************
  *  Functions
  **********************************/
@@ -52,12 +61,15 @@
 static void dsp_postexecute_update_pc(dsp_core_t* dsp);
 static void dsp_postexecute_interrupts(dsp_core_t* dsp);
 
-#ifdef _MSC_VER
-#define DSP_HOT __forceinline
-#else
-#define DSP_HOT inline __attribute__((always_inline))
-#endif
-static DSP_HOT uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address);
+static inline void dsp_postexecute_interrupts_if_needed(dsp_core_t* dsp)
+{
+    /* With no pending interrupt or active pipeline, the full handler only
+     * returns. Keep pipeline progression even after its pending count clears. */
+    if (dsp->interrupt_counter || dsp->interrupt_state == DSP_INTERRUPT_DISABLED)
+        dsp_postexecute_interrupts(dsp);
+}
+
+static DSP_PREAD_INLINE uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address);
 static uint32_t read_memory_disasm(dsp_core_t* dsp, int space, uint32_t address);
 
 static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint32_t value);
@@ -709,11 +721,8 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
     /* Process the PC */
     dsp_postexecute_update_pc(dsp);
 
-    /* Process Interrupts. With none pending and the pipeline not counting
-     * down it returns at once; the check here saves the call on nearly every
-     * instruction (3% of a GP frame). */
-    if (dsp->interrupt_counter || dsp->interrupt_state == DSP_INTERRUPT_DISABLED)
-        dsp_postexecute_interrupts(dsp);
+    /* Process Interrupts */
+    dsp_postexecute_interrupts_if_needed(dsp);
 
 
     dsp->num_inst += dsp->instr_cycle;
@@ -950,7 +959,7 @@ static void dsp_postexecute_interrupts(dsp_core_t* dsp)
  *  Read/Write memory functions
  **********************************/
 
-static DSP_HOT uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address)
+static DSP_PREAD_INLINE uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address)
 {
     assert((address & 0xFF000000) == 0);
     assert(address < DSP_PRAM_SIZE);

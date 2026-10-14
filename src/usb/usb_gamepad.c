@@ -592,14 +592,28 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
             unsigned long now = (unsigned long)GetTickCount();
             if (now - last > 1000) {
                 XBOX_INPUT_STATE probe;
+                const char *keyboard = getenv("RECOMP_KEYBOARD");
+                const char *layout = getenv("RECOMP_KEYBOARD_LAYOUT");
                 DWORD rc = xbox_InputGetState(0, &probe);
                 last = now;
-                fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
-                        "InputGetState=%lu buttons=0x%04X\n",
-                        getenv("RECOMP_KEYBOARD") ? 1 : 0,
+                fprintf(stderr, "  [INPUT] pad=0 kbd_env=%s layout=%s "
+                        "window_has_RETURN=%d "
+                        "keys(up/3/down/1/left/right)=%d/%d/%d/%d/%d/%d "
+                        "InputGetState=%lu buttons=0x%04X LT=%u RT=%u LX=%d\n",
+                        keyboard ? keyboard : "off",
+                        layout ? layout : "legacy",
                         xbox_FramebufferKeyDown(0x0D),
+                        xbox_FramebufferKeyDown(0x26),
+                        xbox_FramebufferKeyDown('3'),
+                        xbox_FramebufferKeyDown(0x28),
+                        xbox_FramebufferKeyDown('1'),
+                        xbox_FramebufferKeyDown(0x25),
+                        xbox_FramebufferKeyDown(0x27),
                         (unsigned long)rc,
-                        rc == 0 ? probe.Gamepad.wButtons : 0);
+                        rc == 0 ? probe.Gamepad.wButtons : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] : 0,
+                        rc == 0 ? probe.Gamepad.sThumbLX : 0);
                 fflush(stderr);
             }
         }

@@ -31,6 +31,7 @@ extern bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
 extern void nv2a_hook_pvideo_consume(unsigned bank);
 
 static volatile LONG s_fb_running;
+static void (*s_close_handler)(void);
 static volatile HWND s_hwnd;
 static uint32_t      s_fb_va, s_fb_pitch;
 /* Set by the first flip: from then on flips decide what is shown, except for a
@@ -59,6 +60,11 @@ static DWORD         s_pvideo_next_capture_tick;
 HWND xbox_FramebufferWindowHandle(void)
 {
     return s_hwnd;
+}
+
+void xbox_FramebufferSetCloseHandler(void (*handler)(void))
+{
+    s_close_handler = handler;
 }
 
 /* Optional per-submission thumbnails for detecting corruption between
@@ -421,6 +427,11 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;                       /* auto-repeat of Alt+Enter */
     switch (m) {
     case WM_CLOSE:
+        if (s_close_handler)
+            s_close_handler();
+        InterlockedExchange(&s_fb_running, 0);
+        return 0;
+
     case WM_DESTROY:
         /* Closing the window ends the run. Only stopping this thread left
          * every other one running -- audio played on, and the process had

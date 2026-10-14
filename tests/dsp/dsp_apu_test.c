@@ -446,11 +446,17 @@ int main(void)
     mcpx_apu_dsp_pcm_consumed(d);
     for (unsigned i = 0; i < 1024; i++) CHECK(((uint8_t *)d->monitor.frame_buf)[i] == 0x11);
     /* Rewriting an already released reset register must not discard PCM. */
+    run_locked_frame(d, mixbins);
+    run_locked_frame(d, mixbins);
+    mcpx_apu_dsp_pcm_consumed(d);
+    CHECK(d->monitor.ep_pcm_head == 1024 && d->monitor.ep_pcm_queued == 1024);
     d->monitor.ep_pcm_offset = 512;
     mcpx_apu_dsp_write(d, false, NV_PAPU_EPRST, 3, 4);
     CHECK(d->monitor.ep_pcm_offset == 512);
+    CHECK(d->monitor.ep_pcm_head == 1024 && d->monitor.ep_pcm_queued == 1024);
     mcpx_apu_dsp_write(d, false, NV_PAPU_EPRST, 0, 4);
-    CHECK(d->monitor.ep_pcm_offset == 0 && d->monitor.ep_pcm_queued == 0 && !d->monitor.ep_pcm_ready);
+    CHECK(d->monitor.ep_pcm_offset == 0 && d->monitor.ep_pcm_queued == 0 &&
+          d->monitor.ep_pcm_head == 0 && !d->monitor.ep_pcm_ready);
     /* Failed EP DMA must not publish its payload as native host PCM. */
     mcpx_apu_dsp_write(d, false, NV_PAPU_EPRST, 3, 4);
     for (unsigned i = 0; i < 7; i++)

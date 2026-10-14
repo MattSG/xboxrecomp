@@ -7,6 +7,8 @@
  *   T:\               -> <save_dir>/TitleData/
  *   U:\               -> <save_dir>/UserData/
  *   Z:\               -> <save_dir>/Cache/
+ *   Partition1\UDATA/TDATA -> explicit <save_dir>/UDATA/TDATA, otherwise
+ *                              <game_dir>/UDATA/TDATA
  *
  * The Win32 build emits UTF-16 paths (for CreateFileW); the Linux build
  * emits UTF-8 paths with '/' separators (for open()).
@@ -84,6 +86,27 @@ static const path_rule s_rules[] = {
     { "\\??\\T:\\",                           1, "\\TitleData","/TitleData"  },
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
+
+static int s_explicit_save_root;
+
+/* XAPI mounts U: and T: below Partition1\UDATA/TDATA. Resolving those
+ * symbolic links used to bypass an explicitly supplied save directory and
+ * send profile writes back to game_dir. Keep that legacy location when no
+ * save root is supplied, while isolating only these two save components when
+ * one is supplied; Partition1 assets and unrelated similarly named folders
+ * still belong to game_dir. */
+static int rule_uses_save_root(const path_rule *rule, const char *path)
+{
+    int skip;
+    if (rule->to_save) return 1;
+    if (!s_explicit_save_root) return 0;
+    skip = match_prefix(path, "\\Device\\Harddisk0\\Partition1\\");
+    if (!skip) return 0;
+    path += skip;
+    skip = match_prefix(path, "UDATA");
+    if (!skip) skip = match_prefix(path, "TDATA");
+    return skip && (!path[skip] || path[skip] == '\\' || path[skip] == '/');
+}
 
 /*
  * Rewrite a path through a drive letter the title mapped for itself.
@@ -273,6 +296,7 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     WCHAR save_base[MAX_PATH];
+    s_explicit_save_root = save_dir && save_dir[0];
 
     /* The fallbacks used to name Burnout 3 specifically, so any other title
      * that passed NULL silently pointed its game dir and its saves at another
@@ -286,7 +310,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         GetCurrentDirectoryW(MAX_PATH, s_game_dir);
     }
 
-    if (save_dir) {
+    if (s_explicit_save_root) {
         MultiByteToWideChar(CP_UTF8, 0, save_dir, -1, s_save_dir, MAX_PATH);
     } else {
         if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, save_base))) {
@@ -329,11 +353,12 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
      * happy if they already exist. */
     {
         static const WCHAR *subs[] = { L"TitleData", L"UserData", L"Cache",
-                                       L"SystemData" };
+                                       L"SystemData", L"UDATA", L"TDATA" };
         WCHAR image[MAX_PATH];
         WCHAR dir[MAX_PATH];
         SHCreateDirectoryExW(NULL, s_save_dir, NULL);
         for (int i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
+            if (i >= 4 && !s_explicit_save_root) continue;
             swprintf_s(dir, MAX_PATH, L"%s\\%s", s_save_dir, subs[i]);
             SHCreateDirectoryExW(NULL, dir, NULL);
         }
@@ -414,7 +439,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
-        if (xbox_io_trace()) { fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path); fflush(stderr); }
+        XBOX_TRACE(XBOX_LOG_PATH, "%s -> partition image", xbox_path);
         return TRUE;
     }
 
@@ -422,7 +447,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         skip = match_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
-            base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
+            base_dir  = rule_uses_save_root(&s_rules[i], xbox_path) ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_win;
             goto translate;
         }
@@ -435,7 +460,6 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 translate:
     if (g_xbox_path_hook)
         g_xbox_path_hook(xbox_path);
-    if (xbox_io_trace()) { fprintf(stderr, "  [PATH] %s\n", xbox_path); fflush(stderr); }
     {
         WCHAR remainder_wide[MAX_PATH];
         MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH);
@@ -519,6 +543,7 @@ static void mkdir_p(const char* path)
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
+    s_explicit_save_root = save_dir && save_dir[0];
     if (game_dir) {
         snprintf(s_game_dir, sizeof(s_game_dir), "%s", game_dir);
     } else {
@@ -529,7 +554,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         snprintf(s_game_dir, sizeof(s_game_dir), "%s/game", cwd);
     }
 
-    if (save_dir) {
+    if (s_explicit_save_root) {
         snprintf(s_save_dir, sizeof(s_save_dir), "%s", save_dir);
     } else {
         /* XDG base-directory spec: $XDG_DATA_HOME or ~/.local/share */
@@ -545,6 +570,13 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 
     strip_trailing_slash(s_game_dir);
     strip_trailing_slash(s_save_dir);
+    if (s_explicit_save_root) {
+        char dir[MAX_PATH];
+        snprintf(dir, sizeof(dir), "%s/UDATA", s_save_dir);
+        mkdir_p(dir);
+        snprintf(dir, sizeof(dir), "%s/TDATA", s_save_dir);
+        mkdir_p(dir);
+    }
 
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
@@ -574,7 +606,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         skip = match_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
-            base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
+            base_dir  = rule_uses_save_root(&s_rules[i], xbox_path) ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_posix;
             goto translate;
         }

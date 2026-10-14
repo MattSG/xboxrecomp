@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_graphics_quality C)
+
+enable_testing()
+add_executable(nv2a_graphics_quality test_graphics_quality.c)
+target_include_directories(nv2a_graphics_quality PRIVATE ../../src ../../src/video)
+target_link_libraries(nv2a_graphics_quality PRIVATE d3d11 dxgi dxguid d3dcompiler)
+foreach(case panorama gates depth placement)
+    add_test(NAME nv2a_graphics_quality_${case} COMMAND nv2a_graphics_quality ${case})
+endforeach()

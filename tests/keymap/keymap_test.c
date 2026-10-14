@@ -5,14 +5,30 @@
 
 static unsigned char held[256];
 int xbox_FramebufferKeyDown(int vk) { return vk >= 0 && vk < 256 && held[vk]; }
-static int menu_flag;
+static int menu_flag, driving_flag;
+static int probe_driving(void) { return driving_flag; }
 static int probe_menu(void) { return menu_flag; }
 int xbox_FramebufferMouse(float *x, float *y) { *x = *y = 0; return 0; }
 void nv2a_d3d_collect_menu_rects(int on) { (void)on; }
 
-int main(void)
+int main(int argc, char **argv)
 {
     XBOX_INPUT_STATE s;
+    if (argc == 2 && !strcmp(argv[1], "default-padmap")) {
+        XINPUT_GAMEPAD g = {0};
+        XBOX_GAMEPAD out;
+        _putenv_s("RECOMP_PADMAP", "");
+        g.wButtons = XINPUT_GAMEPAD_RIGHT_SHOULDER;
+        pad_buttons(&g, &out);
+        if (out.bAnalogButtons[XBOX_BUTTON_BLACK] != 255 || out.bAnalogButtons[XBOX_BUTTON_WHITE]) return 21;
+        g.wButtons = XINPUT_GAMEPAD_LEFT_SHOULDER;
+        pad_buttons(&g, &out);
+        if (out.bAnalogButtons[XBOX_BUTTON_WHITE] != 255 || out.bAnalogButtons[XBOX_BUTTON_BLACK]) return 22;
+        puts("PASS: right shoulder is Black and left shoulder is White by default");
+        return 0;
+    }
+    _putenv_s("RECOMP_KEYBOARD_LAYOUT", "mm3");
+    xbox_InputSetKeyboardDrivingProbe(probe_driving);
     _putenv_s("RECOMP_KEYMAP", "A:57,RX-:2,LX-:41,START:0");
     _putenv_s("RECOMP_MENU_KEYS", "1"); /* read once, like the keymap */
     xbox_InputSetMenuProbe(probe_menu);
@@ -42,8 +58,8 @@ int main(void)
     {
         XINPUT_GAMEPAD g = {0};
         XBOX_GAMEPAD out;
-        _putenv_s("RECOMP_PADMAP", "BLACK:RB,WHITE:LB,A:RT,START:A");
-        g.wButtons = XINPUT_GAMEPAD_RIGHT_SHOULDER | XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B;
+        _putenv_s("RECOMP_PADMAP", "BLACK:LB,WHITE:RB,A:RT,START:A");
+        g.wButtons = XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B;
         g.bRightTrigger = 200;
         pad_buttons(&g, &out);
         if (out.bAnalogButtons[XBOX_BUTTON_BLACK] != 255 || out.bAnalogButtons[XBOX_BUTTON_WHITE]) { puts("FAIL: shoulders not swapped"); return 12; }
@@ -51,6 +67,19 @@ int main(void)
         if (!(out.wButtons & XBOX_GAMEPAD_START)) { puts("FAIL: Start not on A"); return 14; }
         if (out.bAnalogButtons[XBOX_BUTTON_B] != 255) { puts("FAIL: B lost its own button"); return 15; }
     }
+    memset(held, 0, sizeof held);
+    driving_flag = 1;
+    held[VK_UP] = held[VK_LEFT] = held['R'] = held['F'] = held['C'] = held[VK_SPACE] = 1;
+    keyboard_state(&s);
+    if (s.Gamepad.wButtons & (XBOX_GAMEPAD_DPAD_UP | XBOX_GAMEPAD_DPAD_LEFT)) return 16;
+    if (s.Gamepad.sThumbLX != -32767 || s.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] != 255) return 17;
+    if (s.Gamepad.bAnalogButtons[XBOX_BUTTON_B] != 255 || s.Gamepad.bAnalogButtons[XBOX_BUTTON_X] != 255 ||
+        s.Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] != 255 || s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] != 255) return 18;
+    held[VK_RIGHT] = 1; keyboard_state(&s);
+    if (s.Gamepad.sThumbLX) return 19;
+    menu_flag = 1; keyboard_state(&s);
+    if (!(s.Gamepad.wButtons & XBOX_GAMEPAD_DPAD_UP) || s.Gamepad.sThumbLX ||
+        s.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER]) return 20;
     puts("PASS: RECOMP_KEYMAP rebinds keys and mouse buttons; menu keys only in menus; RECOMP_PADMAP remaps the pad");
     return 0;
 }

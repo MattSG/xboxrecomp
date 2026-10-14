@@ -195,16 +195,56 @@ int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
+/* Configure an existing mirror before entering guest code. It then accepts
+ * only matching executed NV097 semaphore releases, never the next counter. */
+int xbox_Nv2aCommandFence(uint32_t device_ptr_va,
+                          uint32_t dma_context, uint32_t semaphore_offset);
+/* Executor callback; completion retains the target/value until readback. */
+void xbox_Nv2aSemaphoreRelease(uint32_t dma_context,
+                                uint32_t semaphore_offset, uint32_t value);
+/* Publish an owned USER PUT with its PFIFO cache/busy state first. Other
+ * addresses retain the original software-channel store. */
+void xbox_Nv2aDmaPublish(uint32_t put_va, uint32_t value);
+/* Host wait for exact CACHE1 PUT == GET and PGRAPH idle. The caller keeps
+ * the original final reads/branches; unknown apertures retain guest polling. */
+void xbox_Nv2aDmaWait(uint32_t pfifo_base_va);
+
+/* Opt-in parser diagnostics only. Roots come from registered fence mirrors;
+ * the raw device bytes let a title's producer layout be decoded off-line. */
+#define XBOX_NV2A_CAPTURE_MIRRORS 4
+#define XBOX_NV2A_CAPTURE_DEVICE_BYTES 0x2200
+typedef struct {
+    uint32_t device_ptr_va, device_va, device_valid, device_bytes;
+    uint32_t put_offset, get_ptr_offset, put_value, fence_va, fence_value, fence_valid;
+    uint32_t channel_va, channel_valid, channel_put, channel_get;
+    uint32_t pfifo_va, pfifo_valid, pfifo_subroutine;
+    uint32_t command_mode, command_dma, command_offset, command_pending;
+    uint32_t command_value, command_fence_va, command_queue_count;
+    uint8_t device[XBOX_NV2A_CAPTURE_DEVICE_BYTES];
+} XBOX_NV2A_CAPTURE_MIRROR;
+typedef struct {
+    uint32_t version, bytes, mmio_valid, user_put, user_get;
+    uint32_t pfifo_put, pfifo_get, pfifo_subroutine;
+    uint32_t get_held, get_held_value, scan_incomplete;
+    uint32_t notify_count, notify_param, notify_device_ptr, notify_event_offset;
+    uint32_t counter_mirrors, frame_counters, mirror_count;
+    XBOX_NV2A_CAPTURE_MIRROR mirrors[XBOX_NV2A_CAPTURE_MIRRORS];
+} XBOX_NV2A_CAPTURE_STATE;
+void xbox_Nv2aCaptureSnapshot(XBOX_NV2A_CAPTURE_STATE *out);
 
 /* The KEVENT at *(device_ptr_va) + event_off is the title D3D's GPU-notify
  * event; KeWaitForSingleObject on it waits for the executor to consume all
  * submitted push-buffer instead (see xbox_memory_layout.c). NotifyWait
  * returns 0 when object_va is not that event. */
 int xbox_Nv2aNotifyEvent(uint32_t device_ptr_va, uint32_t event_off, uint32_t nop_param);
-/* The executor ran NO_OPERATION with this parameter; the one registered
- * above is the notify D3D waits for, and ends that wait. */
+/* Record an executed matching NO_OPERATION. Its notification ends the wait
+ * only after the associated consumed GET and prior readbacks are published. */
 void xbox_Nv2aNop(uint32_t param);
 int xbox_Nv2aNotifyWait(uint32_t object_va);
+/* Host wait for a direct guest fence poll. The caller retains its original
+ * final read/unsigned branch; this helper never writes guest state. */
+void xbox_Nv2aFenceWait(uint32_t fence_va, uint32_t submitted,
+                         uint32_t allowed_distance);
 
 void xbox_MemoryLayoutShutdown(void);
 
@@ -370,6 +410,11 @@ typedef union RecompXmm {
  * XBOX_TIB_MAIN is where the first thread's TIB is built; every spawned
  * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
  * it. */
+/* Xbox FS addresses a KPCR: 0x28-byte prefix plus the 0x258-byte KPRCB.
+ * DpcRoutineActive is a ULONG at PrcbData + 0x30, beyond the NT_TIB. */
+#define XBOX_KPCR_SIZE              0x280u
+#define XBOX_KPCR_IRQL_OFFSET       0x24u
+#define XBOX_KPCR_DPC_ACTIVE_OFFSET 0x58u
 #define XBOX_TIB_MAIN       0x00004000
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
@@ -458,7 +503,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 /**
- * Free a block from the Xbox heap. Currently a no-op (bump allocator).
+ * Free a block from the Xbox heap and coalesce adjacent free blocks.
  */
 void xbox_HeapFree(uint32_t xbox_va);
 
@@ -471,9 +516,9 @@ void xbox_HeapFree(uint32_t xbox_va);
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
 
 /**
- * True when RECOMP_HEAP_RECLAIM is set: freed heap blocks are split rather than
- * handed over whole, and NtFreeVirtualMemory returns heap memory to the heap.
- * Off by default; it changes which address later allocations get.
+ * True when RECOMP_HEAP_RECLAIM is set: NtFreeVirtualMemory returns heap memory
+ * to the heap and zeroes decommitted pages. Off by default. Ordinary heap
+ * allocation always splits reused blocks, independently of this switch.
  */
 int xbox_HeapReclaimEnabled(void);
 
