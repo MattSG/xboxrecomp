@@ -3897,6 +3897,13 @@ static int present_kept(void)
         return 0;                           /* resized since: draw afresh */
     }
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)bb, (ID3D11Resource *)s_kept);
+    {                                       /* host UI stays live between ticks */
+        ID3D11RenderTargetView *rtv = NULL;
+        if (SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &rtv))) {
+            xbox_FramebufferRenderHostOverlay(s_dev, s_ctx, rtv);
+            ID3D11RenderTargetView_Release(rtv);
+        }
+    }
     capture_backbuffer(bb);
     if (vsync < 0) vsync = getenv("RECOMP_VSYNC") ? atoi(getenv("RECOMP_VSYNC")) : 0;
     IDXGISwapChain1_Present(s_swap, (UINT)vsync, 0);
@@ -3938,7 +3945,8 @@ static void present_surface(Surface *s)
             static int vsync = -1;
             ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &rtv);
             composite(rtv, s_swap_w, s_swap_h, s, &pc, 1);
-            keep_image(bb);
+            keep_image(bb);                 /* game image only */
+            xbox_FramebufferRenderHostOverlay(s_dev, s_ctx, rtv);
             if (!getenv("RECOMP_CAPTURE_SURFACE"))
                 capture_backbuffer(bb);
             if (vsync < 0) vsync = getenv("RECOMP_VSYNC") ? atoi(getenv("RECOMP_VSYNC")) : 0;
