@@ -3902,6 +3902,7 @@ static int present_kept(void)
         if (SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &rtv))) {
             xbox_FramebufferRenderHostOverlay(s_dev, s_ctx, rtv);
             ID3D11RenderTargetView_Release(rtv);
+            unbind_targets();   /* it bound the back buffer behind s_cur_rt */
         }
     }
     capture_backbuffer(bb);
