@@ -3112,8 +3112,14 @@ static void apply_scissor(const NvD3DState *st, uint32_t gw, uint32_t gh)
     D3D11_RECT r;
     uint32_t x0 = st->clip_x, y0 = st->clip_y;
     uint32_t x1 = st->clip_x + st->clip_w, y1 = st->clip_y + st->clip_h;
+    if (x0 < st->wclip_x0) x0 = st->wclip_x0;
+    if (y0 < st->wclip_y0) y0 = st->wclip_y0;
+    if (x1 > st->wclip_x1) x1 = st->wclip_x1;
+    if (y1 > st->wclip_y1) y1 = st->wclip_y1;
     if (x1 > gw) x1 = gw;
     if (y1 > gh) y1 = gh;
+    if (x0 > x1) x0 = x1;
+    if (y0 > y1) y0 = y1;
     r.left = (LONG)(x0 * s_aa_x * s_cur_sx + 0.5f);
     r.top = (LONG)(y0 * s_aa_y * s_cur_sy + 0.5f);
     r.right = (LONG)(x1 * s_aa_x * s_cur_sx + 0.5f);

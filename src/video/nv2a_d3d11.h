@@ -42,6 +42,7 @@ typedef struct {
     uint32_t color_pitch, zeta_pitch;
     uint32_t surface_format;            /* raw SET_SURFACE_FORMAT */
     uint32_t clip_x, clip_y, clip_w, clip_h;
+    uint32_t wclip_x0, wclip_y0, wclip_x1, wclip_y1;  /* window clip, max exclusive */
     /* Output merger. */
     uint32_t blend_enable, blend_sfactor, blend_dfactor, blend_equation;
     uint32_t blend_color, color_mask;
