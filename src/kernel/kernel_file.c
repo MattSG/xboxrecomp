@@ -18,6 +18,8 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -60,7 +62,9 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  *
  * The POSIX backend does not populate this yet, so it reads 0 there; that is a
  * missing detail rather than a missing symbol, and it is visible here. */
-uint32_t g_xbox_last_file_error;
+/* A bridge reads this after its host open returns. Streaming workers can open
+ * simultaneously, so another thread must not replace that call's reason. */
+static XBOX_THREAD_LOCAL uint32_t g_xbox_last_file_error;
 
 uint32_t xbox_LastFileError(void)
 {
@@ -70,6 +74,273 @@ uint32_t xbox_LastFileError(void)
 #if defined(_WIN32)
 /* ====================  Win32 backend  =================================== */
 /* ======================================================================== */
+
+static INIT_ONCE s_file_hitch_once = INIT_ONCE_STATIC_INIT;
+static volatile LONG s_file_hitch_ready;
+static int s_file_hitch_enabled;
+static LARGE_INTEGER s_file_hitch_frequency;
+
+/* Opt-in evidence for a failed cache overwrite. The ledger does not change
+ * the effective access or sharing policy: it records opens, never retries or
+ * closes an owner's handle. It is diagnostic only, not handle ownership. */
+typedef struct XboxFileDiagOpen {
+    struct XboxFileDiagOpen *next;
+    HANDLE handle;
+    DWORD thread;
+    ULONG access, share, disposition, options;
+    WCHAR path[MAX_PATH];
+} XboxFileDiagOpen;
+
+static INIT_ONCE s_file_diag_once = INIT_ONCE_STATIC_INIT;
+static volatile LONG s_file_diag_ready;
+static int s_file_diag_enabled;
+static SRWLOCK s_file_diag_lock = SRWLOCK_INIT;
+static XboxFileDiagOpen *s_file_diag_opens;
+
+static BOOL CALLBACK file_diag_initialize(PINIT_ONCE once, PVOID parameter,
+                                         PVOID *context)
+{
+    const char *setting = getenv("RECOMP_FILE_DIAGNOSTICS");
+    (void)once; (void)parameter; (void)context;
+    s_file_diag_enabled = setting && *setting && strcmp(setting, "0") != 0;
+    InterlockedExchange(&s_file_diag_ready, 1);
+    return TRUE;
+}
+
+static void file_diag_init(void)
+{
+    if (!s_file_diag_ready)
+        InitOnceExecuteOnce(&s_file_diag_once, file_diag_initialize, NULL, NULL);
+}
+
+static int file_diag_path(const WCHAR *path, WCHAR normalized[MAX_PATH])
+{
+    WCHAR unc[MAX_PATH];
+    DWORD length;
+    if (!_wcsnicmp(path, L"\\\\?\\UNC\\", 8)) {
+        if (swprintf_s(unc, MAX_PATH, L"\\\\%s", path + 8) < 0) return 0;
+        path = unc;
+    } else if (!_wcsnicmp(path, L"\\\\?\\", 4)) {
+        path += 4;
+    }
+    length = GetFullPathNameW(path, MAX_PATH, normalized, NULL);
+    return length && length < MAX_PATH;
+}
+
+static int file_diag_archive(const WCHAR *path)
+{
+    const WCHAR *leaf = wcsrchr(path, L'\\');
+    return leaf && !_wcsicmp(leaf + 1, L"Data_hd.zip");
+}
+
+static int file_diag_cached_archive(const WCHAR *path)
+{
+    static const WCHAR suffix[] = L"\\Cache\\Data\\Data_hd.zip";
+    size_t length = wcslen(path), suffix_length = sizeof suffix / sizeof *suffix - 1;
+    return length >= suffix_length &&
+        !_wcsicmp(path + length - suffix_length, suffix);
+}
+
+static void file_diag_open(HANDLE handle, const WCHAR *path, ULONG access,
+                           ULONG share, ULONG disposition, ULONG options)
+{
+    XboxFileDiagOpen *entry;
+    WCHAR normalized[MAX_PATH];
+    DWORD error = GetLastError();
+    file_diag_init();
+    if (!s_file_diag_enabled || !file_diag_path(path, normalized) ||
+        !file_diag_archive(normalized)) goto done;
+    entry = malloc(sizeof *entry);
+    if (!entry) {
+        fprintf(stderr, "[FILE_DIAG] archive open could not be recorded handle=%p\n", handle);
+        goto done;
+    }
+    entry->handle = handle;
+    entry->thread = GetCurrentThreadId();
+    entry->access = access; entry->share = share;
+    entry->disposition = disposition; entry->options = options;
+    wcscpy_s(entry->path, MAX_PATH, normalized);
+    AcquireSRWLockExclusive(&s_file_diag_lock);
+    entry->next = s_file_diag_opens;
+    s_file_diag_opens = entry;
+    ReleaseSRWLockExclusive(&s_file_diag_lock);
+done:
+    SetLastError(error);
+}
+
+static BOOL file_diag_close_native(HANDLE handle)
+{
+    XboxFileDiagOpen **link, *entry = NULL;
+    DWORD error;
+    BOOL closed;
+    if (!s_file_diag_enabled) return CloseHandle(handle);
+    /* Serialize the close with ledger publication: once CloseHandle returns,
+     * another thread may already get this same native handle value. Removing
+     * by value after releasing the lock could erase that newer open's record. */
+    AcquireSRWLockExclusive(&s_file_diag_lock);
+    closed = CloseHandle(handle);
+    error = GetLastError();
+    if (closed) {
+        for (link = &s_file_diag_opens; *link; link = &(*link)->next) {
+            if ((*link)->handle != handle) continue;
+            entry = *link;
+            *link = entry->next;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_file_diag_lock);
+    free(entry);
+    SetLastError(error);
+    return closed;
+}
+
+/* SystemExtendedHandleInformation is used only on the failed-open path.
+ * Duplicate current-process handles long enough to query their disk paths,
+ * then close the duplicates. No foreign-process handles are opened, and no
+ * original handle is altered. A handle can disappear concurrently; such a
+ * failed duplicate is simply omitted rather than treated as an owner. */
+typedef struct XboxFileDiagHandleEntry {
+    PVOID object;
+    ULONG_PTR process_id, handle;
+    ULONG access;
+    USHORT backtrace, type;
+    ULONG attributes, reserved;
+} XboxFileDiagHandleEntry;
+typedef struct XboxFileDiagHandles {
+    ULONG_PTR count, reserved;
+    XboxFileDiagHandleEntry entries[1];
+} XboxFileDiagHandles;
+typedef LONG (NTAPI *XboxFileDiagQuerySystem)(ULONG, PVOID, ULONG, PULONG);
+
+static void file_diag_host_handles(const WCHAR *failed_path)
+{
+    XboxFileDiagQuerySystem query = (XboxFileDiagQuerySystem)GetProcAddress(
+        GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
+    XboxFileDiagHandles *snapshot = NULL;
+    ULONG capacity = 1024u * 1024u, needed = 0;
+    LONG status;
+    unsigned owners = 0;
+    if (!query) goto unavailable;
+    for (;;) {
+        snapshot = malloc(capacity);
+        if (!snapshot) goto unavailable;
+        status = query(64u, snapshot, capacity, &needed);
+        if (status >= 0) break;
+        free(snapshot); snapshot = NULL;
+        if ((ULONG)status != 0xC0000004u || capacity >= 32u * 1024u * 1024u)
+            goto unavailable;
+        capacity *= 2;
+        if (needed > capacity) capacity = needed;
+        if (capacity > 32u * 1024u * 1024u) goto unavailable;
+    }
+    if (snapshot->count > (capacity - offsetof(XboxFileDiagHandles, entries)) /
+                           sizeof snapshot->entries[0]) goto unavailable;
+    for (ULONG_PTR i = 0; i < snapshot->count; ++i) {
+        const XboxFileDiagHandleEntry *item = &snapshot->entries[i];
+        HANDLE duplicate;
+        WCHAR path[MAX_PATH], normalized[MAX_PATH];
+        DWORD length;
+        int tracked = 0;
+        if (item->process_id != GetCurrentProcessId()) continue;
+        if (!DuplicateHandle(GetCurrentProcess(), (HANDLE)item->handle,
+                GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) continue;
+        if (GetFileType(duplicate) != FILE_TYPE_DISK) {
+            CloseHandle(duplicate);
+            continue;
+        }
+        length = GetFinalPathNameByHandleW(duplicate, path, MAX_PATH,
+                                         FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        CloseHandle(duplicate);
+        if (!length || length >= MAX_PATH || !file_diag_path(path, normalized) ||
+            _wcsicmp(normalized, failed_path)) continue;
+        AcquireSRWLockShared(&s_file_diag_lock);
+        for (XboxFileDiagOpen *entry = s_file_diag_opens; entry; entry = entry->next)
+            if (entry->handle == (HANDLE)item->handle &&
+                !_wcsicmp(entry->path, failed_path)) { tracked = 1; break; }
+        ReleaseSRWLockShared(&s_file_diag_lock);
+        fprintf(stderr, "[FILE_DIAG] host_same_file handle=%p granted=0x%08lX guest_tracked=%d\n",
+                (HANDLE)item->handle, (unsigned long)item->access, tracked);
+        ++owners;
+    }
+    fprintf(stderr, "[FILE_DIAG] current_process_same_file_handles=%u; external or transient ownership is not determined\n",
+            owners);
+    free(snapshot);
+    return;
+unavailable:
+    free(snapshot);
+    fprintf(stderr, "[FILE_DIAG] current-process handle inventory unavailable; lock ownership unresolved\n");
+}
+
+static void file_diag_failure(const WCHAR *path, DWORD error)
+{
+    WCHAR normalized[MAX_PATH];
+    unsigned owners = 0;
+    file_diag_init();
+    if (!s_file_diag_enabled || error != ERROR_SHARING_VIOLATION ||
+        !file_diag_path(path, normalized) || !file_diag_cached_archive(normalized))
+        goto done;
+    fprintf(stderr, "[FILE_DIAG] sharing failure pid=%lu thread=%lu path=%ls\n",
+            (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(), normalized);
+    AcquireSRWLockShared(&s_file_diag_lock);
+    for (XboxFileDiagOpen *entry = s_file_diag_opens; entry; entry = entry->next) {
+        if (_wcsicmp(entry->path, normalized)) continue;
+        fprintf(stderr, "[FILE_DIAG] guest_same_file handle=%p open_thread=%lu access=0x%08X share=0x%X disposition=%u options=0x%X\n",
+                entry->handle, (unsigned long)entry->thread, (unsigned)entry->access,
+                (unsigned)entry->share, (unsigned)entry->disposition, (unsigned)entry->options);
+        ++owners;
+    }
+    ReleaseSRWLockShared(&s_file_diag_lock);
+    fprintf(stderr, "[FILE_DIAG] active_guest_same_file_handles=%u\n", owners);
+    file_diag_host_handles(normalized);
+    fflush(stderr);
+done:
+    SetLastError(error);
+}
+
+static BOOL CALLBACK file_hitch_init(PINIT_ONCE once, PVOID parameter,
+                                     PVOID *context)
+{
+    const char *setting = getenv("RECOMP_HITCH_TRACE");
+    (void)once; (void)parameter; (void)context;
+    s_file_hitch_enabled = setting && *setting && strcmp(setting, "0") != 0;
+    if (s_file_hitch_enabled)
+        QueryPerformanceFrequency(&s_file_hitch_frequency);
+    InterlockedExchange(&s_file_hitch_ready, 1);
+    return TRUE;
+}
+
+static int64_t file_hitch_begin(void)
+{
+    LARGE_INTEGER now;
+    if (!s_file_hitch_ready)
+        InitOnceExecuteOnce(&s_file_hitch_once, file_hitch_init, NULL, NULL);
+    if (!s_file_hitch_enabled) return 0;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+static void file_hitch_end(int64_t started, HANDLE handle, ULONG length,
+                           PLARGE_INTEGER offset, DWORD bytes, BOOL result,
+                           DWORD error)
+{
+    LARGE_INTEGER ended;
+    double ms, duration;
+    if (!started) return;
+    QueryPerformanceCounter(&ended);
+    ms = 1000.0 / (double)s_file_hitch_frequency.QuadPart;
+    duration = (ended.QuadPart - started) * ms;
+    if (duration >= 8.0)
+        fprintf(stderr,
+            "[HITCH] phase=file_read qpc_ms=%.3f start_qpc_ms=%.3f "
+            "duration_ms=%.3f thread=%lu handle=%p length=%u offset=%lld "
+            "bytes=%lu error=%lu\n",
+            ended.QuadPart * ms, started * ms, duration,
+            (unsigned long)GetCurrentThreadId(), handle, (unsigned)length,
+            offset ? (long long)offset->QuadPart : -1LL,
+            (unsigned long)bytes, (unsigned long)(result ? ERROR_SUCCESS : error));
+    /* Timing and diagnostics must not replace the read's last-error value. */
+    SetLastError(error);
+}
 
 /* Convert Xbox create disposition to Win32 */
 static DWORD xbox_disposition_to_win32(ULONG Disposition)
@@ -145,6 +416,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
     (void)AllocationSize;
+    g_xbox_last_file_error = 0;
 
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
@@ -205,9 +477,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
-        if (xbox_io_trace())
-        fprintf(stderr, "[NtCreateFile] FAILED path=%ls err=%lu\n",
-                win_path, (unsigned long)err);
+        NTSTATUS status;
+        file_diag_failure(win_path, err);
+        const char *result = (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+            ? "NOT_FOUND" : "FAILED";
+        fprintf(stderr, "[NtCreateFile] %s path=%ls err=%lu access=0x%08X share=0x%X disposition=%u options=0x%X\n",
+                result, win_path, (unsigned long)err, (unsigned)DesiredAccess,
+                (unsigned)ShareAccess, (unsigned)CreateDisposition,
+                (unsigned)CreateOptions);
         /* Kept for the caller's trace. An NTSTATUS says "it did not open";
          * only the Win32 error distinguishes a title probing for a file that
          * is genuinely absent from one it cannot open because this runtime
@@ -218,20 +495,27 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          * silently decides a volume or asset is missing, and in a Release
          * build that decision was invisible. */
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                 "NtCreateFile FAILED: %S (err=%u)", win_path, err);
+                 "NtCreateFile %s: %S (err=%u)", result, win_path, err);
+        switch (err) {
+            case ERROR_FILE_NOT_FOUND: status = STATUS_OBJECT_NAME_NOT_FOUND; break;
+            case ERROR_PATH_NOT_FOUND: status = STATUS_OBJECT_PATH_NOT_FOUND; break;
+            case ERROR_ACCESS_DENIED:  status = STATUS_ACCESS_DENIED; break;
+            case ERROR_ALREADY_EXISTS: status = STATUS_OBJECT_NAME_COLLISION; break;
+            /* A short-lived host file lock is not a missing asset or a
+             * generic I/O failure. Preserve it through the guest's error
+             * conversion without retrying or altering existing handles. */
+            case ERROR_SHARING_VIOLATION: status = STATUS_SHARING_VIOLATION; break;
+            default:                   status = STATUS_UNSUCCESSFUL; break;
+        }
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = status;
             IoStatusBlock->Information = 0;
         }
-        switch (err) {
-            case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
-            case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
-            case ERROR_ACCESS_DENIED:  return STATUS_ACCESS_DENIED;
-            case ERROR_ALREADY_EXISTS: return STATUS_OBJECT_NAME_COLLISION;
-            default:                   return STATUS_UNSUCCESSFUL;
-        }
+        return status;
     }
 
+    file_diag_open(h, win_path, DesiredAccess, ShareAccess,
+                   CreateDisposition, CreateOptions);
     *FileHandle = h;
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
@@ -249,10 +533,14 @@ NTSTATUS __stdcall xbox_NtReadFile(
     DWORD bytes_read = 0;
     BOOL result;
     OVERLAPPED ov;
+    DWORD error;
+    int64_t hitch_started;
     (void)ApcRoutine; (void)ApcContext;
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
+
+    hitch_started = file_hitch_begin();
 
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
@@ -262,8 +550,11 @@ NTSTATUS __stdcall xbox_NtReadFile(
     } else {
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
     }
+    error = GetLastError();
+    file_hitch_end(hitch_started, FileHandle, Length, ByteOffset, bytes_read,
+                   result, error);
 
-    if (result || GetLastError() == ERROR_HANDLE_EOF) {
+    if (result || error == ERROR_HANDLE_EOF) {
         IoStatusBlock->Information = bytes_read;
         if (bytes_read == 0 && Length > 0) {
             IoStatusBlock->Status = STATUS_END_OF_FILE;
@@ -275,7 +566,6 @@ NTSTATUS __stdcall xbox_NtReadFile(
     }
 
     {
-        DWORD error = GetLastError();
         fprintf(stderr, "[NtReadFile] FAILED handle=%p len=%u err=%lu\n",
                 FileHandle, Length, (unsigned long)error);
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p, len=%u) failed err=%u",
@@ -328,7 +618,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         xbox_dir_context_drop(Handle);
-        CloseHandle(Handle);
+        file_diag_close_native(Handle);
         return STATUS_SUCCESS;
     }
     return STATUS_INVALID_HANDLE;
@@ -852,12 +1142,13 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (fd < 0) {
         int e = errno;
+        NTSTATUS status = errno_to_status(e);
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = status;
             IoStatusBlock->Information = 0;
         }
-        return errno_to_status(e);
+        return status;
     }
 
     *FileHandle = w32_open_handle(fd, host_path);

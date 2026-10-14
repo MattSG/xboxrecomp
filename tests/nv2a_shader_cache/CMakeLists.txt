@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_shader_cache C)
+set(CMAKE_C_STANDARD 11)
+enable_testing()
+add_executable(nv2a_shader_cache test_main.c)
+target_include_directories(nv2a_shader_cache PRIVATE ../../src/video)
+target_link_libraries(nv2a_shader_cache PRIVATE d3dcompiler)
+add_test(NAME nv2a_shader_cache COMMAND nv2a_shader_cache)

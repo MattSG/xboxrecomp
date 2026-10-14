@@ -59,24 +59,44 @@ static void ep_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
                            ptr, addr, len, dir)) d->ep.dsp->dma.error = true;
 }
 
+/* Callers cap this whole-frame ring at 64 frames. Capacity, head and queued
+ * bytes are frame-aligned, so a single frame never crosses the allocation.
+ * Grow geometrically. A doubled allocation has room
+ * after the old end for the wrapped prefix, so realloc can retain the queue
+ * in FIFO order without a second allocation. Native OOM only limits staging. */
+static void reserve_pcm_queue(MCPXAPUState *d, size_t required)
+{
+    size_t old_capacity = d->monitor.ep_pcm_capacity;
+    size_t capacity = old_capacity ? old_capacity : sizeof(d->monitor.frame_buf);
+    if (required <= old_capacity) return;
+    while (capacity < required) capacity *= 2;
+    uint8_t *queue = realloc(d->monitor.ep_pcm_queue, capacity);
+    if (!queue) return;
+    if (old_capacity &&
+        d->monitor.ep_pcm_queued > old_capacity - d->monitor.ep_pcm_head) {
+        size_t wrapped = d->monitor.ep_pcm_queued -
+                         (old_capacity - d->monitor.ep_pcm_head);
+        memcpy(queue + old_capacity, queue, wrapped);
+    }
+    d->monitor.ep_pcm_queue = queue;
+    d->monitor.ep_pcm_capacity = capacity;
+}
+
 static void publish_pcm_frame(MCPXAPUState *d, const uint8_t *pcm)
 {
     size_t size = sizeof(d->monitor.frame_buf);
     if ((d->monitor.ep_pcm_ready || d->monitor.frame_mixed) &&
         d->monitor.ep_pcm_capacity - d->monitor.ep_pcm_queued < size &&
         d->monitor.ep_pcm_queued < 64 * size) {
-        size_t required = d->monitor.ep_pcm_queued + size;
-        uint8_t *queue = realloc(d->monitor.ep_pcm_queue, required);
-        if (queue) {
-            d->monitor.ep_pcm_queue = queue;
-            d->monitor.ep_pcm_capacity = required;
-        }
+        reserve_pcm_queue(d, d->monitor.ep_pcm_queued + size);
     }
     if (!d->monitor.ep_pcm_ready && !d->monitor.frame_mixed) {
         memcpy(d->monitor.frame_buf, pcm, sizeof(d->monitor.frame_buf));
         d->monitor.ep_pcm_ready = true;
     } else if (d->monitor.ep_pcm_capacity - d->monitor.ep_pcm_queued >= sizeof(d->monitor.frame_buf)) {
-        memcpy(d->monitor.ep_pcm_queue + d->monitor.ep_pcm_queued,
+        size_t tail = d->monitor.ep_pcm_head + d->monitor.ep_pcm_queued;
+        if (tail >= d->monitor.ep_pcm_capacity) tail -= d->monitor.ep_pcm_capacity;
+        memcpy(d->monitor.ep_pcm_queue + tail,
                pcm, sizeof(d->monitor.frame_buf));
         d->monitor.ep_pcm_queued += sizeof(d->monitor.frame_buf);
     } else {
@@ -113,13 +133,7 @@ static void fifo_rw(MCPXAPUState *d, bool gp, uint8_t *ptr, unsigned index,
         if (frames > (SIZE_MAX - d->monitor.ep_pcm_queued) / frame_size) { dsp->dma.error = true; return; }
         size_t required = d->monitor.ep_pcm_queued + frames * frame_size;
         if (required > 64 * frame_size) required = 64 * frame_size;
-        if (required > d->monitor.ep_pcm_capacity) {
-            uint8_t *queue = realloc(d->monitor.ep_pcm_queue, required);
-            if (queue) {
-                d->monitor.ep_pcm_queue = queue;
-                d->monitor.ep_pcm_capacity = required;
-            }
-        }
+        reserve_pcm_queue(d, required);
     }
     uint8_t *pcm = ptr;
     size_t pcm_len = len;
@@ -169,10 +183,13 @@ void mcpx_apu_dsp_pcm_consumed(MCPXAPUState *d)
     d->monitor.ep_pcm_ready = false;
     d->monitor.frame_mixed = false;
     if (d->monitor.ep_pcm_queued >= sizeof(d->monitor.frame_buf)) {
-        memcpy(d->monitor.frame_buf, d->monitor.ep_pcm_queue, sizeof(d->monitor.frame_buf));
+        memcpy(d->monitor.frame_buf,
+               d->monitor.ep_pcm_queue + d->monitor.ep_pcm_head,
+               sizeof(d->monitor.frame_buf));
         d->monitor.ep_pcm_queued -= sizeof(d->monitor.frame_buf);
-        memmove(d->monitor.ep_pcm_queue,
-                d->monitor.ep_pcm_queue + sizeof(d->monitor.frame_buf), d->monitor.ep_pcm_queued);
+        d->monitor.ep_pcm_head += sizeof(d->monitor.frame_buf);
+        if (d->monitor.ep_pcm_head == d->monitor.ep_pcm_capacity ||
+            !d->monitor.ep_pcm_queued) d->monitor.ep_pcm_head = 0;
         d->monitor.ep_pcm_ready = true;
     }
 }
@@ -250,6 +267,7 @@ static void dsp_write_word_locked(MCPXAPUState *d, bool gp, uint32_t addr, uint3
                 d->ep_frame_div = 0;
                 d->monitor.ep_pcm_offset = 0;
                 d->monitor.ep_pcm_queued = 0;
+                d->monitor.ep_pcm_head = 0;
                 d->monitor.ep_pcm_ready = false;
                 d->monitor.frame_mixed = false;
             }

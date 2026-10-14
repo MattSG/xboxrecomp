@@ -124,6 +124,9 @@ enum {
 #ifndef STATUS_OBJECT_PATH_NOT_FOUND
 #define STATUS_OBJECT_PATH_NOT_FOUND    ((NTSTATUS)0xC000003AL)
 #endif
+#ifndef STATUS_SHARING_VIOLATION
+#define STATUS_SHARING_VIOLATION        ((NTSTATUS)0xC0000043L)
+#endif
 #ifndef STATUS_MUTANT_NOT_OWNED
 #define STATUS_MUTANT_NOT_OWNED         ((NTSTATUS)0xC0000046L)
 #endif
@@ -512,6 +515,13 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
 
+/* Authorize inline Type 0/1, Size 4 KEVENT handling only at these guest kernel
+ * return PCs. Register both setter and wait sites before starting guest code;
+ * the bridge copies at most 16 callers. NULL/0 clears the list. Returns 0 on
+ * success, -1 for an invalid list. RECOMP_TITLE_KEVENTS remains independently
+ * opt-in; titles registering nothing retain the original behavior. */
+int xbox_kernel_set_inline_event_callers(const uint32_t *callers, unsigned count);
+
 /**
  * Per-title kernel ordinal remap.
  *
@@ -600,6 +610,7 @@ void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count);
 
 VOID    __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
+BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 
 ULONG   __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status);
@@ -793,6 +804,7 @@ KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
  * Device models ask before delivering an interrupt; raising IRQL masks the
  * line for the whole processor on hardware, not just for one thread. */
 int     xbox_IrqlBlocksInterrupts(void);
+int     xbox_IrqlCurrent(void);
 int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
 void    xbox_IrqlLeaveInterrupt(int saved);

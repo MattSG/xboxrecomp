@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include <fenv.h>
 #ifdef _MSC_VER
 #include <intrin.h>
 #else
@@ -103,10 +104,20 @@ static float clampf(float v, float mn, float mx)
     return v;
 }
 
-static float attenuate(uint16_t vol)
+static float attenuate(const MCPXAPUState *d, uint16_t vol)
 {
-    vol &= 0xFFF;
-    return (vol == 0xFFF) ? 0.0f : powf(10.0f, vol / (64.0f * -20.0f));
+    return d->vp.attenuation[vol & 0xFFF];
+}
+
+static void prepare_attenuation(MCPXAPUState *d)
+{
+    int rounding = fegetround();
+    if (d->vp.attenuation_rounding == rounding)
+        return;
+    for (unsigned vol = 0; vol < 0xFFF; ++vol)
+        d->vp.attenuation[vol] = powf(10.0f, vol / (64.0f * -20.0f));
+    d->vp.attenuation[0xFFF] = 0.0f;
+    d->vp.attenuation_rounding = rounding;
 }
 
 /* ============================================================
@@ -1240,7 +1251,7 @@ static void voice_process(MCPXAPUState *d,
         } else {
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
-        g *= attenuate(vol[b]) / hr;
+        g *= attenuate(d, vol[b]) / hr;
         /* Bin channel follows xemu (b % channels). Splitting HRTF bins into
          * left/right ear pairs fed the GP crosstalk bins (one title: 6 8 7 9)
          * distinct ears: gameplay went out of phase (L/R corr -0.73), +8 dB
@@ -1260,7 +1271,7 @@ static void voice_process(MCPXAPUState *d,
         float g = 0.0f;
         for (int b = 0; b < 8; b++) {
             float hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
-            float bg = attenuate(vol[b]) / hr;
+            float bg = attenuate(d, vol[b]) / hr;
             if (bg > g) g = bg;
         }
         g *= ea_value;
@@ -1282,6 +1293,9 @@ static void voice_process(MCPXAPUState *d,
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    /* Initialization and mixing can run on different host threads. Match the
+     * current rounding mode once per frame, never once per bin/voice. */
+    prepare_attenuation(d);
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1336,8 +1350,13 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
 void mcpx_apu_vp_init(MCPXAPUState *d)
 {
-    /* Single-threaded - no worker dispatch needed */
-    (void)d;
+    /* Eight bins per voice used to repeat this powf every 32 samples, even
+     * when their volume had not changed. Calculate the finite input domain
+     * using the same expression and host math library, before the frame
+     * thread starts. The final encoding is the hardware's silence sentinel.
+     * Keeping the table in the APU avoids lazy-init races and shared state. */
+    d->vp.attenuation_rounding = -2;
+    prepare_attenuation(d);
 }
 
 void mcpx_apu_vp_finalize(MCPXAPUState *d)

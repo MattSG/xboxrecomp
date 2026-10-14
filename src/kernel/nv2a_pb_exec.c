@@ -172,6 +172,9 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_NO_OPERATION                0x0100
+#define NV097_SET_CONTEXT_DMA_SEMAPHORE    0x01A8
+#define NV097_SET_SEMAPHORE_OFFSET         0x1D6C
+#define NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
 #define NV097_ARRAY_ELEMENT16             0x1800
 /* Draw a run of vertices straight out of the arrays, with no index list:
  * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
@@ -3456,6 +3459,7 @@ static void tex_stage_method(uint32_t method, uint32_t param)
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+    static uint32_t semaphore_dma, semaphore_offset;
     if (!inited) {
         inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
@@ -3516,6 +3520,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     switch (method) {
+    case NV097_SET_CONTEXT_DMA_SEMAPHORE:
+        semaphore_dma = param;
+        return;
+    case NV097_SET_SEMAPHORE_OFFSET:
+        semaphore_offset = param;
+        return;
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        xbox_Nv2aSemaphoreRelease(semaphore_dma, semaphore_offset, param);
+        return;
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;
         s_gpu.clip_w = (param >> 16) & 0xFFFF;

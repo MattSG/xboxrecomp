@@ -40,6 +40,11 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+int xbox_IrqlCurrent(void)
+{
+    return (int)g_current_irql;
+}
+
 /* The current IRQL, where guest code reads it: KPCR.Irql, fs:[0x24].
  *
  * The XDK does not always ask the kernel. DirectSound's lock
@@ -182,6 +187,10 @@ void xbox_IrqlDumpHolders(void)
  * dropped on the crossing back. Recursive, so an ISR that queues work on its
  * own thread does not deadlock itself. */
 static CRITICAL_SECTION g_dispatch_lock;
+/* Device-level callbacks serialize with KeSynchronizeExecution without
+ * taking the DPC gate. This lets a real ISR preempt a guest at DISPATCH_LEVEL
+ * while preventing concurrent hardware callbacks from sharing guest state. */
+static CRITICAL_SECTION g_isr_lock;
 static INIT_ONCE g_dispatch_lock_once = INIT_ONCE_STATIC_INIT;
 /* How many times this thread holds g_dispatch_lock, so a lowering never
  * releases a lock the thread does not own (a device interrupt skips it). */
@@ -193,6 +202,7 @@ static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
     (void)o; (void)p; (void)c;
     InitializeCriticalSection(&g_dispatch_lock);
+    InitializeCriticalSection(&g_isr_lock);
     return TRUE;
 }
 
@@ -257,10 +267,16 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  * Return values carry these two cases in bits 8 and 9 for the leave. */
 #define IRQL_ISR_UNLOCKED 0x100
 #define IRQL_DPC_LOCKED   0x200
+#define IRQL_ISR_LOCKED   0x400
 
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
+    if (level > DISPATCH_LEVEL) {
+        InitOnceExecuteOnce(&g_dispatch_lock_once, dispatch_lock_init, NULL, NULL);
+        EnterCriticalSection(&g_isr_lock);
+        saved |= IRQL_ISR_LOCKED;
+    }
     if (level > DISPATCH_LEVEL && g_current_irql < DISPATCH_LEVEL) {
         InterlockedIncrement(&g_irql_raised_count);    /* devices still hold off */
         g_isr_unlocked++;
@@ -286,25 +302,25 @@ int xbox_IrqlEnterInterrupt(int level)
 
 void xbox_IrqlLeaveInterrupt(int saved)
 {
+    int isr_locked = saved & IRQL_ISR_LOCKED;
+    saved &= ~IRQL_ISR_LOCKED;
     if (saved & IRQL_ISR_UNLOCKED) {
         g_isr_unlocked--;
         InterlockedDecrement(&g_irql_raised_count);
         g_current_irql = (KIRQL)(saved & 0xFF);
         irql_publish();
-        return;
-    }
-    if (saved & IRQL_DPC_LOCKED) {
+    } else if (saved & IRQL_DPC_LOCKED) {
         g_dispatch_owned--;
         LeaveCriticalSection(&g_dispatch_lock);
         g_current_irql = (KIRQL)(saved & 0xFF);
         irql_publish();
-        return;
-    }
-    if (g_current_irql != (KIRQL)saved) {
+    } else if (g_current_irql != (KIRQL)saved) {
         irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
         g_current_irql = (KIRQL)saved;
         irql_publish();
     }
+    if (isr_locked)
+        LeaveCriticalSection(&g_isr_lock);
 }
 
 /*

@@ -2,12 +2,13 @@
  * D3D11 renderer for the NV2A pushbuffer executor.
  *
  * The executor (src/kernel/nv2a_pb_exec.c) decodes the title's GPU command
- * stream and runs its vertex programs; this turns the result into D3D11 draws.
+ * stream and supplies vertex arrays, indices and state for D3D11 draws. A
+ * host vertex shader interprets the title's NV2A vertex programs.
  * Rasterisation, register combiners, texturing, blending, depth and stencil
  * all run on the host GPU. Render targets live in host textures keyed by the
- * physical address the title gave them, so a surface the title later samples
- * as a texture (its own render-to-texture passes) is read back from the GPU
- * rather than from guest RAM, which the GPU never writes.
+ * physical address the title gave them. Render-to-texture passes sample these
+ * host resources. CPU-assisted synchronization merges guest RAM writes into
+ * surfaces and copies completed renderings back to guest RAM at flips.
  *
  * Everything here runs on the one thread that executes the pushbuffer.
  */
@@ -118,6 +119,7 @@ float nv2a_d3d_display_aspect(void);
 typedef struct {
     const float (*pos)[4];  /* screen position by vertex - lo */
     const uint32_t *idx;
+    const NvD3DAttrib *attrib; /* 16 original guest arrays; read only. */
     uint32_t ni, lo, count; /* indices; vertices lo .. lo + count - 1 */
     uint32_t per;           /* indices per primitive: 3, 2 or 1 */
     float gw, gh;           /* target size in guest pixels */
@@ -130,8 +132,16 @@ typedef struct {
     void (*frame)(void);    /* at each flip, before the next frame's draws */
     int (*place)(const NvOverlayDraw *d, float *dx, float *squeeze, float *shift);
     int (*hold_aspect)(void);   /* nonzero: defer an aspect change */
+    /* Optional title metadata cleanup on the private GPU copy. `copy` begins
+     * at element lo of this attribute and follows attrib->stride. Called for
+     * each readable, enabled array, even without screen positions or a wide
+     * target. Do not change guest RAM or write outside the copied attribute. */
+    void (*sanitize_vertex_upload)(uint8_t *copy, const NvD3DAttrib *attrib,
+                                   unsigned attribute, uint32_t lo, uint32_t count);
 } NvOverlayHooks;
 void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks);
+/* Opt in lamp visibility sprites to scene depth, without depth writes. */
+void nv2a_d3d_set_flare_depth_test(int on);
 /* A title that multiplies its far plane by `scale` (w-buffered, so depth is
  * w / far) still indexes its authored depth lookups (fog ramps) with the
  * original fractions. Depth read back as a texture is reported in those:

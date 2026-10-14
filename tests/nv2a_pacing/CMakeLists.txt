@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_pacing C)
+enable_testing()
+add_executable(nv2a_pacing test_pacing.c)
+target_include_directories(nv2a_pacing PRIVATE ../../src/video)
+foreach(case cadence failures conversion native)
+    add_test(NAME nv2a_pacing_${case} COMMAND nv2a_pacing ${case})
+endforeach()

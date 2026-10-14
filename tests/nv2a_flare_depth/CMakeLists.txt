@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_flare_depth C)
+enable_testing()
+add_executable(nv2a_flare_depth test_flare_depth.c)
+target_include_directories(nv2a_flare_depth PRIVATE ../../src)
+target_link_libraries(nv2a_flare_depth PRIVATE d3d11 dxgi dxguid d3dcompiler)
+foreach(samples 1 4)
+    foreach(scale 1 3)
+        add_test(NAME nv2a_flare_depth_${samples}x_scale${scale}
+            COMMAND nv2a_flare_depth ${samples} ${scale})
+    endforeach()
+endforeach()

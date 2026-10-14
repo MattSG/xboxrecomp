@@ -12,6 +12,9 @@
 #include <windows.h>
 /* The window to present into, or NULL until it exists. */
 HWND xbox_FramebufferWindowHandle(void);
+/* Register before window startup. Called on its message thread when the user
+ * closes the display; the title owns stopping its guest workers. */
+void xbox_FramebufferSetCloseHandler(void (*handler)(void));
 #endif
 
 /* A buffer the display reads straight from guest memory because the title is

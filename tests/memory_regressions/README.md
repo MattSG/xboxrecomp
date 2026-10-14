@@ -15,12 +15,18 @@ One test per mode, one process each, because the switches are read once and cach
 
 | Test | What it checks |
 |---|---|
-| `memory_regressions_default` | No switch set. Pins what every title gets today: reuse hands a freed block over whole, contiguous memory is reused, an explicit high base is not honoured. A change to the default fails here. |
+| `memory_regressions_default` | No switch set. Freed heap blocks are split on reuse, contiguous memory is reused, and an explicit high base is not honoured. |
+| `memory_regressions_car_churn` | No switch set. Reuses an unaligned free tail for a page-aligned request, coalesces its fragments, and runs 200 model-sized temporary allocations interspersed with small persistent objects without exhausting the heap or corrupting those objects. |
+| `memory_regressions_scene_churn` | `RECOMP_HEAP_RECLAIM=1` on a 128 MB map. Repeats 24 whole-roster scene loads using MM3's commit-only flags and observed model sizes, releasing through the NT bridge; addresses stabilize, reused bytes are zero, and live neighbours remain intact. |
 | `memory_regressions_heap_reclaim` | `RECOMP_HEAP_RECLAIM=1`. The first table below. |
 | `memory_regressions_ext_vma` | `RECOMP_EXT_VMA=1`. The second table. |
 | `memory_regressions_ext_vma_128` | `RECOMP_EXT_VMA=1` on a 128 MB map. The tracker stays off. |
+| `memory_regressions_reserve_heap` | Retail RAM on a 128 MB map. Heap growth preserves above-RAM reservations, partial commit retains its address, and the existing reserve release/decommit no-ops retain ownership. Later reservations skip issued heap blocks. |
 
-## `RECOMP_HEAP_RECLAIM`
+## Heap reuse and `RECOMP_HEAP_RECLAIM`
+
+Splitting reused blocks, coalescing neighbours and contiguous reuse are always
+enabled. `RECOMP_HEAP_RECLAIM` additionally enables NT release/decommit behavior.
 
 Each check fails without the change and passes with it.
 
@@ -64,10 +70,11 @@ loader does not place modules in the low 2 GB.
 
 ## What it does not cover
 
-Titles. It shows the allocator and the tracker do what they should when the
-switch is set and what they did before when it is not; it does not show any
-particular title runs better with them. Which titles free enough for the switch to matter, and
+Titles. It shows the allocator and the tracker contracts in each mode; it does
+not show any particular title runs better with them. Which titles free enough for the switch to matter, and
 whether a title's addresses matter to it, is a per-title question.
 
 The block table's lock is not exercised: nothing here allocates from two
-threads.
+threads. `tests/kernel_dispatch/reserve_heap_ownership_test.c` separately checks
+both allocation orders, exact alignment gaps, arithmetic overflow, and eight
+simultaneous reservation/heap allocation threads.

@@ -10,7 +10,10 @@
  *
  *   default       No switch set. Pins what every title gets today, so a change
  *                 that alters the default shows up here.
- *   heap-reclaim  RECOMP_HEAP_RECLAIM=1. Each check fails without the fix:
+ *   car-churn     No switch set. Model-sized temporary buffers mixed with
+ *                 small retained objects must not consume the entire heap.
+ *   heap-reclaim  RECOMP_HEAP_RECLAIM=1 additionally enables NT release and
+ *                 decommit. Reuse/splitting and contiguous frees are default.
  *
  *   1. A small request after a large free takes only what it needs. Reuse used
  *      to hand over the whole block, so a 16-byte request could take 2 MB.
@@ -32,6 +35,9 @@
  *   ext-vma-128   The same switch on a 128 MB map, where the mirrors already
  *                 reach past user space. The tracker must stay out of the way
  *                 rather than reserve a range of negative size.
+ *   reserve-heap  Retail RAM on a 128 MB map. Above-RAM reservations keep
+ *                 exact ownership through partial commit and no-op release,
+ *                 and both allocators exclude the other's issued blocks.
  */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
@@ -169,7 +175,10 @@ static void set_env(const char *name, const char *value)
 #ifdef _WIN32
     _putenv_s(name, value);
 #else
-    setenv(name, value, 1);
+    if (*value)
+        setenv(name, value, 1);
+    else
+        unsetenv(name);
 #endif
 }
 
@@ -177,25 +186,32 @@ int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "default";
     const char *path = argc > 2 ? argv[2] : "tools/conformance/test.xbe";
-    int reclaim = !strcmp(mode, "heap-reclaim");
+    int scene_churn = !strcmp(mode, "scene-churn") || !strcmp(mode, "scene-churn-baseline");
+    int reclaim = !strcmp(mode, "heap-reclaim") || !strcmp(mode, "scene-churn");
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
+    int reserve_heap = !strcmp(mode, "reserve-heap");
+    int car_churn = !strcmp(mode, "car-churn");
     size_t xbe_len = 0;
     unsigned char *xbe;
     char d[160];
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !reserve_heap && !car_churn && !scene_churn && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
-    if (reclaim)
+    if (reclaim || reserve_heap)
         set_env("RECOMP_HEAP_RECLAIM", "1");
+    else if (scene_churn)
+        set_env("RECOMP_HEAP_RECLAIM", "");
     if (ext)
         set_env("RECOMP_EXT_VMA", "1");
     if (ext128)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
+    if (reserve_heap || scene_churn)
+        xbox_SetMapSize(XBOX_DEVKIT_RAM);
 
     xbe = load_file(path, &xbe_len);
     if (!xbe) {
@@ -220,6 +236,148 @@ int main(int argc, char **argv)
         }
     }
     printf("mode: %s\n", mode);
+    if (scene_churn) {
+        /* Sizes from MM3's race -> menu -> car-change OOM report. Unlike
+         * car-churn, these blocks return through the NT bridge, not HeapFree.
+         * Keeping the whole roster live for each scene catches a release
+         * no-op even when individual car changes appear stable. */
+        const uint32_t sizes[] = {2441264u, 2818096u, 1638448u, 1720368u,
+                                 1261616u, 1458224u, 1635472u, 1342608u};
+        uint32_t blocks[8], first[8] = {0};
+        uint32_t guard = xbox_HeapAlloc(4096, 16);
+        unsigned completed = 0;
+        int reused = 1, intact = 1, released = 1;
+        *G(guard) = 0xC0FFEE42u;
+        for (unsigned round = 0; round < 24; ++round) {
+            unsigned loaded = 0;
+            for (; loaded < 8; ++loaded) {
+                uint32_t size = sizes[loaded], base = 0;
+                /* MM3's large CRT allocation requests commit at base zero,
+                 * optionally with MEM_NOZERO. It returns base + 0x30 to the
+                 * file loader and subtracts that header before release. */
+                uint32_t st = nt_alloc_at(&base, &size, loaded & 1 ? 0x801000 : 0x1000);
+                blocks[loaded] = base;
+                if (st || !blocks[loaded]) break;
+                if (!round) first[loaded] = blocks[loaded];
+                else if (blocks[loaded] != first[loaded]) reused = 0;
+                if (*G(blocks[loaded]) || *G(blocks[loaded] + sizes[loaded] - 4)) intact = 0;
+                *G(blocks[loaded]) = 0xABCD0000u + loaded;
+                *G(blocks[loaded] + sizes[loaded] - 4) = 0x12340000u + loaded;
+            }
+            for (unsigned j = 0; j < loaded; ++j) {
+                if (*G(blocks[j]) != 0xABCD0000u + j ||
+                    *G(blocks[j] + sizes[j] - 4) != 0x12340000u + j) intact = 0;
+            }
+            for (unsigned j = 0; j < loaded; ++j) {
+                if (nt_release(blocks[j]) || xbox_HeapBlockSize(blocks[j])) released = 0;
+            }
+            if (*G(guard) != 0xC0FFEE42u) intact = 0;
+            if (loaded != 8) break;
+            ++completed;
+        }
+        snprintf(d, sizeof d, "completed %u of 24 whole-roster scene cycles", completed);
+        check(completed == 24, "repeated race/menu NT allocations do not exhaust heap", d);
+        check(released, "MEM_RELEASE removes every model from the live heap", NULL);
+        check(reused, "model addresses stabilize after the first scene", NULL);
+        check(intact, "reused models are zeroed and live neighbours stay intact", NULL);
+        goto shutdown;
+    }
+    if (car_churn) {
+        const uint32_t big = 2u * 1024u * 1024u;
+        const uint32_t models[] = {2818096u, 2441264u, 1638448u, 1720368u};
+        uint32_t retained[200] = {0};
+        uint32_t a = xbox_HeapAlloc(big, 4096);
+        uint32_t guard = xbox_HeapAlloc(4096, 16);
+        uint32_t small, page, merged;
+        unsigned completed = 0;
+        int intact = 1;
+        *G(guard) = 0x12345678u;
+        xbox_HeapFree(a);
+        small = xbox_HeapAlloc(40, 16);
+        page = xbox_HeapAlloc(4096, 4096);
+        check(small == a && xbox_HeapBlockSize(small) == 40,
+              "a 40-byte request does not retain a freed 2 MB block", NULL);
+        check(page == a + 4096 && xbox_HeapBlockSize(page) == 4096,
+              "page-aligned reuse carves the unaligned free tail", NULL);
+        check(*G(guard) == 0x12345678u,
+              "splitting preserves the live neighbouring allocation", NULL);
+        xbox_HeapFree(small);
+        xbox_HeapFree(page);
+        merged = xbox_HeapAlloc(big, 4096);
+        check(merged == a, "aligned head and tail coalesce after both frees", NULL);
+        xbox_HeapFree(merged);
+
+        /* Model-sized temporary buffers followed by persistent small objects
+         * reproduce whole-block internal fragmentation without a title leak.
+         * Live requested bytes stay below one model plus 12 KB throughout. */
+        for (unsigned n = 0; n < 200; ++n) {
+            uint32_t size = models[n % 4];
+            uint32_t model = xbox_HeapAlloc(size, 16);
+            uint32_t tiny_size = 40u + (n % 3u) * 8u;
+            if (!model) break;
+            *G(model) = 0xA5A50000u + n;
+            *G(model + size - 4) = 0x5A5A0000u + n;
+            xbox_HeapFree(model);
+            retained[n] = xbox_HeapAlloc(tiny_size, 16);
+            if (!retained[n]) break;
+            if (xbox_HeapBlockSize(retained[n]) != tiny_size) intact = 0;
+            *G(retained[n]) = 0xC0FF0000u + n;
+            ++completed;
+        }
+        for (unsigned n = 0; n < completed; ++n) {
+            if (*G(retained[n]) != 0xC0FF0000u + n) intact = 0;
+            xbox_HeapFree(retained[n]);
+        }
+        snprintf(d, sizeof d, "completed %u of 200 bounded-live-memory cycles", completed);
+        check(completed == 200, "200 model loads with small retained objects avoid OOM", d);
+        check(intact, "retained small objects keep exact size and live contents", NULL);
+        goto shutdown;
+    }
+    if (reserve_heap) {
+        const uint32_t ram_end = XBOX_TOTAL_RAM;
+        uint32_t reserve = 0, size = 0x100000, st, base, heap, later, args[3];
+        st = nt_alloc_at(&reserve, &size, 0x2000);
+        check(st == 0 && reserve == ram_end && size == 0x100000,
+              "large pure reserve starts above retail RAM", NULL);
+        if (st != 0 || reserve != ram_end) goto shutdown;
+
+        base = reserve + 0x1000; size = 0x1000;
+        st = nt_alloc_at(&base, &size, 0x1000);
+        check(st == 0 && base == reserve + 0x1000 && size == 0x1000,
+              "partial commit keeps its reserved guest address", NULL);
+        *G(reserve) = 0xA5A5A5A5u;
+        *G(reserve + 0x1000) = 0xC0FFEE01u;
+        *G(reserve + 0xFFFFC) = 0xA5A5A5A5u;
+
+        /* A single request that previously crossed 64 MB must move past the
+         * whole reservation before zero filling any byte. */
+        heap = xbox_HeapAlloc(ram_end - (scratch + 0x10000) + 0x1000, 4096);
+        check(heap == reserve + 0x100000,
+              "heap growth crossing 64 MB skips the full reservation", NULL);
+        check(*G(reserve) == 0xA5A5A5A5u && *G(reserve + 0x1000) == 0xC0FFEE01u &&
+              *G(reserve + 0xFFFFC) == 0xA5A5A5A5u,
+              "ordinary heap zero fill preserves committed/reserved bytes", NULL);
+
+        *G(OUT_VA) = reserve + 0x1000; *G(OUT_VA + 4) = 0x1000;
+        args[0] = OUT_VA; args[1] = OUT_VA + 4; args[2] = 0x4000;
+        st = call(S_FREE, 3, args);
+        check(st == 0 && xbox_ReserveRangeAllocated(reserve + 0x1000) &&
+              *G(reserve + 0x1000) == 0xC0FFEE01u,
+              "reserve decommit remains a no-op and retains exact ownership", NULL);
+        st = nt_release(reserve);
+        check(st == 0 && xbox_ReserveRangeAllocated(reserve) &&
+              xbox_ReserveRangeAllocated(reserve + 0xFFFFF),
+              "reserve release remains a no-op even with heap reclaim enabled", NULL);
+
+        later = 0; size = 0x100000;
+        st = nt_alloc_at(&later, &size, 0x2000);
+        check(st == 0 && later >= heap + xbox_HeapBlockSize(heap),
+              "later reservation skips the already-issued ordinary heap", NULL);
+        check(!xbox_ReserveRangeAllocated(heap) &&
+              !xbox_ReserveRangeAllocated(reserve + 0x100000),
+              "skipped ordinary heap bytes are not reservation coverage", NULL);
+        goto shutdown;
+    }
     *G(0x00070000u) = 0x12345678u;
     *G(0x80070000u) = 0x87654321u;
     check(*G(0x00070000u) == 0x12345678u &&
@@ -238,18 +396,10 @@ int main(int argc, char **argv)
         s1 = xbox_HeapAlloc(16, 16);
         s2 = xbox_HeapAlloc(16, 16);
 
-        if (reclaim) {
-            snprintf(d, sizeof d, "block is %u bytes, expected 16", xbox_HeapBlockSize(s1));
-            check(xbox_HeapBlockSize(s1) == 16, "16-byte request takes 16 bytes of a freed 2 MB", d);
-            snprintf(d, sizeof d, "second request at 0x%08X, outside 0x%08X", s2, a);
-            check(s2 >= a && s2 < a + big, "the rest of the block is still available", d);
-        } else {
-            snprintf(d, sizeof d, "block is %u bytes", xbox_HeapBlockSize(s1));
-            check(s1 == a && xbox_HeapBlockSize(s1) == big,
-                  "default: reuse hands over the whole freed block", d);
-            check(s2 < a || s2 >= a + big,
-                  "default: the second request cannot share it", NULL);
-        }
+        snprintf(d, sizeof d, "block is %u bytes, expected 16", xbox_HeapBlockSize(s1));
+        check(xbox_HeapBlockSize(s1) == 16, "16-byte request takes 16 bytes of a freed 2 MB", d);
+        snprintf(d, sizeof d, "second request at 0x%08X, outside 0x%08X", s2, a);
+        check(s2 >= a && s2 < a + big, "the rest of the block is still available", d);
     }
 
     /* 2. Three neighbours freed so that the third meets an empty slot. */
@@ -391,6 +541,7 @@ int main(int argc, char **argv)
         }
     }
 
+shutdown: ;
 #ifdef _WIN32
     void *host_base = (void *)((uintptr_t)xbox_GetMemoryOffset());
 #endif

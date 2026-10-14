@@ -159,14 +159,21 @@ static inline void hrtf_filter_process(HrtfFilter *f,
             int di = (int)d;
             float dfrac = d - di;
             float acc = 0.0f;
-            for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-                int idx1 = (f->buf_pos - di - k + HRTF_BUFLEN) % HRTF_BUFLEN;
-                float s = buf[idx1];
-                if (dfrac > 0.0f) {
-                    int idx2 = (idx1 - 1 + HRTF_BUFLEN) % HRTF_BUFLEN;
+            int idx1 = (f->buf_pos - di + HRTF_BUFLEN) % HRTF_BUFLEN;
+            if (dfrac > 0.0f) {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    float s = buf[idx1];
+                    int idx2 = idx1 == 0 ? HRTF_BUFLEN - 1 : idx1 - 1;
                     s = s * (1 - dfrac) + buf[idx2] * dfrac;
+                    acc += coeff[k] * s;
+                    idx1 = idx1 == 0 ? HRTF_BUFLEN - 1 : idx1 - 1;
                 }
-                acc += coeff[k] * s;
+            } else {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    float s = buf[idx1];
+                    acc += coeff[k] * s;
+                    idx1 = idx1 == 0 ? HRTF_BUFLEN - 1 : idx1 - 1;
+                }
             }
             out[n][ch] = acc;
         }
@@ -314,6 +321,9 @@ typedef struct MCPXAPUVPState {
     uint8_t hrtf_headroom;
     uint8_t hrtf_submix[4];
     uint8_t submix_headroom[NUM_MIXBINS];
+    /* Rebuilt only if the audio thread's floating-point rounding changes. */
+    float attenuation[0x1000];
+    int attenuation_rounding;
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     uint64_t voice_locked[4];
     volatile long voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
@@ -404,6 +414,7 @@ struct MCPXAPUState {
         size_t ep_pcm_offset;
         uint8_t *ep_pcm_queue;
         size_t ep_pcm_queued, ep_pcm_capacity;
+        size_t ep_pcm_head; /* Byte offset of the oldest pending whole frame. */
         bool ep_pcm_ready;
         bool frame_mixed; /* Retained host frame must be mixed only once. */
         uint64_t ep_pcm_dropped_frames;
