@@ -4717,6 +4717,57 @@ static ID3D11Texture2D *s_cap_tex;
 static ID3D11RenderTargetView *s_cap_rtv;
 static UINT s_cap_w, s_cap_h;
 
+/* A copy of the last image presented, for nv2a_d3d_repeat_frame: the guest
+ * may already be drawing the next frame into the surface it came from. */
+static ID3D11Texture2D *s_kept;
+
+static void keep_image(ID3D11Texture2D *bb)
+{
+    D3D11_TEXTURE2D_DESC d, k;
+    ID3D11Texture2D_GetDesc(bb, &d);
+    if (s_kept) {
+        ID3D11Texture2D_GetDesc(s_kept, &k);
+        if (k.Width != d.Width || k.Height != d.Height || k.Format != d.Format) {
+            ID3D11Texture2D_Release(s_kept);
+            s_kept = NULL;
+        }
+    }
+    if (!s_kept) {
+        d.BindFlags = 0;
+        d.MiscFlags = 0;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.CPUAccessFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &s_kept)))
+            s_kept = NULL;
+    }
+    if (s_kept)
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_kept, (ID3D11Resource *)bb);
+}
+
+/* The kept image presented again; 0 if there is none to show. */
+static int present_kept(void)
+{
+    ID3D11Texture2D *bb = NULL;
+    D3D11_TEXTURE2D_DESC d, k;
+    static int vsync = -1;
+    if (!s_kept || !s_swap ||
+        FAILED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&bb)))
+        return 0;
+    ID3D11Texture2D_GetDesc(bb, &d);
+    ID3D11Texture2D_GetDesc(s_kept, &k);
+    if (k.Width != d.Width || k.Height != d.Height || k.Format != d.Format) {
+        ID3D11Texture2D_Release(bb);
+        return 0;                           /* resized since: draw afresh */
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)bb, (ID3D11Resource *)s_kept);
+    capture_backbuffer(bb);
+    if (vsync < 0) vsync = getenv("RECOMP_VSYNC") ? atoi(getenv("RECOMP_VSYNC")) : 0;
+    IDXGISwapChain1_Present(s_swap, (UINT)vsync, 0);
+    ID3D11Texture2D_Release(bb);
+    s_last_present = GetTickCount();
+    return 1;
+}
+
 /* One wait per guest flip; tick/movie presentation passes no pacing state. */
 typedef struct FlipPacing {
     int done;
@@ -4786,6 +4837,7 @@ static void present_surface(Surface *s, FlipPacing *pacing)
                 return; /* The guest flip still receives its fallback wait. */
             }
             composite(rtv, s_swap_w, s_swap_h, s, &pc, 1);
+            keep_image(bb);
             if (!getenv("RECOMP_CAPTURE_SURFACE"))
                 capture_backbuffer(bb);
             if (vsync < 0) vsync = getenv("RECOMP_VSYNC") ? atoi(getenv("RECOMP_VSYNC")) : 0;
@@ -4964,6 +5016,21 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
     s_frame++;
 }
 
+/* The last flipped frame shown again, paced like a flip: for a title that
+ * has nothing new to draw this frame (MM3's console-rate mod between world
+ * updates). Asked from the title's thread, done on this one, which owns the
+ * device; the asker waits for it as it would for a flip. */
+static volatile LONG s_repeat;
+
+void nv2a_d3d_repeat_frame(void)
+{
+    if (!s_shown)
+        return;
+    InterlockedExchange(&s_repeat, 1);
+    while (InterlockedCompareExchange(&s_repeat, 1, 1))
+        SwitchToThread();
+}
+
 void nv2a_d3d_tick(void)
 {
     DWORD now;
@@ -4971,6 +5038,17 @@ void nv2a_d3d_tick(void)
     /* CPU scanout and PVIDEO can precede the first pushbuffer flip. */
     if (s_init_state <= 0 && !nv2a_d3d_init())
         return;
+    if (s_repeat) {
+        int64_t t0;
+        if (!present_kept())
+            present_surface(s_shown, NULL);
+        t0 = qpc();
+        pace_vblank();
+        frame_csv(qpc() - t0);
+        s_frame++;
+        InterlockedExchange(&s_repeat, 0);
+        return;
+    }
     now = GetTickCount();
     if (now - s_last_present < 16)
         return;
@@ -5028,6 +5106,7 @@ void nv2a_d3d_clear(const NvD3DState *st, uint32_t f, uint32_t c, uint32_t z,
 { (void)st; (void)f; (void)c; (void)z; (void)x0; (void)y0; (void)x1; (void)y1; }
 void nv2a_d3d_flip(uint32_t a, uint32_t p) { (void)a; (void)p; }
 void nv2a_d3d_tick(void) {}
+void nv2a_d3d_repeat_frame(void) {}
 void nv2a_d3d_kick(void) {}
 void nv2a_d3d_draw_ub(const NvD3DState *st, int t, const NvD3DAttrib a[16], const float d[16][4],
                       int pr, const uint32_t *i, uint32_t n, uint32_t lo, uint32_t hi,
