@@ -23,6 +23,14 @@
 #include "apu_state.h"
 #include "fpconv.h"
 
+/* Cached: getenv locks and scans the environment, and these run every frame. */
+static bool apu_trace(void)
+{
+    static int trace = -1;
+    if (trace < 0) trace = getenv("RECOMP_APU_TRACE") != NULL;
+    return trace;
+}
+
 static bool scatter_gather_rw(MCPXAPUState *d, uint32_t sge_base,
                               uint32_t max_sge, uint8_t *ptr, uint32_t addr,
                               size_t len, bool dir)
@@ -167,7 +175,7 @@ static void fifo_rw(MCPXAPUState *d, bool gp, uint8_t *ptr, unsigned index,
         }
         static unsigned traced_pcm;
         static bool traced_nonzero_pcm;
-        if (getenv("RECOMP_APU_TRACE") && (traced_pcm < 8 || !traced_nonzero_pcm)) {
+        if (apu_trace() && (traced_pcm < 8 || !traced_nonzero_pcm)) {
             unsigned nonzero = 0;
             for (size_t i = 0; i < pcm_len; i++) nonzero += pcm[i] != 0;
             if (traced_pcm++ < 8 || nonzero)
@@ -257,7 +265,7 @@ static void dsp_write_word_locked(MCPXAPUState *d, bool gp, uint32_t addr, uint3
             if ((value & enabled) != enabled) dsp_reset(dsp);
             else if ((regs[addr] & enabled) != enabled) {
                 dsp_bootstrap(dsp);
-                if (getenv("RECOMP_APU_TRACE"))
+                if (apu_trace())
                     fprintf(stderr, "[DSP] %s bootstrap P[0..2]=%06X %06X %06X DMA.error=%d\n",
                             gp ? "GP" : "EP", dsp_read_memory(dsp, 'P', 0),
                             dsp_read_memory(dsp, 'P', 1), dsp_read_memory(dsp, 'P', 2), dsp->dma.error);
@@ -315,9 +323,15 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
         fprintf(stderr, "[APU] Cannot allocate DSP interpreter state\n");
         abort();
     }
-    d->monitor.point = MCPX_APU_DEBUG_MON_GP_OR_EP;
+    /* RECOMP_APU_DSP=0: xemu's default (use_dsp off). The voice processor's
+     * own mix goes out and the GP/EP get one batch a frame (run_dsp_frame) --
+     * far less CPU, but none of the title's DSP effects (reverb, 3D crosstalk,
+     * mixdown). */
+    const char *use_dsp = getenv("RECOMP_APU_DSP");
+    d->monitor.point = use_dsp && !strcmp(use_dsp, "0") ? MCPX_APU_DEBUG_MON_VP : MCPX_APU_DEBUG_MON_GP_OR_EP;
     mcpx_apu_update_dsp_preference(d);
-    fprintf(stderr, "[APU] GP/EP DSP56300 interpreters initialized\n");
+    fprintf(stderr, "[APU] GP/EP DSP56300 interpreters initialized%s\n",
+            d->monitor.point == MCPX_APU_DEBUG_MON_VP ? " (off: voice mix only)" : "");
 }
 
 /* Called with the APU lock held, as are the frame's native mixer operations. */
@@ -332,13 +346,16 @@ static void run_dsp_frame(MCPXAPUState *d, DSPState *dsp)
     do {
         LARGE_INTEGER begin, end;
         if (profile) QueryPerformanceCounter(&begin);
-        dsp_run(dsp, 1000);
+        dsp_run(dsp, 4000);
         if (profile) {
             QueryPerformanceCounter(&end);
             frame_ticks += (uint64_t)(end.QuadPart - begin.QuadPart);
             batches[index]++;
         }
         if (!dsp_has_work(dsp) || qatomic_read(&d->exiting)) break;
+        /* DSP off: one batch a frame, as xemu without use_dsp. DirectSound's
+         * handshakes with the GP/EP still complete; their output is unused. */
+        if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) break;
         /* Guest MMIO must be able to reset or command a continuously running DSP. */
         qemu_mutex_unlock(&d->lock);
         Sleep(0);
@@ -376,7 +393,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
         ep_enabled = (d->ep.regs[NV_PAPU_EPRST] & enabled) == enabled;
         g_dbg.gp.cycles = d->gp.dsp->core.cycle_count;
         static unsigned gp_trace_frames;
-        if (getenv("RECOMP_APU_TRACE") && gp_trace_frames++ < 8)
+        if (apu_trace() && gp_trace_frames++ < 8)
             fprintf(stderr, "[DSP] GP frame cycles=%llu idle=%d DMA.error=%d EOL=%d\n",
                     (unsigned long long)g_dbg.gp.cycles, d->gp.dsp->core.is_idle,
                     d->gp.dsp->dma.error, d->gp.dsp->dma.eol);
@@ -394,7 +411,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
         run_dsp_frame(d, d->ep.dsp);
         g_dbg.ep.cycles = d->ep.dsp->core.cycle_count;
         static unsigned ep_trace_frames;
-        if (getenv("RECOMP_APU_TRACE") && ep_trace_frames++ < 8)
+        if (apu_trace() && ep_trace_frames++ < 8)
             fprintf(stderr, "[DSP] EP frame cycles=%llu idle=%d DMA.error=%d EOL=%d\n",
                     (unsigned long long)g_dbg.ep.cycles, d->ep.dsp->core.is_idle,
                     d->ep.dsp->dma.error, d->ep.dsp->dma.eol);

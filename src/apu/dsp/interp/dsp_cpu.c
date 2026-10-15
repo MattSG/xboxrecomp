@@ -75,7 +75,31 @@ static uint32_t read_memory_disasm(dsp_core_t* dsp, int space, uint32_t address)
 static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint32_t value);
 static void write_memory_disasm(dsp_core_t* dsp, int space, uint32_t address, uint32_t value);
 
-static void dsp_write_reg(dsp_core_t* dsp, uint32_t numreg, uint32_t value);
+static void dsp_write_reg_slow(dsp_core_t* dsp, uint32_t numreg, uint32_t value);
+
+/* X0-Y1 and A/B outside SA mode and the address registers are most writes:
+ * the slow path's default and accumulator cases, without its register switch. */
+static void dsp_write_reg(dsp_core_t* dsp, uint32_t numreg, uint32_t value)
+{
+    if (!(dsp->registers[DSP_REG_SR] & (1u << DSP_SR_SA))) {
+        if (numreg >= DSP_REG_X0 && numreg <= DSP_REG_Y1) {
+            dsp->registers[numreg] = value & BITMASK(24);
+            return;
+        }
+        if (numreg == DSP_REG_A || numreg == DSP_REG_B) {
+            unsigned r = numreg - DSP_REG_A;
+            dsp->registers[DSP_REG_A0 + r] = 0;
+            dsp->registers[DSP_REG_A1 + r] = value;
+            dsp->registers[DSP_REG_A2 + r] = value & (1<<23) ? 0xff : 0x0;
+            return;
+        }
+    }
+    if (numreg >= DSP_REG_R0 && numreg <= DSP_REG_M7) {    /* dsp_register_mask */
+        dsp->registers[numreg] = value & ((dsp->registers[DSP_REG_SR] & (1u << DSP_SR_SC)) ? 0xffff : 0xffffff);
+        return;
+    }
+    dsp_write_reg_slow(dsp, numreg, value);
+}
 
 static void dsp_stack_push(dsp_core_t* dsp, uint32_t curpc, uint32_t cursr, uint16_t sshOnly);
 static void dsp_stack_pop(dsp_core_t* dsp, uint32_t *curpc, uint32_t *cursr);
@@ -167,6 +191,27 @@ static uint32_t dsp_move_source(dsp_core_t* dsp, unsigned reg)
         (dsp->registers[DSP_REG_SR] & (1u << DSP_SR_SC))) return value & 0xffff;
     return (reg >= DSP_REG_R0 && reg <= DSP_REG_M7) || reg == DSP_REG_LA || reg == DSP_REG_LC || reg == DSP_REG_VBA || reg == DSP_REG_EP || reg == DSP_REG_SZ || reg == DSP_REG_SSH || reg == DSP_REG_SSL || reg == DSP_REG_SP ?
            value & dsp_register_mask(dsp, reg) : value;
+}
+
+/* Interpreter data accesses: X RAM below 0xc00, the two mixbuffer windows and
+ * Y RAM are plain arrays (no peripheral or SC window decoding); nearly every
+ * access lands there. Anything else takes the full path. */
+static DSP_PREAD_INLINE uint32_t dsp_read_xy(dsp_core_t* dsp, int space, uint32_t address)
+{
+    if (space == DSP_SPACE_X && address < 0xc00) return dsp->xram[address];
+    if (space == DSP_SPACE_X && address < 0xc00 + DSP_MIXBUFFER_SIZE) return dsp->mixbuffer[address - 0xc00];
+    if (space == DSP_SPACE_X && address - DSP_MIXBUFFER_BASE < DSP_MIXBUFFER_SIZE) return dsp->mixbuffer[address - DSP_MIXBUFFER_BASE];
+    if (space == DSP_SPACE_Y && address < DSP_YRAM_SIZE) return dsp->yram[address];
+    return dsp56k_read_memory(dsp, space, address);
+}
+
+static DSP_PREAD_INLINE void dsp_write_xy(dsp_core_t* dsp, int space, uint32_t address, uint32_t value)
+{
+    assert((value & 0xFF000000) == 0);
+    if (!TRACE_DSP_DISASM_MEM && space == DSP_SPACE_X && address < 0xc00) dsp->xram[address] = value;
+    else if (!TRACE_DSP_DISASM_MEM && space == DSP_SPACE_X && address - DSP_MIXBUFFER_BASE < DSP_MIXBUFFER_SIZE) dsp->mixbuffer[address - DSP_MIXBUFFER_BASE] = value;
+    else if (!TRACE_DSP_DISASM_MEM && space == DSP_SPACE_Y && address < DSP_YRAM_SIZE) dsp->yram[address] = value;
+    else dsp56k_write_memory(dsp, space, address, value);
 }
 
 
@@ -1084,7 +1129,7 @@ static void write_memory_disasm(dsp_core_t* dsp, int space, uint32_t address, ui
     }
 }
 
-static void dsp_write_reg(dsp_core_t* dsp, uint32_t numreg, uint32_t value)
+static void dsp_write_reg_slow(dsp_core_t* dsp, uint32_t numreg, uint32_t value)
 {
     uint32_t stack_error;
 

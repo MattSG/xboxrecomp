@@ -87,7 +87,7 @@ static void emu_update_rn_modulo(dsp_core_t* dsp, uint32_t numreg, int32_t modif
     dsp->registers[DSP_REG_R0+numreg] = (uint32_t)result & mask;
 }
 
-static void emu_update_rn(dsp_core_t* dsp, uint32_t numreg, int32_t modifier)
+static void emu_update_rn_slow(dsp_core_t* dsp, uint32_t numreg, int32_t modifier)
 {
     uint16_t m_reg;
 
@@ -117,6 +117,17 @@ static void emu_update_rn(dsp_core_t* dsp, uint32_t numreg, int32_t modifier)
     }
 }
 
+/* Linear addressing (M = $FFFF) is nearly every update; the mask is the R
+ * register's (dsp_register_mask). Other modes take the full path. */
+static DSP_PREAD_INLINE void emu_update_rn(dsp_core_t* dsp, uint32_t numreg, int32_t modifier)
+{
+    if ((uint16_t)dsp->registers[DSP_REG_M0+numreg] == 65535) {
+        dsp->registers[DSP_REG_R0+numreg] = (dsp->registers[DSP_REG_R0+numreg] + (uint32_t)modifier) &
+            ((dsp->registers[DSP_REG_SR] & (1u << DSP_SR_SC)) ? 0xffff : 0xffffff);
+        return;
+    }
+    emu_update_rn_slow(dsp, numreg, modifier);
+}
 static int emu_calc_ea(dsp_core_t* dsp, uint32_t ea_mode, uint32_t *dst_addr)
 {
     uint32_t value, numreg, curreg;
@@ -5459,7 +5470,7 @@ static void emu_pm_0(dsp_core_t* dsp)
     opcodes_alu[dsp->cur_inst & BITMASK(8)](dsp);
 
     /* Move [A|B] to [x|y]:ea */
-    dsp56k_write_memory(dsp, memspace, addr, save_accu);
+    dsp_write_xy(dsp, memspace, addr, save_accu);
 
     /* Move [x|y]0 to [A|B] */
     dsp->registers[DSP_REG_A0+numreg] = 0;
@@ -5506,7 +5517,7 @@ static void emu_pm_1(dsp_core_t* dsp)
         if (retour)
             save_1 = xy_addr;
         else
-            save_1 = dsp56k_read_memory(dsp, memspace, xy_addr);
+            save_1 = dsp_read_xy(dsp, memspace, xy_addr);
     } else {
         /* Read S1 */
         if ((numreg1==DSP_REG_A) || (numreg1==DSP_REG_B))
@@ -5547,7 +5558,7 @@ static void emu_pm_1(dsp_core_t* dsp)
     }       dsp->registers[numreg1] = save_1;
     } else {
         /* Read S1 */
-        dsp56k_write_memory(dsp, memspace, xy_addr, save_1);
+        dsp_write_xy(dsp, memspace, xy_addr, save_1);
     }
 
     /* S2 -> D2 */
@@ -5707,8 +5718,8 @@ static void emu_pm_4x(dsp_core_t* dsp)
 
     if (dsp->cur_inst & (1<<15)) {
         /* Write D */
-        save_lx = dsp56k_read_memory(dsp, DSP_SPACE_X,l_addr);
-        save_ly = dsp56k_read_memory(dsp, DSP_SPACE_Y,l_addr);
+        save_lx = dsp_read_xy(dsp, DSP_SPACE_X,l_addr);
+        save_ly = dsp_read_xy(dsp, DSP_SPACE_Y,l_addr);
     }
     else {
         /* Read S */
@@ -5820,8 +5831,8 @@ static void emu_pm_4x(dsp_core_t* dsp)
     }
     else {
         /* Read S */
-        dsp56k_write_memory(dsp, DSP_SPACE_X, l_addr, save_lx);
-        dsp56k_write_memory(dsp, DSP_SPACE_Y, l_addr, save_ly);
+        dsp_write_xy(dsp, DSP_SPACE_X, l_addr, save_lx);
+        dsp_write_xy(dsp, DSP_SPACE_Y, l_addr, save_ly);
     }
 }
 
@@ -5859,7 +5870,7 @@ static void emu_pm_5(dsp_core_t* dsp)
         if (retour)
             value = xy_addr;
         else
-            value = dsp56k_read_memory(dsp, memspace, xy_addr);
+            value = dsp_read_xy(dsp, memspace, xy_addr);
     }
     else {
         /* Read S */
@@ -5879,7 +5890,7 @@ static void emu_pm_5(dsp_core_t* dsp)
     }
     else {
         /* Read S */
-        dsp56k_write_memory(dsp, memspace, xy_addr, value);
+        dsp_write_xy(dsp, memspace, xy_addr, value);
     }
 }
 
@@ -5927,7 +5938,7 @@ static void emu_pm_8(dsp_core_t* dsp)
 
     if (dsp->cur_inst & (1<<15)) {
         /* Write D1 */
-        save_reg1 = dsp56k_read_memory(dsp, DSP_SPACE_X, x_addr);
+        save_reg1 = dsp_read_xy(dsp, DSP_SPACE_X, x_addr);
     } else {
         /* Read S1 */
         if ((numreg1==DSP_REG_A) || (numreg1==DSP_REG_B))
@@ -5938,7 +5949,7 @@ static void emu_pm_8(dsp_core_t* dsp)
 
     if (dsp->cur_inst & (1<<22)) {
         /* Write D2 */
-        save_reg2 = dsp56k_read_memory(dsp, DSP_SPACE_Y, y_addr);
+        save_reg2 = dsp_read_xy(dsp, DSP_SPACE_Y, y_addr);
     } else {
         /* Read S2 */
         if ((numreg2==DSP_REG_A) || (numreg2==DSP_REG_B))
@@ -5969,7 +5980,7 @@ static void emu_pm_8(dsp_core_t* dsp)
         }
     } else {
         /* Read S1 */
-        dsp56k_write_memory(dsp, DSP_SPACE_X, x_addr, save_reg1);
+        dsp_write_xy(dsp, DSP_SPACE_X, x_addr, save_reg1);
     }
 
     /* Write second parallel move */
@@ -5990,7 +6001,7 @@ static void emu_pm_8(dsp_core_t* dsp)
         }
     } else {
         /* Read S2 */
-        dsp56k_write_memory(dsp, DSP_SPACE_Y, y_addr, save_reg2);
+        dsp_write_xy(dsp, DSP_SPACE_Y, y_addr, save_reg2);
     }
 }
 
@@ -6239,14 +6250,14 @@ static void emu_bchg_aa(dsp_core_t* dsp)
     numbit = dsp->cur_inst & BITMASK(5);
 
     addr = value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
     if (newcarry) {
         value -= (1<<numbit);
     } else {
         value += (1<<numbit);
     }
-    dsp56k_write_memory(dsp, memspace, addr, value);
+    dsp_write_xy(dsp, memspace, addr, value);
 
     /* Set carry */
     dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_C));
@@ -6264,14 +6275,14 @@ static void emu_bchg_ea(dsp_core_t* dsp)
     numbit = dsp->cur_inst & BITMASK(5);
 
     emu_calc_ea(dsp, value, &addr);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
     if (newcarry) {
         value -= (1<<numbit);
     } else {
         value += (1<<numbit);
     }
-    dsp56k_write_memory(dsp, memspace, addr, value);
+    dsp_write_xy(dsp, memspace, addr, value);
 
     /* Set carry */
     dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_C));
@@ -6290,14 +6301,14 @@ static void emu_bchg_pp(dsp_core_t* dsp)
 
     /* pp and qq differ only in the short I/O address bank. */
     addr = ((dsp->cur_inst & 0x080000) ? 0xffffc0 : 0xffff80) + value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
     if (newcarry) {
         value -= (1<<numbit);
     } else {
         value += (1<<numbit);
     }
-    dsp56k_write_memory(dsp, memspace, addr, value);
+    dsp_write_xy(dsp, memspace, addr, value);
 
     /* Set carry */
     dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_C));
@@ -6343,10 +6354,10 @@ static void emu_bclr_aa(dsp_core_t* dsp)
     addr = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
 
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
     value &= 0xffffffff-(1<<numbit);
-    dsp56k_write_memory(dsp, memspace, addr, value);
+    dsp_write_xy(dsp, memspace, addr, value);
 
     /* Set carry */
     dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_C));
@@ -6364,10 +6375,10 @@ static void emu_bclr_ea(dsp_core_t* dsp)
     numbit = dsp->cur_inst & BITMASK(5);
 
     emu_calc_ea(dsp, value, &addr);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
     value &= 0xffffffff-(1<<numbit);
-    dsp56k_write_memory(dsp, memspace, addr, value);
+    dsp_write_xy(dsp, memspace, addr, value);
 
     /* Set carry */
     dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_C));
@@ -6386,10 +6397,10 @@ static void emu_bclr_pp(dsp_core_t* dsp)
 
     /* pp and qq differ only in the short I/O address bank. */
     addr = ((dsp->cur_inst & 0x080000) ? 0xffffc0 : 0xffff80) + value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
     value &= 0xffffffff-(1<<numbit);
-    dsp56k_write_memory(dsp, memspace, addr, value);
+    dsp_write_xy(dsp, memspace, addr, value);
 
     /* Set carry */
     dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_C));
@@ -6464,7 +6475,7 @@ static void emu_brclr_pp(dsp_core_t* dsp)
     uint32_t value = (dsp->cur_inst>>8) & BITMASK(6);
     uint32_t numbit = dsp->cur_inst & BITMASK(5);
     uint32_t addr = emu_bit_branch_address(dsp, value);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
 
     dsp->instr_cycle += 4;
 
@@ -6513,7 +6524,7 @@ static void emu_brset_pp(dsp_core_t* dsp)
     uint32_t value = (dsp->cur_inst>>8) & BITMASK(6);
     uint32_t numbit = dsp->cur_inst & BITMASK(5);
     uint32_t addr = emu_bit_branch_address(dsp, value);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
 
     dsp->instr_cycle += 4;
 
@@ -6562,10 +6573,10 @@ static void emu_bset_aa(dsp_core_t* dsp)
     numbit = dsp->cur_inst & BITMASK(5);
 
     addr = value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
     value |= (1<<numbit);
-    dsp56k_write_memory(dsp, memspace, addr, value);
+    dsp_write_xy(dsp, memspace, addr, value);
 
     /* Set carry */
     dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_C));
@@ -6634,10 +6645,10 @@ static void emu_bset_ea(dsp_core_t* dsp)
     numbit = dsp->cur_inst & BITMASK(5);
 
     emu_calc_ea(dsp, value, &addr);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
     value |= (1<<numbit);
-    dsp56k_write_memory(dsp, memspace, addr, value);
+    dsp_write_xy(dsp, memspace, addr, value);
 
     /* Set carry */
     dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_C));
@@ -6655,10 +6666,10 @@ static void emu_bset_pp(dsp_core_t* dsp)
     numbit = dsp->cur_inst & BITMASK(5);
     /* pp and qq differ only in the short I/O address bank. */
     addr = ((dsp->cur_inst & 0x080000) ? 0xffffc0 : 0xffff80) + value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
     value |= (1<<numbit);
-    dsp56k_write_memory(dsp, memspace, addr, value);
+    dsp_write_xy(dsp, memspace, addr, value);
 
     /* Set carry */
     dsp->registers[DSP_REG_SR] &= ~((1<<DSP_SR_C));
@@ -6701,7 +6712,7 @@ static void emu_btst_aa(dsp_core_t* dsp)
     numbit = dsp->cur_inst & BITMASK(5);
 
     addr = value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
 
     /* Set carry */
@@ -6720,7 +6731,7 @@ static void emu_btst_ea(dsp_core_t* dsp)
     numbit = dsp->cur_inst & BITMASK(5);
 
     emu_calc_ea(dsp, value, &addr);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
 
     /* Set carry */
@@ -6740,7 +6751,7 @@ static void emu_btst_pp(dsp_core_t* dsp)
 
     /* pp and qq differ only in the short I/O address bank. */
     addr = ((dsp->cur_inst & 0x080000) ? 0xffffc0 : 0xffff80) + value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newcarry = (value>>numbit) & 1;
 
     /* Set carry */
@@ -7010,7 +7021,7 @@ static void emu_do_aa(dsp_core_t* dsp)
 
     memspace = (dsp->cur_inst>>6) & 1;
     addr = (dsp->cur_inst>>8) & BITMASK(6);
-    dsp->registers[DSP_REG_LC] = dsp56k_read_memory(dsp, memspace, addr) & dsp_register_mask(dsp, DSP_REG_LC);
+    dsp->registers[DSP_REG_LC] = dsp_read_xy(dsp, memspace, addr) & dsp_register_mask(dsp, DSP_REG_LC);
 
     emu_do_skip_empty(dsp);
     dsp->instr_cycle += 4;
@@ -7051,7 +7062,7 @@ static void emu_do_ea(dsp_core_t* dsp)
     memspace = (dsp->cur_inst>>6) & 1;
     ea_mode = (dsp->cur_inst>>8) & BITMASK(6);
     emu_calc_ea(dsp, ea_mode, &addr);
-    dsp->registers[DSP_REG_LC] = dsp56k_read_memory(dsp, memspace, addr) & dsp_register_mask(dsp, DSP_REG_LC);
+    dsp->registers[DSP_REG_LC] = dsp_read_xy(dsp, memspace, addr) & dsp_register_mask(dsp, DSP_REG_LC);
 
     emu_do_skip_empty(dsp);
     dsp->instr_cycle += 4;
@@ -7280,8 +7291,8 @@ static void emu_vsl(dsp_core_t* dsp)
     uint32_t address;
     int immediate = emu_calc_ea(dsp, (dsp->cur_inst >> 8) & 63, &address);
     assert(!immediate);
-    dsp56k_write_memory(dsp, DSP_SPACE_X, address, middle);
-    dsp56k_write_memory(dsp, DSP_SPACE_Y, address,
+    dsp_write_xy(dsp, DSP_SPACE_X, address, middle);
+    dsp_write_xy(dsp, DSP_SPACE_Y, address,
                         ((low << 1) | ((dsp->cur_inst >> 4) & 1)) & 0xffffff);
 }
 
@@ -7382,7 +7393,7 @@ static void emu_jclr_aa(dsp_core_t* dsp)
     memspace = (dsp->cur_inst>>6) & 1;
     addr = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7405,7 +7416,7 @@ static void emu_jclr_ea(dsp_core_t* dsp)
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     emu_calc_ea(dsp, value, &addr);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
 
     dsp->instr_cycle += 4;
 
@@ -7425,7 +7436,7 @@ static void emu_jclr_pp(dsp_core_t* dsp)
     value = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
     addr = ((dsp->cur_inst & 0x080000) ? 0xffffc0 : 0xffff80) + value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7522,7 +7533,7 @@ static void emu_jsclr_aa(dsp_core_t* dsp)
     memspace = (dsp->cur_inst>>6) & 1;
     addr = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7545,7 +7556,7 @@ static void emu_jsclr_ea(dsp_core_t* dsp)
     value = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
     emu_calc_ea(dsp, value, &addr);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7568,7 +7579,7 @@ static void emu_jsclr_pp(dsp_core_t* dsp)
     value = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
     addr = ((dsp->cur_inst & 0x080000) ? 0xffffc0 : 0xffff80) + value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7616,7 +7627,7 @@ static void emu_jset_aa(dsp_core_t* dsp)
     memspace = (dsp->cur_inst>>6) & 1;
     addr = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7638,7 +7649,7 @@ static void emu_jset_ea(dsp_core_t* dsp)
     value = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
     emu_calc_ea(dsp, value, &addr);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7660,7 +7671,7 @@ static void emu_jset_pp(dsp_core_t* dsp)
     value = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
     addr = ((dsp->cur_inst & 0x080000) ? 0xffffc0 : 0xffff80) + value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7744,7 +7755,7 @@ static void emu_jsset_aa(dsp_core_t* dsp)
     memspace = (dsp->cur_inst>>6) & 1;
     addr = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7767,7 +7778,7 @@ static void emu_jsset_ea(dsp_core_t* dsp)
     value = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
     emu_calc_ea(dsp, value, &addr);
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7790,7 +7801,7 @@ static void emu_jsset_pp(dsp_core_t* dsp)
     value = (dsp->cur_inst>>8) & BITMASK(6);
     numbit = dsp->cur_inst & BITMASK(5);
     addr = ((dsp->cur_inst & 0x080000) ? 0xffffc0 : 0xffff80) + value;
-    value = dsp56k_read_memory(dsp, memspace, addr);
+    value = dsp_read_xy(dsp, memspace, addr);
     newaddr = read_memory_p(dsp, dsp->pc+1);
 
     dsp->instr_cycle += 4;
@@ -7942,7 +7953,7 @@ static void emu_movec_aa(dsp_core_t* dsp)
 
     if (dsp->cur_inst & (1<<15)) {
         /* Write D1 */
-        value = dsp56k_read_memory(dsp, memspace, addr);
+        value = dsp_read_xy(dsp, memspace, addr);
         value &= dsp_register_mask(dsp, numreg);
         dsp_write_reg(dsp, numreg, value);
     } else {
@@ -7954,7 +7965,7 @@ static void emu_movec_aa(dsp_core_t* dsp)
         else {
             value = dsp_move_source(dsp, numreg);
         }
-        dsp56k_write_memory(dsp, memspace, addr, value);
+        dsp_write_xy(dsp, memspace, addr, value);
     }
 }
 
@@ -7990,7 +8001,7 @@ static void emu_movec_ea(dsp_core_t* dsp)
         if (retour) {
             value = addr;
         } else {
-            value = dsp56k_read_memory(dsp, memspace, addr);
+            value = dsp_read_xy(dsp, memspace, addr);
         }
         value &= dsp_register_mask(dsp, numreg);
         dsp_write_reg(dsp, numreg, value);
@@ -8004,7 +8015,7 @@ static void emu_movec_ea(dsp_core_t* dsp)
         else {
             value = dsp_move_source(dsp, numreg);
         }
-        dsp56k_write_memory(dsp, memspace, addr, value);
+        dsp_write_xy(dsp, memspace, addr, value);
     }
 }
 
@@ -8032,7 +8043,7 @@ static void emu_movem_aa(dsp_core_t* dsp)
         else {
             value = dsp_move_source(dsp, numreg);
         }
-        dsp56k_write_memory(dsp, DSP_SPACE_P, addr, value);
+        dsp_write_xy(dsp, DSP_SPACE_P, addr, value);
     }
 
     dsp->instr_cycle += 4;
@@ -8063,7 +8074,7 @@ static void emu_movem_ea(dsp_core_t* dsp)
         else {
             value = dsp_move_source(dsp, numreg);
         }
-        dsp56k_write_memory(dsp, DSP_SPACE_P, addr, value);
+        dsp_write_xy(dsp, DSP_SPACE_P, addr, value);
     }
 
     dsp->instr_cycle += 4;
@@ -8099,10 +8110,10 @@ static void emu_movep_0(dsp_core_t* dsp)
         else {
             value = dsp_move_source(dsp, numreg);
         }
-        dsp56k_write_memory(dsp, memspace, addr, value);
+        dsp_write_xy(dsp, memspace, addr, value);
     } else {
         /* Read pp */
-        value = dsp56k_read_memory(dsp, memspace, addr);
+        value = dsp_read_xy(dsp, memspace, addr);
         value &= dsp_register_mask(dsp, numreg);
         dsp_write_reg(dsp, numreg, value);
     }
@@ -8126,10 +8137,10 @@ static void emu_movep_1(dsp_core_t* dsp)
 
     if (dsp->cur_inst & (1u << (lower ? 14 : 15))) {
         /* Write pp */
-        dsp56k_write_memory(dsp, memspace, xyaddr, read_memory_p(dsp, paddr));
+        dsp_write_xy(dsp, memspace, xyaddr, read_memory_p(dsp, paddr));
     } else {
         /* Read pp */
-        dsp56k_write_memory(dsp, DSP_SPACE_P, paddr, dsp56k_read_memory(dsp, memspace, xyaddr));
+        dsp_write_xy(dsp, DSP_SPACE_P, paddr, dsp_read_xy(dsp, memspace, xyaddr));
     }
 
     /* Movep is 4 cycles, but according to the motorola doc, */
@@ -8165,13 +8176,13 @@ static void emu_movep_23(dsp_core_t* dsp)
         /* Write pp */
 
         if (retour) {
-            dsp56k_write_memory(dsp, perspace, peraddr, addr);
+            dsp_write_xy(dsp, perspace, peraddr, addr);
         } else {
-            dsp56k_write_memory(dsp, perspace, peraddr, dsp56k_read_memory(dsp, easpace, addr));
+            dsp_write_xy(dsp, perspace, peraddr, dsp_read_xy(dsp, easpace, addr));
         }
     } else {
         /* Read pp */
-        dsp56k_write_memory(dsp, easpace, addr, dsp56k_read_memory(dsp, perspace, peraddr));
+        dsp_write_xy(dsp, easpace, addr, dsp_read_xy(dsp, perspace, peraddr));
     }
 
     dsp->instr_cycle += 2;
@@ -8192,15 +8203,15 @@ static void emu_movep_qq(dsp_core_t* dsp)
         /* Write qq */
 
         if (retour) {
-            dsp56k_write_memory(dsp, per_space, x_addr, ea_addr);
+            dsp_write_xy(dsp, per_space, x_addr, ea_addr);
         } else {
-            dsp56k_write_memory(dsp, per_space, x_addr,
-                dsp56k_read_memory(dsp, ea_space, ea_addr));
+            dsp_write_xy(dsp, per_space, x_addr,
+                dsp_read_xy(dsp, ea_space, ea_addr));
         }
     } else {
         /* Read qq */
-        dsp56k_write_memory(dsp, ea_space, ea_addr,
-            dsp56k_read_memory(dsp, per_space, x_addr));
+        dsp_write_xy(dsp, ea_space, ea_addr,
+            dsp_read_xy(dsp, per_space, x_addr));
     }
 
     dsp->instr_cycle += 2;
@@ -8224,9 +8235,9 @@ static void emu_move_x_long(dsp_core_t* dsp)
         } else {
             value = dsp_move_source(dsp, numreg);
         }
-        dsp56k_write_memory(dsp, space, x_addr, value);
+        dsp_write_xy(dsp, space, x_addr, value);
     } else {
-        dsp_write_reg(dsp, numreg, dsp56k_read_memory(dsp, space, x_addr));
+        dsp_write_reg(dsp, numreg, dsp_read_xy(dsp, space, x_addr));
     }
 
     // TODO: cycles
@@ -8248,9 +8259,9 @@ static void emu_move_xy_imm(dsp_core_t* dsp, int space)
         } else {
             value = dsp_move_source(dsp, numreg);
         }
-        dsp56k_write_memory(dsp, space, addr, value);
+        dsp_write_xy(dsp, space, addr, value);
     } else {
-        dsp_write_reg(dsp, numreg, dsp56k_read_memory(dsp, space, addr));
+        dsp_write_reg(dsp, numreg, dsp_read_xy(dsp, space, addr));
     }
 
     // TODO: cycles
@@ -8428,7 +8439,7 @@ static void emu_rep_aa(dsp_core_t* dsp)
     dsp->pc_on_rep = 1; /* Not decrement LC at first time */
     dsp->loop_rep = 1;  /* We are now running rep */
 
-    dsp->registers[DSP_REG_LC]=dsp56k_read_memory(dsp, (dsp->cur_inst>>6) & 1,(dsp->cur_inst>>8) & BITMASK(6));
+    dsp->registers[DSP_REG_LC]=dsp_read_xy(dsp, (dsp->cur_inst>>6) & 1,(dsp->cur_inst>>8) & BITMASK(6));
 
     dsp->instr_cycle += 2;
 }
@@ -8459,7 +8470,7 @@ static void emu_rep_ea(dsp_core_t* dsp)
     dsp->loop_rep = 1;  /* We are now running rep */
 
     emu_calc_ea(dsp, (dsp->cur_inst>>8) & BITMASK(6),&value);
-    dsp->registers[DSP_REG_LC]= dsp56k_read_memory(dsp, (dsp->cur_inst>>6) & 1, value);
+    dsp->registers[DSP_REG_LC]= dsp_read_xy(dsp, (dsp->cur_inst>>6) & 1, value);
 
     dsp->instr_cycle += 2;
 }

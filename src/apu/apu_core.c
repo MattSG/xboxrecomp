@@ -74,9 +74,18 @@ extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
+    /* Contiguous allocations are whole pages and positive coverage is
+     * permanent (xbox_ContiguousRangeAllocated), so a page once seen allocated
+     * stays so. The voice processor resolves every voice field and sample it
+     * reads; skip the lookup for known pages. Bytes are only ever set: no lock. */
+    static uint8_t known_contig[(64u << 20) >> 12];     /* XBOX_CONTIG_SIZE (kernel.h) */
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
-    if (xbox_ContiguousRangeAllocated(a, 1))
+    if (a >> 12 < sizeof(known_contig) && known_contig[a >> 12])
         return g_apu_ram_ptr + 0x80000000u + a;
+    if (xbox_ContiguousRangeAllocated(a, 1)) {
+        if (a >> 12 < sizeof(known_contig)) known_contig[a >> 12] = 1;
+        return g_apu_ram_ptr + 0x80000000u + a;
+    }
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     /* A large reservation is placed above RAM (kernel_bridge.c), and

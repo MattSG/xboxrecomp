@@ -230,7 +230,9 @@ void dsp_dma_step(DSPDMAState *s)
 
         size_t transfer_size = (size_t)word_count * item_size;
 
-        uint8_t *scratch_buf = malloc(transfer_size ? transfer_size : 1);
+        /* Per-frame transfers are small; the heap round trip was ~1.5% of the APU thread. */
+        uint8_t stack_buf[4096];
+        uint8_t *scratch_buf = transfer_size <= sizeof(stack_buf) ? stack_buf : malloc(transfer_size);
         if (!scratch_buf) {
             s->error = true;
             s->control &= ~DMA_CONTROL_RUNNING;
@@ -307,7 +309,7 @@ void dsp_dma_step(DSPDMAState *s)
                 assert(!"Unhandled dsp dma buffer");
             }
 
-            if (s->error) { free(scratch_buf); return; }
+            if (s->error) { if (scratch_buf != stack_buf) free(scratch_buf); return; }
 
             for (uint32_t i = 0; i < word_count; i++) {
                 uint32_t v;
@@ -331,11 +333,11 @@ void dsp_dma_step(DSPDMAState *s)
             }
         }
 
-        if (s->error) { free(scratch_buf); return; }
+        if (s->error) { if (scratch_buf != stack_buf) free(scratch_buf); return; }
         if (buffer_offset_writeback) {
             s->mem_write(s->mem_opaque, block_space, block_addr+4, scratch_offset);
         }
-        free(scratch_buf);
+        if (scratch_buf != stack_buf) free(scratch_buf);
     }
     /* Transfers above have completed; polling never manufactures completion. */
     if (s->next_block & NODE_POINTER_EOL) {
