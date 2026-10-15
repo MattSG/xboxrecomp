@@ -42,7 +42,9 @@ typedef struct {
     uint32_t color_pitch, zeta_pitch;
     uint32_t surface_format;            /* raw SET_SURFACE_FORMAT */
     uint32_t clip_x, clip_y, clip_w, clip_h;
-    uint32_t wclip_x0, wclip_y0, wclip_x1, wclip_y1;  /* window clip, max exclusive */
+    /* Window clip: SET_WINDOW_CLIP_TYPE (bit 0 exclusive) and the regions
+     * the title set (mask bit n: region n), each min | max << 16. */
+    uint32_t wclip_type, wclip_mask, wclip_h[8], wclip_v[8];
     /* Output merger. */
     uint32_t blend_enable, blend_sfactor, blend_dfactor, blend_equation;
     uint32_t blend_color, color_mask;

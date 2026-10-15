@@ -277,9 +277,10 @@ static struct {
     uint64_t pixels;
     uint32_t pixel_max;   /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
-    /* SET_WINDOW_CLIP_TYPE and region 0 (min | max << 16, inclusive):
-     * how Xbox D3D clips a viewport, as the GPU does not clip x/y. */
-    uint32_t wclip_type, wclip_h, wclip_v;
+    /* SET_WINDOW_CLIP_TYPE and the 8 regions (min | max << 16): how Xbox
+     * D3D clips a viewport, as the GPU does not clip x/y. Regions never
+     * written are not used (mask). */
+    uint32_t wclip_type, wclip_mask, wclip_h[8], wclip_v[8];
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
@@ -2580,14 +2581,10 @@ static void d3d_fill_state(NvD3DState *st)
     st->surface_format = s_gpu.format;
     st->clip_x = s_gpu.clip_x; st->clip_y = s_gpu.clip_y;
     st->clip_w = s_gpu.clip_w; st->clip_h = s_gpu.clip_h;
-    /* ponytail: region 0, inclusive only -- what Xbox D3D viewports use;
-     * regions 1-7 / exclusive (SetScissors) would need a per-pixel test. */
-    if (!(s_gpu.wclip_type & 1)) {
-        st->wclip_x0 = s_gpu.wclip_h & 0xFFF; st->wclip_x1 = (s_gpu.wclip_h >> 16 & 0xFFF) + 1;
-        st->wclip_y0 = s_gpu.wclip_v & 0xFFF; st->wclip_y1 = (s_gpu.wclip_v >> 16 & 0xFFF) + 1;
-    } else {
-        st->wclip_x0 = st->wclip_y0 = 0; st->wclip_x1 = st->wclip_y1 = 0x1000;
-    }
+    st->wclip_type = s_gpu.wclip_type;
+    st->wclip_mask = s_gpu.wclip_mask;
+    memcpy(st->wclip_h, s_gpu.wclip_h, sizeof st->wclip_h);
+    memcpy(st->wclip_v, s_gpu.wclip_v, sizeof st->wclip_v);
     st->blend_enable = s_gpu.blend_enable;
     st->blend_sfactor = s_gpu.blend_sfactor;
     st->blend_dfactor = s_gpu.blend_dfactor;
@@ -3481,7 +3478,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
-        s_gpu.wclip_h = s_gpu.wclip_v = 0x0FFF0000u;   /* whole surface until set */
     }
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
@@ -3552,11 +3548,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x02B4:                                  /* SET_WINDOW_CLIP_TYPE */
         s_gpu.wclip_type = param;
         break;
-    case 0x02C0:                                  /* SET_WINDOW_CLIP_HORIZONTAL(0) */
-        s_gpu.wclip_h = param;
+    case 0x02C0: case 0x02C4: case 0x02C8: case 0x02CC:   /* SET_WINDOW_CLIP_HORIZONTAL(n) */
+    case 0x02D0: case 0x02D4: case 0x02D8: case 0x02DC:
+        s_gpu.wclip_h[(method - 0x02C0) / 4] = param;
+        s_gpu.wclip_mask |= 1u << (method - 0x02C0) / 4;
         break;
-    case 0x02E0:                                  /* SET_WINDOW_CLIP_VERTICAL(0) */
-        s_gpu.wclip_v = param;
+    case 0x02E0: case 0x02E4: case 0x02E8: case 0x02EC:   /* SET_WINDOW_CLIP_VERTICAL(n) */
+    case 0x02F0: case 0x02F4: case 0x02F8: case 0x02FC:
+        s_gpu.wclip_v[(method - 0x02E0) / 4] = param;
+        s_gpu.wclip_mask |= 1u << (method - 0x02E0) / 4;
         break;
     case NV097_SET_SURFACE_FORMAT:
         s_gpu.format = param;

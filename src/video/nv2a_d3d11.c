@@ -656,6 +656,7 @@ static const char s_hlsl[] =
 "  float4 fog_color;\n"
 "  float4 bump_mat[4]; float4 bump_lum[4];\n"
 "  float4 zp0; float4 zp1;\n"
+"  float4 wclip[8]; uint wclip_mode; uint3 wclip_pad;\n"  /* 1 keep inside, 2 keep outside */
 "};\n"
 "#ifdef SPEC\n"
 "#undef c_icw\n#undef a_icw\n#undef c_ocw\n#undef a_ocw\n#undef fin0\n#undef fin1\n#undef rc_control\n"
@@ -749,6 +750,12 @@ static const char s_hlsl[] =
 "}\n"
 "float4 shade(PSIn i, out uint cov) {\n"
 "  g_pos = i.pos.xy;\n"
+"  if (wclip_mode != 0u) {\n"   /* window clip regions the scissor cannot express */
+"    bool in_any = false;\n"
+"    [unroll] for (uint w = 0; w < 8; w++)\n"
+"      in_any = in_any || (all(i.pos.xy >= wclip[w].xy) && all(i.pos.xy < wclip[w].zw));\n"
+"    if (in_any == (wclip_mode == 2u)) discard;\n"
+"  }\n"
 "  float4 tc[4] = { i.t0, i.t1, i.t2, i.t3 };\n"
 "  float4 T[4] = { float4(0,0,0,1), float4(0,0,0,1), float4(0,0,0,1), float4(0,0,0,1) }; float dots[4] = { 0, 0, 0, 0 };\n"
 "  [unroll] for (uint n = 0; n < 4; n++) {\n"
@@ -1024,6 +1031,8 @@ typedef struct {
     float fog_color[4];
     float bump_mat[4][4], bump_lum[4][4];
     float zp0[4], zp1[4];
+    float wclip[8][4];
+    uint32_t wclip_mode, wclip_pad[3];
 } PSConsts;
 
 typedef struct {
@@ -3107,15 +3116,25 @@ static ID3D11ShaderResourceView *feedback_copy(Surface *s)
     return s_feedback_srv;
 }
 
+/* Inclusive with region 0 alone (an Xbox D3D viewport): the scissor does
+ * it. Anything else is tested per pixel in shade(). */
+static int wclip_scissored(const NvD3DState *st)
+{
+    return !(st->wclip_type & 1) && (st->wclip_mask & ~1u) == 0;
+}
+
 static void apply_scissor(const NvD3DState *st, uint32_t gw, uint32_t gh)
 {
     D3D11_RECT r;
     uint32_t x0 = st->clip_x, y0 = st->clip_y;
     uint32_t x1 = st->clip_x + st->clip_w, y1 = st->clip_y + st->clip_h;
-    if (x0 < st->wclip_x0) x0 = st->wclip_x0;
-    if (y0 < st->wclip_y0) y0 = st->wclip_y0;
-    if (x1 > st->wclip_x1) x1 = st->wclip_x1;
-    if (y1 > st->wclip_y1) y1 = st->wclip_y1;
+    if (wclip_scissored(st) && (st->wclip_mask & 1)) {
+        uint32_t h = st->wclip_h[0], v = st->wclip_v[0];
+        if (x0 < (h & 0xFFF)) x0 = h & 0xFFF;
+        if (y0 < (v & 0xFFF)) y0 = v & 0xFFF;
+        if (x1 > (h >> 16 & 0xFFF) + 1) x1 = (h >> 16 & 0xFFF) + 1;
+        if (y1 > (v >> 16 & 0xFFF) + 1) y1 = (v >> 16 & 0xFFF) + 1;
+    }
     if (x1 > gw) x1 = gw;
     if (y1 > gh) y1 = gh;
     if (x0 > x1) x0 = x1;
@@ -3580,6 +3599,20 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         if (s_depth_hazed && st->depth_test && st->depth_mask && s_zview_remap[0] > 1.0f) {
             pc.zp1[2] = s_zview_remap[0];
             pc.zp1[3] = s_zview_remap[1];
+        }
+    }
+    if (!wclip_scissored(st)) {
+        /* Regions apply per pixel: inclusive keeps a pixel inside any
+         * region the title set, exclusive one outside all of them. */
+        int w;
+        pc.wclip_mode = st->wclip_type & 1 ? 2u : 1u;
+        for (w = 0; w < 8; w++) {
+            uint32_t h = st->wclip_h[w], v = st->wclip_v[w];
+            if (!(st->wclip_mask >> w & 1)) continue;
+            pc.wclip[w][0] = (float)(h & 0xFFF) * s_aa_x * s_cur_sx;
+            pc.wclip[w][1] = (float)(v & 0xFFF) * s_aa_y * s_cur_sy;
+            pc.wclip[w][2] = (float)((h >> 16 & 0xFFF) + 1) * s_aa_x * s_cur_sx;
+            pc.wclip[w][3] = (float)((v >> 16 & 0xFFF) + 1) * s_aa_y * s_cur_sy;
         }
     }
     if (!upload_ps_constants(&pc)) return 0;
