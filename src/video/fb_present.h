@@ -15,6 +15,18 @@ HWND xbox_FramebufferWindowHandle(void);
 /* Register before window startup. Called on its message thread when the user
  * closes the display; the title owns stopping its guest workers. */
 void xbox_FramebufferSetCloseHandler(void (*handler)(void));
+
+/* Optional host UI. Register before starting the window/render threads.
+ * Message delivery and rendering run on different threads; the client owns
+ * synchronization. Device/context/target are borrowed D3D11 interfaces. */
+typedef struct {
+    void (*render)(void *window, void *device, void *context, void *target);
+    int (*message)(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
+    int (*capture)(void);
+} XboxHostOverlay;
+void xbox_FramebufferSetHostOverlay(const XboxHostOverlay *overlay);
+void xbox_FramebufferRenderHostOverlay(void *device, void *context, void *target);
+int xbox_FramebufferHostInputCaptured(void);
 #endif
 
 /* A buffer the display reads straight from guest memory because the title is
