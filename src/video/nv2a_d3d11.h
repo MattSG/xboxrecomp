@@ -154,14 +154,17 @@ void nv2a_d3d_set_flare_depth_test(int on);
  * scale 1 (the default) leaves depth untouched. */
 void nv2a_d3d_set_depth_view_remap(float scale, float knee);
 
-/* Ordered host fog command: a non-increasing NO_OPERATION packet with seven
- * parameters: this tag, float W-to-world scale, far clip, start, end, ARGB, flags.
+/* Ordered host fog command: a non-increasing NO_OPERATION packet with eleven
+ * parameters: this tag, float W-to-world scale, far clip, start, end, ARGB,
+ * flags, sky-fade plane XYZ and inverse width.
  * The executor runs the dedicated D3D11 depth-texture pass at this point,
  * before subsequent UI draws. Stored scene depth must be linear W, even if
  * current state has W writes disabled. SKY_MASK optionally rebuilds destination
- * alpha for later depth-masked composition. No title fog textures are involved. */
+ * alpha for later depth-masked composition. SKY_FADE uses the supplied NDC
+ * camera-ray world-up plane and inverse transition width to soften that mask.
+ * No title fog textures are involved. */
 void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip,
-                         float start, float end, uint32_t argb, uint32_t flags);
+                         float start, float end, uint32_t argb, uint32_t flags, const float sky_fade[4]);
 
 /* NV097_CLEAR_SURFACE: flags as the method's parameter, rect inclusive. */
 void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,

@@ -268,11 +268,11 @@ static uint32_t native_fog_pixel(NvD3DState *st, float depth, float start)
     /* At the postprocess marker, UI/glare setup may already have disabled
      * W-buffer writes. The stored scene depth still contains linear W. */
     NvD3DState post = *st; post.z_perspective = 0; post.depth_mask = 0;
-    nv2a_d3d_distance_fog(&post,1000.f/16777216.f,1000,start,800,0xFF0000FF,0);
+    nv2a_d3d_distance_fog(&post,1000.f/16777216.f,1000,start,800,0xFF0000FF,0,NULL);
     read_pixels(pixels);
     CHECK((pixels[16*64+16]>>24) == alpha); /* Fog preserves destination alpha. */
     uint32_t colour = pixels[16*64+16]&0xFFFFFF;
-    nv2a_d3d_distance_fog(&post,1000.f/16777216.f,1000,start,800,0xFF0000FF,NV2A_HOST_FOG_SKY_MASK);
+    nv2a_d3d_distance_fog(&post,1000.f/16777216.f,1000,start,800,0xFF0000FF,NV2A_HOST_FOG_SKY_MASK,NULL);
     read_pixels(pixels);
     CHECK((pixels[16*64+16]>>24) == (isfinite(start) ? (depth >= .99999f ? 255u : 0u) : alpha));
     uint32_t masked_colour = pixels[16*64+16]&0xFFFFFF;
@@ -294,9 +294,30 @@ static void test_native_fog(void)
     uint32_t distant = native_fog_pixel(&st,.8f,200);
     CHECK((distant>>16) <= 4 && (distant&255) >= 251);
     CHECK(native_fog_pixel(&st,1,200) == 0xFF0000); /* Default keeps clear/sky colour. */
-    nv2a_d3d_distance_fog(&st,1000.f/16777216.f,1000,200,800,0xFF0000FF,NV2A_HOST_FOG_SKY_FILL);
+    nv2a_d3d_distance_fog(&st,1000.f/16777216.f,1000,200,800,0xFF0000FF,NV2A_HOST_FOG_SKY_FILL,NULL);
     read_pixels(pixels);
     CHECK((pixels[16*64+16]&0xFFFFFF) == 0x0000FF); /* No panorama: clear depth becomes untextured air. */
+    /* The sky mask fades continuously above the camera's world horizon. */
+    const float sky_planes[2][4] = {{0,1,0,1},{.6f,.8f,-.1f,1}};
+    for (unsigned plane = 0; plane < 2; ++plane) {
+        nv2a_d3d_clear(&st,0xF1,0xFF0000FF,0xFFFFFF00,0,0,63,63);
+        const float *sky_fade = sky_planes[plane];
+        nv2a_d3d_distance_fog(&st,1000.f/16777216.f,1000,200,800,0xFF0000FF,
+            NV2A_HOST_FOG_SKY_MASK | NV2A_HOST_FOG_SKY_FADE,sky_fade);
+        read_pixels(pixels);
+        for (unsigned y = 0; y < 64; ++y) for (unsigned x = 0; x < 64; ++x) {
+            float h = sky_fade[0]*(2.f*(x+.5f)/64-1) + sky_fade[1]*(1.f-2.f*(y+.5f)/64) + sky_fade[2];
+            float fade = fminf(1,fmaxf(0,h));
+            int expected = (int)roundf(255*fade*fade*(3-2*fade));
+            CHECK(abs((int)(pixels[y*64+x]>>24)-expected) <= 1);
+        }
+        int sky_alpha = pixels[16*64+16]>>24;
+        NvD3DState panorama = st; panorama.depth_test = panorama.depth_mask = 0;
+        panorama.blend_enable = 1; panorama.blend_sfactor = 0x304; panorama.blend_dfactor = 0x305;
+        triangle(&panorama,1,0); read_pixels(pixels);
+        CHECK(abs((int)((pixels[16*64+16]>>8)&255)-sky_alpha) <= 1);
+        CHECK(abs((int)(pixels[16*64+16]&255)-(255-sky_alpha)) <= 1);
+    }
     CHECK(native_fog_pixel(&st,.8f,NAN) == 0xFF0000);
     native_fog_pixel(&st,.8f,200);
     st.depth_test = 0; st.depth_mask = 0;

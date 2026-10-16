@@ -1,6 +1,6 @@
 /* Dedicated host fog pass. Included after the renderer's surface helpers. */
 static const char s_native_fog_hlsl[] =
-"cbuffer Fog : register(b0) { float4 band; float4 colour; };\n"
+"cbuffer Fog : register(b0) { float4 band; float4 colour; float4 sky; };\n"
 "#if FOG_MSAA\n"
 "Texture2DMS<float> Depth : register(t0);\n"
 "#else\n"
@@ -16,7 +16,14 @@ static const char s_native_fog_hlsl[] =
 "#else\n"
 "  float z = Depth.Load(int3(int2(p.xy), 0));\n"
 "#endif\n"
-"  if (colour.a > 0) return float4(0,0,0,z >= 0.99999 ? 1 : 0);\n"
+"  if (colour.a > 0) {\n"
+"    float a = z >= 0.99999 ? 1 : 0;\n"
+"    if (sky.w > 0) {\n"
+"      float t = saturate(dot(float3(p.xy,1),sky.xyz) * sky.w);\n"
+"      a *= t*t*(3-2*t);\n"
+"    }\n"
+"    return float4(0,0,0,a);\n"
+"  }\n"
 "  if (z >= 0.99999) return float4(colour.rgb,band.w);\n"
 "  float x = saturate((z * band.z - band.x) * band.y);\n"
 "  return float4(colour.rgb, 1.0 - exp2(-6.643856 * x * x));\n"
@@ -45,7 +52,7 @@ static ID3DBlob *native_fog_compile(const char *entry, const char *target, int m
 static int native_fog_init(void)
 {
     ID3DBlob *code;
-    D3D11_BUFFER_DESC cb = {32,D3D11_USAGE_DYNAMIC,D3D11_BIND_CONSTANT_BUFFER,D3D11_CPU_ACCESS_WRITE,0,0};
+    D3D11_BUFFER_DESC cb = {48,D3D11_USAGE_DYNAMIC,D3D11_BIND_CONSTANT_BUFFER,D3D11_CPU_ACCESS_WRITE,0,0};
     D3D11_BLEND_DESC blend = {0};
     D3D11_DEPTH_STENCIL_DESC depth = {0};
     D3D11_RASTERIZER_DESC raster = {0};
@@ -97,17 +104,27 @@ fail:
     return 0;
 }
 
-void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb, uint32_t flags)
+void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb, uint32_t flags, const float sky_fade[4])
 {
+    if ((flags & NV2A_HOST_FOG_SKY_FADE) && (!sky_fade ||
+        !isfinite(sky_fade[0]) || !isfinite(sky_fade[1]) || !isfinite(sky_fade[2]) ||
+        !isfinite(sky_fade[3]) || sky_fade[3] <= 0)) return;
     Surface *s = NULL; Depth *d = NULL; uint32_t gw, gh;
     if (!isfinite(depth_to_world) || !isfinite(far_clip) || !isfinite(start) || !isfinite(end) ||
         depth_to_world <= 0 || far_clip <= 0 || start < 0 || end <= start || end > far_clip ||
         !st || !bind_targets(st,1,&s,&d,&gw,&gh) ||
         !s || !d || !d->zsrv || s->iw != d->iw || s->ih != d->ih ||
         (!!s->ms != (d->samples > 1)) || !native_fog_init()) return;
-    float params[8] = {start,1.f/(end-start),depth_to_world*(d->zf == 1 ? 65536.f : 16777216.f),(flags & NV2A_HOST_FOG_SKY_FILL) ? 1.f : 0.f,
+    float params[12] = {start,1.f/(end-start),depth_to_world*(d->zf == 1 ? 65536.f : 16777216.f),(flags & NV2A_HOST_FOG_SKY_FILL) ? 1.f : 0.f,
                       ((argb>>16)&255)/255.f,((argb>>8)&255)/255.f,(argb&255)/255.f,0};
-    if (!isfinite(params[1]) || !isfinite(params[2]) ||
+    if (flags & NV2A_HOST_FOG_SKY_FADE) {
+        params[8] = 2.f*sky_fade[0]/s->iw;
+        params[9] = -2.f*sky_fade[1]/s->ih;
+        params[10] = sky_fade[2]-sky_fade[0]+sky_fade[1];
+        params[11] = sky_fade[3];
+    }
+    if (!isfinite(params[1]) || !isfinite(params[2]) || !isfinite(params[8]) ||
+        !isfinite(params[9]) || !isfinite(params[10]) ||
         !upload_cb(s_native_fog_cb,params,sizeof params)) return;
     D3D11_VIEWPORT vp = {0,0,(float)s->iw,(float)s->ih,0,1};
     D3D11_RECT sc = {0,0,(LONG)s->iw,(LONG)s->ih};
