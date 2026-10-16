@@ -34,6 +34,18 @@ static volatile LONG s_fb_running;
 static void (*s_close_handler)(void);
 static volatile HWND s_hwnd;
 static XboxHostOverlay s_host_overlay;
+static HCURSOR (*s_cursor_handler)(void);
+static int (*s_mouse_press_handler)(float, float);
+
+void xbox_FramebufferSetMousePressHandler(int (*handler)(float, float))
+{
+    s_mouse_press_handler = handler;
+}
+
+void xbox_FramebufferSetCursorHandler(HCURSOR (*handler)(void))
+{
+    s_cursor_handler = handler;
+}
 
 void xbox_FramebufferSetHostOverlay(const XboxHostOverlay *overlay)
 {
@@ -440,6 +452,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return m == WM_SYSKEYDOWN || m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
     }
     switch (m) {
+    case WM_SETCURSOR:
+        if (LOWORD(l) == HTCLIENT && s_cursor_handler) {
+            SetCursor(s_cursor_handler());
+            return TRUE;
+        }
+        break;
     case WM_CLOSE:
         if (s_close_handler)
             s_close_handler();
@@ -525,6 +543,15 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     /* Mouse buttons are virtual keys too, so RECOMP_KEYMAP can bind them. */
     case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+        {
+            RECT rc;
+            if (GetClientRect(h, &rc) && rc.right > 0 && rc.bottom > 0) {
+                s_mouse_x = (float)(short)LOWORD(l) / (float)rc.right;
+                s_mouse_y = (float)(short)HIWORD(l) / (float)rc.bottom;
+            }
+        }
+        if (m == WM_LBUTTONDOWN && s_mouse_press_handler &&
+            s_mouse_press_handler(s_mouse_x, s_mouse_y)) return 0;
         s_key_down[VK_LBUTTON] = m == WM_LBUTTONDOWN;
         return 0;
     case WM_RBUTTONDOWN: case WM_RBUTTONUP:
@@ -616,6 +643,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
+        }
+        /* Refresh a title cursor when UI changes under a stationary pointer. */
+        if (s_cursor_handler) {
+            POINT point;
+            RECT client;
+            if (GetCursorPos(&point) && WindowFromPoint(point) == hwnd &&
+                GetClientRect(hwnd, &client) && ScreenToClient(hwnd, &point) && PtInRect(&client, point))
+                SetCursor(s_cursor_handler());
         }
         {
             static DWORD t0;

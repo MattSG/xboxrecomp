@@ -200,6 +200,21 @@ static BOOL menu_keys_enabled(void)
 extern int xbox_FramebufferMouse(float *x, float *y);
 extern void nv2a_d3d_collect_menu_rects(int on);
 static int (*s_menu_pointer)(float x, float y, int *offset);
+static int (*s_menu_click)(float x, float y);
+extern void xbox_FramebufferSetMousePressHandler(int (*handler)(float, float));
+
+static int menu_press(float x, float y)
+{
+    return keyboard_enabled() && menu_keys_enabled() &&
+        (!s_in_menu || s_in_menu()) && !xbox_FramebufferHostInputCaptured() &&
+        s_menu_click && s_menu_click(x, y);
+}
+
+void xbox_InputSetMenuClickHandler(int (*click)(float, float))
+{
+    s_menu_click = click;
+    xbox_FramebufferSetMousePressHandler(click ? menu_press : NULL);
+}
 
 void xbox_InputSetMenuPointer(int (*pointer)(float x, float y, int *offset))
 {
@@ -247,7 +262,10 @@ static WORD menu_hover(BOOL nav_keys, BOOL *click)
             pulse_until = now + 50;
         }
     }
-    if (down && !was_down) click_at = now;
+    if (down && !was_down) {
+        if (s_menu_click && s_menu_click(x, y)) click_at = 0;
+        else click_at = now;
+    }
     was_down = key_down(VK_LBUTTON);
     /* Off an item the click goes straight through; on one it waits for the
      * focus, or 800 ms where the highlight cannot be found. */
