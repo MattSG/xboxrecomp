@@ -12,6 +12,12 @@
 #include <windows.h>
 /* The window to present into, or NULL until it exists. */
 HWND xbox_FramebufferWindowHandle(void);
+/* Register before window startup. Called on the window thread for client
+ * cursor selection; NULL result hides it. Cursor ownership stays with caller. */
+void xbox_FramebufferSetCursorHandler(HCURSOR (*handler)(void));
+/* Window-thread press notification, before held-key sampling. Nonzero
+ * consumes the left press; the callback must not call guest functions. */
+void xbox_FramebufferSetMousePressHandler(int (*handler)(float x, float y));
 /* Register before window startup. Called on its message thread when the user
  * closes the display; the title owns stopping its guest workers. */
 void xbox_FramebufferSetCloseHandler(void (*handler)(void));
