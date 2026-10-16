@@ -9,5 +9,6 @@
 #define NV2A_HOST_FOG_TAG 0x58424647u
 #define NV2A_HOST_FOG_WORDS 8u
 #define NV2A_HOST_FOG_SKY_MASK 1u /* Destination alpha: 1 at clear depth, 0 at geometry. */
+#define NV2A_HOST_FOG_SKY_FILL 2u /* Fill clear-depth background with the fog colour. */
 
 #endif

@@ -293,7 +293,10 @@ static void test_native_fog(void)
     CHECK(abs((int)(middle>>16)-81) <= 2 && abs((int)(middle&255)-174) <= 2);
     uint32_t distant = native_fog_pixel(&st,.8f,200);
     CHECK((distant>>16) <= 4 && (distant&255) >= 251);
-    CHECK(native_fog_pixel(&st,1,200) == 0xFF0000); /* Clear/sky depth. */
+    CHECK(native_fog_pixel(&st,1,200) == 0xFF0000); /* Default keeps clear/sky colour. */
+    nv2a_d3d_distance_fog(&st,1000.f/16777216.f,1000,200,800,0xFF0000FF,NV2A_HOST_FOG_SKY_FILL);
+    read_pixels(pixels);
+    CHECK((pixels[16*64+16]&0xFFFFFF) == 0x0000FF); /* No panorama: clear depth becomes untextured air. */
     CHECK(native_fog_pixel(&st,.8f,NAN) == 0xFF0000);
     native_fog_pixel(&st,.8f,200);
     st.depth_test = 0; st.depth_mask = 0;

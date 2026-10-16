@@ -17,7 +17,7 @@ static const char s_native_fog_hlsl[] =
 "  float z = Depth.Load(int3(int2(p.xy), 0));\n"
 "#endif\n"
 "  if (colour.a > 0) return float4(0,0,0,z >= 0.99999 ? 1 : 0);\n"
-"  if (z >= 0.99999) return 0;\n"
+"  if (z >= 0.99999) return float4(colour.rgb,band.w);\n"
 "  float x = saturate((z * band.z - band.x) * band.y);\n"
 "  return float4(colour.rgb, 1.0 - exp2(-6.643856 * x * x));\n"
 "}\n";
@@ -105,7 +105,7 @@ void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far
         !st || !bind_targets(st,1,&s,&d,&gw,&gh) ||
         !s || !d || !d->zsrv || s->iw != d->iw || s->ih != d->ih ||
         (!!s->ms != (d->samples > 1)) || !native_fog_init()) return;
-    float params[8] = {start,1.f/(end-start),depth_to_world*(d->zf == 1 ? 65536.f : 16777216.f),0,
+    float params[8] = {start,1.f/(end-start),depth_to_world*(d->zf == 1 ? 65536.f : 16777216.f),(flags & NV2A_HOST_FOG_SKY_FILL) ? 1.f : 0.f,
                       ((argb>>16)&255)/255.f,((argb>>8)&255)/255.f,(argb&255)/255.f,0};
     if (!isfinite(params[1]) || !isfinite(params[2]) ||
         !upload_cb(s_native_fog_cb,params,sizeof params)) return;
