@@ -94,6 +94,12 @@ int xa2_init(void)
         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
         goto fail;
     }
+    {   /* RECOMP_AUDIO_MUTE=1: the device runs and paces as usual, at volume 0
+         * (scripted runs). */
+        const char *mute = getenv("RECOMP_AUDIO_MUTE");
+        if (mute && *mute && *mute != '0')
+            IXAudio2MasteringVoice_SetVolume(g_xa2_master, 0.0f, XAUDIO2_COMMIT_NOW);
+    }
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
     wfx.nChannels       = XA2_CHANNELS;
