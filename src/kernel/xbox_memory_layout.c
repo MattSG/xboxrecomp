@@ -924,7 +924,7 @@ void xbox_Nv2aSemaphoreRelease(uint32_t dma_context,
         if (!fence_readable(target, 4)) continue;
         /* Consecutive releases to one address can retain the last value in
          * execution order, including uint32 wrap. A target change must retain
-         * both writes; the fixed MM3 target needs no allocation at all. */
+         * both writes; a fixed target needs no allocation at all. */
         if (g_fence_mirrors[i].command_pending) {
             XBOX_COMMAND_FENCE *tail = g_fence_mirrors[i].command_tail;
             uint32_t last_target = tail ? tail->target :

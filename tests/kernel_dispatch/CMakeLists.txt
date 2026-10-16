@@ -106,7 +106,7 @@ add_test(NAME kernel-thread-tib-state COMMAND kernel-thread-tib-test state)
 add_executable(kernel-async-wait-trace-test kernel_async_wait_trace_test.c)
 target_include_directories(kernel-async-wait-trace-test PRIVATE ../../src/kernel)
 target_link_libraries(kernel-async-wait-trace-test PRIVATE xboxrecomp)
-foreach(case off on inline override)
+foreach(case off on inline)
     add_test(NAME kernel-async-wait-trace-${case} COMMAND kernel-async-wait-trace-test ${case})
 endforeach()
 

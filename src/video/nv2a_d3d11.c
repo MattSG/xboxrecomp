@@ -3164,16 +3164,16 @@ static uint32_t write_mask(const NvD3DState *st, Surface *s)
  * stored widened (its image already spans the wide screen). */
 static int s_draw_textured, s_draw_reads_wide;
 static uint32_t s_draw_tex_addr;
-static int s_flare_depth_test;
+static uint32_t s_flare_stage_program;
 static int s_draw_bspline;
 static uint32_t s_bspline_sf, s_bspline_df;
 
 extern const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4];
 extern const float (*nv2a_vsh_constants(uint32_t *version))[4];
 
-void nv2a_d3d_set_flare_depth_test(int on)
+void nv2a_d3d_set_flare_depth_test(uint32_t stage_program)
 {
-    s_flare_depth_test = on != 0;
+    s_flare_stage_program = stage_program;
 }
 
 static int flare_needs_depth(const NvD3DState *st)
@@ -3184,9 +3184,9 @@ static int flare_needs_depth(const NvD3DState *st)
     uint32_t address, reject = 0;
     unsigned n;
     /* tex_used describes only the fixed-function fallback in the pushbuffer
-     * executor. Register-combiner draws select sampled stages in stage_program;
-     * 0x8421 is the native Flares program's four projective 2D stages. */
-    if (!s_flare_depth_test || !st->rc_seen || st->rc.stage_program != 0x8421u)
+     * executor. Register-combiner draws select sampled stages in stage_program,
+     * which the title names (nv2a_d3d_set_flare_depth_test). */
+    if (!s_flare_stage_program || !st->rc_seen || st->rc.stage_program != s_flare_stage_program)
         return 0;
     address = phys(st->tex[0].addr);
     if (!address || phys(st->tex[3].addr) == address) return 0;
@@ -3195,7 +3195,7 @@ static int flare_needs_depth(const NvD3DState *st)
     if (!st->blend_enable || st->blend_dfactor != 1u || st->blend_equation != 0x8006u)
         reject |= 2u;
     if (!mask || mask->w != st->clip_w || mask->h != st->clip_h) reject |= 4u;
-    /* MM3 Flares/Flares.psh: t0..t2 sample the screen visibility mask;
+    /* The flare shader: t0..t2 sample the screen visibility mask;
      * t3 samples the lamp texture. Four framebuffer taps are bloom, and
      * one/two textures can be HUD or road light passes: none qualify. */
     for (n = 0; n < 3; ++n) {
@@ -3204,7 +3204,7 @@ static int flare_needs_depth(const NvD3DState *st)
             ((t->filter >> 24) & 15u) != 2u)
             reject |= 8u;
     }
-    if (traced < 4 && getenv("MM3_FLARE_TRACE") &&
+    if (traced < 4 && getenv("RECOMP_FLARE_TRACE") &&
         phys(st->tex[1].addr) == address && phys(st->tex[2].addr) == address) {
         fprintf(stderr, "[D3D11] lamp pass reject=%X clip=%ux%u mask=%ux%u depth=%u write=%u zeta=%08X wbuffer=%u tex_used=%X filter=%08X/%08X/%08X\n",
                 reject, st->clip_w, st->clip_h, mask ? mask->w : 0, mask ? mask->h : 0,
@@ -5176,7 +5176,7 @@ void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
-void nv2a_d3d_set_flare_depth_test(int on) { (void)on; }
+void nv2a_d3d_set_flare_depth_test(uint32_t stage_program) { (void)stage_program; }
 void nv2a_d3d_set_depth_view_remap(float scale, float knee) { (void)scale; (void)knee; }
 void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb, uint32_t flags, const float sky_fade[4]) { (void)st; (void)depth_to_world; (void)far_clip; (void)start; (void)end; (void)argb; (void)flags; (void)sky_fade; }
 #endif

@@ -144,8 +144,10 @@ typedef struct {
                                    unsigned attribute, uint32_t lo, uint32_t count);
 } NvOverlayHooks;
 void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks);
-/* Opt in lamp visibility sprites to scene depth, without depth writes. */
-void nv2a_d3d_set_flare_depth_test(int on);
+/* Opt in lamp visibility sprites to scene depth, without depth writes:
+ * `stage_program` is the flare shader's combiner stage program (its texture
+ * modes), 0 to turn it off. */
+void nv2a_d3d_set_flare_depth_test(uint32_t stage_program);
 /* A title that multiplies its far plane by `scale` (w-buffered, so depth is
  * w / far) still indexes its authored depth lookups (fog ramps) with the
  * original fractions. Depth read back as a texture is reported in those:

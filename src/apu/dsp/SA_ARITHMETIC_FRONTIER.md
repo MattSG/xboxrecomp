@@ -184,4 +184,4 @@ Update: unrounded parallel MPY now routes through emu_multiply; the inventory ab
 
 Update: rounded parallel MPYR also routes through emu_multiply; accumulated and immediate paths remain open.
 
-Update (closure): all handlers in the inventory now route through SA-aware wrappers or dedicated SA paths; see ACCEPTANCE.md "SA frontier closure" for the inferred rules and the regression set.
+Update (closure): all handlers in the inventory now route through SA-aware wrappers or dedicated SA paths.

@@ -24,6 +24,7 @@ HWND xbox_FramebufferWindowHandle(void) { return NULL; }
 int xbox_FramebufferScanSource(uint32_t *va, uint32_t *pitch) { return 0; }
 int xbox_FramebufferOverlay(XboxOverlay *ovl) { return 0; }
 void xbox_FramebufferNoteFlip(uint32_t draws) {}
+void xbox_FramebufferRenderHostOverlay(void *device, void *context, void *target) { (void)device; (void)context; (void)target; }
 const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4]
 {
     *start = 0; *version = 1;
@@ -155,7 +156,7 @@ int main(int argc, char **argv)
         st.tex[n].filter = 0x02062000;
     }
     for (n = 0; n < 64 * 64; ++n) ((uint32_t *)(ram + 0x60000))[n] = 0xFFFFFFFFu;
-    nv2a_d3d_set_flare_depth_test(1);
+    nv2a_d3d_set_flare_depth_test(0x8421);
     CHECK(flare_needs_depth(&st));
     other = st; other.tex[3] = other.tex[0]; CHECK(!flare_needs_depth(&other)); /* bloom */
     other = st; other.tex_used = 1; CHECK(flare_needs_depth(&other)); /* native RC fallback mask */
@@ -171,7 +172,7 @@ int main(int argc, char **argv)
     for (wbuffer = 0; wbuffer < 2; ++wbuffer) {
         st.z_perspective = wbuffer;
         for (enabled = 0; enabled < 2; ++enabled) {
-            nv2a_d3d_set_flare_depth_test(enabled);
+            nv2a_d3d_set_flare_depth_test(enabled ? 0x8421u : 0u);
             ID3D11DeviceContext_ClearRenderTargetView(s_ctx, target->rtv, red);
             target->gen++; target->ms_dirty = 1;
             ID3D11DeviceContext_ClearDepthStencilView(s_ctx, depth->dsv, D3D11_CLEAR_DEPTH, .5f, 0);
@@ -214,7 +215,7 @@ int main(int argc, char **argv)
         float lamp_depth = wbuffer ? 1.0f / (2.71648e-7f * 16777216.0f) : .999532f;
         st.z_perspective = wbuffer;
         for (enabled = 0; enabled < 2; ++enabled) {
-            nv2a_d3d_set_flare_depth_test(enabled);
+            nv2a_d3d_set_flare_depth_test(enabled ? 0x8421u : 0u);
             CHECK(setup_pipeline(&st, NV_D3D_TRIANGLES, &target, &gw, &gh, &zmax));
             depth = s_cur_ds;
             if (!depth) depth = depth_find(phys(st.zeta_addr));
