@@ -235,6 +235,7 @@ uint64_t mcpx_apu_dsp_read(MCPXAPUState *d, bool gp, uint32_t addr, unsigned siz
     char space;
     uint32_t word;
     qemu_mutex_lock(&d->lock);
+    qemu_mutex_lock(&d->dsp_lock);
     uint64_t result = 0;
     for (unsigned i = 0; i < size; ) {
         uint32_t aligned = (addr + i) & ~3u;
@@ -246,6 +247,7 @@ uint64_t mcpx_apu_dsp_read(MCPXAPUState *d, bool gp, uint32_t addr, unsigned siz
             lane++; i++;
         }
     }
+    qemu_mutex_unlock(&d->dsp_lock);
     qemu_mutex_unlock(&d->lock);
     return result;
 }
@@ -293,6 +295,7 @@ void mcpx_apu_dsp_write(MCPXAPUState *d, bool gp, uint32_t addr, uint64_t value,
     DSPState *dsp = gp ? d->gp.dsp : d->ep.dsp;
     if (!dsp) return;
     qemu_mutex_lock(&d->lock);
+    qemu_mutex_lock(&d->dsp_lock);
     for (unsigned i = 0; i < size; ) {
         uint32_t aligned = (addr + i) & ~3u;
         char space;
@@ -307,6 +310,7 @@ void mcpx_apu_dsp_write(MCPXAPUState *d, bool gp, uint32_t addr, uint64_t value,
         }
         dsp_write_word_locked(d, gp, aligned, merged);
     }
+    qemu_mutex_unlock(&d->dsp_lock);
     qemu_mutex_unlock(&d->lock);
 }
 
@@ -334,7 +338,7 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
             d->monitor.point == MCPX_APU_DEBUG_MON_VP ? " (off: voice mix only)" : "");
 }
 
-/* Called with the APU lock held, as are the frame's native mixer operations. */
+/* Called on the DSP thread with dsp_lock held. */
 static void run_dsp_frame(MCPXAPUState *d, DSPState *dsp)
 {
     static int profile = -1;
@@ -357,9 +361,9 @@ static void run_dsp_frame(MCPXAPUState *d, DSPState *dsp)
          * handshakes with the GP/EP still complete; their output is unused. */
         if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) break;
         /* Guest MMIO must be able to reset or command a continuously running DSP. */
-        qemu_mutex_unlock(&d->lock);
+        qemu_mutex_unlock(&d->dsp_lock);
         Sleep(0);
-        qemu_mutex_lock(&d->lock);
+        qemu_mutex_lock(&d->dsp_lock);
         uint32_t reset = dsp->is_gp ? d->gp.regs[NV_PAPU_GPRST] : d->ep.regs[NV_PAPU_EPRST];
         uint32_t enabled = NV_PAPU_GPRST_GPRST | NV_PAPU_GPRST_GPDSPRST;
         if ((reset & enabled) != enabled) break;
@@ -379,7 +383,7 @@ static void run_dsp_frame(MCPXAPUState *d, DSPState *dsp)
     }
 }
 
-void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int div)
 {
     for (int bin = 0; bin < NUM_MIXBINS; bin++)
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
@@ -399,15 +403,15 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
                     d->gp.dsp->dma.error, d->gp.dsp->dma.eol);
         if (d->monitor.point == MCPX_APU_DEBUG_MON_GP ||
             (d->monitor.point == MCPX_APU_DEBUG_MON_GP_OR_EP && !ep_enabled)) {
-            int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+            int off = (div % 8) * NUM_SAMPLES_PER_FRAME;
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                 ((int16_t (*)[2])d->monitor.ep_pcm_buf)[off + i][0] = dsp_read_memory(d->gp.dsp, 'X', 0x1400 + i) >> 8;
                 ((int16_t (*)[2])d->monitor.ep_pcm_buf)[off + i][1] = dsp_read_memory(d->gp.dsp, 'X', 0x1420 + i) >> 8;
             }
-            if (d->ep_frame_div % 8 == 7) publish_pcm_frame(d, d->monitor.ep_pcm_buf);
+            if (div % 8 == 7) publish_pcm_frame(d, d->monitor.ep_pcm_buf);
         }
     }
-    if (ep_enabled && d->ep_frame_div % 8 == 0) {
+    if (ep_enabled && div % 8 == 0) {
         run_dsp_frame(d, d->ep.dsp);
         g_dbg.ep.cycles = d->ep.dsp->core.cycle_count;
         static unsigned ep_trace_frames;

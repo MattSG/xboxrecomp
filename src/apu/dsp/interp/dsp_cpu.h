@@ -148,6 +148,8 @@ struct dsp_core_s {
 /* Functions */
 void dsp56k_reset_cpu(dsp_core_t* dsp);		/* Set dsp_core to use */
 void dsp56k_execute_instruction(dsp_core_t* dsp);	/* Execute 1 instruction */
+/* Run recompiled code from the PC (tools/dsp_recomp); cycles used, 0 if none applies. */
+int dsp56k_execute_recompiled(dsp_core_t* dsp, int budget, const uint32_t* dma_control, uint32_t dma_running);
 
 uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address);
 void dsp56k_write_memory(dsp_core_t* dsp, int space, uint32_t address, uint32_t value);

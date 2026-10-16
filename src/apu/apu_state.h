@@ -387,6 +387,21 @@ struct MCPXAPUState {
 
     uint32_t regs[0x20000];
 
+    /* The GP/EP run on their own thread (apu_core.c, mcpx_apu_dsp_thread),
+     * through the frames the frame thread queues as it mixes their voices --
+     * up to one output group of 8, which it waits for before consuming the
+     * group's output. dsp_lock guards the GP/EP, their registers and the PCM
+     * they publish (monitor.ep_pcm_*, frame_buf); whoever needs it and lock
+     * takes lock first. The queue has its own lock, never held while a frame
+     * runs: posting behind a running frame's dsp_lock stalled the frame thread
+     * (a critical section is not fair) and made the thread a net loss. */
+    QemuThread dsp_thread;
+    QemuMutex dsp_lock, dsp_queue_lock;
+    QemuCond dsp_job_cond, dsp_done_cond;
+    int dsp_job_head, dsp_job_count;      /* oldest queued frame; frames queued or running */
+    int dsp_job_div[8];
+    float dsp_job_mixbins[8][NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+
     int ep_frame_div;
     int sleep_acc_us;
     int frame_count;
@@ -437,7 +452,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d);
 void mcpx_apu_dsp_init(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_pcm_consumed(MCPXAPUState *d);
-void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int div);
 uint64_t mcpx_apu_dsp_read(MCPXAPUState *d, bool gp, uint32_t addr, unsigned size);
 void mcpx_apu_dsp_write(MCPXAPUState *d, bool gp, uint32_t addr, uint64_t value, unsigned size);
 

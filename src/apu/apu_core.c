@@ -528,6 +528,48 @@ static void throttle(MCPXAPUState *d)
  * se_frame - Process one audio frame (VP -> GP -> EP pipeline)
  * ============================================================ */
 
+/* ============================================================
+ * DSP thread: the GP/EP for frame N while the voices for N+1 mix
+ * ============================================================ */
+
+/* Called with d->lock held: waits until the DSP thread has run every queued
+ * frame, with d->lock released so guest accesses meanwhile are not held up. */
+static void dsp_job_wait(MCPXAPUState *d)
+{
+    qemu_mutex_unlock(&d->lock);
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    while (d->dsp_job_count)
+        qemu_cond_wait(&d->dsp_done_cond, &d->dsp_queue_lock);
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    qemu_mutex_lock(&d->lock);
+}
+
+static void *mcpx_apu_dsp_thread(void *arg)
+{
+    MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#ifdef _WIN32
+    /* Its frames are on the output's critical path, as the frame thread's are. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    for (;;) {
+        while (!d->dsp_job_count && !qatomic_read(&d->exiting))
+            qemu_cond_wait(&d->dsp_job_cond, &d->dsp_queue_lock);
+        if (!d->dsp_job_count) break;
+        int job = d->dsp_job_head;
+        qemu_mutex_unlock(&d->dsp_queue_lock);
+        qemu_mutex_lock(&d->dsp_lock);
+        mcpx_apu_dsp_frame(d, d->dsp_job_mixbins[job], d->dsp_job_div[job]);
+        qemu_mutex_unlock(&d->dsp_lock);
+        qemu_mutex_lock(&d->dsp_queue_lock);
+        d->dsp_job_head = (job + 1) % 8;
+        d->dsp_job_count--;
+        qemu_cond_signal(&d->dsp_done_cond);
+    }
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    return NULL;
+}
+
 static void se_frame(MCPXAPUState *d)
 {
     mcpx_apu_update_dsp_preference(d);
@@ -551,7 +593,25 @@ static void se_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
 
     mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
+
+    /* Queue the frame for the DSP thread; the voices for the next frames mix
+     * meanwhile. The GP publishes a group of 8 frames' output on the eighth,
+     * which the monitor then consumes: wait for the queue to empty there. A
+     * full queue (the group end was skipped) is waited for the same way. */
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    bool full = d->dsp_job_count == 8;
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    if (full)
+        dsp_job_wait(d);
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    int job = (d->dsp_job_head + d->dsp_job_count) % 8;
+    memcpy(d->dsp_job_mixbins[job], mixbins, sizeof(mixbins));
+    d->dsp_job_div[job] = d->ep_frame_div;
+    if (d->dsp_job_count++ == 0)
+        qemu_cond_signal(&d->dsp_job_cond);
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    if ((d->ep_frame_div + 1) % 8 == 0)
+        dsp_job_wait(d);
     mcpx_apu_monitor_frame(d);
 
     d->ep_frame_div++;
@@ -576,6 +636,7 @@ static void *mcpx_apu_frame_thread(void *arg)
 
     while (!qatomic_read(&d->exiting)) {
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
+            dsp_job_wait(d);
             d->is_idle = true;
             qemu_cond_signal(&d->idle_cond);
             qemu_cond_wait(&d->cond, &d->lock);
@@ -606,6 +667,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             se_frame(d);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            dsp_job_wait(d);
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
@@ -667,11 +729,13 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
     memset(d->regs, 0, sizeof(d->regs));
     mcpx_apu_vp_reset(d);
 
+    qemu_mutex_lock(&d->dsp_lock);   /* the frame thread is idle: no frame runs */
     if (d->gp.dsp) dsp_reset(d->gp.dsp);
     if (d->ep.dsp) dsp_reset(d->ep.dsp);
     memset(d->gp.regs, 0, sizeof(d->gp.regs));
     memset(d->ep.regs, 0, sizeof(d->ep.regs));
     d->monitor.ep_pcm_offset = 0;
+    qemu_mutex_unlock(&d->dsp_lock);
     d->set_irq = false;
 }
 
@@ -700,6 +764,10 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     qemu_mutex_lock(&d->lock);
     qemu_cond_init(&d->cond);
     qemu_cond_init(&d->idle_cond);
+    qemu_mutex_init(&d->dsp_lock);
+    qemu_mutex_init(&d->dsp_queue_lock);
+    qemu_cond_init(&d->dsp_job_cond);
+    qemu_cond_init(&d->dsp_done_cond);
 
     /* Init VP (voice processor) */
     mcpx_apu_vp_init(d);
@@ -717,7 +785,9 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
     }
 
-    /* Start background frame thread */
+    /* Start background frame and DSP threads */
+    qemu_thread_create(&d->dsp_thread, "mcpx.dsp_thread",
+                       mcpx_apu_dsp_thread, d, QEMU_THREAD_JOINABLE);
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
     mcpx_apu_wait_for_idle(d);
@@ -744,6 +814,10 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     qemu_mutex_unlock(&d->lock);
 
     qemu_thread_join(&d->apu_thread);
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    qemu_cond_signal(&d->dsp_job_cond);
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    qemu_thread_join(&d->dsp_thread);
     mcpx_apu_vp_finalize(d);
     mcpx_apu_monitor_finalize(d);
 

@@ -79,7 +79,7 @@ static void dsp_write_reg_slow(dsp_core_t* dsp, uint32_t numreg, uint32_t value)
 
 /* X0-Y1 and A/B outside SA mode and the address registers are most writes:
  * the slow path's default and accumulator cases, without its register switch. */
-static void dsp_write_reg(dsp_core_t* dsp, uint32_t numreg, uint32_t value)
+static DSP_PREAD_INLINE void dsp_write_reg(dsp_core_t* dsp, uint32_t numreg, uint32_t value)
 {
     if (!(dsp->registers[DSP_REG_SR] & (1u << DSP_SR_SA))) {
         if (numreg >= DSP_REG_X0 && numreg <= DSP_REG_Y1) {
@@ -790,6 +790,26 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
  *  Update the PC
 **********************************/
 
+/* The PC has just passed the last instruction of a DO loop (LA). */
+static void dsp_do_loop_end(dsp_core_t* dsp)
+{
+    --dsp->registers[DSP_REG_LC];
+    dsp->registers[DSP_REG_LC] &= dsp_register_mask(dsp, DSP_REG_LC);
+
+    if (dsp->registers[DSP_REG_LC] == 0 && !(dsp->registers[DSP_REG_SR] & (1u << DSP_SR_FV))) {
+        /* end of loop */
+        uint32_t saved_pc, saved_sr;
+
+        dsp_stack_pop(dsp, &saved_pc, &saved_sr);
+        dsp->registers[DSP_REG_SR] &= ~((1u << DSP_SR_LF) | (1u << DSP_SR_FV));
+        dsp->registers[DSP_REG_SR] |= saved_sr & ((1u << DSP_SR_LF) | (1u << DSP_SR_FV));
+        dsp_stack_pop(dsp, &dsp->registers[DSP_REG_LA], &dsp->registers[DSP_REG_LC]);
+    } else {
+        /* Loop one more time */
+        dsp->pc = dsp->registers[DSP_REG_SSH];
+    }
+}
+
 static void dsp_postexecute_update_pc(dsp_core_t* dsp)
 {
     /* When running a REP, PC must stay on the current instruction */
@@ -824,21 +844,7 @@ static void dsp_postexecute_update_pc(dsp_core_t* dsp)
 
         /* Did we execute the last instruction in loop ? */
         if (dsp->pc == dsp->registers[DSP_REG_LA] + 1) {
-            --dsp->registers[DSP_REG_LC];
-            dsp->registers[DSP_REG_LC] &= dsp_register_mask(dsp, DSP_REG_LC);
-
-            if (dsp->registers[DSP_REG_LC] == 0 && !(dsp->registers[DSP_REG_SR] & (1u << DSP_SR_FV))) {
-                /* end of loop */
-                uint32_t saved_pc, saved_sr;
-
-                dsp_stack_pop(dsp, &saved_pc, &saved_sr);
-                dsp->registers[DSP_REG_SR] &= ~((1u << DSP_SR_LF) | (1u << DSP_SR_FV));
-                dsp->registers[DSP_REG_SR] |= saved_sr & ((1u << DSP_SR_LF) | (1u << DSP_SR_FV));
-                dsp_stack_pop(dsp, &dsp->registers[DSP_REG_LA], &dsp->registers[DSP_REG_LC]);
-            } else {
-                /* Loop one more time */
-                dsp->pc = dsp->registers[DSP_REG_SSH];
-            }
+            dsp_do_loop_end(dsp);
         }
     }
 }
@@ -1551,4 +1557,55 @@ static uint32_t dsp_signextend(int bits, uint32_t v) {
     const int shift = sizeof(int)*8 - bits;
     assert(shift > 0);
     return (uint32_t)(((int32_t)v << shift) >> shift);
+}
+
+/**********************************
+ *  Recompiled programs
+ **********************************/
+
+/* tools/dsp_recomp generates C for the programs a title loaded; the build
+ * names that file in DSP_RECOMP_INC. DSP_RECOMP_STEP is
+ * dsp56k_execute_instruction for one known word (its PC update and interrupt
+ * test inline: the full ones only for REP, a DO loop's end or an interrupt),
+ * then dsp_run's accounting.
+ * It returns to dsp_run wherever that loop would do anything but run the
+ * next instruction: a REP, WAIT/STOP, idle, DMA started, or the budget used. */
+#ifdef DSP_RECOMP_INC
+#define DSP_RECOMP_STOPPED (used >= budget || dsp->loop_rep || dsp->is_waiting || dsp->is_stopped || \
+        dsp->is_debugging || dsp->is_idle || (*dma_control & dma_running))
+#define DSP_RECOMP_STEP(W, CALL) do { \
+        dsp->disasm_memory_ptr = 0; \
+        dsp->cur_inst = (W); \
+        dsp->cur_inst_len = 1; \
+        dsp->instr_cycle = 2; \
+        CALL; \
+        if (dsp->loop_rep) { \
+            dsp_postexecute_update_pc(dsp); \
+        } else { \
+            dsp->pc += dsp->cur_inst_len; \
+            if ((dsp->registers[DSP_REG_SR] & (1u << DSP_SR_LF)) && \
+                dsp->pc == dsp->registers[DSP_REG_LA] + 1) \
+                dsp_do_loop_end(dsp); \
+        } \
+        if (dsp->interrupt_counter || dsp->interrupt_state == DSP_INTERRUPT_DISABLED) \
+            dsp_postexecute_interrupts(dsp); \
+        dsp->num_inst += dsp->instr_cycle; \
+        dsp->cycle_count += dsp->instr_cycle; \
+        used += dsp->instr_cycle; \
+        if (DSP_RECOMP_STOPPED) \
+            return used; \
+    } while (0)
+#include DSP_RECOMP_INC
+#endif
+
+int dsp56k_execute_recompiled(dsp_core_t* dsp, int budget, const uint32_t* dma_control, uint32_t dma_running)
+{
+#ifdef DSP_RECOMP_INC
+    if (dsp->loop_rep || dsp->is_waiting || dsp->is_stopped || dsp->is_debugging) return 0;
+    return dsp->is_gp ? dsp_recomp_gp(dsp, budget, dma_control, dma_running)
+                      : dsp_recomp_ep(dsp, budget, dma_control, dma_running);
+#else
+    (void)dsp; (void)budget; (void)dma_control; (void)dma_running;
+    return 0;
+#endif
 }
