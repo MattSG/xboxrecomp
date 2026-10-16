@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_pb_wrap_test C)
+if(NOT WIN32)
+    message(FATAL_ERROR "The guard region uses Windows VirtualAlloc")
+endif()
+set(CMAKE_C_STANDARD 11)
+# test_main.c compiles nv2a_pb_scan.c itself and supplies what it calls.
+add_executable(nv2a_pb_wrap_test test_main.c)
+target_include_directories(nv2a_pb_wrap_test PRIVATE ../../src ../../src/kernel)
+enable_testing()
+add_test(NAME nv2a_pb_wrap COMMAND nv2a_pb_wrap_test)

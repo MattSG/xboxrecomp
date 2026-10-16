@@ -460,6 +460,19 @@ int nv2a_pb_dma_walk(void)
  * wrap is handled by the caller, which scans the two pieces separately.
  * Addresses are physical, like PUT's, and reach guest memory through the
  * contiguous window. */
+/* The NV2A's physical bus is 26 bits: JUMP and CALL targets, and reads that
+ * run off the end of RAM, wrap at 64 MB -- the size of the contiguous window
+ * behind them. Masking to 28 bits read past the window. */
+static uint32_t pb_window_va(uint32_t physical)
+{
+    return 0x80000000u | (physical & (PB_RAM_BYTES - 1u));
+}
+
+static const uint8_t *pb_word_ptr(const uint8_t *mem, uint32_t va)
+{
+    return mem + pb_window_va(va - 0x80000000u);
+}
+
 static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                 uint32_t *jumps, uint32_t *unknown)
 {
@@ -467,7 +480,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
     uint32_t words = 0;
 
     while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        uint32_t w = *(const uint32_t *)pb_word_ptr(mem, va);
         va += 4;
         words++;
 
@@ -477,7 +490,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             (*jumps)++;
             if (!in_call)
                 break;                        /* the ring: a jump ends it */
-            va = 0x80000000u | (target & 0x0FFFFFFFu);
+            va = pb_window_va(target);
             end_va = va + 0x400000u;
             continue;
         }
@@ -488,7 +501,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
         }
         if ((w & 3u) == 2u) {                    /* CALL */
             if (!in_call) {
-                uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+                uint32_t sub = pb_window_va(w & 0xFFFFFFFCu);
                 s_tot_calls++;
                 words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
             }
@@ -505,7 +518,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                 note(subch, m);
                 if (s_exec_enabled)
                     nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
+                                        *(const uint32_t *)pb_word_ptr(mem, va));
                 va += 4;
                 words++;
             }
