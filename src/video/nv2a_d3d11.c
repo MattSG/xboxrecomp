@@ -5147,5 +5147,5 @@ uint32_t nv2a_d3d_zpass_read(void) { return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
 void nv2a_d3d_set_flare_depth_test(int on) { (void)on; }
 void nv2a_d3d_set_depth_view_remap(float scale, float knee) { (void)scale; (void)knee; }
-void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb, uint32_t flags) { (void)st; (void)depth_to_world; (void)far_clip; (void)start; (void)end; (void)argb; (void)flags; }
+void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb, uint32_t flags, const float sky_fade[4]) { (void)st; (void)depth_to_world; (void)far_clip; (void)start; (void)end; (void)argb; (void)flags; (void)sky_fade; }
 #endif
