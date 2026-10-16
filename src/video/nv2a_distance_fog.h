@@ -16,6 +16,7 @@ static const char s_native_fog_hlsl[] =
 "#else\n"
 "  float z = Depth.Load(int3(int2(p.xy), 0));\n"
 "#endif\n"
+"  if (colour.a > 0) return float4(0,0,0,z >= 0.99999 ? 1 : 0);\n"
 "  if (z >= 0.99999) return 0;\n"
 "  float x = saturate((z * band.z - band.x) * band.y);\n"
 "  return float4(colour.rgb, 1.0 - exp2(-6.643856 * x * x));\n"
@@ -24,7 +25,7 @@ static const char s_native_fog_hlsl[] =
 static ID3D11VertexShader *s_native_fog_vs;
 static ID3D11PixelShader *s_native_fog_ps[2];
 static ID3D11Buffer *s_native_fog_cb;
-static ID3D11BlendState *s_native_fog_blend;
+static ID3D11BlendState *s_native_fog_blend, *s_native_fog_mask;
 static ID3D11DepthStencilState *s_native_fog_depth;
 static ID3D11RasterizerState *s_native_fog_raster;
 
@@ -80,6 +81,9 @@ static int native_fog_init(void)
         FAILED(ID3D11Device_CreateBlendState(s_dev,&blend,&s_native_fog_blend)) ||
         FAILED(ID3D11Device_CreateDepthStencilState(s_dev,&depth,&s_native_fog_depth)) ||
         FAILED(ID3D11Device_CreateRasterizerState(s_dev,&raster,&s_native_fog_raster))) goto fail;
+    blend.RenderTarget[0].BlendEnable = FALSE;
+    blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALPHA;
+    if (FAILED(ID3D11Device_CreateBlendState(s_dev,&blend,&s_native_fog_mask))) goto fail;
     return 1;
 fail:
     if (s_native_fog_vs) { ID3D11VertexShader_Release(s_native_fog_vs); s_native_fog_vs = NULL; }
@@ -87,14 +91,15 @@ fail:
         if (s_native_fog_ps[i]) { ID3D11PixelShader_Release(s_native_fog_ps[i]); s_native_fog_ps[i] = NULL; }
     if (s_native_fog_cb) { ID3D11Buffer_Release(s_native_fog_cb); s_native_fog_cb = NULL; }
     if (s_native_fog_blend) { ID3D11BlendState_Release(s_native_fog_blend); s_native_fog_blend = NULL; }
+    if (s_native_fog_mask) { ID3D11BlendState_Release(s_native_fog_mask); s_native_fog_mask = NULL; }
     if (s_native_fog_depth) { ID3D11DepthStencilState_Release(s_native_fog_depth); s_native_fog_depth = NULL; }
     if (s_native_fog_raster) { ID3D11RasterizerState_Release(s_native_fog_raster); s_native_fog_raster = NULL; }
     return 0;
 }
 
-void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb)
+void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb, uint32_t flags)
 {
-    Surface *s; Depth *d; uint32_t gw, gh;
+    Surface *s = NULL; Depth *d = NULL; uint32_t gw, gh;
     if (!isfinite(depth_to_world) || !isfinite(far_clip) || !isfinite(start) || !isfinite(end) ||
         depth_to_world <= 0 || far_clip <= 0 || start < 0 || end <= start || end > far_clip ||
         !st || !bind_targets(st,1,&s,&d,&gw,&gh) ||
@@ -121,6 +126,12 @@ void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx,0,1,&s_native_fog_cb);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx,0,1,&d->zsrv);
     ID3D11DeviceContext_Draw(s_ctx,3,0);
+    /* Optional mask for subsequent destination-alpha composition. */
+    params[7] = 1;
+    if ((flags & NV2A_HOST_FOG_SKY_MASK) && upload_cb(s_native_fog_cb,params,sizeof params)) {
+        ID3D11DeviceContext_OMSetBlendState(s_ctx,s_native_fog_mask,NULL,0xFFFFFFFFu);
+        ID3D11DeviceContext_Draw(s_ctx,3,0);
+    }
     unbind_textures();
     unbind_targets();
     s->gpu_dirty = 1; s->ms_dirty = !!s->ms; ++s->gen;

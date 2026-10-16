@@ -268,10 +268,20 @@ static uint32_t native_fog_pixel(NvD3DState *st, float depth, float start)
     /* At the postprocess marker, UI/glare setup may already have disabled
      * W-buffer writes. The stored scene depth still contains linear W. */
     NvD3DState post = *st; post.z_perspective = 0; post.depth_mask = 0;
-    nv2a_d3d_distance_fog(&post,1000.f/16777216.f,1000,start,800,0xFF0000FF);
+    nv2a_d3d_distance_fog(&post,1000.f/16777216.f,1000,start,800,0xFF0000FF,0);
     read_pixels(pixels);
     CHECK((pixels[16*64+16]>>24) == alpha); /* Fog preserves destination alpha. */
-    return pixels[16*64+16]&0xFFFFFF;
+    uint32_t colour = pixels[16*64+16]&0xFFFFFF;
+    nv2a_d3d_distance_fog(&post,1000.f/16777216.f,1000,start,800,0xFF0000FF,NV2A_HOST_FOG_SKY_MASK);
+    read_pixels(pixels);
+    CHECK((pixels[16*64+16]>>24) == (isfinite(start) ? (depth >= .99999f ? 255u : 0u) : alpha));
+    uint32_t masked_colour = pixels[16*64+16]&0xFFFFFF;
+    /* The next panorama draw must affect sky alone, never nearby geometry. */
+    post.depth_test = 0; post.blend_enable = 1;
+    post.blend_sfactor = 0x304; post.blend_dfactor = 0x305;
+    triangle(&post,1,0); read_pixels(pixels);
+    if (isfinite(start)) CHECK((pixels[16*64+16]&0xFFFFFF) == (depth >= .99999f ? 0x00FF00 : masked_colour));
+    return colour;
 }
 
 static void test_native_fog(void)
@@ -288,8 +298,8 @@ static void test_native_fog(void)
     native_fog_pixel(&st,.8f,200);
     st.depth_test = 0; st.depth_mask = 0;
     triangle(&st,1,0); read_pixels(pixels);
-    CHECK(pixels[16*64+16] == 0xFF00FF00); /* UI after the pass stays unchanged. */
-    puts("PASS: dedicated fog pass reads depth, preserves near/sky/alpha, fades mid/far, rejects invalid ranges, and restores subsequent UI rendering");
+    CHECK((pixels[16*64+16]&0xFFFFFF) == 0x00FF00); /* UI RGB after the pass stays unchanged. */
+    puts("PASS: dedicated fog pass reads depth, preserves near/sky/alpha, optionally rebuilds skyline alpha, fades mid/far, rejects invalid ranges, and restores subsequent UI rendering");
 }
 
 static void test_failures(void)
