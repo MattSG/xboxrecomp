@@ -88,12 +88,13 @@ typedef struct XBOX_INPUT_CAPABILITIES {
  */
 void xbox_InputInit(void);
 
-/* Configure before input polling starts. The optional probe runs on the
- * input thread, so it must be fast and safe to call from that thread.
- * For the MM3 keyboard layout, TRUE maps arrows to driving controls;
- * FALSE (or no probe) maps them only to the menu d-pad. Legacy is unchanged. */
-typedef BOOL (*XBOX_KEYBOARD_DRIVING_PROBE)(void);
-void xbox_InputSetKeyboardDrivingProbe(XBOX_KEYBOARD_DRIVING_PROBE probe);
+/* A title's own contextual keys (Windows, RECOMP_KEYBOARD=1): the hook may
+ * change the keyboard pad after the default keys are read. `menu` is TRUE
+ * while RECOMP_MENU_KEYS navigation applies; xbox_FramebufferKeyDown reads
+ * a key. Configure before input polling starts. It runs on the input thread,
+ * so it must be fast and safe to call from that thread. */
+typedef void (*XBOX_KEYBOARD_HOOK)(XBOX_INPUT_STATE *state, BOOL menu);
+void xbox_InputSetKeyboardHook(XBOX_KEYBOARD_HOOK hook);
 
 /**
  * Get the state of a controller.

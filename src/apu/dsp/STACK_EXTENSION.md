@@ -35,7 +35,7 @@ EP/SZ guest storage, compatibility widths and SZ reset preservation exist. Non-e
 
 SC storage/accounting, extended logical SP, spill/refill, WRP/EOV/EUN behavior, transfer timing and memory-order verification remain unimplemented. The current 16-entry non-extended helpers must not be presented as extended-stack support. Existing capture layout has spare register slots, but introducing SC accounting changes state interpretation: decide capture compatibility explicitly and regenerate/version fixtures where needed.
 
-Required proof includes more than 16 nested actual guest calls and returns in X and Y extension memory; exact spill words and EP/SC/SP at thresholds; double pushes/pops from loops; sticky fault/rearm behavior; reset; and identical-program/input comparison against an independent extension implementation where available. Full MM3 audio acceptance remains a separate requirement.
+Required proof includes more than 16 nested actual guest calls and returns in X and Y extension memory; exact spill words and EP/SC/SP at thresholds; double pushes/pops from loops; sticky fault/rearm behavior; reset; and identical-program/input comparison against an independent extension implementation where available.
 
 ## Reference investigation, 2026-10-08
 

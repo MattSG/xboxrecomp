@@ -49,7 +49,6 @@ static void invoke(unsigned ordinal, uint32_t object, uint32_t expected, DWORD e
 int main(int argc, char **argv) {
     int inline_events = argc > 1 && strcmp(argv[1], "inline") == 0;
     int tracing = argc > 1 && strcmp(argv[1], "off") != 0;
-    int override = argc > 1 && strcmp(argv[1], "override") == 0;
     FILE *captured;
     int saved;
     char *output = malloc(400000);
@@ -59,12 +58,10 @@ int main(int argc, char **argv) {
     NTSTATUS native_status;
     LARGE_INTEGER zero = {0};
     CHECK(output != NULL);
-    CHECK(_putenv_s("RECOMP_ASYNC_WAIT_TRACE", tracing && !override ? "1" : "0") == 0);
-    CHECK(_putenv_s("MM3_BUILDING_TRACE", override ? "1" : "0") == 0);
+    CHECK(_putenv_s("RECOMP_ASYNC_WAIT_TRACE", tracing ? "1" : "0") == 0);
     CHECK(_putenv_s("RECOMP_TITLE_KEVENTS", inline_events ? "1" : "0") == 0);
     CHECK(_putenv_s("RECOMP_KERNEL_LOG_BUDGET", "0") == 0);
     CHECK(_putenv_s("RECOMP_GUEST_LOCK", "0") == 0);
-    if (override) tracing = 0;
     memory = VirtualAlloc(NULL, 0x100000, MEM_RESERVE, PAGE_NOACCESS);
     CHECK(memory && VirtualAlloc(memory, 0x40000, MEM_COMMIT, PAGE_READWRITE) == memory);
     g_xbox_mem_offset = (ptrdiff_t)memory;

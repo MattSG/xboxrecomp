@@ -6,7 +6,7 @@ Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted fro
 - **GP (Global Processor)** — DSP for global effects (reverb, chorus). Executes guest-uploaded programs through the adapted xemu interpreter.
 - **EP (Encode Processor)** — DSP for AC3/DTS encoding. Executes guest-uploaded programs through the adapted xemu interpreter; AC3/DTS conformance remains unproven.
 
-Native output uses XAudio2 with Windows `waveOut` fallback at 48kHz stereo 16-bit. See [DSP acceptance](dsp/ACCEPTANCE.md) and [provenance/licensing](dsp/PROVENANCE.md) for remaining conformance and audible-gameplay gates.
+Native output uses XAudio2 with Windows `waveOut` fallback at 48kHz stereo 16-bit. See [provenance/licensing](dsp/PROVENANCE.md) for where the DSP code comes from and how it was adapted.
 
 ## Files
 

@@ -2134,9 +2134,7 @@ static int bridge_async_wait_trace_enabled(void)
     static int enabled = -1;
     if (enabled < 0) {
         const char *async = getenv("RECOMP_ASYNC_WAIT_TRACE");
-        const char *building = getenv("MM3_BUILDING_TRACE");
-        enabled = async && *async ? *async != '0' :
-                  (building && *building && *building != '0');
+        enabled = async && *async && *async != '0';
     }
     return enabled;
 }

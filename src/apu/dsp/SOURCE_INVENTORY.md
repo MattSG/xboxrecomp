@@ -2,7 +2,7 @@
 
 Pinned xemu commit: `478b4f496102379c7eaa7f3ec10e714a703c4300`. Upstream DSP sources were verified unchanged. Hashes record this snapshot and require refresh after edits.
 
-Production `src/apu/CMakeLists.txt` links `apu_dsp.c`, `dsp/dsp.c`, `dsp/dsp_dma.c` and `dsp/interp/dsp_cpu.c` in static `xbox_apu`; interpreter includes provide the remaining implementation. The full MM3 Release build links this target.
+Production `src/apu/CMakeLists.txt` links `apu_dsp.c`, `dsp/dsp.c`, `dsp/dsp_dma.c` and `dsp/interp/dsp_cpu.c` in static `xbox_apu`; interpreter includes provide the remaining implementation.
 
 | Local source | Pinned upstream source | Header license | Local SHA-256 | Upstream SHA-256 |
 |---|---|---|---|---|

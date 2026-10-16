@@ -17,11 +17,11 @@
 #include <stdio.h>
 #include <string.h>
 
-static XBOX_KEYBOARD_DRIVING_PROBE s_keyboard_driving_probe;
+static XBOX_KEYBOARD_HOOK s_keyboard_hook;
 
-void xbox_InputSetKeyboardDrivingProbe(XBOX_KEYBOARD_DRIVING_PROBE probe)
+void xbox_InputSetKeyboardHook(XBOX_KEYBOARD_HOOK hook)
 {
-    s_keyboard_driving_probe = probe;
+    s_keyboard_hook = hook;
 }
 
 /* ======================================================================== */
@@ -69,13 +69,7 @@ static DWORD finish_state(DWORD port, XBOX_INPUT_STATE *state)
  *   Q E           white black       1 3        triggers
  *   numpad 8/2/4/6 left thumb       I/K/J/L    right thumb
  *
- * RECOMP_KEYBOARD_LAYOUT=mm3 maps arrows to driving while the title's
- * driving probe is true: up/down are the right/left triggers and left/right
- * steer. Otherwise they are only menu d-pad buttons. The numbered trigger
- * and numpad stick keys still work in either context. While driving, R/F
- * also alias Xbox B/X (MM3's default manual gear up/down), Space aliases A
- * (handbrake), and C aliases Black (change camera view). Escape aliases B in
- * this layout, matching X's menu-back action. Enter remains Start.
+ * A title adds its own contextual keys with xbox_InputSetKeyboardHook.
  *
  * Keys come from the framebuffer window, which only receives them while it
  * has the focus, so typing in another window does not drive the game.
@@ -86,16 +80,6 @@ static BOOL keyboard_enabled(void)
     if (on < 0) {
         const char *v = getenv("RECOMP_KEYBOARD");
         on = (v && *v && *v != '0') ? 1 : 0;
-    }
-    return on ? TRUE : FALSE;
-}
-
-static BOOL keyboard_mm3_layout(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *v = getenv("RECOMP_KEYBOARD_LAYOUT");
-        on = (v && _stricmp(v, "mm3") == 0) ? 1 : 0;
     }
     return on ? TRUE : FALSE;
 }
@@ -298,22 +282,17 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     WORD b = 0, nav = 0;
     BOOL hover_click = FALSE;
     int i;
-    BOOL mm3 = keyboard_mm3_layout();
-    BOOL driving;
 
     load_keymap();
     memset(pState, 0, sizeof(*pState));
     s_menu = menu_keys_enabled() && (!s_in_menu || s_in_menu());
-    driving = mm3 && !s_menu && s_keyboard_driving_probe && s_keyboard_driving_probe();
     if (menu_keys_enabled() && s_menu_pointer)
         nv2a_d3d_collect_menu_rects(s_menu);
 
-    if (!driving) {
-        if (bound_down(K_UP))    b |= XBOX_GAMEPAD_DPAD_UP;
-        if (bound_down(K_DOWN))  b |= XBOX_GAMEPAD_DPAD_DOWN;
-        if (bound_down(K_LEFT))  b |= XBOX_GAMEPAD_DPAD_LEFT;
-        if (bound_down(K_RIGHT)) b |= XBOX_GAMEPAD_DPAD_RIGHT;
-    }
+    if (bound_down(K_UP))    b |= XBOX_GAMEPAD_DPAD_UP;
+    if (bound_down(K_DOWN))  b |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (bound_down(K_LEFT))  b |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (bound_down(K_RIGHT)) b |= XBOX_GAMEPAD_DPAD_RIGHT;
     if (bound_down(K_START)) b |= XBOX_GAMEPAD_START;
     if (bound_down(K_BACK))  b |= XBOX_GAMEPAD_BACK;
     if (bound_down(K_LS))    b |= XBOX_GAMEPAD_LEFT_THUMB;
@@ -337,28 +316,15 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     if (s_menu && (key_down(VK_ESCAPE) || key_down(VK_RBUTTON)))
         pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
 
-    /* Retain MM3's contextual driving aliases alongside the user's keymap. */
-    if (mm3 && key_down(VK_ESCAPE))
-        pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
-    if (driving) {
-        if (key_down(VK_SPACE)) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
-        if (key_down('R')) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
-        if (key_down('F')) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] = 255;
-        if (key_down('C')) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] = 255;
-        if (key_down(VK_DOWN)) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = 255;
-        if (key_down(VK_UP)) pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = 255;
-    }
-
     /* W/A/S/D would collide with the face buttons above, so the left thumb
      * shares the arrow keys' row on the numeric pad instead. */
-    {
-        BOOL left = bound_down(K_LX_NEG) || (driving && key_down(VK_LEFT));
-        BOOL right = bound_down(K_LX_POS) || (driving && key_down(VK_RIGHT));
-        pState->Gamepad.sThumbLX = (SHORT)((right - left) * 32767);
-    }
+    pState->Gamepad.sThumbLX = axis_from_keys(K_LX_NEG, K_LX_POS);
     pState->Gamepad.sThumbLY = axis_from_keys(K_LY_NEG, K_LY_POS);
     pState->Gamepad.sThumbRX = axis_from_keys(K_RX_NEG, K_RX_POS);
     pState->Gamepad.sThumbRY = axis_from_keys(K_RY_NEG, K_RY_POS);
+
+    if (s_keyboard_hook)
+        s_keyboard_hook(pState, s_menu);
 
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */
