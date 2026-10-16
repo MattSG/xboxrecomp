@@ -3706,6 +3706,8 @@ static uint8_t *ring_map(ID3D11Buffer *b, UINT *pos, UINT cap, UINT bytes,
     return (uint8_t *)m->pData + *pos;
 }
 
+#include "nv2a_distance_fog.h"
+
 /* ---------------------------------------------- vertex processing on the GPU
  *
  * Every draw runs ub_vs: it pulls the title's raw vertex arrays from a byte
@@ -3714,6 +3716,7 @@ static uint8_t *ring_map(ID3D11Buffer *b, UINT *pos, UINT cap, UINT bytes,
  * through. One shader for everything means every pass over an object rounds
  * its depth the same way (no z-fighting between passes), nothing waits on a
  * shader compile, and no vertex is drawn from a CPU transform. */
+
 
 #define NV_VSH_SLOTS 136
 extern const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4];
@@ -5144,4 +5147,5 @@ uint32_t nv2a_d3d_zpass_read(void) { return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
 void nv2a_d3d_set_flare_depth_test(int on) { (void)on; }
 void nv2a_d3d_set_depth_view_remap(float scale, float knee) { (void)scale; (void)knee; }
+void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb) { (void)st; (void)depth_to_world; (void)far_clip; (void)start; (void)end; (void)argb; }
 #endif

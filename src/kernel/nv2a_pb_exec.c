@@ -3479,6 +3479,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
     }
+    /* Host postprocessing is ordered with guest draws, never a title-thread
+     * call into the render context or a policy applied to later draw calls. */
+    static uint32_t fog_words[5];
+    static unsigned fog_word;
+    if (subch == 0 && method == 0x100) {
+        if (!fog_word) { if (param == NV2A_HOST_FOG_TAG) fog_word = 1; return; }
+        fog_words[fog_word++ - 1] = param;
+        if (fog_word == 6) {
+            NvD3DState st; float values[4];
+            memcpy(values,fog_words,sizeof values);
+            d3d_fill_state(&st);
+            nv2a_d3d_distance_fog(&st,values[0],values[1],values[2],values[3],fog_words[4]);
+            fog_word = 0;
+        }
+        return;
+    }
+    fog_word = 0; /* An interrupted/malformed extension cannot consume state commands. */
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. Cached: this runs for every method, and an

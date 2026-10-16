@@ -16,6 +16,7 @@
 #define XBOXRECOMP_NV2A_D3D11_H
 
 #include <stdint.h>
+#include "../../include/nv2a_host_commands.h"
 #include "../kernel/nv2a_combiner.h"
 
 typedef struct {
@@ -152,6 +153,13 @@ void nv2a_d3d_set_flare_depth_test(int on);
  * stretched so the rest of the authored ramp ends at the new far plane.
  * scale 1 (the default) leaves depth untouched. */
 void nv2a_d3d_set_depth_view_remap(float scale, float knee);
+
+/* Ordered host fog command: a non-increasing NO_OPERATION packet with six
+ * parameters: this tag, float W-to-world scale, far clip, start, end, ARGB.
+ * The executor runs the dedicated D3D11 depth-texture pass at this point,
+ * before subsequent UI draws. No title fog textures/shaders are involved. */
+void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip,
+                         float start, float end, uint32_t argb);
 
 /* NV097_CLEAR_SURFACE: flags as the method's parameter, rect inclusive. */
 void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,
