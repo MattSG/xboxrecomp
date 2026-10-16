@@ -53,6 +53,7 @@ HWND xbox_FramebufferWindowHandle(void) { return test_window; }
 int xbox_FramebufferScanSource(uint32_t *va, uint32_t *pitch) { return 0; }
 int xbox_FramebufferOverlay(XboxOverlay *ovl) { return 0; }
 void xbox_FramebufferNoteFlip(uint32_t draws) {}
+void xbox_FramebufferRenderHostOverlay(void *device, void *context, void *target) {}
 const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4] { return NULL; }
 const float (*nv2a_vsh_constants(uint32_t *version))[4] { return NULL; }
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); exit(1); } } while(0)
@@ -248,6 +249,49 @@ static void test_pixels(void)
     CHECK(layout_calls==1 && srv_calls==1 && ps_cb1_calls==1);
     puts("PASS: exact reference GPU pixels, actual fixed/changed slots, six auxiliary paths, updated raw data/constants, DISCARD/NO_OVERWRITE and both ring wraps");
 }
+static uint32_t native_fog_pixel(NvD3DState *st, float depth, float start)
+{
+    float rhw = 1.f/(depth*16777216.f);
+    float positions[3][4] = {{8,8,0,0},{56,8,0,0},{8,56,0,0}};
+    NvD3DAttrib attr[16] = {0}; float def[16][4] = {{0}};
+    uint32_t idx[3] = {0,1,2}, pixels[64*64];
+    for (unsigned i = 0; i < 3; ++i) {
+        positions[i][3] = rhw;
+        positions[i][2] = (1000.f/990.f - 10.f/(990.f*depth))*16777215.f;
+    }
+    attr[0] = (NvD3DAttrib){1,2,4,16,(const uint8_t *)positions};
+    def[3][0] = 1; def[3][3] = .5f;
+    pixel_state = st;
+    nv2a_d3d_clear(st,0xF1,0x80FF0000,0xFFFFFF00,0,0,63,63);
+    nv2a_d3d_draw_ub(st,NV_D3D_TRIANGLES,attr,def,0,idx,3,0,2,NULL);
+    read_pixels(pixels); uint32_t alpha = pixels[16*64+16] >> 24;
+    /* At the postprocess marker, UI/glare setup may already have disabled
+     * W-buffer writes. The stored scene depth still contains linear W. */
+    NvD3DState post = *st; post.z_perspective = 0; post.depth_mask = 0;
+    nv2a_d3d_distance_fog(&post,1000.f/16777216.f,1000,start,800,0xFF0000FF);
+    read_pixels(pixels);
+    CHECK((pixels[16*64+16]>>24) == alpha); /* Fog preserves destination alpha. */
+    return pixels[16*64+16]&0xFFFFFF;
+}
+
+static void test_native_fog(void)
+{
+    NvD3DState st = draw_state(); uint32_t pixels[64*64];
+    st.z_perspective = 1; st.depth_mask = 1;
+    CHECK(native_fog_pixel(&st,.1f,200) == 0xFF0000);
+    uint32_t middle = native_fog_pixel(&st,.5f,200);
+    CHECK(abs((int)(middle>>16)-81) <= 2 && abs((int)(middle&255)-174) <= 2);
+    uint32_t distant = native_fog_pixel(&st,.8f,200);
+    CHECK((distant>>16) <= 4 && (distant&255) >= 251);
+    CHECK(native_fog_pixel(&st,1,200) == 0xFF0000); /* Clear/sky depth. */
+    CHECK(native_fog_pixel(&st,.8f,NAN) == 0xFF0000);
+    native_fog_pixel(&st,.8f,200);
+    st.depth_test = 0; st.depth_mask = 0;
+    triangle(&st,1,0); read_pixels(pixels);
+    CHECK(pixels[16*64+16] == 0xFF00FF00); /* UI after the pass stays unchanged. */
+    puts("PASS: dedicated fog pass reads depth, preserves near/sky/alpha, fades mid/far, rejects invalid ranges, and restores subsequent UI rendering");
+}
+
 static void test_failures(void)
 {
     NvD3DState st=draw_state(); uint32_t expected[64*64], actual[64*64];
@@ -576,7 +620,7 @@ static void benchmark(void)
 int main(int argc,char **argv)
 {
     CHECK(argc==2);
-    _putenv_s("RECOMP_MSAA","1"); _putenv_s("RECOMP_RENDER_SCALE","1");
+    _putenv_s("RECOMP_MSAA",!strcmp(argv[1],"native_fog_msaa")?"4":"1"); _putenv_s("RECOMP_RENDER_SCALE","1");
     _putenv_s("RECOMP_ASPECT","4:3"); _putenv_s("RECOMP_PS_SPEC","0");
     _putenv_s("RECOMP_FPS_LIMIT","0");
     if(!strcmp(argv[1],"init_failure")) {
@@ -588,6 +632,7 @@ int main(int argc,char **argv)
     }
     CHECK(nv2a_d3d_init()); check_slots(NULL,NULL);
     if(!strcmp(argv[1],"pixels")) test_pixels();
+    else if(!strcmp(argv[1],"native_fog") || !strcmp(argv[1],"native_fog_msaa")) test_native_fog();
     else if(!strcmp(argv[1],"fixed_updates")) test_fixed_updates();
     else if(!strcmp(argv[1],"failures")) test_failures();
     else if(!strcmp(argv[1],"resize")) test_resize();
