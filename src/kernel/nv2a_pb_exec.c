@@ -3481,16 +3481,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     /* Host postprocessing is ordered with guest draws, never a title-thread
      * call into the render context or a policy applied to later draw calls. */
-    static uint32_t fog_words[5];
+    static uint32_t fog_words[6];
     static unsigned fog_word;
     if (subch == 0 && method == 0x100) {
         if (!fog_word) { if (param == NV2A_HOST_FOG_TAG) fog_word = 1; return; }
         fog_words[fog_word++ - 1] = param;
-        if (fog_word == 6) {
+        if (fog_word == 7) {
             NvD3DState st; float values[4];
             memcpy(values,fog_words,sizeof values);
             d3d_fill_state(&st);
-            nv2a_d3d_distance_fog(&st,values[0],values[1],values[2],values[3],fog_words[4]);
+            nv2a_d3d_distance_fog(&st,values[0],values[1],values[2],values[3],fog_words[4],fog_words[5]);
             fog_word = 0;
         }
         return;
