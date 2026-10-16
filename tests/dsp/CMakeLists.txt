@@ -114,3 +114,32 @@ add_test(NAME dsp_clipped_capture COMMAND "${CMAKE_COMMAND}" -E env
 set_tests_properties(dsp_clipped_capture PROPERTIES FIXTURES_SETUP clipped_frame)
 add_test(NAME dsp_clipped_replay COMMAND dsp_frame_replay "${CMAKE_CURRENT_BINARY_DIR}/clipped-frame.ep.frame.bin")
 set_tests_properties(dsp_clipped_replay PROPERTIES FIXTURES_REQUIRED clipped_frame)
+
+# Recompiled programs (tools/dsp_recomp): the clipped-capture program is
+# captured at build time, recompiled, and its frame replayed through the
+# recompiled code; the replay checks the final state byte for byte.
+add_executable(dsp_capture_program dsp_capture_program.c)
+target_include_directories(dsp_capture_program PRIVATE ../../src/apu/dsp)
+target_compile_definitions(dsp_capture_program PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_executable(dsp_recomp_gen ../../tools/dsp_recomp/dsp_recomp_gen.c)
+target_include_directories(dsp_recomp_gen PRIVATE ../../src/apu/dsp/interp ../../src/apu/dsp)
+target_compile_definitions(dsp_recomp_gen PRIVATE _CRT_SECURE_NO_WARNINGS NDEBUG)
+set(recomp_dir ${CMAKE_CURRENT_BINARY_DIR}/recomp)
+set(recomp_capture ${recomp_dir}/clipped-frame.ep.frame.bin)
+set(recomp_inc ${recomp_dir}/dsp_recomp_programs.inc)
+set(dsp_interp ${CMAKE_CURRENT_SOURCE_DIR}/../../src/apu/dsp/interp)
+add_custom_command(OUTPUT ${recomp_capture} ${recomp_dir}/ep.p.bin
+  COMMAND "${CMAKE_COMMAND}" -E make_directory ${recomp_dir}
+  COMMAND "${CMAKE_COMMAND}" -E env "RECOMP_DSP_FRAME_DUMP=${recomp_dir}/clipped-frame"
+          "RECOMP_DSP_CAPTURE_CLIPPED=1" $<TARGET_FILE:dsp_clipped_capture_test>
+  COMMAND dsp_capture_program ${recomp_capture} ${recomp_dir}
+  DEPENDS dsp_clipped_capture_test dsp_capture_program VERBATIM)
+add_custom_command(OUTPUT ${recomp_inc}
+  COMMAND dsp_recomp_gen ${dsp_interp}/dsp_cpu.c ${dsp_interp}/dsp_emu.c.inc ${recomp_inc} ${recomp_dir}
+  DEPENDS dsp_recomp_gen ${recomp_dir}/ep.p.bin ${dsp_interp}/dsp_cpu.c ${dsp_interp}/dsp_emu.c.inc VERBATIM)
+add_executable(dsp_recomp_frame_replay dsp_frame_replay.c ${dsp_interp}/dsp_cpu.c
+  ../../src/apu/dsp/dsp_dma.c ../../src/apu/dsp/dsp.c ${recomp_inc})
+target_include_directories(dsp_recomp_frame_replay PRIVATE ../../src/apu/dsp)
+target_compile_features(dsp_recomp_frame_replay PRIVATE c_std_11)
+target_compile_definitions(dsp_recomp_frame_replay PRIVATE _CRT_SECURE_NO_WARNINGS DSP_RECOMP_INC="${recomp_inc}")
+add_test(NAME dsp_recomp_replay COMMAND dsp_recomp_frame_replay ${recomp_capture})

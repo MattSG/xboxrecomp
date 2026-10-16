@@ -59,6 +59,18 @@ int main(int argc, char **argv)
     processor->dma.mem_write = wiring.dma.mem_write;
     processor->dma.scratch_rw = scratch;
     processor->dma.fifo_rw = fifo;
+#ifdef DSP_RECOMP_INC
+    /* Built with recompiled programs: the captured state must run recompiled
+     * code (tried on a copy, so the replay starts from the capture). */
+    {
+        static DSPState probe;
+        probe = *processor;
+        probe.core.opaque = &probe;
+        probe.dma.mem_opaque = &probe.core;
+        uint32_t control = 0;
+        CHECK(dsp56k_execute_recompiled(&probe.core, 1, &control, 1) > 0);
+    }
+#endif
     /* Real uploaded instructions and DMA execute; only external RAM/FIFO input
      * is replayed. Every outgoing transfer must match the recorded payload. */
     unsigned batches = 0;

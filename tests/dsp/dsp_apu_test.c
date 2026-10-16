@@ -49,11 +49,12 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
     return ram + addr;
 }
 
+/* As the DSP thread runs a frame: under dsp_lock, with the frame thread's index. */
 static void run_locked_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
-    qemu_mutex_lock(&d->lock);
-    mcpx_apu_dsp_frame(d, mixbins);
-    qemu_mutex_unlock(&d->lock);
+    qemu_mutex_lock(&d->dsp_lock);
+    mcpx_apu_dsp_frame(d, mixbins, d->ep_frame_div);
+    qemu_mutex_unlock(&d->dsp_lock);
 }
 
 static DWORD WINAPI looping_frame(void *opaque)
@@ -69,6 +70,7 @@ int main(void)
     CHECK(d);
     d->ram_ptr = ram;
     qemu_mutex_init(&d->lock);
+    qemu_mutex_init(&d->dsp_lock);
     qemu_cond_init(&d->cond);
     mcpx_apu_dsp_init(d);
     if (getenv("DSP_TEST_CAPTURE_WAIT")) {
@@ -553,9 +555,9 @@ int main(void)
     CHECK(thread);
     bool running = false;
     for (unsigned attempt = 0; attempt < 1000 && !running; attempt++) {
-        qemu_mutex_lock(&d->lock);
+        qemu_mutex_lock(&d->dsp_lock);
         running = d->gp.dsp->core.cycle_count >= 1000 && !d->gp.dsp->core.is_idle;
-        qemu_mutex_unlock(&d->lock);
+        qemu_mutex_unlock(&d->dsp_lock);
         if (!running) Sleep(1);
     }
     CHECK(running);

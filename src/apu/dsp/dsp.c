@@ -17,6 +17,11 @@
 #include "dsp.h"
 #include "dsp_dma_regs.h"
 #include "dsp_port.h"
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #define INTERRUPT_START_FRAME (1u << 1)
 #define INTERRUPT_DMA_EOL (1u << 7)
@@ -234,8 +239,55 @@ void dsp_bootstrap(DSPState *dsp)
     }
 }
 
+/* Cycles each processor ran in the interpreter rather than recompiled code,
+ * and the program addresses it interpreted. */
+static unsigned interpreted_cycles[2];
+static uint8_t interpreted_at[2][DSP_PRAM_SIZE];
+
+/* RECOMP_DSP_PROGRAM_DIR: save the code a processor runs (gp.p.bin, ep.p.bin:
+ * the words at addresses it executed, zero elsewhere) for the build to
+ * recompile (tools/dsp_recomp), once it has run mostly interpreted for 1500
+ * frames in a row. Words already in the file that program memory still holds
+ * are kept, so the file only grows with new paths and stops changing; data
+ * the program keeps in P memory never enters it. */
+static void program_save_check(DSPState *dsp)
+{
+    static const char *dir;
+    static bool dir_read;
+    static unsigned frames[2];
+    static uint32_t image[DSP_PRAM_SIZE], existing[DSP_PRAM_SIZE];
+    unsigned i = dsp->is_gp ? 0 : 1, cycles = interpreted_cycles[i];
+    interpreted_cycles[i] = 0;
+    if (!dir_read) { dir = getenv("RECOMP_DSP_PROGRAM_DIR"); dir_read = true; }
+    if (!dir || !*dir) return;
+    if (cycles < 2000) { frames[i] = 0; return; }
+    if (++frames[i] < 1500) return;
+    frames[i] = 0;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.p.bin", dir, i ? "ep" : "gp");
+    memset(existing, 0, sizeof(existing));
+    FILE *file = fopen(path, "rb");
+    bool had = file && fread(existing, 4, DSP_PRAM_SIZE, file) == DSP_PRAM_SIZE;
+    if (file) fclose(file);
+    for (unsigned a = 0; a < DSP_PRAM_SIZE; a++)
+        image[a] = interpreted_at[i][a] || (existing[a] && existing[a] == dsp->core.pram[a]) ? dsp->core.pram[a] : 0;
+    if (had && !memcmp(image, existing, sizeof(image))) return;
+#ifdef _WIN32
+    _mkdir(dir);
+#else
+    mkdir(dir, 0777);
+#endif
+    file = fopen(path, "wb");
+    bool saved = file && fwrite(image, 4, DSP_PRAM_SIZE, file) == DSP_PRAM_SIZE;
+    if (file && fclose(file)) saved = false;
+    fprintf(stderr, "[DSP] %s program %s %s; rebuild to recompile it\n", i ? "EP" : "GP",
+            saved ? "saved to" : "could not be saved to", path);
+}
+
 void dsp_start_frame(DSPState *dsp)
 {
+    program_save_check(dsp);
     dsp->interrupts |= INTERRUPT_START_FRAME;
     if (!dsp->core.is_waiting && !dsp->core.is_stopped && !dsp->core.is_debugging && !dsp->core.bootstrap_failed) dsp->core.is_idle = false;
     dsp->core.cycle_count = 0;
@@ -266,7 +318,17 @@ void dsp_run(DSPState *dsp, int cycles)
             continue;
         }
         bool dma_running = (dsp->dma.control & DMA_CONTROL_RUNNING) != 0;
+        if (!dma_running) {
+            int used = dsp56k_execute_recompiled(&dsp->core, dsp->save_cycles,
+                                                 &dsp->dma.control, DMA_CONTROL_RUNNING);
+            if (used) {
+                dsp->save_cycles -= used;
+                continue;
+            }
+        }
+        interpreted_at[dsp->is_gp ? 0 : 1][dsp->core.pc & (DSP_PRAM_SIZE - 1)] = 1;
         dsp56k_execute_instruction(&dsp->core);
+        interpreted_cycles[dsp->is_gp ? 0 : 1] += dsp->core.instr_cycle;
         /* A START issued by this instruction schedules work for the next
          * instruction boundary, so the guest can observe the running engine. */
         if (dma_running && !dsp->core.is_stopped && !dsp->core.is_debugging) dsp_dma_step(&dsp->dma);
