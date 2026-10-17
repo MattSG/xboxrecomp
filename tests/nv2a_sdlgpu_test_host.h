@@ -150,4 +150,12 @@ static void nv2a_test_triangle(const NvD3DState *st, uint32_t argb, int program)
     nv2a_d3d_draw_ub(st, NV_D3D_TRIANGLES, attributes, defaults, program, indices, 3, 0, 2, NULL);
 }
 
+
+/* Standalone renderer fixtures do not request executor replay. */
+void nv2a_pb_interp_enable(int on) { (void)on; abort(); }
+int nv2a_pb_replay(float t) { (void)t; abort(); return 0; }
+int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp, uint32_t *w, uint32_t *h)
+{ (void)pitch; (void)bpp; (void)w; (void)h; return 0; }
+void xbox_FramebufferSdlHints(void) {}
+
 #endif

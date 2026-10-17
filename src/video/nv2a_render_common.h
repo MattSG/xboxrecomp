@@ -136,8 +136,8 @@ static void texture_refused(const NvD3DTexture *t, const char *reason, size_t by
 {
     unsigned n = ++s_tex_refusals;
     if (n > 8 && (n & (n - 1))) return;
-    fprintf(stderr, "[TEXTURE_REFUSED] count=%u addr=%08X phys=%08X size=%ux%u color=%02X format=%08X pitch=%u levels=%u bytes=%zu reason=%s\n",
-            n, t->addr, phys(t->addr), t->width, t->height, t->color, t->format,
+    fprintf(stderr, "[TEXTURE_REFUSED] count=%u addr=%08X size=%ux%u color=%02X format=%08X pitch=%u levels=%u bytes=%zu reason=%s\n",
+            n, t->addr, t->width, t->height, t->color, t->format,
             t->pitch, t->levels, bytes, reason);
     fflush(stderr);
 }

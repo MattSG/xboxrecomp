@@ -96,7 +96,7 @@ static int test_decode_equivalence(void)
                                                            x, y, w, &expected));
                             else {
                                 uint32_t address = swizzle_offset(x, y, w, h);
-                                expected = texel(texture.color, data + offset + address * 4, NULL);
+                                expected = texel(texture.color, data + offset + address * 4, NULL, 0);
                             }
                             CHECK(decoded[y * w + x] == expected);
                         }
