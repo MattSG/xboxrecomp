@@ -91,9 +91,10 @@ typedef struct {
 } PB_HITCH;
 static int64_t s_hitch_frequency, s_hitch_previous_end;
 
+/* QueryPerformanceCounter and GetThreadTimes come from win32_compat on POSIX
+ * (CLOCK_MONOTONIC and CLOCK_THREAD_CPUTIME_ID there). */
 static int pb_hitch_enabled(void)
 {
-#ifdef _WIN32
     static int enabled = -1;
     if (enabled < 0) {
         const char *setting = getenv("RECOMP_HITCH_TRACE");
@@ -105,30 +106,21 @@ static int pb_hitch_enabled(void)
         }
     }
     return enabled;
-#else
-    return 0;
-#endif
 }
 
 static int64_t pb_hitch_clock(void)
 {
-#ifdef _WIN32
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return now.QuadPart;
-#else
-    return 0;
-#endif
 }
 
 static int64_t pb_hitch_cpu(void)
 {
-#ifdef _WIN32
     FILETIME created, exited, kernel, user;
     if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user))
         return (((int64_t)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime)
              + (((int64_t)user.dwHighDateTime << 32) | user.dwLowDateTime);
-#endif
     return 0;
 }
 

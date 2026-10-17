@@ -44,9 +44,8 @@ int main(void)
     /* A local stand-in for a peer, and an echo server for the NAT. */
     SOCKET peer, echo;
     struct sockaddr_in a;
-    int al = sizeof a;
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    net_socklen_t al = sizeof a;
+    net_sock_startup();
     peer = udp_socket(0);
     getsockname(peer, (struct sockaddr *)&a, &al);
     char peers[64];
@@ -92,10 +91,8 @@ int main(void)
     /* The peer got both broadcasts, tagged. */
     {
         uint8_t got[4 + FRAME_MAX];
-        u_long nb = 0;
-        DWORD tmo = 500;
-        ioctlsocket(peer, FIONBIO, &nb);
-        setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
+        net_sock_set_nonblocking(peer, 0);
+        net_sock_set_recv_timeout(peer, 500);
         int k = recv(peer, (char *)got, sizeof got, 0);
         if (k < 4 + 14 || rd32(got) != TUNNEL_MAGIC) { puts("FAIL: peer did not get the broadcast"); return 8; }
     }
@@ -109,7 +106,8 @@ int main(void)
     {
         char buf[16];
         struct sockaddr_in from;
-        int fl = sizeof from, k = -1;
+        net_socklen_t fl = sizeof from;
+        int k = -1;
         for (int t = 0; t < 100 && k < 0; t++) {
             k = recvfrom(echo, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
             if (k < 0) Sleep(5);
@@ -125,7 +123,7 @@ int main(void)
     {
         uint8_t t[4 + 60] = {0};
         struct sockaddr_in me;
-        int ml = sizeof me;
+        net_socklen_t ml = sizeof me;
         wr32(t, TUNNEL_MAGIC);
         memcpy(t + 4, guest, 6);
         wr16(t + 4 + 12, 0x88B5);

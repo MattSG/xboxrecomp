@@ -1,6 +1,7 @@
 /* Real event bridges with MM3 XPP's pending-request/wait/cancel contract.
  * No game assets or guest event opt-in are needed. */
 #include "../../src/kernel/kernel_bridge.c"
+#include "../kernel_test_host.h"
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL line %d: %s status=%08X error=%lu\n", __LINE__, #c, g_eax, GetLastError()); fflush(stderr); exit(1); } } while (0)
 #define EVENT_VA 0x22000u
@@ -242,12 +243,14 @@ static void check_invalid(void)
     BRIDGE_MEM32(EVENT_VA) = 0x00080000;
     CHECK(ke_guest_event(EVENT_VA, &type) == NULL);
     prepare_event(EVENT_VA, 0, 0);
-    DWORD protection;
-    CHECK(VirtualProtect(memory + EVENT_VA, 0x1000, PAGE_READONLY, &protection));
-    CHECK(ke_guest_event(EVENT_VA, &type) == NULL);
-    CHECK(set_event(EVENT_VA, SETTER_PC) == 0);
-    CHECK(BRIDGE_MEM32(EVENT_VA + 4) == 0);
-    CHECK(VirtualProtect(memory + EVENT_VA, 0x1000, protection, &protection));
+    {
+        DWORD protection;
+        CHECK(VirtualProtect(memory + EVENT_VA, 0x1000, PAGE_READONLY, &protection));
+        CHECK(ke_guest_event(EVENT_VA, &type) == NULL);
+        CHECK(set_event(EVENT_VA, SETTER_PC) == 0);
+        CHECK(BRIDGE_MEM32(EVENT_VA + 4) == 0);
+        CHECK(VirtualProtect(memory + EVENT_VA, 0x1000, protection, &protection));
+    }
     /* A syntactically valid header whose last word has no committed backing. */
     BRIDGE_MEM32(0x3FFF4) = 0x00040000;
     BRIDGE_MEM32(0x3FFF8) = 0;
@@ -259,8 +262,10 @@ static void check_invalid(void)
 
 static void check_reuse(void)
 {
-    DWORD before, after;
+    DWORD before = 0, after = 0;
+#ifdef _WIN32   /* POSIX events are not descriptors, so the count cannot see them */
     CHECK(GetProcessHandleCount(GetCurrentProcess(), &before));
+#endif
     for (unsigned i = 0; i < KE_SHADOW_SIZE + 64; ++i) {
         unsigned type = i & 1;
         prepare_event(EVENT_VA, type, 0);
@@ -272,10 +277,14 @@ static void check_reuse(void)
         CHECK(wait_event(EVENT_VA, AUTO_WAIT_PC, TIMEOUT_VA + 8) == STATUS_TIMEOUT);
     }
     CHECK(shadow_count() == 1);
+#ifdef _WIN32
     CHECK(GetProcessHandleCount(GetCurrentProcess(), &after));
     CHECK(after == before + 1);
+#endif
     ke_shadow_remove(EVENT_VA);
+#ifdef _WIN32
     CHECK(GetProcessHandleCount(GetCurrentProcess(), &after)); CHECK(after == before);
+#endif
 }
 
 static void check_capacity(void)

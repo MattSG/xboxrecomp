@@ -1,6 +1,6 @@
 /* Exercise real wait bridges and HLE without game assets. */
 #include "../../src/kernel/kernel_bridge.c"
-#include <io.h>
+#include "../kernel_test_host.h"
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s status=%08X host_error=%lu\n", __LINE__, #c, g_eax, GetLastError()); fflush(stdout); exit(1); } } while (0)
 recomp_func_t recomp_lookup(uint32_t address) { (void)address; abort(); }

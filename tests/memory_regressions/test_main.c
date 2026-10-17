@@ -565,7 +565,13 @@ shutdown: ;
     xbox_MemoryLayoutShutdown();
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION host_info;
-    check(VirtualQuery(host_base, &host_info, sizeof host_info) && host_info.State == MEM_FREE,
+    /* Released means no longer ours: free, or already reused by an unrelated
+     * allocation -- the renderer's shader-compile threads keep allocating
+     * while this runs, and the freed range is a natural place for them to
+     * land (often at its very start). The reservation itself spans at least
+     * base + mirrors, gigabytes, which nothing else here comes near. */
+    check(VirtualQuery(host_base, &host_info, sizeof host_info) &&
+          (host_info.State == MEM_FREE || host_info.RegionSize < ((SIZE_T)1 << 30)),
           "shutdown releases the host placeholder reservation", NULL);
 #endif
     free(xbe);

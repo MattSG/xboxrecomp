@@ -8,13 +8,30 @@
 
 #include <stdint.h>
 
-#if defined(_WIN32)
+#if defined(XBOXRECOMP_SDL3)
+/* SDL3 window (the SDL3 GPU renderer): an SDL cursor, SDL events. */
+struct SDL_Window;
+union SDL_Event;
+typedef struct SDL_Cursor *XboxCursor;
+/* The window to present into, or NULL until the renderer has opened it. */
+struct SDL_Window *xbox_FramebufferSdlWindow(void);
+/* 1 when Windows started the process hidden (STARTF_USESHOWWINDOW, SW_HIDE),
+ * which SDL windows must honour themselves; 0 elsewhere. */
+int xbox_FramebufferStartHidden(void);
+/* SDL video hints every SDL window in the process should share (Linux: prefer
+ * native Wayland); call before SDL's video subsystem starts. */
+void xbox_FramebufferSdlHints(void);
+#elif defined(_WIN32)
 #include <windows.h>
+typedef HCURSOR XboxCursor;
 /* The window to present into, or NULL until it exists. */
 HWND xbox_FramebufferWindowHandle(void);
+#endif
+
+#if defined(XBOXRECOMP_SDL3) || defined(_WIN32)
 /* Register before window startup. Called on the window thread for client
  * cursor selection; NULL result hides it. Cursor ownership stays with caller. */
-void xbox_FramebufferSetCursorHandler(HCURSOR (*handler)(void));
+void xbox_FramebufferSetCursorHandler(XboxCursor (*handler)(void));
 /* Window-thread press notification, before held-key sampling. Nonzero
  * consumes the left press; the callback must not call guest functions. */
 void xbox_FramebufferSetMousePressHandler(int (*handler)(float x, float y));
@@ -23,11 +40,18 @@ void xbox_FramebufferSetMousePressHandler(int (*handler)(float x, float y));
 void xbox_FramebufferSetCloseHandler(void (*handler)(void));
 
 /* Optional host UI. Register before starting the window/render threads.
- * Message delivery and rendering run on different threads; the client owns
- * synchronization. Device/context/target are borrowed D3D11 interfaces. */
+ * Message delivery and rendering can run on different threads; the client
+ * owns synchronization. Device/context/target are borrowed: D3D11 device,
+ * context and render-target view, or with SDL3 the SDL_GPUDevice, the
+ * SDL_GPUCommandBuffer being recorded and the swapchain SDL_GPUTexture (the
+ * overlay begins and ends its own render pass, loading what is there). */
 typedef struct {
     void (*render)(void *window, void *device, void *context, void *target);
+#if defined(XBOXRECOMP_SDL3)
+    int (*event)(const union SDL_Event *event);
+#else
     int (*message)(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
+#endif
     int (*capture)(void);
 } XboxHostOverlay;
 void xbox_FramebufferSetHostOverlay(const XboxHostOverlay *overlay);

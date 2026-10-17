@@ -29,6 +29,10 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#if defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -247,11 +251,146 @@ VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv)
 }
 
 /* ===================================================================== */
+/* WaitOnAddress / WakeByAddress*                                        */
+/* ===================================================================== */
+
+/* Both implementations work on the variable's aligned 32-bit word. Linux
+ * sleeps on that word with a futex. Snapshotting the word before the byte
+ * compare means a store in between makes the futex return EAGAIN, so no wake
+ * is lost. Elsewhere (macOS and other POSIX) a fixed table of mutex/condvar
+ * buckets does the same job under the bucket lock. Spurious returns are
+ * allowed, as on Windows; callers re-check their predicate. */
+
+static int64_t w32_mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+#if defined(__linux__)
+
+static BOOL w32_wait_futex(volatile VOID *address, PVOID compare, SIZE_T size, DWORD ms)
+{
+    uintptr_t addr = (uintptr_t)address;
+    volatile uint32_t *word = (volatile uint32_t *)(addr & ~(uintptr_t)3);
+    /* A variable crossing a word boundary has no single futex word to watch. */
+    int straddles = (addr & 3) + size > 4;
+    int64_t start = w32_mono_ns();
+    for (;;) {
+        uint32_t snapshot = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+        struct timespec rel, *timeout = NULL;
+        int64_t left = -1;
+        if (memcmp((const void *)address, compare, size) != 0) return TRUE;
+        if (ms != INFINITE) {
+            left = (int64_t)ms * 1000000LL - (w32_mono_ns() - start);
+            if (left <= 0) { SetLastError(ERROR_TIMEOUT); return FALSE; }
+            if (straddles && left > 1000000LL) left = 1000000LL; /* re-check each 1 ms */
+            rel.tv_sec = left / 1000000000LL;
+            rel.tv_nsec = left % 1000000000LL;
+            timeout = &rel;
+        }
+        if (syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, (long)snapshot, timeout, NULL, 0) == 0)
+            return TRUE;
+        if (errno == EAGAIN || errno == EINTR) return TRUE;   /* word changed or signal */
+        if (errno != ETIMEDOUT) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    }
+}
+
+static void w32_wake_futex(PVOID address, int count)
+{
+    uintptr_t addr = (uintptr_t)address & ~(uintptr_t)3;
+    syscall(SYS_futex, (volatile uint32_t *)addr, FUTEX_WAKE_PRIVATE, count);
+}
+
+VOID WakeByAddressSingle(PVOID address) { w32_wake_futex(address, 1); }
+VOID WakeByAddressAll(PVOID address)    { w32_wake_futex(address, 0x7FFFFFFF); }
+
+#else
+
+#define W32_PARK_BUCKETS 64
+static pthread_once_t  w32_park_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t w32_park_mutex[W32_PARK_BUCKETS];
+static pthread_cond_t  w32_park_cond[W32_PARK_BUCKETS];
+
+static void w32_park_init(void)
+{
+    for (int i = 0; i < W32_PARK_BUCKETS; i++) {
+        pthread_mutex_init(&w32_park_mutex[i], NULL);
+        pthread_cond_init(&w32_park_cond[i], NULL);
+    }
+}
+
+static unsigned w32_park_bucket(const volatile VOID *address)
+{
+    return (unsigned)(((uintptr_t)address >> 2) % W32_PARK_BUCKETS);
+}
+
+static BOOL w32_wait_park(volatile VOID *address, PVOID compare, SIZE_T size, DWORD ms)
+{
+    unsigned bucket;
+    int64_t start = w32_mono_ns();
+    pthread_once(&w32_park_once, w32_park_init);
+    bucket = w32_park_bucket(address);
+    pthread_mutex_lock(&w32_park_mutex[bucket]);
+    while (memcmp((const void *)address, compare, size) == 0) {
+        if (ms == INFINITE) {
+            pthread_cond_wait(&w32_park_cond[bucket], &w32_park_mutex[bucket]);
+            continue;
+        }
+        int64_t left = (int64_t)ms * 1000000LL - (w32_mono_ns() - start);
+        if (left <= 0) {
+            pthread_mutex_unlock(&w32_park_mutex[bucket]);
+            SetLastError(ERROR_TIMEOUT);
+            return FALSE;
+        }
+        struct timespec abs;
+        clock_gettime(CLOCK_REALTIME, &abs);
+        abs.tv_nsec += (long)(left % 1000000000LL);
+        abs.tv_sec += (time_t)(left / 1000000000LL) + abs.tv_nsec / 1000000000L;
+        abs.tv_nsec %= 1000000000L;
+        pthread_cond_timedwait(&w32_park_cond[bucket], &w32_park_mutex[bucket], &abs);
+    }
+    pthread_mutex_unlock(&w32_park_mutex[bucket]);
+    return TRUE;
+}
+
+static void w32_wake_park(PVOID address)
+{
+    unsigned bucket;
+    pthread_once(&w32_park_once, w32_park_init);
+    bucket = w32_park_bucket(address);
+    /* Broadcast: a waiter from another address in this bucket re-checks and
+     * sleeps again, so a single signal could be spent on the wrong one. */
+    pthread_mutex_lock(&w32_park_mutex[bucket]);
+    pthread_cond_broadcast(&w32_park_cond[bucket]);
+    pthread_mutex_unlock(&w32_park_mutex[bucket]);
+}
+
+VOID WakeByAddressSingle(PVOID address) { w32_wake_park(address); }
+VOID WakeByAddressAll(PVOID address)    { w32_wake_park(address); }
+
+#endif
+
+BOOL WaitOnAddress(volatile VOID *address, PVOID compare, SIZE_T size, DWORD ms)
+{
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+#if defined(__linux__)
+    return w32_wait_futex(address, compare, size, ms);
+#else
+    return w32_wait_park(address, compare, size, ms);
+#endif
+}
+
+/* ===================================================================== */
 /* Waitable kernel objects                                               */
 /* ===================================================================== */
 
 typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
-               K_FILEMAP, K_FILE, K_WAITABLE_TIMER } w32_kind;
+               K_FILEMAP, K_FILE, K_WAITABLE_TIMER, K_PROCESS } w32_kind;
 
 #define W32_MAX_APC 16
 
@@ -327,6 +466,73 @@ DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 
+/* Live objects. A HANDLE here is the object's address, so a value that is
+ * not one -- a guest pointer, a stale or made-up handle -- would otherwise be
+ * dereferenced. Windows answers those with ERROR_INVALID_HANDLE, and callers
+ * (the kernel HLE falls back to raw guest values) rely on that.
+ * Open addressing over the pointer; deleted slots keep a tombstone. */
+#define W32_TOMB ((w32_object *)1)
+static w32_object s_process_heap;
+static w32_object **s_live;
+static size_t s_live_cap, s_live_used;      /* used counts tombstones too */
+static pthread_rwlock_t s_live_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static size_t live_slot(const void *p, size_t cap)
+{
+    uintptr_t v = (uintptr_t)p >> 4;
+    return (size_t)((v * 0x9E3779B97F4A7C15ull) >> 7) & (cap - 1);
+}
+
+static void live_insert_locked(w32_object *o)
+{
+    size_t i;
+    if ((s_live_used + 1) * 2 > s_live_cap) {
+        size_t cap = s_live_cap ? s_live_cap * 2 : 1024, j;
+        w32_object **old = s_live, **grown = (w32_object **)calloc(cap, sizeof *grown);
+        for (j = 0; j < s_live_cap; j++)
+            if (old[j] && old[j] != W32_TOMB) {
+                i = live_slot(old[j], cap);
+                while (grown[i]) i = (i + 1) & (cap - 1);
+                grown[i] = old[j];
+            }
+        s_live_used = 0;
+        for (j = 0; j < cap; j++) s_live_used += grown[j] != NULL;
+        free(old);
+        s_live = grown;
+        s_live_cap = cap;
+    }
+    i = live_slot(o, s_live_cap);
+    while (s_live[i] && s_live[i] != W32_TOMB) i = (i + 1) & (s_live_cap - 1);
+    if (!s_live[i]) s_live_used++;
+    s_live[i] = o;
+}
+
+static size_t live_find_locked(const void *h)
+{
+    size_t i, n;
+    if (!s_live_cap) return (size_t)-1;
+    for (i = live_slot(h, s_live_cap), n = 0; s_live[i] && n < s_live_cap;
+         i = (i + 1) & (s_live_cap - 1), n++)
+        if (s_live[i] == h) return i;
+    return (size_t)-1;
+}
+
+/* The object behind h, or NULL (ERROR_INVALID_HANDLE) when h is not one. */
+static w32_object *obj_lookup(HANDLE h)
+{
+    size_t i;
+    if (!h || h == INVALID_HANDLE_VALUE) return NULL;
+    if ((w32_object *)h == &s_process_heap) return &s_process_heap;
+    pthread_rwlock_rdlock(&s_live_lock);
+    i = live_find_locked(h);
+    pthread_rwlock_unlock(&s_live_lock);
+    if (i == (size_t)-1) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return NULL;
+    }
+    return (w32_object *)h;
+}
+
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
@@ -335,13 +541,26 @@ static w32_object *obj_alloc(w32_kind kind)
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
     pthread_cond_init(&o->gate, NULL);
+    pthread_rwlock_wrlock(&s_live_lock);
+    live_insert_locked(o);
+    pthread_rwlock_unlock(&s_live_lock);
     return o;
 }
+
+static void share_forget(w32_object *o);
 
 static void obj_release(w32_object *o)
 {
     if (InterlockedDecrement(&o->refcount) > 0)
         return;
+    if (o->kind == K_FILE) share_forget(o);
+    {
+        size_t i;
+        pthread_rwlock_wrlock(&s_live_lock);
+        i = live_find_locked(o);
+        if (i != (size_t)-1) s_live[i] = W32_TOMB;
+        pthread_rwlock_unlock(&s_live_lock);
+    }
     if (o->kind == K_FILE) {
         if (o->fd >= 0) close(o->fd);
         free(o->file_path);
@@ -367,13 +586,13 @@ HANDLE w32_open_handle(int fd, const char *host_path)
 
 int w32_handle_fd(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     return (o && o->kind == K_FILE) ? o->fd : -1;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
@@ -382,7 +601,11 @@ BOOL CloseHandle(HANDLE h)
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
         h == INVALID_HANDLE_VALUE)
         return TRUE;
-    obj_release((w32_object *)h);
+    {
+        w32_object *o = obj_lookup(h);
+        if (!o) return FALSE;
+        if (o != &s_process_heap) obj_release(o);
+    }
     return TRUE;
 }
 
@@ -392,9 +615,12 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
     (void)srcProc; (void)dstProc; (void)access; (void)inherit;
     if (!dst) return FALSE;
     if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
-    if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
+    /* Win32 returns a real process handle here, never the -1 pseudo-handle:
+     * -1 is INVALID_HANDLE_VALUE to callers that store the result. */
+    if (src == PSEUDO_CURRENT_PROCESS) { *dst = (HANDLE)obj_alloc(K_PROCESS); return TRUE; }
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
-    w32_object *o = (w32_object *)src;
+    w32_object *o = obj_lookup(src);
+    if (!o) return FALSE;
     InterlockedIncrement(&o->refcount);
     *dst = src;
     if (options & DUPLICATE_CLOSE_SOURCE)
@@ -474,6 +700,7 @@ static DWORD wait_single(w32_object *o, DWORD ms)
             ready = (o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId());
             break;
         case K_WAITABLE_TIMER: ready = waitable_due(o); break;
+        case K_PROCESS: ready = 0; break;   /* signalled at exit; never here */
         default:       ready = 1; break;
         }
         if (ready) break;
@@ -514,7 +741,11 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
-    return wait_single((w32_object *)h, ms);
+    {
+        w32_object *o = obj_lookup(h);
+        if (!o) return WAIT_FAILED;
+        return wait_single(o, ms);
+    }
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
@@ -586,7 +817,7 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 
 BOOL SetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -597,7 +828,7 @@ BOOL SetEvent(HANDLE h)
 
 BOOL ResetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 0;
@@ -607,7 +838,7 @@ BOOL ResetEvent(HANDLE h)
 
 BOOL PulseEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -637,7 +868,7 @@ HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
 
 BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_SEM) return FALSE;
     pthread_mutex_lock(&o->lock);
     if (previousCount) *previousCount = (LONG)o->sem_count;
@@ -667,7 +898,7 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 
 BOOL ReleaseMutex(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_MUTEX) {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
@@ -764,7 +995,7 @@ VOID ExitThread(DWORD exitCode)
 
 BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
     pthread_mutex_lock(&o->lock);
     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
@@ -774,7 +1005,7 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 
 DWORD ResumeThread(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -788,7 +1019,7 @@ DWORD SuspendThread(HANDLE h)
 {
     /* True mid-run suspension is not supported on POSIX; only the
      * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -799,7 +1030,7 @@ DWORD SuspendThread(HANDLE h)
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_THREAD) return FALSE;
     pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
@@ -813,22 +1044,23 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_lookup(h);
     if (o && o->kind == K_THREAD) o->priority = priority;
     return TRUE;   /* real RT priorities need privileges; tracked only */
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_lookup(h);
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
 VOID SwitchToThread(void) { sched_yield(); }
+VOID YieldProcessor(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
+    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_lookup(thread);
     if (!o || o->kind != K_THREAD) return 0;
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
@@ -980,7 +1212,7 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
 BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
                       PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     (void)completion; (void)arg; (void)resume;
     if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
     pthread_mutex_lock(&o->lock);
@@ -1012,7 +1244,7 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
 
 BOOL CancelWaitableTimer(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->waitable_triggered = 0;
@@ -1025,7 +1257,7 @@ BOOL CancelWaitableTimer(HANDLE h)
 /* Heap (thin wrapper over malloc; the single process heap)              */
 /* ===================================================================== */
 
-static w32_object s_process_heap = { .kind = K_HEAP };
+static w32_object s_process_heap = { .kind = K_HEAP };   /* never released */
 
 HANDLE GetProcessHeap(void)                       { return (HANDLE)&s_process_heap; }
 HANDLE HeapCreate(DWORD o, SIZE_T i, SIZE_T m)    { (void)o;(void)i;(void)m; return (HANDLE)&s_process_heap; }
@@ -1129,6 +1361,10 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
  * munmap cannot be called at all. */
 void view_register(void *addr, size_t len);
 size_t view_take(const void *addr);
+static int held_contains(const void *addr, size_t len);
+static int held_release(void *addr, size_t len);
+static void held_add(void *addr, size_t len);
+static void held_drop(const void *addr, size_t len);
 
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
@@ -1148,21 +1384,35 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         /* fall through to a fresh mapping */
     }
 
+    /* Inside one of our own reservations the range is ours to replace, the
+     * way Win32 replaces a placeholder; anywhere else a fixed address must
+     * not displace someone else's mapping. */
+    int replace = address && held_contains(address, size);
+    if (replace)
+        flags |= MAP_FIXED;
 #if defined(MAP_FIXED_NOREPLACE)
-    if (address) flags |= MAP_FIXED_NOREPLACE;
+    else if (address) flags |= MAP_FIXED_NOREPLACE;
 #endif
 
+    /* MEM_RESERVE alone maps no access: a reserved page is neither readable nor
+     * writable until it is committed, and VirtualQuery reports it that way. */
+    int map_prot = (allocationType & MEM_RESERVE) && !(allocationType & MEM_COMMIT)
+                   ? PROT_NONE : (prot ? prot : PROT_READ | PROT_WRITE);
     void *p;
 #if defined(__APPLE__)
-    if (address) {
-        p = mach_map_fixed(address, size, prot);
+    if (address && !replace) {
+        p = mach_map_fixed(address, size, map_prot);
     } else
 #endif
-    p = mmap(address, size, prot, flags, -1, 0);
+    p = mmap(address, size, map_prot, flags, -1, 0);
     if (p == MAP_FAILED) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
+    if (replace)
+        held_drop(p, size);                 /* now an allocation of its own */
+    if ((allocationType & MEM_RESERVE) && !(allocationType & MEM_COMMIT))
+        held_add(p, size);                  /* and still a reservation */
     /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
      * Win32 caller, and munmap cannot be called without one. */
     view_register(p, size);
@@ -1188,14 +1438,93 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
          * TRUE without unmapping -- as this used to -- made every release a
          * silent no-op: the caller believed the address was free, the next
          * allocation there failed, and nothing connected the two. */
+        /* Part of one of our reservations: keep holding it (no access, no
+         * memory) so the slice can be mapped over atomically, instead of
+         * opening a hole another thread's mmap can land in first. */
+        if (size && held_release(address, size))
+            return TRUE;
         size_t len = view_take(address);
         if (size == 0) size = len;
         if (size == 0) return FALSE;
+        held_drop(address, size);
         return munmap(address, size) == 0;
     }
     if (freeType & MEM_DECOMMIT)
         return mprotect(address, size, PROT_NONE) == 0;
     return TRUE;
+}
+
+/* Host page state, read back from the kernel (/proc/self/maps on Linux,
+ * mach_vm_region on Darwin). Win32 protection and commit state derive from it,
+ * so there is no parallel record to drift from the page tables. */
+typedef struct {
+    uintptr_t start, end;   /* [start, end) */
+    int       mapped;       /* 0: [addr, start) is a gap */
+    int       perms;        /* PROT_* of the mapping */
+} w32_host_region;
+
+/* The region holding addr, or else the first one after it. Returns 1 when a
+ * region was found, 0 when nothing maps at or after addr, -1 when the host
+ * state cannot be read. */
+#if defined(__APPLE__)
+static int host_region_at(uintptr_t addr, w32_host_region *r)
+{
+    mach_vm_address_t at = (mach_vm_address_t)addr;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &at, &size, VM_REGION_BASIC_INFO_64,
+                       (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+        return 0;
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+    r->start  = (uintptr_t)at;
+    r->end    = (uintptr_t)(at + size);
+    r->mapped = (uintptr_t)at <= addr;
+    r->perms  = ((info.protection & VM_PROT_READ)    ? PROT_READ  : 0) |
+                ((info.protection & VM_PROT_WRITE)   ? PROT_WRITE : 0) |
+                ((info.protection & VM_PROT_EXECUTE) ? PROT_EXEC  : 0);
+    return 1;
+}
+#else
+static int host_region_at(uintptr_t addr, w32_host_region *r)
+{
+    char line[1024];
+    FILE *maps = fopen("/proc/self/maps", "r");
+    int found = 0;
+    if (!maps) return -1;
+    /* Lines are address-ordered. A line longer than the buffer is cut, but the
+     * fields read here come first, and the tail fails the sscanf below. */
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long lo, hi;
+        char perm[5] = "";
+        if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perm) != 3) continue;
+        if ((uintptr_t)hi <= addr) continue;
+        r->start  = (uintptr_t)lo;
+        r->end    = (uintptr_t)hi;
+        r->mapped = (uintptr_t)lo <= addr;
+        r->perms  = (perm[0] == 'r' ? PROT_READ  : 0) |
+                    (perm[1] == 'w' ? PROT_WRITE : 0) |
+                    (perm[2] == 'x' ? PROT_EXEC  : 0);
+        found = 1;
+        break;
+    }
+    fclose(maps);
+    return found;
+}
+#endif
+
+static DWORD protect_from_perms(int perms)
+{
+    switch (perms & (PROT_READ | PROT_WRITE | PROT_EXEC)) {
+    case 0:                              return PAGE_NOACCESS;
+    case PROT_READ:                      return PAGE_READONLY;
+    case PROT_READ | PROT_WRITE:
+    case PROT_WRITE:                     return PAGE_READWRITE;
+    case PROT_EXEC:                      return PAGE_EXECUTE;
+    case PROT_READ | PROT_EXEC:          return PAGE_EXECUTE_READ;
+    default:                             return PAGE_EXECUTE_READWRITE;
+    }
 }
 
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
@@ -1206,8 +1535,13 @@ BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldPro
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if (oldProtect) *oldProtect = PAGE_READWRITE;
-    return mprotect(address, size, prot) == 0;
+    w32_host_region r;
+    /* Win32 reports the protection of the first page of the range. */
+    int known = host_region_at((uintptr_t)address, &r) == 1 && r.mapped;
+    if (oldProtect) *oldProtect = known ? protect_from_perms(r.perms) : PAGE_READWRITE;
+    if (mprotect(address, size, prot) == 0) return TRUE;
+    SetLastError(ERROR_INVALID_ADDRESS);
+    return FALSE;
 }
 
 /* ===================================================================== */
@@ -1279,6 +1613,30 @@ BOOL QueryPerformanceFrequency(PLARGE_INTEGER freq)
     return TRUE;
 }
 
+/* FILETIME units (100 ns) of the calling thread's CPU time, reported as user
+ * time. Created/exited/kernel times are not tracked. The handle is not checked:
+ * the only caller asks about the calling thread. */
+BOOL GetThreadTimes(HANDLE thread, LPFILETIME created, LPFILETIME exited,
+                    LPFILETIME kernel, LPFILETIME user)
+{
+    struct timespec ts;
+    uint64_t hundred_ns;
+    (void)thread;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return FALSE;
+    }
+    hundred_ns = (uint64_t)ts.tv_sec * 10000000u + (uint64_t)ts.tv_nsec / 100u;
+    if (created) memset(created, 0, sizeof *created);
+    if (exited) memset(exited, 0, sizeof *exited);
+    if (kernel) memset(kernel, 0, sizeof *kernel);
+    if (user) {
+        user->dwLowDateTime = (DWORD)hundred_ns;
+        user->dwHighDateTime = (DWORD)(hundred_ns >> 32);
+    }
+    return TRUE;
+}
+
 /* ===================================================================== */
 /* Misc                                                                  */
 /* ===================================================================== */
@@ -1346,11 +1704,103 @@ unsigned int _clearfp(void)
 #include <fcntl.h>
 #include <sys/stat.h>
 
+/* ---- Win32 share modes for host files ------------------------------------
+ * Each open file is an entry keyed by (dev, ino) holding the access its
+ * handle was granted and the share mask it was opened with, both as
+ * FILE_SHARE_* bits so the rule is one mask test. A new open conflicts when
+ * its access is not shared by an existing open, or an existing open's access
+ * is not shared by it. An entry lives as long as its file object:
+ * DuplicateHandle copies share it, the last CloseHandle removes it.
+ * ponytail: one list under one lock; hash by (dev, ino) if opens grow. */
+typedef struct w32_share {
+    struct w32_share *next;
+    w32_object       *owner;
+    dev_t             dev;
+    ino_t             ino;
+    DWORD             granted, share;
+} w32_share;
+
+static w32_share       *s_shares;
+static pthread_mutex_t  s_shares_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* The FILE_SHARE_* bit each access class needs from every other open. */
+static DWORD share_needs(DWORD access)
+{
+    DWORD need = 0;
+    if (access & (GENERIC_READ | GENERIC_ALL | FILE_READ_DATA))
+        need |= FILE_SHARE_READ;
+    if (access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA))
+        need |= FILE_SHARE_WRITE;
+    if (access & (DELETE | GENERIC_ALL))
+        need |= FILE_SHARE_DELETE;
+    return need;
+}
+
+/* Caller holds s_shares_lock. */
+static int share_conflicts(dev_t dev, ino_t ino, DWORD granted, DWORD share)
+{
+    for (w32_share *e = s_shares; e; e = e->next)
+        if (e->dev == dev && e->ino == ino &&
+            ((granted & ~e->share) || (e->granted & ~share)))
+            return 1;
+    return 0;
+}
+
+static void share_forget(w32_object *o)
+{
+    w32_share **link;
+    pthread_mutex_lock(&s_shares_lock);
+    for (link = &s_shares; *link; link = &(*link)->next) {
+        if ((*link)->owner != o) continue;
+        w32_share *dead = *link;
+        *link = dead->next;
+        free(dead);
+        break;
+    }
+    pthread_mutex_unlock(&s_shares_lock);
+}
+
+HANDLE w32_open_handle_shared(int fd, const char *host_path, DWORD access,
+                              DWORD share, int truncate_to_zero)
+{
+    struct stat st;
+    w32_share *entry;
+    HANDLE h;
+    DWORD granted = share_needs(access);
+    if (fstat(fd, &st) != 0) { SetLastError(ERROR_GEN_FAILURE); return INVALID_HANDLE_VALUE; }
+    entry = calloc(1, sizeof *entry);
+    if (!entry) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return INVALID_HANDLE_VALUE; }
+    pthread_mutex_lock(&s_shares_lock);
+    if (share_conflicts(st.st_dev, st.st_ino, granted, share)) {
+        pthread_mutex_unlock(&s_shares_lock);
+        free(entry);
+        SetLastError(ERROR_SHARING_VIOLATION);
+        return INVALID_HANDLE_VALUE;
+    }
+    /* Truncation waits for the check: a refused open must not empty the file. */
+    if (truncate_to_zero && ftruncate(fd, 0) != 0) {
+        pthread_mutex_unlock(&s_shares_lock);
+        free(entry);
+        SetLastError(ERROR_GEN_FAILURE);
+        return INVALID_HANDLE_VALUE;
+    }
+    h = w32_open_handle(fd, host_path);
+    entry->owner   = (w32_object *)h;
+    entry->dev     = st.st_dev;
+    entry->ino     = st.st_ino;
+    entry->granted = granted;
+    entry->share   = share;
+    entry->next    = s_shares;
+    s_shares       = entry;
+    pthread_mutex_unlock(&s_shares_lock);
+    return h;
+}
+
 HANDLE CreateFileA(LPCSTR name, DWORD access, DWORD share,
                    LPSECURITY_ATTRIBUTES sa, DWORD disp,
                    DWORD flags, HANDLE templ)
 {
-    (void)share; (void)sa; (void)flags; (void)templ;
+    (void)sa; (void)flags; (void)templ;
     if (!name) { SetLastError(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
 
     int rw = O_RDONLY;
@@ -1374,9 +1824,11 @@ HANDLE CreateFileA(LPCSTR name, DWORD access, DWORD share,
     char norm[1024];
     snprintf(norm, sizeof(norm), "%s", name);
     xbox_path_normalize(norm);
-    int fd = open(norm, rw | extra, 0644);
+    int fd = open(norm, (rw | extra) & ~O_TRUNC, 0644);
     if (fd < 0) { SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
-    return w32_open_handle(fd, name);
+    HANDLE h = w32_open_handle_shared(fd, name, access, share, (extra & O_TRUNC) != 0);
+    if (h == INVALID_HANDLE_VALUE) close(fd);
+    return h;
 }
 
 HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share,
@@ -1440,8 +1892,8 @@ BOOL FlushFileBuffers(HANDLE h)
 }
 
 /* ===================================================================== */
-/* Keyboard + window helpers -- stubs. Real keyboard polling will come   */
-/* via SDL_GetKeyboardState when main.c gets its SDL2 port.              */
+/* Keyboard + window helpers -- stubs. Keys reach titles through the     */
+/* framebuffer window instead (xbox_FramebufferKeyDown, fb_window_sdl.c). */
 /* ===================================================================== */
 
 SHORT GetAsyncKeyState(int vKey)          { (void)vKey; return 0; }
@@ -1466,7 +1918,7 @@ BOOL    PeekMessageA(LPMSG m, HWND w, UINT a, UINT b, UINT f)
 BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
 LRESULT DispatchMessageA(const MSG *m) { (void)m; return 0; }
 
-/* XInput stub: real gamepad is wired through input_compat (SDL2). */
+/* XInput stub: real gamepads come through src/input (SDL3 gamepads). */
 DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
 { (void)idx; if (state) memset(state, 0, sizeof(*state)); return ERROR_DEVICE_NOT_CONNECTED; }
 
@@ -1598,6 +2050,71 @@ int view_lookup(const void *addr, void **base_out, size_t *len_out)
     return found;
 }
 
+/* Reservations made by VirtualAlloc(MEM_RESERVE) and still held: address
+ * ranges this process owns, which a fixed-address map may replace in place.
+ * ponytail: a small array under the views lock; the memory layout makes a
+ * handful of these. */
+typedef struct { uintptr_t lo, hi; } w32_held;
+static w32_held s_held[64];
+
+static void held_add(void *addr, size_t len)
+{
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 64; i++)
+        if (!s_held[i].hi) { s_held[i].lo = (uintptr_t)addr; s_held[i].hi = (uintptr_t)addr + len; break; }
+    pthread_mutex_unlock(&s_views_lock);
+}
+
+static int held_contains(const void *addr, size_t len)
+{
+    uintptr_t lo = (uintptr_t)addr, hi = lo + len;
+    int found = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 64 && !found; i++)
+        found = s_held[i].hi && lo >= s_held[i].lo && hi <= s_held[i].hi;
+    pthread_mutex_unlock(&s_views_lock);
+    return found;
+}
+
+/* A partial release inside a held reservation: discard the contents and keep
+ * the range held. 1 if handled; 0 if not inside one, or if it is the whole
+ * reservation (a real release). */
+static int held_release(void *addr, size_t len)
+{
+    uintptr_t lo = (uintptr_t)addr, hi = lo + len;
+    int partial = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 64; i++)
+        if (s_held[i].hi && lo >= s_held[i].lo && hi <= s_held[i].hi) {
+            partial = !(lo == s_held[i].lo && hi == s_held[i].hi);
+            break;
+        }
+    pthread_mutex_unlock(&s_views_lock);
+    if (!partial) return 0;
+    return mmap(addr, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
+                -1, 0) != MAP_FAILED;
+}
+
+/* Stop holding [addr, addr+len): it was released or mapped over. A held range
+ * that loses a piece from the middle keeps both ends. */
+static void held_drop(const void *addr, size_t len)
+{
+    uintptr_t lo = (uintptr_t)addr, hi = lo + len;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 64; i++) {
+        w32_held h = s_held[i];
+        if (!h.hi || hi <= h.lo || lo >= h.hi) continue;
+        s_held[i].lo = s_held[i].hi = 0;
+        if (h.lo < lo) { s_held[i].lo = h.lo; s_held[i].hi = lo; }
+        if (hi < h.hi) {
+            if (!s_held[i].hi) { s_held[i].lo = hi; s_held[i].hi = h.hi; }
+            else for (int j = 0; j < 64; j++)
+                if (!s_held[j].hi) { s_held[j].lo = hi; s_held[j].hi = h.hi; break; }
+        }
+    }
+    pthread_mutex_unlock(&s_views_lock);
+}
+
 size_t view_take(const void *addr)
 {
     size_t len = 0;
@@ -1671,7 +2188,10 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
      * reserved, so with a base the OS chose rather than one we picked, that
      * difference is the process quietly destroying its own libraries and heap
      * and dying somewhere unrelated a moment later. */
-    if (baseAddr) {
+    int replace = baseAddr && held_contains(baseAddr, len);
+    if (replace) {
+        flags |= MAP_FIXED;                 /* over our own reservation */
+    } else if (baseAddr) {
 #if defined(MAP_FIXED_NOREPLACE)
         flags |= MAP_FIXED_NOREPLACE;
 #elif defined(__APPLE__)
@@ -1697,6 +2217,8 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
         SetLastError(ERROR_INVALID_ADDRESS);
         return NULL;
     }
+    if (replace)
+        held_drop(p, len);
     view_register(p, len);
     return p;
 }
@@ -1755,14 +2277,44 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
         return sizeof(*buffer);
     }
 
-    buffer->BaseAddress      = (PVOID)address;
+    /* The state is the host's: a page with no access is a reservation (Win32
+     * MEM_RESERVE, which also covers a decommitted page), anything else is
+     * committed. Without /proc the registry alone says it is committed RW. */
+    uintptr_t addr      = (uintptr_t)address;
+    uintptr_t page_size = (uintptr_t)sysconf(_SC_PAGESIZE);
+    uintptr_t page      = addr & ~(page_size - 1);
+    uintptr_t limit     = (uintptr_t)base + ((len + page_size - 1) & ~(page_size - 1));
+    w32_host_region r, first, next;
+    int rc = host_region_at(addr, &r);
+
+    if (rc == 0 || (rc > 0 && !r.mapped)) {
+        /* Owned by this layer but not mapped on the host: nothing to report. */
+        buffer->BaseAddress    = (PVOID)page;
+        buffer->AllocationBase = NULL;
+        buffer->State          = MEM_FREE;
+        buffer->Protect        = PAGE_NOACCESS;
+        return sizeof(*buffer);
+    }
+    if (rc < 0) {
+        r.start = addr; r.end = limit; r.mapped = 1; r.perms = PROT_READ | PROT_WRITE;
+    }
+
+    /* RegionSize is the run from this page of pages with the same state and
+     * protection, within the allocation. Callers sizing a copy depend on it. */
+    uintptr_t end = r.end < limit ? r.end : limit;
+    while (end < limit && host_region_at(end, &next) == 1 && next.mapped &&
+           next.start == end && next.perms == r.perms)
+        end = next.end < limit ? next.end : limit;
+
+    if (host_region_at((uintptr_t)base, &first) == 1 && first.mapped)
+        buffer->AllocationProtect = protect_from_perms(first.perms);
+    else
+        buffer->AllocationProtect = PAGE_READWRITE;
+    buffer->BaseAddress      = (PVOID)page;
     buffer->AllocationBase   = base;
-    buffer->AllocationProtect = PAGE_READWRITE;
-    /* From the queried address to the end of the region, which is what Win32
-     * reports and what callers sizing a copy out of it depend on. */
-    buffer->RegionSize       = len - (size_t)((uintptr_t)address - (uintptr_t)base);
-    buffer->State            = MEM_COMMIT;
-    buffer->Protect          = PAGE_READWRITE;
+    buffer->RegionSize       = end - page;
+    buffer->State            = r.perms == 0 ? MEM_RESERVE : MEM_COMMIT;
+    buffer->Protect          = protect_from_perms(r.perms);
     buffer->Type             = MEM_PRIVATE;
     return sizeof(*buffer);
 }
@@ -1959,8 +2511,295 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
 }
 
+/* ---- Vectored exception handlers over SIGSEGV/SIGBUS ------------------ */
+#if defined(__x86_64__)
+#if defined(__APPLE__)
+#include <sys/ucontext.h>   /* <ucontext.h> is the deprecated, _XOPEN_SOURCE-only API */
+#else
+#include <ucontext.h>
+#endif
+
+#define VEH_MAX 16
+static PVECTORED_EXCEPTION_HANDLER s_veh[VEH_MAX];
+static int s_veh_count;
+static pthread_mutex_t s_veh_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct sigaction s_prev_segv, s_prev_bus, s_prev_trap;
+static LPTOP_LEVEL_EXCEPTION_FILTER s_unhandled_filter;
+static void veh_install(void);
+
+#if defined(__APPLE__)
+#define VEH_GREGS(uc) (&(uc)->uc_mcontext->__ss)
+#define VEH_REG(s, linux_name, mac_name) ((s)->mac_name)
+#else
+#define VEH_GREGS(uc) ((uc)->uc_mcontext.gregs)
+#define VEH_REG(s, linux_name, mac_name) ((s)[linux_name])
+#endif
+
+/* Each register once, in both directions. */
+#define VEH_REGS(X) \
+    X(Rax, REG_RAX, __rax) X(Rcx, REG_RCX, __rcx) X(Rdx, REG_RDX, __rdx) \
+    X(Rbx, REG_RBX, __rbx) X(Rsp, REG_RSP, __rsp) X(Rbp, REG_RBP, __rbp) \
+    X(Rsi, REG_RSI, __rsi) X(Rdi, REG_RDI, __rdi) X(R8, REG_R8, __r8)   \
+    X(R9, REG_R9, __r9) X(R10, REG_R10, __r10) X(R11, REG_R11, __r11)   \
+    X(R12, REG_R12, __r12) X(R13, REG_R13, __r13) X(R14, REG_R14, __r14) \
+    X(R15, REG_R15, __r15) X(Rip, REG_RIP, __rip)
+
+static void veh_signal(int sig, siginfo_t *si, void *raw)
+{
+    ucontext_t *uc = (ucontext_t *)raw;
+    CONTEXT ctx;
+    EXCEPTION_RECORD rec;
+    EXCEPTION_POINTERS info = { &rec, &ctx };
+    struct sigaction *prev = sig == SIGBUS ? &s_prev_bus :
+                             sig == SIGTRAP ? &s_prev_trap : &s_prev_segv;
+    int i, count = __atomic_load_n(&s_veh_count, __ATOMIC_ACQUIRE);
+#if defined(__APPLE__)
+    __typeof__(VEH_GREGS(uc)) g = VEH_GREGS(uc);
+    int write = (uc->uc_mcontext->__es.__err & 2) != 0;
+    ctx.EFlags = (uint32_t)g->__rflags;
+#else
+    greg_t *g = VEH_GREGS(uc);
+    int write = (g[REG_ERR] & 2) != 0;        /* page-fault error code: W */
+    ctx.EFlags = (uint32_t)g[REG_EFL];
+#endif
+#define VEH_LOAD(field, l, m) ctx.field = (uint64_t)VEH_REG(g, l, m);
+    VEH_REGS(VEH_LOAD)
+    memset(&rec, 0, sizeof rec);
+    rec.ExceptionAddress = (PVOID)(uintptr_t)ctx.Rip;
+    if (sig == SIGTRAP) {
+        /* After the trapped instruction (TF) or past the int3, as on Windows
+         * for single-step; a breakpoint's address is the int3 itself. */
+        rec.ExceptionCode = si->si_code == TRAP_BRKPT ? EXCEPTION_BREAKPOINT
+                                                      : EXCEPTION_SINGLE_STEP;
+        if (rec.ExceptionCode == EXCEPTION_BREAKPOINT)
+            rec.ExceptionAddress = (PVOID)(uintptr_t)(ctx.Rip - 1);
+        /* The signal's si_code, which says what trapped: TRAP_TRACE (the
+         * trap flag), TRAP_HWBKPT or TRAP_PERF (a hardware watchpoint) --
+         * what Dr6 tells a Win32 handler. */
+        rec.NumberParameters = 1;
+        rec.ExceptionInformation[0] = (ULONG_PTR)si->si_code;
+    } else {
+        rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        rec.NumberParameters = 2;
+        rec.ExceptionInformation[0] = (ULONG_PTR)write;
+        rec.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
+    }
+
+    for (i = 0; i < count; i++) {
+        PVECTORED_EXCEPTION_HANDLER h = s_veh[i];
+        if (h && h(&info) == EXCEPTION_CONTINUE_EXECUTION) {
+#define VEH_STORE(field, l, m) VEH_REG(g, l, m) = ctx.field;
+            VEH_REGS(VEH_STORE)
+#if defined(__APPLE__)
+            g->__rflags = (g->__rflags & ~0xFFFFFFFFull) | ctx.EFlags;
+#else
+            g[REG_EFL] = (greg_t)(((uint64_t)g[REG_EFL] & ~0xFFFFFFFFull) | ctx.EFlags);
+#endif
+            return;
+        }
+    }
+    {
+        LPTOP_LEVEL_EXCEPTION_FILTER filter =
+            __atomic_load_n(&s_unhandled_filter, __ATOMIC_ACQUIRE);
+        if (filter && filter(&info) == EXCEPTION_CONTINUE_EXECUTION) {
+            VEH_REGS(VEH_STORE)
+            return;
+        }
+    }
+    /* Unhandled: whatever was installed before, else the default (re-fault). */
+    if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction) { prev->sa_sigaction(sig, si, raw); return; }
+    } else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+        prev->sa_handler(sig);
+        return;
+    }
+    signal(sig, SIG_DFL);
+    /* A fault re-executes and dies on return; a trap or a raise() would
+     * just carry on, so deliver it again under the default action. */
+    if (sig == SIGTRAP || si->si_code <= 0)
+        raise(sig);
+}
+
+/* Once, under s_veh_lock. */
+static void veh_install(void)
+{
+    static int installed;
+    struct sigaction sa;
+    if (installed) return;
+    installed = 1;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = veh_signal;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &s_prev_segv);
+    sigaction(SIGBUS, &sa, &s_prev_bus);
+    sigaction(SIGTRAP, &sa, &s_prev_trap);
+}
+
+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter)
+{
+    LPTOP_LEVEL_EXCEPTION_FILTER old;
+    pthread_mutex_lock(&s_veh_lock);
+    veh_install();
+    old = __atomic_exchange_n(&s_unhandled_filter, filter, __ATOMIC_ACQ_REL);
+    pthread_mutex_unlock(&s_veh_lock);
+    return old;
+}
+
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
-{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
-ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
+{
+    PVOID result = NULL;
+    if (!Handler) return NULL;
+    pthread_mutex_lock(&s_veh_lock);
+    if (s_veh_count < VEH_MAX) {
+        veh_install();
+        if (First) {
+            memmove(&s_veh[1], &s_veh[0], (size_t)s_veh_count * sizeof s_veh[0]);
+            s_veh[0] = Handler;
+        } else {
+            s_veh[s_veh_count] = Handler;
+        }
+        __atomic_store_n(&s_veh_count, s_veh_count + 1, __ATOMIC_RELEASE);
+        result = (PVOID)Handler;
+    }
+    pthread_mutex_unlock(&s_veh_lock);
+    return result;
+}
+
+/* ponytail: removal clears the slot rather than compacting, so a fault in
+ * flight never sees the array shift; 16 registrations per process. */
+ULONG RemoveVectoredExceptionHandler(PVOID h)
+{
+    int i;
+    ULONG found = 0;
+    pthread_mutex_lock(&s_veh_lock);
+    for (i = 0; i < s_veh_count; i++)
+        if ((PVOID)s_veh[i] == h) { s_veh[i] = NULL; found = 1; break; }
+    pthread_mutex_unlock(&s_veh_lock);
+    return found;
+}
+#else
+PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+{ (void)First; (void)Handler; return NULL; }   /* MMIO decoding is x86-64 only */
+ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 0; }
+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER f)
+{ (void)f; return NULL; }
+#endif
+
+/* ---- Console control over signals ------------------------------------- */
+static PHANDLER_ROUTINE s_console_handler;
+
+static void console_signal(int sig)
+{
+    PHANDLER_ROUTINE h = __atomic_load_n(&s_console_handler, __ATOMIC_ACQUIRE);
+    DWORD event = sig == SIGINT ? CTRL_C_EVENT : CTRL_CLOSE_EVENT;
+    if (h && h(event)) return;
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* ponytail: one handler, the last one added; MM3 registers exactly one. */
+BOOL SetConsoleCtrlHandler(PHANDLER_ROUTINE handler, BOOL add)
+{
+    if (!handler) return TRUE;
+    __atomic_store_n(&s_console_handler, add ? handler : NULL, __ATOMIC_RELEASE);
+    signal(SIGINT, add ? console_signal : SIG_DFL);
+    signal(SIGTERM, add ? console_signal : SIG_DFL);
+    signal(SIGHUP, add ? console_signal : SIG_DFL);
+    return TRUE;
+}
+
+/* ---- Process and module queries --------------------------------------- */
+#include <dlfcn.h>
+#include <execinfo.h>
+#if defined(__linux__)
+#include <sys/uio.h>
+#endif
+
+HMODULE GetModuleHandleA(LPCSTR name)
+{
+    Dl_info info;
+    if (name) return NULL;
+    /* This file is linked into the executable, so its base is the module's. */
+    return dladdr((void *)GetModuleHandleA, &info) ? (HMODULE)info.dli_fbase : NULL;
+}
+
+HMODULE GetModuleHandleW(LPCWSTR name)
+{
+    return name ? NULL : GetModuleHandleA(NULL);
+}
+
+USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash)
+{
+    void *all[128];
+    int n = backtrace(all, 128), i, out = 0;
+    if (hash) *hash = 0;
+    for (i = (int)skip + 1; i < n && out < (int)count; i++)   /* +1: this frame */
+        frames[out++] = all[i];
+    return (USHORT)out;
+}
+
+BOOL ReadProcessMemory(HANDLE process, LPCVOID address, LPVOID buffer, SIZE_T size,
+                       SIZE_T *read)
+{
+    ssize_t got = -1;
+    (void)process;
+    if (read) *read = 0;
+#if defined(__linux__)
+    {
+        struct iovec local = { buffer, size }, remote = { (void *)address, size };
+        got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    }
+#elif defined(__APPLE__)
+    {
+        mach_vm_size_t n = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)address, size,
+                                   (mach_vm_address_t)buffer, &n) == KERN_SUCCESS)
+            got = (ssize_t)n;
+    }
+#endif
+    if (got < 0 || (SIZE_T)got != size) {
+        SetLastError(ERROR_PARTIAL_COPY);
+        if (read && got > 0) *read = (SIZE_T)got;
+        return FALSE;
+    }
+    if (read) *read = size;
+    return TRUE;
+}
+
+BOOL GetComputerNameA(LPSTR name, LPDWORD size)
+{
+    char host[256];
+    size_t len;
+    if (!name || !size || gethostname(host, sizeof host) != 0) return FALSE;
+    host[sizeof host - 1] = '\0';
+    len = strlen(host);
+    if (len + 1 > *size) {
+        *size = (DWORD)(len + 1);
+        SetLastError(ERROR_BUFFER_OVERFLOW);
+        return FALSE;
+    }
+    memcpy(name, host, len + 1);
+    *size = (DWORD)len;
+    return TRUE;
+}
+
+/* An empty value removes the variable, as on Windows. */
+int _putenv_s(const char *name, const char *value)
+{
+    if (!name || !value) return EINVAL;
+    return (*value ? setenv(name, value, 1) : unsetenv(name)) ? errno : 0;
+}
+
+int strcpy_s(char *dst, size_t size, const char *src)
+{
+    size_t len;
+    if (!dst || !size) return EINVAL;
+    if (!src) { dst[0] = '\0'; return EINVAL; }
+    len = strlen(src);
+    if (len >= size) { dst[0] = '\0'; return ERANGE; }
+    memcpy(dst, src, len + 1);
+    return 0;
+}
 
 #endif /* !_WIN32 */

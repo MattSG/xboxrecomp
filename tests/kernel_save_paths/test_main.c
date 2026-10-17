@@ -2,21 +2,27 @@
  * app-data location are substituted, keeping every test write in our own
  * temporary directory and avoiding any game or existing save files. */
 #include "kernel.h"
-#include <shlobj.h>
+#include "../kernel_test_host.h"
 #include <stdio.h>
 #include <string.h>
-#include <wchar.h>
+#if defined(_WIN32)
+#include <shlobj.h>
+#endif
 
-static WCHAR default_folder[MAX_PATH];
+static char default_folder[MAX_PATH];
 static int mounted;
 
+#if defined(_WIN32)
+/* SHGetFolderPathW is the one default-folder source the Win32 backend uses. */
 static HRESULT test_default_folder(HWND window, int folder, HANDLE token,
                                    DWORD flags, LPWSTR path)
 {
     (void)window; (void)folder; (void)token; (void)flags;
-    wcscpy_s(path, MAX_PATH, default_folder);
-    return S_OK;
+    return MultiByteToWideChar(CP_UTF8, 0, default_folder, -1, path, MAX_PATH)
+        ? S_OK : E_FAIL;
 }
+#define SHGetFolderPathW test_default_folder
+#endif
 
 void xbox_log(int level, const char *subsystem, const char *fmt, ...)
 {
@@ -33,111 +39,135 @@ const char *xbox_LookupSymbolicLink(const char *link)
     return NULL;
 }
 
-#define SHGetFolderPathW test_default_folder
 #include "../../src/kernel/kernel_path.c"
+#if defined(_WIN32)
 #undef SHGetFolderPathW
+#endif
 
 static int failures;
 
-static void check_path(const char *guest, const WCHAR *base, const WCHAR *tail)
+/* The backend returns UTF-16 on Windows and UTF-8 elsewhere; paths here are ASCII. */
+static void host_narrow(const xbox_host_char *in, char *out, size_t bytes)
 {
-    WCHAR actual[MAX_PATH], expected[MAX_PATH];
-    if (tail[0]) swprintf_s(expected, MAX_PATH, L"%s\\%s", base, tail);
-    else wcscpy_s(expected, MAX_PATH, base);
-    if (!xbox_translate_path(guest, actual, MAX_PATH) ||
-        _wcsicmp(actual, expected) != 0) {
-        fprintf(stderr, "FAIL %s: got %ls, expected %ls\n", guest, actual, expected);
+#if defined(_WIN32)
+    WideCharToMultiByte(CP_UTF8, 0, in, -1, out, (int)bytes, NULL, NULL);
+#else
+    snprintf(out, bytes, "%s", in);
+#endif
+}
+
+/* Expected host path: base, then the Xbox tail with its separators converted. */
+static void expected_path(char *out, size_t bytes, const char *base, const char *tail)
+{
+    size_t n;
+    if (!tail[0]) { snprintf(out, bytes, "%s", base); return; }
+    n = (size_t)snprintf(out, bytes, "%s" XT_SEP, base);
+    for (size_t i = 0; tail[i] && n + 1 < bytes; i++)
+        out[n++] = tail[i] == '\\' ? XT_SEP[0] : tail[i];
+    out[n] = '\0';
+}
+
+static void check_path(const char *guest, const char *base, const char *tail)
+{
+    xbox_host_char translated[MAX_PATH];
+    char actual[MAX_PATH], expected[MAX_PATH];
+    expected_path(expected, sizeof expected, base, tail);
+    if (!xbox_translate_path(guest, translated, MAX_PATH)) {
+        fprintf(stderr, "FAIL %s: translation failed\n", guest);
+        failures++;
+        return;
+    }
+    host_narrow(translated, actual, sizeof actual);
+    if (xt_stricmp(actual, expected) != 0) {
+        fprintf(stderr, "FAIL %s: got %s, expected %s\n", guest, actual, expected);
         failures++;
     }
 }
 
-static void clean_save_root(const WCHAR *base)
+static void clean_save_root(const char *base)
 {
-    static const WCHAR *dirs[] = { L"TitleData", L"UserData", L"Cache",
-                                    L"SystemData", L"UDATA", L"TDATA" };
-    WCHAR path[MAX_PATH];
+    static const char *dirs[] = { "TitleData", "UserData", "Cache",
+                                  "SystemData", "UDATA", "TDATA" };
+    char path[MAX_PATH], leaf[32];
     for (int i = 0; i < 6; i++) {
-        swprintf_s(path, MAX_PATH, L"%s\\Partition%d.img", base, i);
-        DeleteFileW(path);
-        swprintf_s(path, MAX_PATH, L"%s\\%s", base, dirs[i]);
-        RemoveDirectoryW(path);
+        snprintf(leaf, sizeof leaf, "Partition%d.img", i);
+        xt_join(path, MAX_PATH, base, leaf);
+        xt_delete_file(path);
+        xt_join(path, MAX_PATH, base, dirs[i]);
+        xt_remove_dir(path);
     }
-    RemoveDirectoryW(base);
+    xt_remove_dir(base);
 }
 
 int main(void)
 {
-    WCHAR temp[MAX_PATH], root[MAX_PATH], game[MAX_PATH], save[MAX_PATH];
-    WCHAR path[MAX_PATH], original[MAX_PATH], isolated[MAX_PATH];
-    char game_utf8[MAX_PATH], save_utf8[MAX_PATH];
-    DWORD bytes;
-    HANDLE file;
+    char root[MAX_PATH], game[MAX_PATH], save[MAX_PATH];
+    char path[MAX_PATH], original[MAX_PATH], isolated[MAX_PATH];
     char value[8] = {0};
-    GetTempPathW(MAX_PATH, temp);
-    swprintf_s(root, MAX_PATH, L"%smm3-save-paths-%lu-%llu", temp,
-        GetCurrentProcessId(), (unsigned long long)GetTickCount64());
-    if (!CreateDirectoryW(root, NULL)) return 10;
-    swprintf_s(game, MAX_PATH, L"%s\\game", root);
-    swprintf_s(save, MAX_PATH, L"%s\\isolated", root);
-    swprintf_s(default_folder, MAX_PATH, L"%s\\default", root);
-    CreateDirectoryW(game, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, game, -1, game_utf8, MAX_PATH, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, save, -1, save_utf8, MAX_PATH, NULL, NULL);
-    xbox_path_init(game_utf8, save_utf8);
+    xbox_host_char translated[MAX_PATH];
+    long bytes;
+
+    if (!xt_make_temp_dir(root, sizeof root)) return 10;
+    xt_join(game, MAX_PATH, root, "game");
+    xt_join(save, MAX_PATH, root, "isolated");
+    xt_join(default_folder, MAX_PATH, root, "default");
+    xt_make_dir(game);
+#if !defined(_WIN32)
+    /* POSIX default save root is $XDG_DATA_HOME/xboxrecomp: point it at the
+     * temporary default folder, as the Win32 mock does. */
+    setenv("XDG_DATA_HOME", default_folder, 1);
+#endif
+    xbox_path_init(game, save);
 
     check_path("\\Device\\Harddisk0\\Partition1\\UDATA\\4d53002a\\profile", save,
-               L"UDATA\\4d53002a\\profile");
+               "UDATA\\4d53002a\\profile");
     check_path("\\device\\harddisk0\\partition1\\tdata\\4d53002a\\$C", save,
-               L"TDATA\\4d53002a\\$C");
-    check_path("\\Device\\Harddisk0\\Partition1\\UDATA", save, L"UDATA");
-    check_path("\\Device\\Harddisk0\\Partition1\\TDATA\\", save, L"TDATA");
+               "TDATA\\4d53002a\\$C");
+    check_path("\\Device\\Harddisk0\\Partition1\\UDATA", save, "UDATA");
+    check_path("\\Device\\Harddisk0\\Partition1\\TDATA\\", save, "TDATA");
     check_path("\\Device\\Harddisk0\\Partition1\\UDATA_backup\\profile", game,
-               L"UDATA_backup\\profile");
-    check_path("\\Device\\Harddisk0\\Partition1\\TDATA2\\asset", game, L"TDATA2\\asset");
+               "UDATA_backup\\profile");
+    check_path("\\Device\\Harddisk0\\Partition1\\TDATA2\\asset", game, "TDATA2\\asset");
     check_path("\\Device\\Harddisk0\\Partition1\\Data\\Shared\\Cars\\VRace\\body.cmp", game,
-               L"Data\\Shared\\Cars\\VRace\\body.cmp");
-    check_path("D:\\Data\\Data_hd.zip", game, L"Data\\Data_hd.zip");
-    check_path("U:\\profile", save, L"UserData\\profile");
+               "Data\\Shared\\Cars\\VRace\\body.cmp");
+    check_path("D:\\Data\\Data_hd.zip", game, "Data\\Data_hd.zip");
+    check_path("U:\\profile", save, "UserData\\profile");
     mounted = 1;
-    check_path("U:\\194916D15BE4\\profile", save, L"UDATA\\4d53002a\\194916D15BE4\\profile");
-    check_path("\\??\\T:\\$u\\contentmeta.xbx", save, L"TDATA\\4d53002a\\$u\\contentmeta.xbx");
+    check_path("U:\\194916D15BE4\\profile", save, "UDATA\\4d53002a\\194916D15BE4\\profile");
+    check_path("\\??\\T:\\$u\\contentmeta.xbx", save, "TDATA\\4d53002a\\$u\\contentmeta.xbx");
 
     /* Translation does not manufacture a missing save slot or metadata. */
-    xbox_translate_path("U:\\96734455B22F\\SaveMeta.xbx", path, MAX_PATH);
-    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) failures++;
-    swprintf_s(path, MAX_PATH, L"%s\\UDATA\\4d53002a\\96734455B22F", save);
-    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) failures++;
+    xbox_translate_path("U:\\96734455B22F\\SaveMeta.xbx", translated, MAX_PATH);
+    host_narrow(translated, path, sizeof path);
+    if (xt_path_exists(path)) failures++;
+    xt_join(path, MAX_PATH, save, "UDATA" XT_SEP "4d53002a" XT_SEP "96734455B22F");
+    if (xt_path_exists(path)) failures++;
 
     /* A write using the mounted drive cannot change the legacy profile. */
-    swprintf_s(path, MAX_PATH, L"%s\\UDATA", game); CreateDirectoryW(path, NULL);
-    swprintf_s(original, MAX_PATH, L"%s\\UDATA\\profile", game);
-    file = CreateFileW(original, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
-    if (file == INVALID_HANDLE_VALUE || !WriteFile(file, "legacy", 6, &bytes, NULL)) return 11;
-    CloseHandle(file);
-    swprintf_s(path, MAX_PATH, L"%s\\UDATA\\4d53002a", save); CreateDirectoryW(path, NULL);
-    xbox_translate_path("U:\\profile", isolated, MAX_PATH);
-    file = CreateFileW(isolated, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
-    if (file == INVALID_HANDLE_VALUE || !WriteFile(file, "test", 4, &bytes, NULL)) return 12;
-    CloseHandle(file);
-    file = CreateFileW(original, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
-    if (file == INVALID_HANDLE_VALUE || !ReadFile(file, value, sizeof(value), &bytes, NULL) ||
-        bytes != 6 || memcmp(value, "legacy", 6) != 0) failures++;
-    CloseHandle(file);
+    xt_join(path, MAX_PATH, game, "UDATA"); xt_make_dir(path);
+    xt_join(original, MAX_PATH, game, "UDATA" XT_SEP "profile");
+    if (!xt_write_file(original, "legacy", 6)) return 11;
+    xt_join(path, MAX_PATH, save, "UDATA" XT_SEP "4d53002a"); xt_make_dir(path);
+    xbox_translate_path("U:\\profile", translated, MAX_PATH);
+    host_narrow(translated, isolated, sizeof isolated);
+    if (!xt_write_file(isolated, "test", 4)) return 12;
+    bytes = xt_read_file(original, value, sizeof value);
+    if (bytes != 6 || memcmp(value, "legacy", 6) != 0) failures++;
 
     /* NULL and empty save roots retain the existing game_dir save layout. */
-    xbox_path_init(game_utf8, NULL);
-    check_path("U:\\profile", game, L"UDATA\\4d53002a\\profile");
-    check_path("T:\\$C", game, L"TDATA\\4d53002a\\$C");
-    xbox_path_init(game_utf8, "");
-    check_path("\\Device\\Harddisk0\\Partition1\\UDATA\\profile", game, L"UDATA\\profile");
+    xbox_path_init(game, NULL);
+    check_path("U:\\profile", game, "UDATA\\4d53002a\\profile");
+    check_path("T:\\$C", game, "TDATA\\4d53002a\\$C");
+    xbox_path_init(game, "");
+    check_path("\\Device\\Harddisk0\\Partition1\\UDATA\\profile", game, "UDATA\\profile");
 
-    DeleteFileW(isolated);
-    swprintf_s(path, MAX_PATH, L"%s\\UDATA\\4d53002a", save); RemoveDirectoryW(path);
-    DeleteFileW(original);
-    swprintf_s(path, MAX_PATH, L"%s\\UDATA", game); RemoveDirectoryW(path);
+    xt_delete_file(isolated);
+    xt_join(path, MAX_PATH, save, "UDATA" XT_SEP "4d53002a"); xt_remove_dir(path);
+    xt_delete_file(original);
+    xt_join(path, MAX_PATH, game, "UDATA"); xt_remove_dir(path);
     clean_save_root(save);
-    swprintf_s(path, MAX_PATH, L"%s\\xboxrecomp", default_folder); clean_save_root(path);
-    RemoveDirectoryW(default_folder); RemoveDirectoryW(game); RemoveDirectoryW(root);
+    xt_join(path, MAX_PATH, default_folder, "xboxrecomp"); clean_save_root(path);
+    xt_remove_dir(default_folder); xt_remove_dir(game); xt_remove_dir(root);
     if (failures) return 1;
     puts("PASS: explicit and default save routing, mounted U:/T:, asset paths, and legacy profile preservation");
     return 0;

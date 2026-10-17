@@ -1122,6 +1122,76 @@ static NTSTATUS errno_to_status(int e)
     }
 }
 
+/* Win32 error for a failed host open, as xbox_LastFileError reports it. */
+static DWORD errno_to_win32(int e)
+{
+    switch (e) {
+        case ENOENT:  return ERROR_FILE_NOT_FOUND;
+        case ENOTDIR: return ERROR_PATH_NOT_FOUND;
+        case EACCES:
+        case EPERM:   return ERROR_ACCESS_DENIED;
+        case EEXIST:  return ERROR_ALREADY_EXISTS;
+        default:      return ERROR_GEN_FAILURE;
+    }
+}
+
+/* Xbox access mask to the Win32 bits the share rules read. Mirrors
+ * xbox_access_to_win32 in the Win32 backend. */
+static DWORD posix_access_to_win32(ACCESS_MASK Access)
+{
+    DWORD result = 0;
+    if (Access & XBOX_GENERIC_READ)          result |= GENERIC_READ;
+    if (Access & XBOX_GENERIC_WRITE)         result |= GENERIC_WRITE;
+    if (Access & XBOX_GENERIC_ALL)           result |= GENERIC_ALL;
+    if (Access & XBOX_FILE_READ_DATA)        result |= FILE_READ_DATA;
+    if (Access & XBOX_FILE_WRITE_DATA)       result |= FILE_WRITE_DATA;
+    if (Access & XBOX_FILE_APPEND_DATA)      result |= FILE_APPEND_DATA;
+    if (Access & XBOX_FILE_READ_ATTRIBUTES)  result |= FILE_READ_ATTRIBUTES;
+    if (Access & XBOX_FILE_WRITE_ATTRIBUTES) result |= FILE_WRITE_ATTRIBUTES;
+    if (Access & XBOX_SYNCHRONIZE)           result |= SYNCHRONIZE;
+    if (Access & XBOX_DELETE)                result |= DELETE;
+    if (result == 0 || result == SYNCHRONIZE)
+        result |= GENERIC_READ;
+    return result;
+}
+
+/* Xbox share bits (FILE_SHARE_READ/WRITE/DELETE) are the Win32 values. */
+static DWORD posix_share_to_win32(ULONG Share)
+{
+    return (DWORD)(Share & (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE));
+}
+
+/* Host path for OBJECT_ATTRIBUTES. A relative name resolves under its
+ * RootDirectory handle's host path, as the Win32 backend does with
+ * GetFinalPathNameByHandle; everything else goes through the path table. */
+static BOOL posix_translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+                                     char* host_path, DWORD buf_size)
+{
+    const char* xbox_path = get_xbox_path(ObjectAttributes);
+    const char* root;
+    size_t used;
+
+    if (!xbox_path)
+        return FALSE;
+    if (!ObjectAttributes->RootDirectory || xbox_path[0] == '\\' ||
+        (xbox_path[0] && xbox_path[1] == ':'))
+        return xbox_translate_path(xbox_path, host_path, buf_size);
+
+    root = w32_handle_path(ObjectAttributes->RootDirectory);
+    if (!root)
+        return FALSE;
+    used = (size_t)snprintf(host_path, buf_size, "%s", root);
+    if (used + 2 >= buf_size)
+        return FALSE;
+    if (xbox_path[0]) {
+        host_path[used++] = '/';
+        for (; *xbox_path && used + 1 < buf_size; xbox_path++)
+            host_path[used++] = *xbox_path == '\\' ? '/' : *xbox_path;
+    }
+    host_path[used] = '\0';
+    return *xbox_path == '\0';   /* FALSE if the name did not fit */
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -1129,30 +1199,75 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     ULONG CreateDisposition, ULONG CreateOptions)
 {
     char host_path[MAX_PATH];
-    (void)AllocationSize; (void)FileAttributes; (void)ShareAccess;
+    DWORD win_access, share;
+    int truncate = 0;
+    (void)AllocationSize; (void)FileAttributes;
+    g_xbox_last_file_error = 0;
 
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
+    if (!posix_translate_obj_path(ObjectAttributes, host_path, MAX_PATH)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
     int fd;
+    struct stat st;
+    /* A partition device opened as a directory (a free-space query) gets the
+     * directory that holds its image, as in the Win32 backend. */
+    if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) && stat(host_path, &st) == 0 &&
+        !S_ISDIR(st.st_mode)) {
+        char *slash = strrchr(host_path, '/');
+        if (slash && slash != host_path)
+            *slash = 0;
+    }
+    /* Win32 share rules, as in the Win32 backend: the caller's ShareAccess, and
+     * read sharing for read-only opens (system-link testing shares read-only
+     * disc files between two copies of the game). */
+    win_access = posix_access_to_win32(DesiredAccess);
+    share = posix_share_to_win32(ShareAccess);
+    if (!(win_access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA |
+          FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | DELETE)))
+        share |= FILE_SHARE_READ;
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             mkdir(host_path, 0755);   /* EEXIST is fine */
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
-        fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
+        /* O_TRUNC is left to w32_open_handle_shared, so a refused open
+         * cannot empty a file another open still holds. */
+        int flags = posix_open_flags(DesiredAccess, CreateDisposition);
+        truncate = (flags & O_TRUNC) != 0;
+        fd = open(host_path, flags & ~O_TRUNC, 0644);
     }
 
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    int e = 0;
+    DWORD err = ERROR_SUCCESS;
     if (fd < 0) {
-        int e = errno;
-        NTSTATUS status = errno_to_status(e);
-        XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+        e = errno;
+        err = errno_to_win32(e);
+    } else {
+        handle = w32_open_handle_shared(fd, host_path, win_access, share, truncate);
+        if (handle == INVALID_HANDLE_VALUE) {
+            err = GetLastError();
+            close(fd);
+        }
+    }
+    if (handle == INVALID_HANDLE_VALUE) {
+        NTSTATUS status = err == ERROR_SHARING_VIOLATION ? STATUS_SHARING_VIOLATION
+                        : fd < 0 ? errno_to_status(e) : STATUS_UNSUCCESSFUL;
+        const char *result = status == STATUS_SHARING_VIOLATION ? "SHARING_VIOLATION"
+                           : e == ENOENT || e == ENOTDIR ? "NOT_FOUND" : "FAILED";
+        /* Logged in release builds too: a failed open is how a title decides
+         * a volume or asset is missing. The Win32 reason is kept for the
+         * bridge, which turns a sharing conflict into the title's error. */
+        fprintf(stderr, "[NtCreateFile] %s path=%s errno=%d err=%lu access=0x%08X disposition=%u options=0x%X\n",
+                result, host_path, e, (unsigned long)err,
+                (unsigned)DesiredAccess, (unsigned)CreateDisposition, (unsigned)CreateOptions);
+        g_xbox_last_file_error = (uint32_t)err;
         if (IoStatusBlock) {
             IoStatusBlock->Status = status;
             IoStatusBlock->Information = 0;
@@ -1160,7 +1275,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return status;
     }
 
-    *FileHandle = w32_open_handle(fd, host_path);
+    *FileHandle = handle;
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -1243,6 +1358,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     if (xbox_CloseObjectHandle(Handle))
         return STATUS_SUCCESS;  /* object handle: a link or directory, nothing to close */
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_dir_context_drop(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1252,8 +1368,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     char host_path[MAX_PATH];
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+    if (!posix_translate_obj_path(ObjectAttributes, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
     if (unlink(host_path) == 0) return STATUS_SUCCESS;
@@ -1471,6 +1586,23 @@ typedef struct {
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+/* Closing a directory handle ends its search, as the Win32 backend does. An
+ * open DIR* would otherwise hold a context slot, and a recycled handle value
+ * would resume the old enumeration. */
+void xbox_dir_context_drop(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init) return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].handle == FileHandle && FileHandle) {
+            if (s_dir_contexts[i].dir) closedir(s_dir_contexts[i].dir);
+            s_dir_contexts[i].dir = NULL;
+            s_dir_contexts[i].handle = NULL;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,

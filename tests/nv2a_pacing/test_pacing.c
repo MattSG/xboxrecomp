@@ -1,14 +1,17 @@
 /* Exercise the production helper with deterministic Win32 failure injection
  * and, separately, actual native waits. No GPU/context is needed. */
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <intrin.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); exit(1); } } while (0)
+#if defined(_WIN32)
 static int mocked = 1;
 static int64_t clock_ticks, test_frequency = 1000000;
 static int64_t armed_units, wake_extra, sleep_ticks = 1000;
@@ -67,6 +70,7 @@ static void pacing_yield(void)
 #define Sleep pacing_sleep
 #undef YieldProcessor
 #define YieldProcessor pacing_yield
+#endif
 #include "nv2a_pacing.h"
 #undef CreateWaitableTimerExW
 #undef SetWaitableTimer
@@ -75,6 +79,7 @@ static void pacing_yield(void)
 #undef Sleep
 #undef YieldProcessor
 
+#if defined(_WIN32)
 static void reset(void)
 {
     mocked=1;clock_ticks=1000000;test_frequency=1000000;
@@ -83,6 +88,7 @@ static void reset(void)
     fail_creates=0;fail_arm=0;wait_result=WAIT_OBJECT_0;
     memset(create_flags,0,sizeof create_flags);
 }
+#endif
 static int old_deadline(int64_t *next,int64_t now,int64_t frequency,int limit)
 {
     if(limit<=0)return 0;
@@ -94,7 +100,9 @@ static void test_cadence(void)
 {
     static const int rates[]={1,30,60,120,144,1000};
     unsigned r,i;int64_t next,old,now;
+#if defined(_WIN32)
     reset();
+#endif
     next=123;CHECK(!nv_pacing_deadline(&next,1000,1000000,0) && next==123);
     CHECK(!nv_pacing_deadline(&next,1000,1000000,-3) && next==123);
     CHECK(!nv_pacing_deadline(&next,1000,0,60) && next==123);
@@ -115,9 +123,12 @@ static void test_cadence(void)
     CHECK(next==INT64_MAX-5);
     next=10;CHECK(!nv_pacing_deadline(&next,-1,1000000,60) && next==-1);
     next=0;CHECK(nv_pacing_deadline(&next,0,1000000,60) && next==16666);
+#if defined(_WIN32)
     CHECK(!create_calls && !arm_calls && !wait_calls && !sleep_calls && !spin_calls);
+#endif
     puts("PASS: 60000 legacy deadline/cadence comparisons, off/negative/zero-rate, first/late/exact-boundary frames and signed overflow reset");
 }
+#if defined(_WIN32)
 static void check_fallback(HANDLE timer)
 {
     int64_t start=clock_ticks,deadline=start+16666;
@@ -159,6 +170,7 @@ static void test_failures(void)
     CHECK(clock_ticks>=start+16666 && !sleep_calls && !spin_calls);
     puts("PASS: high-res/ordinary/create-both-fail/arm/wait failures, bounded one-ms spin and Sleep requests, coarse/late wake, successful retry and unchanged successful timer tail");
 }
+#endif
 static void test_conversion(void)
 {
     static const int64_t frequencies[]={60,1000,1000000,10000000,3579545,3000000000ll};
@@ -178,6 +190,7 @@ static void test_conversion(void)
     CHECK(nv_pacing_timer_units(1,INT64_MAX)==1);
     puts("PASS: 60000 exact relative-unit conversions, sub-100ns clamp and overflowing products/division/saturation");
 }
+#if defined(_WIN32)
 static void old_wait(HANDLE timer,int64_t frequency,int64_t deadline,int64_t now)
 {
     int64_t remain=deadline-now,spin=frequency/1000;
@@ -207,13 +220,16 @@ static void test_native(void)
     CloseHandle(timer);
     puts("PASS: actual Windows helper and original timer paths retain identical cadence calculations and never finish before their native QPC deadline");
 }
+#endif
 int main(int argc,char **argv)
 {
     CHECK(argc==2);
     if(!strcmp(argv[1],"cadence"))test_cadence();
-    else if(!strcmp(argv[1],"failures"))test_failures();
     else if(!strcmp(argv[1],"conversion"))test_conversion();
+#if defined(_WIN32)
+    else if(!strcmp(argv[1],"failures"))test_failures();
     else if(!strcmp(argv[1],"native"))test_native();
+#endif
     else CHECK(0);
     return 0;
 }

@@ -1,5 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 project(xaudio2_test C)
+if(NOT WIN32)
+    # POSIX backend: the SDL3 audio stream, on SDL's dummy audio driver.
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+    include(Sdl3)
+    enable_testing()
+    add_executable(xaudio2_sdl_test sdl_test.c)
+    target_link_libraries(xaudio2_sdl_test PRIVATE SDL3::SDL3)
+    add_test(NAME xaudio2_sdl_test COMMAND xaudio2_sdl_test)
+    set_tests_properties(xaudio2_sdl_test PROPERTIES TIMEOUT 60
+        ENVIRONMENT "SDL_AUDIO_DRIVER=dummy")
+    return()
+endif()
 set(CMAKE_C_STANDARD 11)
 add_executable(xaudio2_test test_main.c)
 enable_testing()

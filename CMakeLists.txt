@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 
+# Recompiled x86 code relies on what MSVC does anyway: signed arithmetic wraps
+# like the CPU's, and guest memory is read through whatever pointer type an
+# instruction implies. GCC and Clang optimise both away as undefined
+# behaviour unless told not to.
+if(NOT MSVC)
+    add_compile_options(-fwrapv -fno-strict-aliasing)
+endif()
+
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
 # Pattern: extract emulator subsystems (xemu) into reusable static libraries.
@@ -15,6 +23,36 @@ project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# The host renderer. D3D11 is Windows-only and the default there; SDL3_GPU
+# (Vulkan, Direct3D 12 or Metal through SDL3) is the one choice elsewhere.
+# SDL3_GPU also moves the window and its input to SDL3, and off Windows the
+# audio output and game controllers too.
+if(WIN32)
+    set(_xbr_renderer_default D3D11)
+else()
+    set(_xbr_renderer_default SDL3_GPU)
+endif()
+set(XBOXRECOMP_RENDERER "${_xbr_renderer_default}" CACHE STRING "Host renderer: D3D11 or SDL3_GPU")
+set_property(CACHE XBOXRECOMP_RENDERER PROPERTY STRINGS D3D11 SDL3_GPU)
+if(XBOXRECOMP_RENDERER STREQUAL "SDL3_GPU")
+    set(XBOXRECOMP_SDL3 ON)
+    include(Sdl3)
+    include(Dxc)
+elseif(XBOXRECOMP_RENDERER STREQUAL "D3D11")
+    if(NOT WIN32)
+        message(FATAL_ERROR "XBOXRECOMP_RENDERER=D3D11 needs Windows; use SDL3_GPU")
+    endif()
+    set(XBOXRECOMP_SDL3 OFF)
+else()
+    message(FATAL_ERROR "XBOXRECOMP_RENDERER must be D3D11 or SDL3_GPU, not ${XBOXRECOMP_RENDERER}")
+endif()
+message(STATUS "xboxrecomp renderer: ${XBOXRECOMP_RENDERER}")
+if(XBOXRECOMP_SDL3)
+    add_compile_definitions(XBOXRECOMP_SDL3=1)
+endif()
 
 # Common definitions for all targets
 add_compile_definitions(
@@ -60,9 +98,7 @@ add_subdirectory(src/net)
 add_subdirectory(src/video)
 
 # Host bring-up: MMIO routing to the APU/USB/NV2A models, window and device
-if(WIN32)
-    add_subdirectory(src/host)
-endif()
+add_subdirectory(src/host)
 
 # ── Umbrella target ───────────────────────────────────────────
 
@@ -77,8 +113,10 @@ set(XBOXRECOMP_LIBS
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_host
 )
-if(WIN32)
-    target_link_libraries(xboxrecomp INTERFACE xbox_host)
+# win32_compat.c uses the C99 fenv functions, which glibc provides in libm.
+if(NOT WIN32)
+    target_link_libraries(xboxrecomp INTERFACE m)
 endif()
 

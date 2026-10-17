@@ -1,7 +1,24 @@
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include "platform/xbox_winnt.h"
+#include "platform/win32_compat.h"
+#endif
+#if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
+#endif
+/* The native (AVX2/AVX-512) dispatch exists only in the MSVC build of the
+ * header; elsewhere only the scalar path and the shared checks run. */
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#define NV_HASH_NATIVE_BUILD 1
+#endif
+#if defined(_MSC_VER)
+#define NOINLINE __declspec(noinline)
+#else
+#define NOINLINE __attribute__((noinline))
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +26,7 @@
 static int mock,query_count,xgetbv_count,max_leaf;
 static uint32_t cpuid1,cpuid7;
 static uint64_t xcr0;
+#ifdef NV_HASH_NATIVE_BUILD
 static void cpu_query(int result[4],int leaf,int subleaf)
 {
     query_count++;
@@ -22,11 +40,12 @@ static uint64_t os_state(unsigned index)
 {xgetbv_count++;return mock?xcr0:_xgetbv(index);}
 #define NV_HASH_CPUID cpu_query
 #define NV_HASH_XGETBV os_state
+#endif
 #include "nv2a_texture_hash.h"
 #define CHECK(x) do {if(!(x)){fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x);exit(1);}}while(0)
 
 /* Original scalar implementation, kept independent of the dispatcher. */
-static __declspec(noinline) uint64_t scalar(const uint8_t *p,size_t n)
+static NOINLINE uint64_t scalar(const uint8_t *p,size_t n)
 {
     uint64_t a=0x9E3779B97F4A7C15ull,b=0xC2B2AE3D27D4EB4Full,
              c=0x165667B19E3779F9ull,d=0x27D4EB2F165667C5ull^n;
@@ -44,7 +63,9 @@ static int native_supported;
 static void check_hash(const uint8_t *p,size_t bytes)
 {
     uint64_t old=scalar(p,bytes);CHECK(hash_mem(p,bytes)==old);
+#ifdef NV_HASH_NATIVE_BUILD
     if(native_supported)CHECK(hash_mem_native(p,bytes)==old);
+#endif
 }
 static void fill(uint8_t *p,size_t n)
 {
@@ -77,6 +98,7 @@ static void pages(void)
     VirtualFree(base,0,MEM_RELEASE);
     puts("PASS: 8226 exact protected-page cases, no read beyond an inaccessible following/preceding page, all tails and empty input");
 }
+#ifdef NV_HASH_NATIVE_BUILD
 static void supported_mock(void)
 {mock=1;max_leaf=7;cpuid1=0x1C000000;cpuid7=0x80030020;xcr0=0xE6;query_count=xgetbv_count=0;}
 static void features(void)
@@ -110,13 +132,14 @@ static void features(void)
     CHECK(s_hash_mem_native==native_supported);
     puts("PASS: every required CPU/OS bit absence, missing leaf, cached scalar fallback without XGETBV,216-byte short path without feature queries and real native/scalar selection");
 }
+#endif
 typedef uint64_t (*Hash)(const uint8_t *,size_t);
 static volatile uint64_t sink;
-static __declspec(noinline) uint64_t production(const uint8_t *p,size_t n){return hash_mem(p,n);}
+static NOINLINE uint64_t production(const uint8_t *p,size_t n){return hash_mem(p,n);}
 uint64_t threshold_1024(const uint8_t *p,size_t n);
 uint64_t threshold_2048(const uint8_t *p,size_t n);
 uint64_t threshold_4096(const uint8_t *p,size_t n);
-static __declspec(noinline) double measure(Hash hash,uint8_t *p,size_t n,unsigned count)
+static NOINLINE double measure(Hash hash,uint8_t *p,size_t n,unsigned count)
 {
     LARGE_INTEGER f,a,b;unsigned i;QueryPerformanceFrequency(&f);QueryPerformanceCounter(&a);
     for(i=0;i<count;i++){p[0]++;sink^=hash(p,n);}QueryPerformanceCounter(&b);
@@ -143,11 +166,16 @@ static void benchmark(void)
 }
 int main(int argc,char **argv)
 {
-    CHECK(argc==2);native_supported=hash_mem_cpu_native();
+    CHECK(argc==2);
+#ifdef NV_HASH_NATIVE_BUILD
+    native_supported=hash_mem_cpu_native();
+#endif
     printf("Native feature available=%d\n",native_supported);
     if(!strcmp(argv[1],"exact"))exact();
     else if(!strcmp(argv[1],"pages"))pages();
+#ifdef NV_HASH_NATIVE_BUILD
     else if(!strcmp(argv[1],"features"))features();
+#endif
     else if(!strcmp(argv[1],"benchmark"))benchmark();
     else CHECK(0);
     return 0;
