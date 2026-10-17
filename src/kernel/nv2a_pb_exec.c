@@ -3464,6 +3464,12 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         record_tex_reg(method, param);
 }
 
+/* The last semaphore value released and how many, for the walker's
+ * stop salvage (nv2a_pb_scan.c). */
+static uint32_t s_semaphore_last, s_semaphore_releases;
+uint32_t nv2a_pb_exec_semaphore_last_value(void) { return s_semaphore_last; }
+uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_semaphore_releases; }
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -3554,6 +3560,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
         xbox_Nv2aSemaphoreRelease(semaphore_dma, semaphore_offset, param);
+        s_semaphore_last = param;
+        s_semaphore_releases++;
         return;
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;

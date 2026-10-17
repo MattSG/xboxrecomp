@@ -42,11 +42,16 @@ static int s_seen_count;
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 static uint32_t s_tot_calls;
+/* Walks that stopped short of PUT, and how many of those had their fence
+ * release salvaged. Counted because after eight log lines a stop is silent. */
+static uint32_t s_tot_stops, s_tot_salvaged;
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+extern uint32_t nv2a_pb_exec_semaphore_last_value(void);
+extern uint32_t nv2a_pb_exec_semaphore_releases(void);
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
 
@@ -235,18 +240,61 @@ static const char *nv097_name(uint32_t m)
     return "";
 }
 
-static uint32_t pb_contiguous_va(uint32_t physical)
+/* Every word the walk reads must lie in the 64 MB contiguous window. A real
+ * stream lives in RAM, so a JUMP or CALL target above it is a parameter read
+ * as a command after a desync. Wrapping it would execute whatever sits at the
+ * wrapped address and corrupt GPU state quietly; the walk stops there
+ * instead, as PFIFO does at its DMA limit (xemu's pfifo.c raises a protection
+ * error; it never wraps). apexJCL's walker (blinx2-v0.4.0) made this choice;
+ * MM3 never leaves the window on either. */
+static int pb_in_window(uint32_t va)
 {
-    /* The Xbox has a 26-bit physical address bus. PFIFO jump/call targets
-     * wrap at 64 MB, matching the contiguous window's backing size. */
-    return XBOX_CONTIG_BASE | (physical & (XBOX_CONTIG_SIZE - 1u));
+    return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;
 }
 
-static const uint8_t *pb_word_ptr(const uint8_t *mem, uint32_t va)
+/* The words from a stop to PUT are never executed, and they may hold the
+ * semaphore release the title's next fence wait spins on. Run the last such
+ * release in [from, to): releasing it marks the earlier ones done too, and
+ * none beyond PUT.
+ *
+ * The XDK writes a fence as (BACK_END_WRITE_SEMAPHORE_RELEASE, count 1,
+ * subchannel 0) and its value, but that pair can also be data (index buffer
+ * words). A value taken from data could push the fence far ahead, so a
+ * candidate counts only if it looks like the next fence: odd, as the XDK's
+ * fence values are, after the last release, and at most 128 past it. Returns
+ * how the fence was handled, for the log. A span that wraps or can't be read
+ * is left to the fence mirror. */
+static const char *pb_stop_salvage(const uint8_t *mem, uint32_t from, uint32_t to,
+                                   uint32_t *value)
 {
-    /* A logical scan can cross the end of the mapped window. The Xbox bus
-     * wraps those reads back to the start of physical RAM. */
-    return mem + pb_contiguous_va(va - XBOX_CONTIG_BASE);
+    uint32_t va, last, rel;
+    int found = 0, seen = 0;
+
+    if (!s_exec_enabled)
+        return "not executing";
+    if (from >= to || !pb_in_window(from) || !pb_in_window(to - 4))
+        return "span wraps or is unreadable; fence left to the mirror";
+    last = nv2a_pb_exec_semaphore_last_value();
+    for (va = from; va + 4 < to; va += 4) {
+        if (*(const uint32_t *)(mem + va) == 0x00041D70u) {
+            uint32_t v = *(const uint32_t *)(mem + va + 4);
+            seen++;
+            if ((v & 1u) && (int32_t)(v - last) > 0 && v - last <= 128u) {
+                last = v;
+                found = 1;
+            }
+        }
+    }
+    if (!found)
+        return seen ? "release(s) in the rest but none plausible"
+                    : "no fence release in the rest";
+    rel = nv2a_pb_exec_semaphore_releases();
+    nv2a_pb_exec_method(0, 0x1D70u, last);
+    *value = last;
+    if (nv2a_pb_exec_semaphore_releases() == rel)
+        return "fence release found but refused by the executor";
+    s_tot_salvaged++;
+    return "fence release salvaged";
 }
 
 void nv2a_pb_scan_report(void)
@@ -256,6 +304,8 @@ void nv2a_pb_scan_report(void)
     if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
+        fprintf(stderr, "[PB] %u walks stopped short of PUT (%u with a fence"
+                        " release salvaged)\n", s_tot_stops, s_tot_salvaged);
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
@@ -288,11 +338,6 @@ typedef struct {
 } PB_FIFO_CONTINUATION;
 static PB_FIFO_CONTINUATION s_fifo;
 static unsigned s_parse_split_reports, s_parse_limit_reports;
-
-static uint32_t pb_advance(uint32_t va)
-{
-    return pb_contiguous_va(va + 4);
-}
 
 /* An isolated parser capture records the bytes actually fetched, before GPU
  * callbacks can change RAM. Keep the complete bounded pass, not just its last
@@ -548,6 +593,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va,
     uint32_t last_control = s_fifo.last_control, last_target = s_fifo.last_target;
     uint32_t return_va = s_fifo.return_va;
     int in_call = s_fifo.in_call;
+    const char *why = NULL;
+    uint32_t at = va, word = 0;
 
     while (va != end_va && words < 0x100000u) {
         uint32_t count, subch, method, packet_va;
@@ -558,17 +605,26 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va,
             packet_va = s_packet.packet_va;
             s_packet.active = 0;
         } else {
-            uint32_t w = *(const uint32_t *)pb_word_ptr(mem, va);
+            uint32_t w;
+            if (!pb_in_window(va)) {
+                why = "outside the contiguous window"; at = va;
+                goto stop;
+            }
+            w = *(const uint32_t *)(mem + va);
             if (s_capture.recording)
                 pb_capture_read(va, w, 0, 0, 0, in_call, return_va);
-            packet_va = pb_contiguous_va(va);
-            va = pb_advance(va);
+            packet_va = va;
+            va += 4;
             words++;
 
             if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
                 uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                                  : (w & 0x1FFFFFFCu);
-                last_control = w; last_target = pb_contiguous_va(target);
+                if (target >= XBOX_CONTIG_SIZE) {
+                    why = "jump outside the window"; at = packet_va; word = w;
+                    goto stop;
+                }
+                last_control = w; last_target = XBOX_CONTIG_BASE | target;
                 (*jumps)++;
                 va = last_target;
                 continue;
@@ -581,7 +637,11 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va,
                 continue;
             }
             if ((w & 3u) == 2u) {                    /* CALL */
-                last_control = w; last_target = pb_contiguous_va(w & 0xFFFFFFFCu);
+                if ((w & 0xFFFFFFFCu) >= XBOX_CONTIG_SIZE) {
+                    why = "call outside the window"; at = packet_va; word = w;
+                    goto stop;
+                }
+                last_control = w; last_target = XBOX_CONTIG_BASE | (w & 0xFFFFFFFCu);
                 if (!in_call) {
                     s_tot_calls++;
                     return_va = va;
@@ -613,14 +673,18 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va,
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
+                if (!pb_in_window(va)) {
+                    why = "outside the contiguous window"; at = va;
+                    goto stop;
+                }
                 if (s_exec_enabled || s_capture.recording) {
-                    uint32_t param = *(const uint32_t *)pb_word_ptr(mem, va);
+                    uint32_t param = *(const uint32_t *)(mem + va);
                     if (hitch && !i) first_param = param;
                     if (s_capture.recording)
                         pb_capture_read(va, param, m, count - i, 1, in_call, return_va);
                     if (s_exec_enabled) nv2a_pb_exec_method(subch, m, param);
                 }
-                va = pb_advance(va);
+                va += 4;
                 words++;
             }
             if (i < count) {
@@ -656,6 +720,23 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va,
             }
         }
     }
+    if (0) {
+stop:   /* Out of step: drop the method in progress and the call, run the
+         * fence release the rest may hold, and resume at PUT. Logged once
+         * per stop, the first eight times. */
+        {
+            static unsigned said;
+            uint32_t v = 0;
+            const char *fence = pb_stop_salvage(mem, at, end_va, &v);
+            s_packet.active = 0; in_call = 0;
+            s_tot_stops++;
+            if (said++ < 8)
+                fprintf(stderr, "[PB] walk stopped at 0x%08X (word 0x%08X) after %u"
+                        " words, PUT 0x%08X (%s); %s 0x%08X\n",
+                        at, word, words, end_va, why, fence, v);
+            va = end_va;
+        }
+    }
     s_fifo.pc = va; s_fifo.in_call = in_call; s_fifo.return_va = return_va;
     s_fifo.last_control = last_control; s_fifo.last_target = last_target;
     if (va != end_va && words >= 0x100000u) pb_capture_limit(words);
@@ -677,8 +758,11 @@ int nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     int completed;
     PB_HITCH trace, *hitch = NULL;
 
-    start_va = pb_contiguous_va(start_va);
-    end_va = pb_contiguous_va(end_va);
+    /* GET and PUT are bus addresses: canonicalise the published pointers
+     * (aliases above 64 MB name the same RAM). The walk's own targets and
+     * reads are not wrapped; see pb_in_window. */
+    start_va = XBOX_CONTIG_BASE | (start_va & (XBOX_CONTIG_SIZE - 1u));
+    end_va = XBOX_CONTIG_BASE | (end_va & (XBOX_CONTIG_SIZE - 1u));
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
