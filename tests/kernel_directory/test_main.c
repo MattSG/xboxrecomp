@@ -77,8 +77,6 @@ int main(void) {
     GetTempPathA(MAX_PATH,root); sprintf(path,"%sxml1-dir-test-%lu",root,GetCurrentProcessId());
     if(!CreateDirectoryA(path,NULL)) return 10;
     char child[MAX_PATH]; sprintf(child,"%s\\SaveSlot",path); CreateDirectoryA(child,NULL);
-    HANDLE h=CreateFileA(path,FILE_LIST_DIRECTORY,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,NULL);
-    if(h==INVALID_HANDLE_VALUE||(uintptr_t)h>UINT32_MAX) return 11;
     mem=VirtualAlloc(NULL,16*1024*1024,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE); if(!mem) return 12;
     g_xbox_mem_offset=(ptrdiff_t)mem;
     *(uint32_t *)(mem+0x10000)=0x800000CF;
@@ -90,6 +88,10 @@ int main(void) {
     query=recomp_lookup_kernel(*(uint32_t *)(mem+0x10000));
     close_guest=recomp_lookup_kernel(*(uint32_t *)(mem+0x10004));
     map_status=recomp_lookup_kernel(*(uint32_t *)(mem+0x10008));
+    /* The guest holds a bridge token, never a raw host HANDLE: a raw value is
+     * refused by bridge_resolve_handle. D:\ maps to the game directory, which is path. */
+    HANDLE h=guest_open();
+    if(h==INVALID_HANDLE_VALUE) return 11;
     int ok=invoke(h,"Save*",1,1);
     XBOX_FILE_DIRECTORY_INFORMATION *e=(void *)(mem+0x31000);
     if(ok && (g_eax || e->FileNameLength!=8 || memcmp(e->FileName,"SaveSlot",8) || !(e->FileAttributes&16))) {
@@ -101,8 +103,8 @@ int main(void) {
     if(ok) ok=invoke(h,"*",1,2) && g_eax==0xC0000003u;
     if(ok) ok=check_status_mapping(0x80000006u,18) && check_status_mapping(0,0)
         && check_status_mapping(0xC0000008u,6);
-    if(ok) ok=active_searches()==1 && xbox_NtClose(h)==STATUS_SUCCESS && active_searches()==0;
-    else xbox_NtClose(h);
+    if(ok) ok=active_searches()==1 && guest_close(h) && active_searches()==0;
+    else guest_close(h);
     /* Guest NtClose consumes a tagged table token, not a raw Windows handle.
      * Open through ordinal 202 so this exercises the real bridge contract. */
     for(unsigned round=0;ok && round<MAX_DIR_CONTEXTS+8;round++) {
@@ -112,14 +114,6 @@ int main(void) {
         if(!ok) fprintf(stderr,"FAIL guest open round %u: status=%08X searches=%u\n",round,g_eax,active_searches());
         ok=guest_close(h) && ok && active_searches()==0;
         if(!ok) fprintf(stderr,"FAIL guest close round %u: searches=%u\n",round,active_searches());
-    }
-    for(unsigned round=0;ok && round<MAX_DIR_CONTEXTS+8;round++) {
-        h=CreateFileA(path,FILE_LIST_DIRECTORY,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-            NULL,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,NULL);
-        if(h==INVALID_HANDLE_VALUE) {ok=0;break;}
-        ok=invoke(h,"Save*",0,1) && g_eax==0 && active_searches()==1;
-        ok=xbox_NtClose(h)==STATUS_SUCCESS && ok && active_searches()==0;
-        if(!ok) fprintf(stderr,"FAIL direct close round %u: searches=%u\n",round,active_searches());
     }
     h=guest_open();
     if(ok) ok=invoke(h,"Save*",1,1) && g_eax==0

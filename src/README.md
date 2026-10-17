@@ -93,7 +93,7 @@ These resolve Xbox virtual addresses to native function pointers. The recompiler
 #include "xbox_memory_layout.h"
 
 int main() {
-    // 1. Map Xbox 64MB address space (sections, stack, heap, mirrors)
+    // 1. Map Xbox 64MB address space (sections, stack, heap, reserved slots)
     xbox_MemoryLayoutInit(xbe_data, xbe_size);
 
     // 2. Initialize kernel thunk table (147 imports → Win32)

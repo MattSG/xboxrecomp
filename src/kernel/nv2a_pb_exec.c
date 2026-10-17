@@ -216,6 +216,22 @@ typedef struct {
 #define NV_MAX_INDICES  (1u << 20)
 #define NV_MAX_INLINE   (1u << 21)          /* dwords of INLINE_ARRAY per batch */
 
+static int exec_verbose(void);
+
+/* A batch past one of the caps above is dropped or cut short, never wrapped.
+ * Each cap logs once (by site, as a bit in `site`) and counts what it lost. */
+static uint32_t s_cap_dropped;
+static void cap_exceeded(uint32_t site, const char *what, uint32_t limit, uint32_t lost)
+{
+    static uint32_t logged;
+    s_cap_dropped += lost;
+    if (logged & site)
+        return;
+    logged |= site;
+    fprintf(stderr, "PB_EXEC: %s over the %u cap, %u dropped (counted, logged once per site)\n",
+            what, limit, lost);
+}
+
 /* Texture stage 0, decoded from what the title programmed.
  *
  * Only stage 0: it is the only one the dashboard configures, and a stage
@@ -475,6 +491,20 @@ static void note_unhandled(uint32_t method, uint32_t param)
     }
 }
 
+/* A vertex fetch outside the mapped windows is refused (the caller gets a
+ * degenerate vertex) rather than read past the array. Logged for the first
+ * few so a stale array is visible without flooding the log. */
+static void log_fetch_refused(const VertexAttr *a, uint32_t index, uint64_t at)
+{
+    static int logged;
+    if (logged >= 8)
+        return;
+    logged++;
+    fprintf(stderr, "PB_EXEC: vertex fetch refused: va=0x%llx stride=%u index=%u type=%u size=%u (%d of 8 logged)\n",
+            (unsigned long long)at, (unsigned)a->stride, (unsigned)index,
+            (unsigned)a->type, (unsigned)a->size, logged);
+}
+
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
@@ -503,8 +533,10 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
          * one there, which is why the offset test is on the other side of this
          * branch. */
         size_t at = (size_t)a->offset + (size_t)index * a->stride;
-        if (at + 4 > (size_t)s_gpu.inline_count * 4)
+        if (at + 4 > (size_t)s_gpu.inline_count * 4) {
+            log_fetch_refused(a, index, (uint64_t)at);
             return 0;
+        }
         p = (const uint8_t *)s_gpu.inline_buf + at;
     } else {
         /* Stay inside the mapped guest windows (nv2a_d3d11.c guest_ok): a
@@ -512,8 +544,10 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         uint64_t at = (uint64_t)a->offset + (uint64_t)index * a->stride, end = at + 16;
         if (!a->offset ||
             !((at >= 0x10000u && end <= 0x08000000u) ||
-              (at >= XBOX_CONTIG_BASE && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)))
+              (at >= XBOX_CONTIG_BASE && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE))) {
+            log_fetch_refused(a, index, at);
             return 0;
+        }
         p = mem + at;
     }
 
@@ -730,7 +764,7 @@ static void clear_surface(uint32_t param)
     /* Progress markers, interleaved with everything else in the log. The
      * summary says drawing stopped; only a marker next to the surrounding
      * activity says what the title was doing when it stopped. */
-    if ((s_gpu.clears % 100) == 0)
+    if ((s_gpu.clears % 100) == 0 && exec_verbose())
         fprintf(stderr, "  [GPU] clear #%u\n", s_gpu.clears);
     /* Distinct clear colours actually used. "Cleared to black" and "the clear
      * never ran" look identical in the framebuffer, and only one of them is a
@@ -854,6 +888,15 @@ static void clear_surface(uint32_t param)
  * resolve does exactly that -- its last column and last row, 1119 pixels of
  * white on a black frame, from a rounding step at the boundary.
  */
+/* NV097_SET_TEXTURE_ADDRESS per-axis modes (xemu NV_PGRAPH_TEXADDRESS0_ADDRU_*):
+ * 1 wrap, 2 mirror, 3 clamp-to-edge, 4 border, 5 clamp (GL_CLAMP). Border is
+ * resolved by sample_tex() before it gets here. Mode 5 is logged at the
+ * register write and sampled as clamp-to-edge. */
+static int tex_coord_outside(uint32_t c, uint32_t size)
+{
+    return (int32_t)c < 0 || (int32_t)c >= (int32_t)size;
+}
+
 static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
 {
     /* Coordinates are signed: a bilinear tap one texel left of or above
@@ -867,6 +910,11 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
         if (!(size & (size - 1u))) return c & (size - 1u);
         remainder = sc % n;
         return (uint32_t)(remainder < 0 ? remainder + n : remainder);
+    }
+    if (mode == 2) { /* mirror: period 2n, the odd half reflected back */
+        int32_t period = 2 * n, m = sc % period;
+        if (m < 0) m += period;
+        return (uint32_t)(m < n ? m : period - 1 - m);
     }
     return sc < 0 ? 0u : (sc >= n ? size - 1 : c);   /* clamp, and the rest */
 }
@@ -908,6 +956,13 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
 
     if (!t->valid)
         return 0;
+    /* Border mode: an outside tap reads the border colour (ARGB, same as the
+     * register) instead of a texel. */
+    if ((t->addr_u == 4 && tex_coord_outside(u, t->width)) ||
+        (t->addr_v == 4 && tex_coord_outside(v, t->height))) {
+        *argb = t->border;
+        return 1;
+    }
     u = wrap_coord(u, t->width,  t->addr_u);
     v = wrap_coord(v, t->height, t->addr_v);
 
@@ -1741,6 +1796,9 @@ static int rc_32_taps(const Texture *t, uint32_t face, int32_t u, int32_t v,
     int swizzled = t->color == 0x06u || t->color == 0x07u;
     if (!t->valid || (!swizzled && t->color != 0x12u && t->color != 0x1eu))
         return 0;
+    /* Border taps need sample_tex()'s per-tap border colour; let it take them. */
+    if (t->addr_u == 4 || t->addr_v == 4)
+        return 0;
     u0 = wrap_coord((uint32_t)u, t->width, t->addr_u);
     u1 = wrap_coord((uint32_t)(u + 1), t->width, t->addr_u);
     v0 = wrap_coord((uint32_t)v, t->height, t->addr_v);
@@ -2268,6 +2326,16 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if (T.miny < (int)s_gpu.clip_y) T.miny = (int)s_gpu.clip_y;
     if (T.maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) T.maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
     if (T.maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) T.maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (T.maxx > NV_ZBUF_W || T.maxy > NV_ZBUF_H) {
+        /* The host depth buffer is fixed at NV_ZBUF_W x NV_ZBUF_H, so pixels
+         * past it are not drawn in the software path. Logged once. */
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "PB_EXEC: software raster clipped to the %dx%d depth buffer (target %dx%d)\n",
+                    NV_ZBUF_W, NV_ZBUF_H, (int)(s_gpu.clip_x + s_gpu.clip_w), (int)(s_gpu.clip_y + s_gpu.clip_h));
+        }
+    }
     if (T.maxx > NV_ZBUF_W) T.maxx = NV_ZBUF_W;
     if (T.maxy > NV_ZBUF_H) T.maxy = NV_ZBUF_H;
     if (T.minx >= T.maxx || T.miny >= T.maxy) {
@@ -2906,7 +2974,7 @@ static void raster_batch_impl(void)
         break;                             /* points and lines: not yet */
     }
 
-    if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
+    if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0 && exec_verbose())
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
 
     /* Capture the surface while the geometry is still on it.
@@ -3212,6 +3280,8 @@ static void draw_inline_array(void)
         goto out;
 
     count = (s_gpu.inline_count * 4) / vsize;
+    if (count > NV_MAX_INDICES)
+        cap_exceeded(1, "INLINE_ARRAY vertex count", NV_MAX_INDICES, count);
     if (count < prim_min_vertices() || count > NV_MAX_INDICES)
         goto out;
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
@@ -3267,6 +3337,9 @@ static void draw_immediate(void)
         s_gpu.attr[i].stride = IMM_VERTEX_DWORDS * 4;
     }
 
+    if (s_gpu.imm_count > NV_MAX_INDICES)
+        cap_exceeded(2, "immediate-mode vertex count", NV_MAX_INDICES,
+                     s_gpu.imm_count - NV_MAX_INDICES);
     for (i = 0; i < s_gpu.imm_count && i < NV_MAX_INDICES; i++)
         s_gpu.idx[i] = i;
     s_gpu.idx_count = i;
@@ -3288,8 +3361,12 @@ static void imm_emit_vertex(void)
 {
     uint32_t at = s_gpu.imm_count * IMM_VERTEX_DWORDS;
 
-    if (!s_gpu.prim || at + IMM_VERTEX_DWORDS > NV_MAX_INLINE)
+    if (!s_gpu.prim)
         return;
+    if (at + IMM_VERTEX_DWORDS > NV_MAX_INLINE) {
+        cap_exceeded(4, "immediate-mode payload (dwords)", NV_MAX_INLINE, IMM_VERTEX_DWORDS);
+        return;
+    }
     memcpy(&s_gpu.inline_buf[at], s_gpu.imm_attr, sizeof s_gpu.imm_attr);
     s_gpu.imm_count++;
 }
@@ -3441,10 +3518,17 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case 0x1B3C: memcpy(&t->bump_offset, &param, 4); break;
     case NV097_SET_TEXTURE_ADDRESS:
         t->address_raw = param;
-        /* Four bits per axis. 1 is wrap, 3 clamp-to-edge; mirror and border
-         * fall back to clamp, wrong at an edge rather than everywhere. */
+        /* Four bits per axis: 1 wrap, 2 mirror, 3 clamp-to-edge, 4 border. */
         t->addr_u =  param        & 0xF;
         t->addr_v = (param >>  8) & 0xF;
+        if (t->addr_u == 0 || t->addr_u > 4 || t->addr_v == 0 || t->addr_v > 4) {
+            static int logged;
+            if (logged < 4) {
+                logged++;
+                fprintf(stderr, "PB_EXEC: texture %d address mode u=%u v=%u not implemented (clamp)\n",
+                        stage, t->addr_u, t->addr_v);
+            }
+        }
         break;
     case NV097_SET_TEXTURE_CONTROL1:
         t->pitch = param >> 16;          /* linear formats only */
@@ -3703,8 +3787,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_INLINE_ARRAY:
         /* Vertex data, not a pointer to it. Buffered rather than decoded here
          * because the format is only fully known at END. */
-        if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
-            s_gpu.inline_buf[s_gpu.inline_count++] = param;
+        if (s_gpu.prim) {
+            if (s_gpu.inline_count < NV_MAX_INLINE)
+                s_gpu.inline_buf[s_gpu.inline_count++] = param;
+            else
+                cap_exceeded(8, "INLINE_ARRAY payload (dwords)", NV_MAX_INLINE, 1);
+        }
         break;
 
     case NV097_DRAW_ARRAYS: {
@@ -3724,14 +3812,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             break;
         for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
             s_gpu.idx[s_gpu.idx_count++] = start + i;
+        if (i < count)
+            cap_exceeded(16, "DRAW_ARRAYS indices", NV_MAX_INDICES, count - i);
         break;
     }
 
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
-        if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
+        if (!s_gpu.prim)
+            break;
+        if (s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
             s_gpu.idx[s_gpu.idx_count++] = param & 0xFFFF;
             s_gpu.idx[s_gpu.idx_count++] = param >> 16;
+        } else {
+            cap_exceeded(32, "ARRAY_ELEMENT16 indices", NV_MAX_INDICES, 2);
         }
         break;
 
@@ -3872,8 +3966,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x1E74: s_gpu.dot_rgb_mapping = param; break;
     case 0x1E78: s_gpu.other_stage_input = param; break;
     case 0x1808:                                  /* ARRAY_ELEMENT32 */
-        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
+        if (!s_gpu.prim)
+            break;
+        if (s_gpu.idx_count < NV_MAX_INDICES)
             s_gpu.idx[s_gpu.idx_count++] = param;
+        else
+            cap_exceeded(64, "ARRAY_ELEMENT32 indices", NV_MAX_INDICES, 1);
         break;
 
     /* Depth. */

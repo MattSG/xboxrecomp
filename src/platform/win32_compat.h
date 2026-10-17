@@ -66,6 +66,8 @@ extern "C" {
 #define PAGE_EXECUTE           0x10u
 #define PAGE_EXECUTE_READ      0x20u
 #define PAGE_EXECUTE_READWRITE 0x40u
+#define PAGE_EXECUTE_WRITECOPY 0x80u
+#define PAGE_GUARD            0x100u
 
 /* Code-page ids accepted by MultiByteToWideChar (only UTF8/ACP are honoured) */
 #define CP_ACP    0u
@@ -387,6 +389,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_INVALID_PARAMETER       87u
 #define ERROR_CALL_NOT_IMPLEMENTED    120u
 #define ERROR_INSUFFICIENT_BUFFER     122u
+#define ERROR_BUFFER_OVERFLOW         111u
 #define ERROR_ALREADY_EXISTS          183u
 #define ERROR_MORE_DATA               234u
 #define ERROR_NOT_OWNER               288u
@@ -495,8 +498,9 @@ typedef struct _MEMORYSTATUSEX {
     ULONGLONG ullAvailExtendedVirtual;
 } MEMORYSTATUSEX, *LPMEMORYSTATUSEX;
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX buffer);
+BOOL GetComputerNameA(LPSTR buffer, LPDWORD size);
 
-/* ---- File mapping (memfd-backed; gives true aliased mirror views) ----- */
+/* ---- File mapping (memfd-backed; the RAM view is mapped into a reserved span) */
 #define FILE_MAP_COPY        0x00000001u
 #define FILE_MAP_WRITE       0x00000002u
 #define FILE_MAP_READ        0x00000004u

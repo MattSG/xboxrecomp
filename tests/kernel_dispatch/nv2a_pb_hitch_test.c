@@ -277,8 +277,7 @@ int main(int argc, char **argv)
 
     /* PUT bounds the actual FIFO even within a CALL. Its payload and saved
      * return address survive publication; the caller then jumps around the
-     * list instead of decoding that list a second time. Address aliases are
-     * canonicalized before continuation matching. */
+     * list instead of decoding that list a second time. */
     {
         uint32_t *caller = (uint32_t *)(memory + 0x5000);
         uint32_t *list = (uint32_t *)(memory + 0x5200);
@@ -294,8 +293,15 @@ int main(int argc, char **argv)
         CHECK(nv2a_pb_scan(XBOX_CONTIG_BASE + 0x5000, XBOX_CONTIG_BASE + 0x5208));
         CHECK(command_count == 1 && commands[0].param == 0x00020000);
         CHECK(s_fifo.in_call && s_packet.active && s_packet.remaining == 2);
+        /* Above the window is refused, not folded back onto 0x5208: nothing
+         * runs and the saved call and packet are untouched. */
         CHECK(nv2a_pb_scan(XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE + 0x5208,
                            XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE + 0x5308));
+        CHECK(command_count == 1);
+        CHECK(s_fifo.in_call && s_packet.active && s_packet.remaining == 2);
+        CHECK(nv2a_pb_scan(XBOX_CONTIG_BASE + 0x5208, XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE + 0x10));
+        CHECK(command_count == 1 && s_fifo.in_call && s_packet.active);
+        CHECK(nv2a_pb_scan(XBOX_CONTIG_BASE + 0x5208, XBOX_CONTIG_BASE + 0x5308));
         CHECK(command_count == 4 && !s_fifo.in_call && !s_packet.active);
         for (unsigned i = 0; i < 3; ++i)
             CHECK(commands[i].method == 0x1720 + i * 4 && commands[i].param == saved[i + 1]);
@@ -445,7 +451,7 @@ int main(int argc, char **argv)
                 CHECK(!remove(path));
             }
         }
-        CHECK(nv2a_pb_scan(start + XBOX_CONTIG_SIZE, old_end + 8));
+        CHECK(nv2a_pb_scan(start, old_end + 8));
         CHECK(command_count == 4 && !s_packet.active && !s_fifo.active);
         CHECK(commands[0].method == 0x1720 && commands[0].param == 11);
         CHECK(commands[1].method == 0x1724 && commands[1].param == 22);

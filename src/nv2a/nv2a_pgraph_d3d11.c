@@ -444,9 +444,14 @@ static void submit_draw(void)
     g_pg.stats.draw_calls++;
     g_pg.stats.vertices_submitted += num_verts;
 
-    if (g_pg.stats.draw_calls <= 5 || (g_pg.stats.draw_calls % 1000) == 0) {
-        fprintf(stderr, "[PGRAPH-D3D11] Draw #%u: %u verts, prim=%d, prims=%u\n",
-                g_pg.stats.draw_calls, num_verts, g_pg.d3d_prim_type, prim_count);
+    {
+        /* Draw log behind the executor's verbose flag, read once. */
+        static int verbose = -1;
+        if (verbose < 0) verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+        if (verbose && (g_pg.stats.draw_calls <= 5 || (g_pg.stats.draw_calls % 1000) == 0)) {
+            fprintf(stderr, "[PGRAPH-D3D11] Draw #%u: %u verts, prim=%d, prims=%u\n",
+                    g_pg.stats.draw_calls, num_verts, g_pg.d3d_prim_type, prim_count);
+        }
     }
 }
 

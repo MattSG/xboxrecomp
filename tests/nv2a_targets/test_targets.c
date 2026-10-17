@@ -8,6 +8,8 @@ HWND xbox_FramebufferWindowHandle(void) { return NULL; }
 int xbox_FramebufferScanSource(uint32_t *va, uint32_t *pitch) { return 0; }
 int xbox_FramebufferOverlay(XboxOverlay *ovl) { return 0; }
 void xbox_FramebufferNoteFlip(uint32_t draws) {}
+int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp, uint32_t *w, uint32_t *h) { (void)pitch; (void)bpp; (void)w; (void)h; return 0; }
+void xbox_FramebufferRenderHostOverlay(void *device, void *context, void *target) {}
 const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4] { return NULL; }
 const float (*nv2a_vsh_constants(uint32_t *version))[4] { return NULL; }
 
@@ -412,6 +414,26 @@ int main(int argc, char **argv)
             ID3D11ShaderResourceView_Release(view);
         }
         puts("PASS: colour/depth Y16 aliases retain GPU values and depth precedence");
+    }
+    {
+        /* Targets that cannot bind are refused and counted, never silently dropped. */
+        NvD3DState bad = {0};
+        Surface *none_s;
+        Depth *none_d;
+        uint32_t none_w, none_h;
+        unsigned before = s_target_refusals;
+        bad.color_pitch = 64 * 4; bad.surface_format = 0x28;
+        bad.clip_w = bad.clip_h = 64;
+        bad.color_addr = 0x07FFF000; /* 64 x 64 x 4 runs past the guest window */
+        CHECK(!bind_targets(&bad, 0, &none_s, &none_d, &none_w, &none_h));
+        CHECK(s_target_refusals == before + 1);
+        bad.color_addr = 0x10000; bad.surface_format = 0x00; /* no colour bpp */
+        CHECK(!bind_targets(&bad, 0, &none_s, &none_d, &none_w, &none_h));
+        CHECK(s_target_refusals == before + 2);
+        bad.surface_format = 0x28; bad.clip_w = 5000;
+        CHECK(!bind_targets(&bad, 0, &none_s, &none_d, &none_w, &none_h));
+        CHECK(s_target_refusals == before + 3);
+        puts("PASS: unbindable colour targets are refused and counted");
     }
     return 0;
 }

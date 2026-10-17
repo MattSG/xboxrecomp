@@ -50,8 +50,17 @@ HWND xbox_FramebufferWindowHandle(void) { return NULL; }
 int xbox_FramebufferScanSource(uint32_t *va, uint32_t *pitch) { return 0; }
 int xbox_FramebufferOverlay(XboxOverlay *ovl) { return 0; }
 void xbox_FramebufferNoteFlip(uint32_t draws) {}
+void xbox_FramebufferRenderHostOverlay(void *device, void *context, void *target) {}
 const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4] { return NULL; }
 const float (*nv2a_vsh_constants(uint32_t *version))[4] { return NULL; }
+/* kernel_hal.c is compiled in for the real AvSetDisplayMode; these are the
+ * runtime globals and logger it needs, which this renderer harness does not run. */
+__declspec(thread) uint32_t g_esp, g_fs_base;
+ptrdiff_t g_xbox_mem_offset;
+void xbox_log(int level, const char *subsystem, const char *fmt, ...) { (void)level; (void)subsystem; (void)fmt; }
+void __stdcall xbox_AvSetDisplayMode(void *register_base, unsigned long step, unsigned long mode,
+                                     unsigned long format, unsigned long pitch, unsigned long framebuffer);
+int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp, uint32_t *w, uint32_t *h);
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
@@ -156,6 +165,72 @@ static int test_mip_retry(void)
     return 0;
 }
 
+/* Refused guest textures must stay refused and be counted, not vanish. */
+static int test_refusals(void)
+{
+    NvD3DTexture texture = {0};
+    size_t count = s_tex_refusals;
+    ID3D11ShaderResourceView *view;
+    texture.addr = 0x07FFF000; /* 64 x 64 x 4 runs past the 128 MB guest window */
+    texture.color = 0x12;
+    texture.format = 0x00011200;
+    texture.width = texture.height = 64; texture.pitch = 256; texture.levels = 1;
+    CHECK(texture_get(&texture) == NULL);
+    CHECK(s_tex_refusals == count + 1);
+    texture.addr = 0x20000;
+    texture.color = 0x7F; /* not a format tex_format knows */
+    CHECK(texture_get(&texture) == NULL);
+    CHECK(s_tex_refusals == count + 2);
+    texture.color = 0x12; texture.width = 8192; texture.height = 4;
+    CHECK(texture_get(&texture) == NULL);
+    CHECK(s_tex_refusals == count + 3);
+    /* A palette outside guest RAM refuses the texture: I8 must not decode
+     * against a made-up greyscale ramp. */
+    memset(&texture, 0, sizeof texture);
+    texture.addr = 0x20000;
+    texture.color = 0x0B; texture.format = 0x0B00;
+    texture.width = texture.height = 4; texture.levels = 1;
+    texture.palette = 0x7FFFF000; texture.palette_len = 256;
+    memset(ram + texture.addr, 1, 16);
+    view = texture_get(&texture);
+    CHECK(view == NULL);
+    CHECK(s_tex_refusals == count + 4);
+    /* A paletted texture whose palette register was never written has no
+     * colours either: refuse it, do not decode a greyscale ramp. */
+    memset(&texture, 0, sizeof texture);
+    texture.addr = 0x20000;
+    texture.color = 0x0B; texture.format = 0x0B00;
+    texture.width = texture.height = 4; texture.levels = 1;
+    texture.palette = 0; texture.palette_len = 256;
+    view = texture_get(&texture);
+    CHECK(view == NULL);
+    CHECK(s_tex_refusals == count + 5);
+    puts("PASS: refused guest textures are counted; a missing or unreadable palette refuses the texture");
+    return 0;
+}
+
+/* A flip with no surface at its address is sized from the mode the title gave
+ * AvSetDisplayMode, and only guessed (640 wide) when there is no such mode or
+ * its pitch does not match the flip. */
+static int test_scanout_size(void)
+{
+    Surface *s;
+    uint32_t pitch = 0, bpp = 0, w = 0, h = 0;
+    CHECK(!xbox_GetDisplayMode(&pitch, &bpp, &w, &h));
+    s = scan_surface(0x20000, 2560);      /* no mode yet: guessed 640x480 */
+    CHECK(s && s->w == 640 && s->h == 480);
+    xbox_AvSetDisplayMode(NULL, 0, 0x00400104, 0x1E, 4096, 0x03000000); /* NTSC, X8R8G8B8, 1024 wide */
+    s = scan_surface(0x30000, 4096);
+    CHECK(s && s->w == 1024 && s->h == 480);
+    xbox_AvSetDisplayMode(NULL, 0, 0x00800304, 0x11, 1280, 0x03000000); /* PAL, R5G6B5, 640 wide */
+    s = scan_surface(0x40000, 1280);
+    CHECK(s && s->w == 640 && s->h == 576);
+    s = scan_surface(0x50000, 2560);      /* pitch differs from the recorded mode: guessed again */
+    CHECK(s && s->w == 640 && s->h == 480);
+    puts("PASS: a flip without a surface is sized from the recorded AvSetDisplayMode, guessed only without one");
+    return 0;
+}
+
 static int test_palette_identity(void)
 {
     NvD3DTexture texture = {0};
@@ -177,6 +252,30 @@ static int test_palette_identity(void)
     texture.palette_len = 32;
     CHECK(texture_get(&texture) == short_view);
     puts("PASS: independently changed palette length cannot bypass cache validation");
+    return 0;
+}
+
+/* An I8 index past PALETTE_LENGTH is outside the validated and hashed palette
+ * span, so it must not read the guest word beyond it (the sentinel). */
+static int test_palette_bounds(void)
+{
+    NvD3DTexture texture = {0};
+    ID3D11ShaderResourceView *view;
+    uint32_t *palette = (uint32_t *)(ram + 0x41000);
+    texture.addr = 0x40000;
+    texture.color = 0x0B; texture.format = 0x02210B00;
+    texture.width = texture.height = 4; texture.levels = 1;
+    texture.palette = 0x41000; texture.palette_len = 32;
+    palette[31] = 0xFF00FF00u;         /* last entry in the palette */
+    palette[200] = 0xFFCAFE00u;        /* sentinel: beyond palette_len */
+    memset(ram + texture.addr, 31, 16);
+    view = texture_get(&texture);
+    CHECK(view && read_mip(view, 0) == 0xFF00FF00u);
+    memset(ram + texture.addr, 200, 16);
+    nv2a_d3d_kick();                   /* the guest may rewrite memory only between kicks */
+    view = texture_get(&texture);
+    CHECK(view && read_mip(view, 0) == 0u);
+    puts("PASS: an I8 index past palette_len decodes transparent black, never the word beyond the palette");
     return 0;
 }
 
@@ -225,7 +324,7 @@ static int test_decode_equivalence(void)
                                                            x, y, w, &expected));
                             else {
                                 uint32_t address = swizzle_offset(x, y, w, h);
-                                expected = texel(texture.color, data + offset + address * 4, NULL);
+                                expected = texel(texture.color, data + offset + address * 4, NULL, 0);
                             }
                             CHECK(decoded[y * w + x] == expected);
                         }
@@ -256,7 +355,7 @@ static void decode_before(const NvD3DTexture *t, const TexLayout *L, const uint8
         for (y = 0; y < h; y++) {
             uint32_t ox = 0, *dst = out + (size_t)y * w;
             for (x = 0; x < w; x++) {
-                dst[x] = texel(t->color, src + (size_t)(oy + ox) * L->bpp, pal);
+                dst[x] = texel(t->color, src + (size_t)(oy + ox) * L->bpp, pal, t->palette_len);
                 ox = (ox - mx) & mx;
             }
             oy = (oy - my) & my;
@@ -330,7 +429,8 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "benchmark_decode")) return benchmark_decode();
     if (!strcmp(argv[1], "mip_inplace")) return test_mip_inplace();
     if (!strcmp(argv[1], "benchmark_mip_cpu")) return benchmark_mip_cpu();
-    ram = calloc(1, (!strcmp(argv[1], "benchmark_native_bc") || !strcmp(argv[1], "benchmark_mip_upload")) ? 0x1000000 : 0x100000);
+    ram = calloc(1, (!strcmp(argv[1], "benchmark_native_bc") || !strcmp(argv[1], "benchmark_mip_upload") ||
+                     !strcmp(argv[1], "scanout_size")) ? 0x1000000 : 0x100000); /* a 1024x480 scanout is 2 MB */
     CHECK(ram);
     _putenv_s("RECOMP_MSAA", "1");
     _putenv_s("RECOMP_RENDER_SCALE", "1");
@@ -339,7 +439,10 @@ int main(int argc, char **argv)
     CHECK(nv2a_d3d_init());
     if (!strcmp(argv[1], "srv_retry")) return test_srv_retry();
     if (!strcmp(argv[1], "mip_retry")) return test_mip_retry();
+    if (!strcmp(argv[1], "refusals")) return test_refusals();
+    if (!strcmp(argv[1], "scanout_size")) return test_scanout_size();
     if (!strcmp(argv[1], "palette_identity")) return test_palette_identity();
+    if (!strcmp(argv[1], "palette_bounds")) return test_palette_bounds();
     if (!strcmp(argv[1], "native_bc")) return test_native_bc();
     if (!strcmp(argv[1], "mip_chain")) return test_mip_chain();
     if (!strcmp(argv[1], "benchmark_mip_upload")) return benchmark_mip_upload();

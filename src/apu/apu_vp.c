@@ -633,13 +633,28 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
  * SGE data pointer resolution
  * ============================================================ */
 
-static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
+/* The VP has no SGE length register (NV_PAPU only has VPSGEADDR), so the only
+ * bound a caller can give is the largest page index a 32-bit linear address
+ * reaches. */
+#define VP_SGE_MAX_ENTRY (UINT32_MAX / TARGET_PAGE_SIZE)
+
+/* False, with the access refused, when the page index is past max_sge. */
+static bool get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr,
+                         hwaddr *out)
 {
     unsigned int entry = addr / TARGET_PAGE_SIZE;
-    assert(entry <= max_sge);
+    if (entry > max_sge) {
+        static volatile LONG bad_entry_count;
+        LONG n = InterlockedIncrement(&bad_entry_count);
+        if (n <= 8)
+            fprintf(stderr, "[APU] VP SGE index %u past max %u (linear 0x%08X, sge 0x%llX); access refused\n",
+                    entry, max_sge, addr, (unsigned long long)sge_base);
+        return false;
+    }
     uint32_t prd_address =
         ldl_le_phys(address_space_memory, sge_base + entry * 4 * 2);
-    return prd_address + addr % TARGET_PAGE_SIZE;
+    *out = prd_address + addr % TARGET_PAGE_SIZE;
+    return true;
 }
 
 /* ============================================================
@@ -927,10 +942,13 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     linear_addr += ba;
                     for (unsigned int word_index = 0;
                          word_index < (9 * samples_per_block); word_index++) {
-                        hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
-                                                   0xFFFFFFFF, linear_addr);
-                        adpcm_block[word_index] =
-                            ldl_le_phys(address_space_memory, addr);
+                        hwaddr addr;
+                        if (get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                         VP_SGE_MAX_ENTRY, linear_addr, &addr))
+                            adpcm_block[word_index] =
+                                ldl_le_phys(address_space_memory, addr);
+                        else
+                            adpcm_block[word_index] = 0;
                         linear_addr += 4;
                     }
                 }
@@ -946,18 +964,24 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     adpcm_decoded[block_position * channels + 1]);
             }
         } else {
-            hwaddr addr;
+            hwaddr addr = 0;
+            bool addr_ok = true;
             if (stream) {
                 addr = segment_offset + cbo * block_size;
             } else {
                 uint32_t linear_addr = ba + cbo * (uint32_t)block_size;
-                addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
-                                    linear_addr);
+                addr_ok = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                       VP_SGE_MAX_ENTRY, linear_addr, &addr);
             }
 
             for (unsigned int channel = 0; channel < channels; channel++) {
                 uint32_t ival;
                 float fval;
+                if (!addr_ok) {
+                    /* Refused: this sample is silence. */
+                    samples[sample_count][channel] = 0.0f;
+                    continue;
+                }
                 switch (sample_size) {
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
                     ival = ldub_phys(address_space_memory, addr);

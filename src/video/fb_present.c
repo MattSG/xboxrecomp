@@ -181,7 +181,21 @@ static void pvideo_poll(void)
         uint8_t *snapshot;
         size_t available;
         if (!(regs[NV_PVIDEO_BUFFER / 4] & (1u << (bank * 4u)))) continue;
-        if (!bytes || physical + bytes > 0x04000000u) continue;
+        if (!bytes) continue;
+        if (physical + bytes > 0x04000000u) {
+            /* Retail Xbox RAM is 64 MB, so this bank cannot be a real scanout.
+             * Skip it, but say so once rather than silently. */
+            static int range_logged;
+            if (!range_logged) {
+                range_logged = 1;
+                fprintf(stderr, "[PVIDEO_RANGE] bank=%u base=%08X offset=%08X pitch=%u height=%u physical=%llX outside 64MB, skipped\n",
+                        bank, regs[(NV_PVIDEO_BASE + bank * 4) / 4],
+                        regs[(NV_PVIDEO_OFFSET + bank * 4) / 4], pitch, height,
+                        (unsigned long long)physical);
+                fflush(stderr);
+            }
+            continue;
+        }
         va = (uintptr_t)(0x80000000u + (uint32_t)physical) +
              (uintptr_t)xbox_GetMemoryOffset();
         if (!VirtualQuery((const void *)va, &mapping, sizeof(mapping)) ||

@@ -67,6 +67,15 @@ extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 extern ptrdiff_t g_xbox_mem_offset;
 
+/* Object handles and unsupported-code notes, defined in kernel_io.c. They are
+ * declared here, not in kernel.h, because they are used by this file alone. */
+extern NTSTATUS xbox_OpenSymbolicLink(const char* name, HANDLE* out);
+extern const char* xbox_SymbolicLinkHandleTarget(HANDLE h);
+extern NTSTATUS xbox_CreateDirectoryHandle(const char* name, HANDLE* out);
+extern int xbox_IsObjectHandle(HANDLE h);
+extern int xbox_CloseObjectHandle(HANDLE h);
+extern void xbox_NoteUnsupportedIoctl(const char* what, ULONG code);
+
 /* Dispatch table lookup (for function pointer args) */
 typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t xbox_va);
@@ -389,6 +398,31 @@ static void kernel_data_init(void)
 /* Ordinal for each slot (read from Xbox memory during init) */
 static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
+/* Calls per slot that had no bridge and returned 0. The first call per slot is
+ * logged where it happens; the totals are printed once, at exit, so the list of
+ * kernel functions a run touched is in one place. ExitProcess skips atexit, so
+ * HalReturnToFirmware prints it too. */
+static volatile LONGLONG g_unbridged_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
+static int g_unbridged_registered;
+
+static void bridge_unbridged_report(void)
+{
+    int slot, any = 0;
+    for (slot = 0; slot < XBOX_KERNEL_THUNK_TABLE_SIZE; slot++) {
+        LONGLONG n = InterlockedCompareExchange64(&g_unbridged_calls[slot], 0, 0);
+        if (!n)
+            continue;
+        if (!any) {
+            fprintf(stderr, "  [KERNEL] ordinals with no bridge (each returned 0):\n");
+            any = 1;
+        }
+        fprintf(stderr, "  [KERNEL]   ordinal %u (slot %d) x%lld\n",
+                g_slot_ordinals[slot], slot, (long long)n);
+    }
+    if (any)
+        fflush(stderr);
+}
+
 /* Kernel diagnostics are configured before guest threads start. In normal
  * play, stop counting once the boot trace budget is exhausted: clock polling
  * alone can dispatch tens of millions of calls, and neither shared counters
@@ -643,9 +677,15 @@ static void bridge_PsCreateSystemThreadEx(void)
             g_thread_call_count, start_routine, start_context1, start_context2);
     fflush(stderr);
 
-    /* Write a fake handle to the output pointer */
+    /* Default handle: 0xBEEF0001, an untagged sentinel. It is replaced below
+     * by a real table token when a worker is spawned on its own host thread.
+     * It stays for the threads that run inline (the main thread, and workers
+     * when no stack is free or RECOMP_WORKERS=inline). Those have no host
+     * thread object, so there is no real handle to give; the value is safe
+     * because bridge_resolve_handle passes it through unchanged and Win32
+     * rejects it, so a wait on it fails at once instead of hanging. */
     if (xbox_handle_ptr) {
-        BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0001;  /* fake handle */
+        BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0001u;
     }
 
     /* Call the start routine synchronously through the recomp dispatch.
@@ -760,8 +800,10 @@ static void bridge_NtClose(void)
 
     bridge_forget_async_handle(raw_handle);
 
-    /* Close real handles but skip fake/synthetic ones */
-    if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
+    /* Object handles (links, directories) release their own slot and have no
+     * host object to close. Everything else is a table token or a sentinel,
+     * and bridge_take_handle returns NULL for those. */
+    if (raw_handle && !xbox_CloseObjectHandle((HANDLE)(uintptr_t)raw_handle)) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE)
             xbox_NtClose(h);
@@ -903,6 +945,32 @@ static void bridge_MmFreeContiguousMemory(void)
     g_eax = 0;
 }
 
+/* A base at or above the mapped range is not memory the guest owns. The slots
+ * above the map are reserved and never mapped, so an access there faults
+ * rather than reading RAM. Returns 0 to carry on, or the status to refuse with.
+ *
+ * - A reservation is placed by the allocator, not at the requested base; the
+ *   write-back reports where it went. The allocator's arena lies inside the
+ *   mapped range, so the grant is backed and it carries on.
+ * - A commit claims the pages at base, and nothing above the map is backed: no
+ *   reservation can cover it, because xbox_ReserveAlloc stops at the map top.
+ *   Refused, so no title is told it owns pages that fault. */
+static uint32_t bridge_check_above_map(uint32_t base, uint32_t size,
+                                       uint32_t alloc_type, uint32_t map_size)
+{
+    static unsigned refused;
+
+    if (alloc_type & 0x2000)
+        return 0;
+    if (refused++ < 8)
+        fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: commit at 0x%08X (size %u, "
+                        "type 0x%X) is above the %u MB mapping and no reservation backs "
+                        "it; refusing (STATUS_CONFLICTING_ADDRESSES)\n",
+                base, size, alloc_type, (unsigned)(map_size / (1024 * 1024)));
+    fflush(stderr);
+    return (uint32_t)STATUS_CONFLICTING_ADDRESSES;
+}
+
 /* ── NtAllocateVirtualMemory (ordinal 184) ────────────────
  * NTSTATUS NtAllocateVirtualMemory(PVOID *BaseAddress, ULONG ZeroBits,
  *     PULONG AllocationSize, ULONG AllocationType, ULONG Protect)
@@ -926,7 +994,7 @@ static void bridge_NtAllocateVirtualMemory(void)
         fflush(stderr);
     }
 
-    /* RECOMP_EXT_VMA: a request for a specific address above the RAM mirrors
+    /* RECOMP_EXT_VMA: a request for a specific address above the slots
      * gets exactly that address, or a failure the caller can act on. The heap
      * path below never honours a base; it substitutes whatever its cursor is
      * at, which breaks any title that checks what it got against what it asked
@@ -968,36 +1036,22 @@ static void bridge_NtAllocateVirtualMemory(void)
      * so MEM_COMMIT on an already-reserved region is a no-op.
      * Only allocate new memory when MEM_RESERVE is requested.
      */
-    /* An address above physical RAM is not free memory -- it aliases.
-     *
-     * The runtime maps 64 MB and then mirrors it at 64 MB intervals,
-     * because real Xbox RAM wraps on a 26-bit address bus. So a guest that
-     * sub-allocates past the top of RAM does not get fresh pages, it gets
-     * low memory that something else already owns, and the two quietly
-     * share storage. Half-Life 2 put a CUtlRBTree element array at
-     * 0x0CB80000, which aliases 0x00B80000; other regions it took land
-     * inside the live heap (0x05B80000 -> 0x01B80000).
-     *
-     * Real hardware wraps *physical* addresses while translating virtual
-     * ones, so this never happens there. Modelling every guest address as
-     * physical is the gap, and that is a bigger change than a bridge fix.
-     * Until then, say so: silent aliasing surfaces as corrupted data
-     * structures far from here, which is the worst way to find it.
-     */
-    if (base_hint >= (g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram)) {
-        static unsigned warned;
-        if (warned++ < 8)
-            fprintf(stderr,
-                    "  [KERNEL] WARNING: allocation at 0x%08X is above "
-                    "%u MB mapped; it aliases 0x%08X\n",
-                    base_hint,
-                    (unsigned)((g_xbox_map_size ? g_xbox_map_size
-                                                : g_xbox_total_ram)
-                               / (1024 * 1024)),
-                    (uint32_t)(base_hint % (g_xbox_map_size
-                                            ? g_xbox_map_size
-                                            : g_xbox_total_ram)));
-        fflush(stderr);
+    /* An address above the mapped range is not free memory. The slots above
+     * the map are reserved and never mapped (xbox_memory_layout.c), so a guest
+     * access there faults; it does not alias low RAM. A commit there would
+     * claim pages nobody reserved, so it is refused. A reservation there is
+     * placed by the allocator below, and the write-back reports the address. */
+    {
+        uint32_t map_size = (uint32_t)(g_xbox_map_size ? g_xbox_map_size
+                                                       : g_xbox_total_ram);
+        if (base_hint >= map_size) {
+            uint32_t refused = bridge_check_above_map(base_hint, size,
+                                                      alloc_type, map_size);
+            if (refused) {
+                g_eax = refused;
+                return;
+            }
+        }
     }
 
     if (base_hint != 0 && (alloc_type & 0x2000) == 0) {
@@ -1026,15 +1080,15 @@ static void bridge_NtAllocateVirtualMemory(void)
      * main -- on a console with 64 MB, asking for 128 MB is normal, not an
      * error.
      *
-     * So a reserve that does not fit is clamped to what the heap can actually
-     * back, and the caller is told the real size through the IN/OUT RegionSize
-     * parameter, which is where the API already reports the rounded figure.
+     * So a reserve that does not fit is refused with STATUS_NO_MEMORY, once the
+     * space above RAM has been tried too. Handing back a smaller block with a
+     * success status is not a substitute: the title sub-allocates across the
+     * range it was granted, and the part it was never given is memory it does not own (5362bc3).
      *
      * ponytail: the honest fix is a reserve that costs nothing and a commit
      * that backs pages on demand, which needs the allocator to separate the
-     * two. This clamp is enough for a title that reserves generously and
-     * commits little, and it fails loudly and later rather than silently and
-     * at startup if one does not. */
+     * two. Until then a reserve that does not fit fails at the call that asked
+     * for it. */
     /* A large pure reservation goes above RAM first. Taken from the heap it
      * consumes physical page numbers below 64 MB that the contiguous window
      * shares: a large reservation can push the heap
@@ -1052,9 +1106,9 @@ static void bridge_NtAllocateVirtualMemory(void)
          * Clamping instead -- handing back a fraction of what was asked for --
          * is what broke Half-Life 2. It reserves 128 MB and then 200 MB, got
          * 32 MB and 12.5 MB, and then sub-allocated across the range it
-         * believed it owned. That walks past the top of RAM, where the mirrors
-         * alias low memory, so its containers quietly shared storage with the
-         * live heap. Granting the full range is both more honest and less
+         * believed it owned. That walks past the end of what it was granted,
+         * into memory the allocator may have given to something else, so its
+         * containers quietly shared storage with it. Granting the full range is both more honest and less
          * damaging. Returns 0 unless the title asked for a mapping larger than
          * RAM, so nothing changes for titles that did not. */
         xbox_va = xbox_ReserveAlloc(size, 4096);
@@ -1064,21 +1118,14 @@ static void bridge_NtAllocateVirtualMemory(void)
             fflush(stderr);
         }
     }
-    if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
-        uint32_t want = size;
-        while (want > 0x10000 && !xbox_va) {
-            want /= 2;
-            xbox_va = xbox_HeapAlloc(want, 4096);
-        }
-        if (xbox_va) {
-            fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: reserve of %u "
-                            "clamped to %u (heap cannot back the full range)\n",
-                    size, want);
-            fflush(stderr);
-            size = want;
-        }
-    }
     if (!xbox_va) {
+        static unsigned refused;
+        if (refused++ < 8)
+            fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: %u bytes "
+                            "(type 0x%X) refused, neither the heap nor the space "
+                            "above RAM can back it (STATUS_NO_MEMORY)\n",
+                    size, alloc_type);
+        fflush(stderr);
         g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
         return;
     }
@@ -1444,6 +1491,7 @@ static void bridge_HalReturnToFirmware(void)
      * boot is exactly the one whose targets are worth having. No-op unless
      * RECOMP_ICALL_FEEDBACK is on. */
     RECOMP_ICALL_FEEDBACK_DUMP();
+    bridge_unbridged_report();
 
     /* Let a host-played FMV finish before the process goes away.
      *
@@ -1642,8 +1690,8 @@ static void bridge_KeSetEvent(void)
     h = ke_shadow_lookup_initialized(guest_va);
     if (!h)
         h = bridge_resolve_handle(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
+    /* An unmodelled guest dispatcher object is not a Win32 handle.
+     * bridge_resolve_handle reports and rejects it; keep that rejection. */
     if (h)
         g_eax = (uint32_t)SetEvent(h);
     else
@@ -1775,11 +1823,7 @@ static void bridge_KeWaitForSingleObject(void)
     h = ke_shadow_lookup_initialized(object);
     if (!h) {
         h = bridge_resolve_handle(object);
-        resolution = "resolved_handle";
-    }
-    if (!h) {
-        h = XBOX_TO_NATIVE(object);
-        resolution = "guest_va";
+        resolution = h ? "resolved_handle" : "unknown_object";
     }
 
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
@@ -3169,7 +3213,7 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
  * pointers (win32_compat objects, or real Win32 handles on Windows). Map
  * 32-bit tokens <-> native HANDLEs so a handle survives a round-trip through
  * Xbox memory. Tokens carry a tag in the high byte so they never collide
- * with the synthetic handles (0xDEAD0001 / 0xBEEF0010) used elsewhere.
+ * with the synthetic handles the bridge issues untagged (see bridge_is_sentinel).
  */
 #define BRIDGE_HANDLE_TAG  0x48000000u
 #define BRIDGE_HANDLE_MASK 0x00FFFFFFu
@@ -3240,15 +3284,10 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h)
 }
 
 /* Resolve a 32-bit Xbox handle slot back to a native HANDLE. */
+static HANDLE bridge_resolve_handle(uint32_t token);
 static HANDLE bridge_read_handle(uint32_t va)
 {
-    uint32_t token = BRIDGE_MEM32(va);
-    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
-        uint32_t i = token & BRIDGE_HANDLE_MASK;
-        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? bridge_handle_load(i) : NULL;
-    }
-    /* Untagged value: synthetic/dummy handle -- pass through unchanged. */
-    return (HANDLE)(uintptr_t)token;
+    return bridge_resolve_handle(BRIDGE_MEM32(va));
 }
 
 /* Resolve a token to a HANDLE and release its table slot (for NtClose). */
@@ -3264,6 +3303,41 @@ static HANDLE bridge_read_handle(uint32_t va)
  * bridge_read_handle on it -- dereferencing the token as if it were an address.
  * Halo created its save file successfully and then failed the very next call,
  * which surfaced as "couldn't open or create saved game file". */
+/* Untagged values the bridge issues on purpose, and why each may reach Win32
+ * unchanged:
+ *   0xBEEF0001, 0xBEEF0002  PsCreateSystemThreadEx and the sibling create call,
+ *                           for threads that ran inline. They have no host
+ *                           object, and Win32 rejects these values, so a wait
+ *                           on one fails at once instead of hanging.
+ *   BRIDGE_CDROM_HANDLE     the DVD device; NtDeviceIoControlFile matches it.
+ *   object handles          symbolic links and directories (kernel_io.c).
+ */
+#define BRIDGE_CDROM_HANDLE 0xDECD0001u
+
+static int bridge_is_sentinel(uint32_t token)
+{
+    switch (token) {
+    case 0xBEEF0001u:
+    case 0xBEEF0002u:
+    case BRIDGE_CDROM_HANDLE:
+        return 1;
+    }
+    return xbox_IsObjectHandle((HANDLE)(uintptr_t)token);
+}
+
+/* A token that names nothing the bridge issued. Win32 would take a small
+ * number for a host handle, and one may be one, so it is refused here. The
+ * first few are logged. */
+static HANDLE bridge_reject_handle(uint32_t token)
+{
+    static unsigned rejected;
+    if (rejected++ < 8)
+        fprintf(stderr, "  [BRIDGE] handle value 0x%08X was not issued by the "
+                        "bridge; treating it as an invalid handle\n", token);
+    fflush(stderr);
+    return NULL;
+}
+
 static HANDLE bridge_resolve_handle(uint32_t token)
 {
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
@@ -3276,8 +3350,9 @@ static HANDLE bridge_resolve_handle(uint32_t token)
      * and spun forever on the STATUS_UNSUCCESSFUL that came back. */
     if (token >= 0xFFFFFFF0u)
         return (HANDLE)(intptr_t)(int32_t)token;
-    /* Untagged: synthetic/dummy handle -- pass through unchanged. */
-    return (HANDLE)(uintptr_t)token;
+    if (token == 0 || bridge_is_sentinel(token))
+        return (HANDLE)(uintptr_t)token;
+    return bridge_reject_handle(token);
 }
 
 static HANDLE bridge_take_handle(uint32_t token)
@@ -3331,7 +3406,6 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
  *
  * Accepts the "\??\" prefix, since titles reach the device both ways.
  */
-#define BRIDGE_CDROM_HANDLE 0xDECD0001u
 
 static int bridge_is_cdrom_device(const char *path)
 {
@@ -4063,25 +4137,62 @@ static void bridge_NtQueryDirectoryFile(void)
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
+/* Name from a guest OBJECT_ATTRIBUTES, copied NUL-terminated into out.
+ * 0 when there is no name or it does not fit. */
+static int bridge_oa_name(uint32_t oa_va, char *out, size_t out_size)
+{
+    uint32_t name_va, buf_va;
+    uint16_t len;
+
+    if (!oa_va)
+        return 0;
+    name_va = BRIDGE_MEM32(oa_va + 4);   /* ObjectName: PANSI_STRING */
+    if (!name_va)
+        return 0;
+    len = BRIDGE_MEM16(name_va);
+    buf_va = BRIDGE_MEM32(name_va + 4);
+    if (!buf_va || len >= out_size)
+        return 0;
+    memcpy(out, XBOX_TO_NATIVE(buf_va), len);
+    out[len] = '\0';
+    return 1;
+}
+
 /* ── NtOpenSymbolicLinkObject (ordinal 203, 2 args = 8 bytes) */
 static void bridge_NtOpenSymbolicLinkObject(void)
 {
     uint32_t handle_va = STACK_ARG(0);
-    /* arg1: POBJECT_ATTRIBUTES - ignored, we return a synthetic handle.
-     * Written raw (untagged) so NtClose recognises it and skips it. */
-    if (handle_va) BRIDGE_MEM32(handle_va) = 0xDEAD0001u;
-    g_eax = STATUS_SUCCESS;
+    uint32_t oa_va = STACK_ARG(1);
+    char name[128];
+    HANDLE h = NULL;
+    NTSTATUS st;
+
+    if (!handle_va || !bridge_oa_name(oa_va, name, sizeof name)) {
+        g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
+        return;
+    }
+    st = xbox_OpenSymbolicLink(name, &h);
+    /* Written raw, untagged: bridge_resolve_handle and NtClose recognise it
+     * through xbox_IsObjectHandle. */
+    if (NT_SUCCESS(st))
+        BRIDGE_MEM32(handle_va) = (uint32_t)(uintptr_t)h;
+    g_eax = (uint32_t)st;
 }
 
 /* ── NtQuerySymbolicLinkObject (ordinal 215, 3 args = 12 bytes) */
 static void bridge_NtQuerySymbolicLinkObject(void)
 {
-    /* uint32_t handle = STACK_ARG(0); */
+    uint32_t handle = STACK_ARG(0);
     uint32_t target_va = STACK_ARG(1);
     uint32_t retlen_va = STACK_ARG(2);
-    const char* target = "\\Device\\CdRom0";
-    USHORT len = (USHORT)strlen(target);
+    const char* target = xbox_SymbolicLinkHandleTarget((HANDLE)(uintptr_t)handle);
+    USHORT len;
 
+    if (!target) {
+        g_eax = (uint32_t)STATUS_INVALID_HANDLE;
+        return;
+    }
+    len = (USHORT)strlen(target);
     if (retlen_va) BRIDGE_MEM32(retlen_va) = (uint32_t)len;
 
     /* Say so when the buffer could not be filled.
@@ -4091,8 +4202,8 @@ static void bridge_NtQuerySymbolicLinkObject(void)
      * device path and parses whatever was already in that memory. Half-Life 2
      * does exactly that -- it walked uninitialised bytes and dereferenced
      * 0x68737572, the ASCII "rush", as a pointer. That only looked survivable
-     * because the RAM mirrors happened to back the address; with a mapping
-     * that does not alias, it faults immediately.
+     * because low RAM happened to sit at the address; with the slots above the
+     * map reserved and unmapped, it faults immediately.
      *
      * STATUS_BUFFER_TOO_SMALL is the honest answer, and it is one the caller
      * already has to handle -- it is what a real kernel returns when the
@@ -4299,7 +4410,7 @@ static void bridge_NtDeviceIoControlFile(void)
         return;
     }
 
-    fprintf(stderr, "  [FILE] NtDeviceIoControlFile(0x%X) - unhandled\n", ioctl);
+    xbox_NoteUnsupportedIoctl("NtDeviceIoControlFile", ioctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
     g_eax = 0xC00000BBu; /* STATUS_NOT_SUPPORTED */
 }
@@ -4309,18 +4420,40 @@ static void bridge_NtFsControlFile(void)
 {
     uint32_t fsctl = STACK_ARG(5);
     uint32_t ios_va = STACK_ARG(4);
-    fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
+    xbox_NoteUnsupportedIoctl("NtFsControlFile", fsctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
     g_eax = 0xC00000BBu;
 }
 
-/* ── NtCreateDirectoryObject (ordinal 188) ──────────────── */
+/* ── NtCreateDirectoryObject (ordinal 188) ────────────────
+ * NTSTATUS NtCreateDirectoryObject(PHANDLE DirectoryHandle,
+ *     POBJECT_ATTRIBUTES ObjectAttributes)
+ * The directory holds no entries: the object namespace is not modelled. The
+ * handle is its own, so NtClose releases it and two directories never share a
+ * value. */
 static void bridge_NtCreateDirectoryObject(void)
 {
-    /* Return STATUS_SUCCESS with a fake handle */
     uint32_t handle_ptr = STACK_ARG(0);
-    if (handle_ptr) BRIDGE_MEM32(handle_ptr) = 0xBEEF0010;
-    g_eax = 0;  /* STATUS_SUCCESS */
+    uint32_t oa_va = STACK_ARG(1);
+    char name[128];
+    HANDLE h = NULL;
+    NTSTATUS st;
+
+    if (!handle_ptr) {
+        g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
+        return;
+    }
+    if (!bridge_oa_name(oa_va, name, sizeof name))
+        name[0] = '\0';
+    st = xbox_CreateDirectoryHandle(name, &h);
+    if (NT_SUCCESS(st))
+        BRIDGE_MEM32(handle_ptr) = (uint32_t)(uintptr_t)h;
+    if (KERNEL_LOG_ON()) {
+        fprintf(stderr, "  [KERNEL] NtCreateDirectoryObject: '%s' -> status=0x%08X\n",
+                name, (uint32_t)st);
+        fflush(stderr);
+    }
+    g_eax = (uint32_t)st;
 }
 
 /* IoCreateSymbolicLink (ordinal 67, 2 args)
@@ -4469,15 +4602,6 @@ static void bridge_MmMapIoSpace(void)
 static void bridge_MmPersistContiguousMemory(void)
 {
     /* No-op stub */
-    g_eax = 0;
-}
-
-/* ── Generic fallback for simple value-only functions ────── */
-static void bridge_generic_stub(void)
-{
-    /* Success-returning stub for functions whose callers only check for 0.
-     * Deliberately silent: the caller (kernel_thunk_dispatch) warns for
-     * ordinals with no bridge at all, which is the case worth hearing about. */
     g_eax = 0;
 }
 
@@ -9985,6 +10109,14 @@ static void kernel_thunk_dispatch_body(void)
          * usually the reason a game misbehaves, so it must not be swallowed
          * by the general call-trace throttle. Bounded to one line per slot. */
         static uint8_t warned[XBOX_KERNEL_THUNK_TABLE_SIZE];
+        LONGLONG n;
+        do {
+            n = g_unbridged_calls[slot];
+        } while (InterlockedCompareExchange64(&g_unbridged_calls[slot], n + 1, n) != n);
+        if (!g_unbridged_registered) {
+            g_unbridged_registered = 1;
+            atexit(bridge_unbridged_report);
+        }
         if (!warned[slot]) {
             warned[slot] = 1;
             fprintf(stderr, "  [KERNEL] WARNING: no bridge for ordinal %u (slot %d), returning 0\n",

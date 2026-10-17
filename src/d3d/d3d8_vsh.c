@@ -330,11 +330,10 @@ void d3d8_vsh_parse(const DWORD *microcode, int num_insns,
         inst->input_index = (int)vsh_extract(insn, VSH_FIELD_INPUT_IDX_START,
                                               VSH_FIELD_INPUT_IDX_SIZE);
 
-        /* Clamp indices to valid ranges */
-        if (inst->const_index >= NV2A_VS_MAX_CONSTANTS)
-            inst->const_index = 0;
-        if (inst->input_index >= NV2A_VS_MAX_INPUTS)
-            inst->input_index = 0;
+        /* No clamping: the 8-bit const field is the c# index as-is (xemu's
+         * convert_c_register is the identity on it), and the 4-bit input field
+         * cannot exceed NV2A_VS_MAX_INPUTS. Out-of-range c# reads are handled
+         * in emit_source(). */
 
         /* Parse source operands A, B, C */
         parse_source(insn,
@@ -527,10 +526,23 @@ static void emit_source(StrBuf *sb, const NV2AVshSrcOperand *src, int scalar)
         sb_append(sb, "v%d", src->reg_index);
         break;
     case NV2A_VSH_REG_CONST:
-        if (src->rel_addr)
+        if (src->rel_addr) {
             sb_append(sb, "c[a0 + %d]", src->reg_index);
-        else
+        } else if (src->reg_index >= NV2A_VS_MAX_CONSTANTS) {
+            /* The NV2A constant file is 192 entries; c# above that is not
+             * backed by anything. Read it as zero (D3D11 also defines
+             * out-of-bounds cbuffer reads as zero) rather than aliasing c[0].
+             * Logged once. */
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "D3D8 VSH: c[%d] is beyond the %d-entry constant file, reading as zero\n",
+                        src->reg_index, NV2A_VS_MAX_CONSTANTS);
+            }
+            sb_append(sb, "float4(0,0,0,0)");
+        } else {
             sb_append(sb, "c[%d]", src->reg_index);
+        }
         break;
     default:
         sb_append(sb, "float4(0,0,0,0)");
@@ -1268,9 +1280,17 @@ static ID3D11InputLayout *get_cached_layout(VshCacheEntry *entry, DWORD fvf)
             return entry->layouts[i];
     }
 
-    /* Create new layout */
-    if (entry->layout_count >= 16)
-        return entry->layouts[0]; /* Fallback to first */
+    /* Create new layout. Cache full: flush it rather than hand back another
+     * key's layout. A layout already bound stays valid, since the immediate
+     * context holds its own reference once IASetInputLayout has run. */
+    if (entry->layout_count >= 16) {
+        for (i = 0; i < entry->layout_count; i++) {
+            if (entry->layouts[i])
+                ID3D11InputLayout_Release(entry->layouts[i]);
+            entry->layouts[i] = NULL;
+        }
+        entry->layout_count = 0;
+    }
 
     ID3D11InputLayout *layout = create_vsh_input_layout(mask, fvf, entry->vs_blob);
     entry->layouts[entry->layout_count]      = layout;

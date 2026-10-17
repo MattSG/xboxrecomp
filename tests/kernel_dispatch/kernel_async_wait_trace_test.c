@@ -129,6 +129,7 @@ int main(int argc, char **argv) {
         CHECK(strstr(output, "requested=00050000") && strstr(output, "header_read=0"));
         CHECK(strstr(output, "request_read=1 request_status=00000103"));
         CHECK(strstr(output, "stack_read=0"));
+        CHECK(strstr(output, "kind=unknown_object"));
         if (inline_events) CHECK(strstr(output, "kind=inline_kevent"));
     }
     CloseHandle(signaled); CloseHandle(unsignaled);

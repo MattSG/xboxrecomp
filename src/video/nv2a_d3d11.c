@@ -87,6 +87,13 @@ static int64_t s_prof[PROF_COUNT];
 static uint64_t s_prof_verts, s_prof_draws;
 static uint64_t s_prof_ps_uploads, s_prof_ps_reused;
 static int s_prof_on = -1;
+static int s_d3d_trace = -1;
+
+static int d3d_trace_on(void)
+{
+    if (s_d3d_trace < 0) s_d3d_trace = getenv("RECOMP_D3D_TRACE") != NULL;
+    return s_d3d_trace;
+}
 
 static int64_t qpc(void)
 {
@@ -1985,7 +1992,7 @@ static void surface_sync_impl(Surface *s, int force)
                 }
         }
         if (y0 == 0xFFFFFFFFu) { s->synced_frame = s_epoch; return; }
-        if (getenv("RECOMP_D3D_TRACE"))
+        if (d3d_trace_on())
             fprintf(stderr, "[D3D11] CPU wrote surface %08X (frame %u) %u,%u-%u,%u\n",
                     s->phys, s_frame, x0, y0, x1, y1);
     }
@@ -2123,7 +2130,7 @@ static Surface *surface_get(uint32_t va, uint32_t pitch, uint32_t fmt,
         s->ms_dirty = 1; s->gen++;
     }
     surface_sync(s, 1);
-    if (getenv("RECOMP_D3D_TRACE"))
+    if (d3d_trace_on())
         fprintf(stderr, "[D3D11] surface %08X %ux%u pitch %u fmt %X%s\n", p, w, h,
                 pitch, fmt & 0xF, swizzled ? " swizzled" : "");
     return s;
@@ -2196,6 +2203,20 @@ static Depth *depth_get(uint32_t va, uint32_t iw, uint32_t ih, UINT samples)
     return d;
 }
 
+/* Colour or depth targets a draw cannot bind. The draw still runs with what
+ * did bind, so log the first eight with guest context, then power-of-two counts. */
+static unsigned s_target_refusals;
+
+static void target_refused(const char *reason, uint32_t addr, uint32_t fmt,
+                           uint32_t w, uint32_t h, uint32_t pitch)
+{
+    unsigned n = ++s_target_refusals;
+    if (n > 8 && (n & (n - 1))) return;
+    fprintf(stderr, "[TARGET_REFUSED] count=%u reason=%s addr=%08X phys=%08X format=%08X size=%ux%u pitch=%u\n",
+            n, reason, addr, phys(addr), fmt, w, h, pitch);
+    fflush(stderr);
+}
+
 /* The colour surface and depth buffer a draw or clear writes, bound. Returns
  * the colour surface (may be NULL for a depth-only pass) via *out. */
 static int bind_targets(const NvD3DState *st, int want_depth, Surface **out,
@@ -2218,25 +2239,39 @@ static int bind_targets(const NvD3DState *st, int want_depth, Surface **out,
         w = (st->clip_x + st->clip_w) * s_aa_x;
         h = (st->clip_y + st->clip_h) * s_aa_y;
     }
-    if (!w || !h || w > 4096 || h > 4096)
+    if (!w || !h || w > 4096 || h > 4096) {
+        target_refused("colour_size_out_of_range", st->color_addr, fmt, w, h, st->color_pitch);
         return 0;
-    if (st->color_addr && surface_color_bpp(fmt) &&
+    }
+    if (st->color_addr && !surface_color_bpp(fmt))
+        target_refused("colour_format_unsupported", st->color_addr, fmt, w, h, st->color_pitch);
+    else if (st->color_addr && surface_color_bpp(fmt) &&
         guest_ok(st->color_addr, (size_t)(swizzled ? w * surface_color_bpp(fmt) : st->color_pitch) * h)) {
         s = surface_get(st->color_addr, swizzled ? w * surface_color_bpp(fmt) : st->color_pitch,
                         fmt, w, h, swizzled);
         if (s) surface_sync(s, 0);
-    }
+        else target_refused("colour_surface_unavailable", st->color_addr, fmt, w, h, st->color_pitch);
+    } else if (st->color_addr && surface_color_bpp(fmt))
+        target_refused("colour_span_outside_ram", st->color_addr, fmt, w, h, st->color_pitch);
     if (want_depth && st->zeta_addr && ((fmt >> 4) & 0xF)) {
         float wx = (w == GUEST_W && h == GUEST_H) ? s_scale * widen() : s_scale;
         uint32_t iw = s ? s->iw : (uint32_t)(w * wx + 0.5f);
         uint32_t ih = s ? s->ih : (uint32_t)(h * s_scale + 0.5f);
         UINT ns = s ? (s->ms ? s_msaa : 1) : (swizzled ? 1 : s_msaa);
         d = depth_get(st->zeta_addr, iw, ih, ns);
+        if (!d) target_refused("depth_unavailable", st->zeta_addr, fmt, iw, ih, 0);
     }
     if (!s && !d)
         return 0;
-    if (s && d && (d->iw != s->iw || d->ih != s->ih))
+    if (s && d && (d->iw != s->iw || d->ih != s->ih)) {
+        /* Depth is dropped for this draw, so depth test and write are skipped.
+         * D3D11 requires RTV and DSV of equal size, so there is no alternative
+         * binding; flagged for review rather than changed here. */
+        char why[80];
+        snprintf(why, sizeof why, "depth_%ux%u_vs_colour_%ux%u_dropped", d->iw, d->ih, s->iw, s->ih);
+        target_refused(why, st->zeta_addr, fmt, w, h, 0);
         d = NULL;
+    }
     if (s) { s->ms_dirty = 1; s->gen++; }
     if (d) { d->gen++; d->seq = ++s_surf_seq; d->zf = (fmt >> 4) & 0xF; d->w = w; d->h = h; }
     if (s != s_cur_rt || d != s_cur_ds) {
@@ -2299,15 +2334,30 @@ static uint32_t argb(uint32_t a, uint32_t r, uint32_t g, uint32_t b)
     return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
+/* An I8 index past the palette's length. Only the palette_len entries are
+ * validated and hashed, so the read is refused: the texel decodes transparent
+ * black, and the first eight are logged, then power-of-two counts. Masking the
+ * index to the length is not used: nothing here shows the NV2A does that. */
+static unsigned s_palette_refusals;
+
+static uint32_t palette_index_refused(uint32_t index, uint32_t pal_len)
+{
+    unsigned n = ++s_palette_refusals;
+    if (n <= 8 || !(n & (n - 1)))
+        fprintf(stderr, "[PALETTE_REFUSED] count=%u index=%u palette_len=%u (texel is transparent black)\n",
+                n, index, pal_len);
+    return 0;
+}
+
 /* One texel, as ARGB (= BGRA bytes). */
-static uint32_t texel(uint32_t c, const uint8_t *p, const uint32_t *pal)
+static uint32_t texel(uint32_t c, const uint8_t *p, const uint32_t *pal, uint32_t pal_len)
 {
     uint32_t v;
     switch (c) {
     case 0x00: case 0x13: return argb(255, p[0], p[0], p[0]);           /* Y8  */
     case 0x01: case 0x1B: return argb(p[0], p[0], p[0], p[0]);          /* AY8 */
     case 0x19: case 0x1F: return argb(p[0], 255, 255, 255);             /* A8  */
-    case 0x0B: return pal ? pal[p[0]] : argb(255, p[0], p[0], p[0]);    /* I8  */
+    case 0x0B: return p[0] < pal_len ? pal[p[0]] : palette_index_refused(p[0], pal_len); /* I8 */
     case 0x1A: case 0x20: return argb(p[1], p[0], p[0], p[0]);          /* A8Y8 */
     case 0x06: case 0x12: memcpy(&v, p, 4); return v;
     case 0x07: case 0x1E: memcpy(&v, p, 4); return v | 0xFF000000u;
@@ -2427,17 +2477,41 @@ static void texture_trace_event(const NvD3DTexture *t, const char *event,
             s_tex_count, s_tex_bytes, (unsigned long long)s_tex_trace_evictions);
 }
 
+/* A refused guest texture leaves its stage unbound, which is wrong on screen
+ * but otherwise silent. Log the first
+ * eight with guest context, then only power-of-two counts. */
+static unsigned s_tex_refusals;
+
+static void texture_refused(const NvD3DTexture *t, const char *reason, size_t bytes)
+{
+    unsigned n = ++s_tex_refusals;
+    if (n > 8 && (n & (n - 1))) return;
+    fprintf(stderr, "[TEXTURE_REFUSED] count=%u addr=%08X phys=%08X size=%ux%u color=%02X format=%08X pitch=%u levels=%u bytes=%zu reason=%s\n",
+            n, t->addr, phys(t->addr), t->width, t->height, t->color, t->format,
+            t->pitch, t->levels, bytes, reason);
+    fflush(stderr);
+}
+
 static int tex_layout(const NvD3DTexture *t, TexLayout *L)
 {
     uint32_t w = t->width, h = t->height, lv, maxlv = 1, m;
     size_t off = 0;
     memset(L, 0, sizeof *L);
     L->bpp = tex_format(t->color, &L->kind);
-    if (!L->bpp || !w || !h || w > 4096 || h > 4096)
+    if (!L->bpp) {
+        texture_refused(t, "unknown_format", 0);
         return 0;
+    }
+    if (!w || !h || w > 4096 || h > 4096) {
+        texture_refused(t, "size_out_of_range", 0);
+        return 0;
+    }
     L->faces = t->cube ? 6 : 1;
     if (L->kind == K_LIN) {
-        if (!t->pitch) return 0;
+        if (!t->pitch) {
+            texture_refused(t, "linear_pitch_zero", 0);
+            return 0;
+        }
         L->levels = 1;
         L->level_w[0] = w; L->level_h[0] = h;
         L->total = L->face_stride = (size_t)t->pitch * h;
@@ -2446,6 +2520,10 @@ static int tex_layout(const NvD3DTexture *t, TexLayout *L)
     }
     for (m = w > h ? w : h; m > 1; m >>= 1) maxlv++;
     L->levels = t->levels ? (int)t->levels : 1;
+    /* Not a refusal: the guest's mip count is a field that can exceed the
+     * full chain for its base size (log2 + 1). Levels past 1x1 have no texels,
+     * and the offsets below would otherwise run past the real chain into
+     * the next face or resource. Trim to the chain the size allows. */
     if (L->levels > (int)maxlv) L->levels = (int)maxlv;
     for (lv = 0; lv < (uint32_t)L->levels; lv++) {
         uint32_t lw = w >> lv ? w >> lv : 1, lh = h >> lv ? h >> lv : 1;
@@ -2533,7 +2611,7 @@ static void decode_level(const NvD3DTexture *t, const TexLayout *L, const uint8_
                 memcpy(dst, row, (size_t)w * 4);
             } else {
                 for (x = 0; x < w; x++)
-                    dst[x] = texel(t->color, row + (size_t)x * L->bpp, pal);
+                    dst[x] = texel(t->color, row + (size_t)x * L->bpp, pal, t->palette_len);
             }
         }
         return;
@@ -2545,7 +2623,7 @@ static void decode_level(const NvD3DTexture *t, const TexLayout *L, const uint8_
         for (y = 0; y < h; y++) {
             uint32_t ox = 0, *dst = out + (size_t)y * w;
             for (x = 0; x < w; x++) {
-                dst[x] = texel(t->color, src + (size_t)(oy + ox) * L->bpp, pal);
+                dst[x] = texel(t->color, src + (size_t)(oy + ox) * L->bpp, pal, t->palette_len);
                 ox = (ox - mx) & mx;
             }
             oy = (oy - my) & my;
@@ -2659,6 +2737,7 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t, int *gu
     if (guest_levels) *guest_levels = L.levels;
     if (!guest_ok(t->addr, L.total)) {
         texture_trace_event(t, "invalid_guest_span", L.total, L.levels, 0, 0, 0, 0);
+        texture_refused(t, "guest_span_outside_ram", L.total);
         return NULL;
     }
     for (e = *head; e; e = e->next)
@@ -2674,7 +2753,17 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t, int *gu
         return e->srv;
     }
     h = hash_mem(guest(t->addr), L.total);
-    if (t->color == 0x0B && pal_p && guest_ok(pal_p, t->palette_len * 4)) {
+    if (t->color == 0x0B) {
+        /* I8 without its palette has no colours to decode to; refuse rather
+         * than substitute a greyscale ramp. */
+        if (!pal_p) {
+            texture_refused(t, "palette_missing", 0);
+            return NULL;
+        }
+        if (!guest_ok(pal_p, t->palette_len * 4)) {
+            texture_refused(t, "palette_outside_ram", t->palette_len * 4);
+            return NULL;
+        }
         pal = (uint32_t *)guest(pal_p);
         ph = hash_mem((const uint8_t *)pal, t->palette_len * 4);
     }
@@ -2696,6 +2785,7 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t, int *gu
         if (!px) {
             texture_trace_event(t, "scratch_allocation_failed", L.total, L.levels, hl,
                                 previous, h, trace_start);
+            texture_refused(t, "scratch_allocation_failed", L.total);
             if (e) e->used = s_frame;
             return e ? e->srv : NULL;
         }
@@ -2791,6 +2881,7 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t, int *gu
 
 upload_failed:
     texture_trace_event(t, failure, L.total, L.levels, hl, previous, h, trace_start);
+    texture_refused(t, failure, L.total);
     if (e) {
         if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
         if (e->tex) ID3D11Texture2D_Release(e->tex);
@@ -3827,9 +3918,6 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
     int64_t t_draw;
 
     if (!nv2a_d3d_init() || !ni || hi < lo || ib_bytes > IB_BYTES)
-        return;
-    if (getenv("TMP_NOPANO") && !st->depth_test && st->blend_enable && st->blend_sfactor == 0x304 &&
-        st->blend_dfactor == 0x305 && st->tex[0].width == 256 && st->tex[0].height == 256) /* TMPPANO */
         return;
     memset(&uc, 0, sizeof uc);
     memcpy(uc.def, def, sizeof uc.def);
@@ -5012,14 +5100,34 @@ static void display_config(int now)
     fflush(stderr);
 }
 
+int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp, uint32_t *w, uint32_t *h);
+
 /* A display buffer read from guest memory: the surface at that address,
  * brought up to date with whatever the CPU wrote there. */
 static Surface *scan_surface(uint32_t va, uint32_t pitch)
 {
-    uint32_t bpp = pitch >= 640 * 4 ? 4 : 2;
-    uint32_t w = pitch / bpp, h = 480;
+    /* The size the title gave AvSetDisplayMode, when that scanout has this
+     * flip's pitch. Otherwise a 640x480 display is guessed from the pitch, and
+     * each distinct address (first 16) is logged so a wrong guess shows up. */
+    static uint32_t guessed[16];
+    static unsigned guessed_n;
+    uint32_t bpp, w, h, mpitch;
     Surface *s = surface_find(phys(va));
-    if (w > 640) w = 640;
+    if (!(xbox_GetDisplayMode(&mpitch, &bpp, &w, &h) && mpitch == pitch)) {
+        bpp = pitch >= 640 * 4 ? 4 : 2;
+        w = pitch / bpp; h = 480;
+        if (w > 640) w = 640;
+        if (!s) {
+            unsigned i;
+            for (i = 0; i < guessed_n && guessed[i] != va; i++) ;
+            if (i == guessed_n && guessed_n < 16) {
+                guessed[guessed_n++] = va;
+                fprintf(stderr, "[SCAN_GUESS] addr=%08X phys=%08X pitch=%u guessed=%ux%u bpp=%u (no surface at address)\n",
+                        va, phys(va), pitch, w, h, bpp);
+                fflush(stderr);
+            }
+        }
+    }
     if (!s || s->pitch != pitch)
         s = surface_get(va, pitch, bpp == 4 ? 0x5 : 0x3, w, h, 0);
     if (s) surface_sync(s, 1);

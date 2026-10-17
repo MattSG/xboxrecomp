@@ -10,7 +10,7 @@ All 371 ordinals are routed: every export now has either a per-ordinal `bridge_*
 |------|-----|---------|
 | `kernel.h` | 829 | Master public header — all types, constants, and function prototypes |
 | `xbox_memory_layout.h` | 204 | Memory layout constants and API |
-| `xbox_memory_layout.c` | 534 | Memory mapping (CreateFileMapping + 28 mirror views) |
+| `xbox_memory_layout.c` | 534 | Memory mapping (CreateFileMapping for RAM + 28 reserved, unmapped slots) |
 | `kernel_bridge.c` | 8,390 | Core dispatcher — thunk table, ICALL resolution, all 371 per-ordinal bridges, kernel data exports |
 | `kernel_file.c` | 834 | File I/O — NtCreateFile, NtReadFile, path translation |
 | `kernel_thread.c` | 344 | Threading — PsCreateSystemThreadEx, thread priorities |
@@ -46,20 +46,18 @@ Xbox VA Range          Purpose                  Size
 
 ### Why CreateFileMapping?
 
-The Xbox has **mirror regions** — the same physical memory appears at multiple virtual addresses (26-bit address bus wrapping). `CreateFileMapping` gives us true aliases where writes through one address are instantly visible at all mirrors. `VirtualAlloc` would give separate copies.
+RAM is one file mapping. `CreateFileMapping` backs it, and `MapViewOfFileEx` places the view at the Xbox base, so the RAM the guest sees is a single set of pages.
 
-We create 28 mirror views covering 1.75 GB of address space:
+The space above RAM is **not** a second copy of RAM. A virtual address on the console goes through page tables, and a page with no entry faults; the 26-bit bus wrap is a property of physical addresses, not of virtual ones. So the 28 map-sized slots above the mapped range are reserved with `PAGE_NOACCESS` and never mapped. A guest access there faults, and the fault handler names the address. Earlier builds mapped them as views of RAM, so a read at `0x08000000` returned `0x00000000`; titles built corrupt structures on that alias, and it is gone.
 
 ```c
-// The core mapping
+// RAM: one file mapping, viewed at the Xbox base (a host address)
 HANDLE h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 64*1024*1024, NULL);
-
-// Primary view at Xbox base (0x10000000 on host)
 MapViewOfFileEx(h, FILE_MAP_ALL_ACCESS, 0, 0, XBOX_TOTAL_RAM, target_base);
 
-// Mirror views every 64 MB
-for (int i = 1; i < 28; i++)
-    MapViewOfFileEx(h, FILE_MAP_ALL_ACCESS, 0, 0, XBOX_TOTAL_RAM, target_base + i * 64MB);
+// The 28 slots above the mapped range: reserved, never mapped
+for (int i = 1; i <= 28; i++)
+    VirtualAlloc(target_base + i * 64MB, 64MB, MEM_RESERVE, PAGE_NOACCESS);
 ```
 
 ### Global State
@@ -85,7 +83,7 @@ void xbox_MemoryLayoutShutdown(void);
 void     *xbox_GetMemoryBase(void);    // Native pointer to Xbox VA 0
 ptrdiff_t xbox_GetMemoryOffset(void);  // g_xbox_mem_offset value
 BOOL      xbox_IsXboxAddress(uintptr_t address);
-HANDLE    xbox_GetMappingHandle(void); // For creating additional mirror views
+HANDLE    xbox_GetMappingHandle(void); // File mapping behind the RAM view
 
 // Heap (bump allocator, no free)
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);

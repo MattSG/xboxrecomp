@@ -10,6 +10,8 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ============================================================================
@@ -432,4 +434,216 @@ NTSTATUS __stdcall xbox_IoDeleteSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName)
     entry->link[0] = '\0';
     entry->target[0] = '\0';
     return STATUS_SUCCESS;
+}
+
+/* ============================================================================
+ * Object handles for names opened through the Ob* calls.
+ *
+ * NtOpenSymbolicLinkObject and NtCreateDirectoryObject hand out a handle that
+ * names the object. Values sit in 0xDE500000 + slot, a range no host handle
+ * or bridge token uses, so the bridge recognises them by value and passes them
+ * through unchanged. A link handle keeps the target it had at open time, so a
+ * later IoDeleteSymbolicLink does not invalidate a handle already in use.
+ * ============================================================================ */
+
+#define XBOX_OBJ_HANDLE_BASE 0xDE500000u
+#define XBOX_MAX_OBJ_HANDLES 32
+
+typedef struct {
+    BOOL used;
+    int  is_link;               /* 1 = symbolic link, 0 = directory */
+    char name[128];
+    char target[128];           /* link target; empty for directories */
+} XBOX_OBJ_HANDLE;
+
+static XBOX_OBJ_HANDLE g_obj_handles[XBOX_MAX_OBJ_HANDLES + 1];
+
+/* Drive links the runtime knows without a title registering them. The targets
+ * are the device paths kernel_path.c documents for each drive letter. */
+static const struct { const char* key; const char* target; } s_builtin_links[] = {
+    { "D:", "\\Device\\CdRom0" },
+    { "T:", "\\Device\\Harddisk0\\Partition1\\TDATA" },
+    { "U:", "\\Device\\Harddisk0\\Partition1\\UDATA" },
+};
+
+/* Target of the link named by an OBJECT_ATTRIBUTES name, or NULL. The name
+ * may carry the "\??\" prefix or not; the table keys carry it. */
+static const char* xbox_open_link_target(const char* name)
+{
+    const char* key = name;
+    char full[160];
+    const char* target;
+    size_t i;
+
+    if (strncmp(key, "\\??\\", 4) == 0)
+        key += 4;
+    if (strlen(key) >= sizeof(full) - 4)
+        return NULL;
+    strcpy(full, "\\??\\");
+    strcat(full, key);
+    target = xbox_LookupSymbolicLink(full);
+    if (target)
+        return target;
+    for (i = 0; i < sizeof(s_builtin_links) / sizeof(s_builtin_links[0]); i++)
+        if (_stricmp(key, s_builtin_links[i].key) == 0)
+            return s_builtin_links[i].target;
+    return NULL;
+}
+
+static HANDLE xbox_obj_handle_alloc(const char* name, int is_link, const char* target)
+{
+    int i;
+    for (i = 1; i <= XBOX_MAX_OBJ_HANDLES; i++) {
+        if (!g_obj_handles[i].used) {
+            g_obj_handles[i].used = TRUE;
+            g_obj_handles[i].is_link = is_link;
+            strncpy(g_obj_handles[i].name, name, sizeof(g_obj_handles[i].name) - 1);
+            g_obj_handles[i].name[sizeof(g_obj_handles[i].name) - 1] = '\0';
+            strncpy(g_obj_handles[i].target, target ? target : "",
+                    sizeof(g_obj_handles[i].target) - 1);
+            g_obj_handles[i].target[sizeof(g_obj_handles[i].target) - 1] = '\0';
+            return (HANDLE)(uintptr_t)(XBOX_OBJ_HANDLE_BASE + (uint32_t)i);
+        }
+    }
+    return NULL;
+}
+
+/* Slot of an object handle, or 0 when h is not one this table issued. */
+static int xbox_obj_handle_slot(HANDLE h)
+{
+    uintptr_t v = (uintptr_t)h;
+    int i;
+    if (v < XBOX_OBJ_HANDLE_BASE + 1u || v > XBOX_OBJ_HANDLE_BASE + XBOX_MAX_OBJ_HANDLES)
+        return 0;
+    i = (int)(v - XBOX_OBJ_HANDLE_BASE);
+    return g_obj_handles[i].used ? i : 0;
+}
+
+NTSTATUS xbox_OpenSymbolicLink(const char* name, HANDLE* out)
+{
+    const char* target;
+    HANDLE h;
+
+    if (!name || !out)
+        return STATUS_INVALID_PARAMETER;
+    target = xbox_open_link_target(name);
+    if (!target) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_IO,
+            "NtOpenSymbolicLinkObject: '%s' not found", name);
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    h = xbox_obj_handle_alloc(name, 1, target);
+    if (!h) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_IO,
+            "NtOpenSymbolicLinkObject: handle table full, dropping '%s'", name);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_IO,
+        "NtOpenSymbolicLinkObject: '%s' -> '%s'", name, target);
+    *out = h;
+    return STATUS_SUCCESS;
+}
+
+/* Target recorded for a link handle, or NULL if h is not a link handle. */
+const char* xbox_SymbolicLinkHandleTarget(HANDLE h)
+{
+    int i = xbox_obj_handle_slot(h);
+    if (!i || !g_obj_handles[i].is_link)
+        return NULL;
+    return g_obj_handles[i].target;
+}
+
+NTSTATUS xbox_CreateDirectoryHandle(const char* name, HANDLE* out)
+{
+    HANDLE h;
+
+    if (!out)
+        return STATUS_INVALID_PARAMETER;
+    h = xbox_obj_handle_alloc(name ? name : "", 0, NULL);
+    if (!h) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_IO,
+            "NtCreateDirectoryObject: handle table full, dropping '%s'",
+            name ? name : "");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    *out = h;
+    return STATUS_SUCCESS;
+}
+
+/* 1 if h is an object handle this table issued and it is still open. */
+int xbox_IsObjectHandle(HANDLE h)
+{
+    return xbox_obj_handle_slot(h) != 0;
+}
+
+/* Releases an object handle. 1 if h was one of ours, 0 if it was not. */
+int xbox_CloseObjectHandle(HANDLE h)
+{
+    int i = xbox_obj_handle_slot(h);
+    if (!i)
+        return 0;
+    g_obj_handles[i].used = FALSE;
+    return 1;
+}
+
+/* ============================================================================
+ * Unsupported IOCTL and FS control codes.
+ *
+ * A title that polls a code this layer does not implement calls it every
+ * frame. The first call per code is logged; later calls only count, and the
+ * totals are printed at exit. Guest threads call in concurrently, so the table
+ * is guarded by g_ioctl_notes_lock; the log lines are printed under it too,
+ * which keeps a code from being logged twice on a race.
+ * ============================================================================ */
+
+#define XBOX_IOCTL_NOTE_MAX 16
+
+static struct { ULONG code; const char* what; unsigned long long count; }
+    g_ioctl_notes[XBOX_IOCTL_NOTE_MAX];
+static int g_ioctl_notes_used;
+static int g_ioctl_notes_registered;
+static SRWLOCK g_ioctl_notes_lock = SRWLOCK_INIT;
+
+static void xbox_ioctl_notes_report(void)
+{
+    int i;
+    AcquireSRWLockExclusive(&g_ioctl_notes_lock);
+    if (g_ioctl_notes_used) {
+        fprintf(stderr, "  [FILE] unsupported control codes (calls after the first):\n");
+        for (i = 0; i < g_ioctl_notes_used; i++)
+            fprintf(stderr, "  [FILE]   %s(0x%X) x%llu\n", g_ioctl_notes[i].what,
+                    (unsigned)g_ioctl_notes[i].code, g_ioctl_notes[i].count);
+        fflush(stderr);
+    }
+    ReleaseSRWLockExclusive(&g_ioctl_notes_lock);
+}
+
+void xbox_NoteUnsupportedIoctl(const char* what, ULONG code)
+{
+    int i;
+
+    AcquireSRWLockExclusive(&g_ioctl_notes_lock);
+    for (i = 0; i < g_ioctl_notes_used; i++) {
+        if (g_ioctl_notes[i].code == code && strcmp(g_ioctl_notes[i].what, what) == 0) {
+            g_ioctl_notes[i].count++;
+            ReleaseSRWLockExclusive(&g_ioctl_notes_lock);
+            return;
+        }
+    }
+    if (!g_ioctl_notes_registered) {
+        g_ioctl_notes_registered = 1;
+        atexit(xbox_ioctl_notes_report);
+    }
+    if (g_ioctl_notes_used == XBOX_IOCTL_NOTE_MAX) {
+        fprintf(stderr, "  [FILE] %s(0x%X) - unsupported (note table full)\n",
+                what, (unsigned)code);
+    } else {
+        g_ioctl_notes[g_ioctl_notes_used].code = code;
+        g_ioctl_notes[g_ioctl_notes_used].what = what;
+        g_ioctl_notes[g_ioctl_notes_used].count = 1;
+        g_ioctl_notes_used++;
+        fprintf(stderr, "  [FILE] %s(0x%X) - unsupported\n", what, (unsigned)code);
+        fflush(stderr);
+    }
+    ReleaseSRWLockExclusive(&g_ioctl_notes_lock);
 }

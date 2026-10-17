@@ -29,11 +29,11 @@
  *      request of that size reuses it; contiguous pages are reused in both modes.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
- *                 above the RAM mirrors gets it, can commit inside it and use
- *                 the memory, is told the truth when it asks, and is refused
- *                 cleanly for an address that would alias live memory.
- *   ext-vma-128   The same switch on a 128 MB map, where the mirrors already
- *                 reach past user space. The tracker must stay out of the way
+ *                 above RAM gets it, can commit inside it and use the memory,
+ *                 is told the truth when it asks, and is refused cleanly for
+ *                 an address in the unmapped slots above RAM.
+ *   ext-vma-128   The same switch on a 128 MB map, where the slots above RAM
+ *                 already reach past user space. The tracker must stay out of the way
  *                 rather than reserve a range of negative size.
  *   reserve-heap  Retail RAM on a 128 MB map. Above-RAM reservations keep
  *                 exact ownership through partial commit and no-op release,
@@ -382,7 +382,23 @@ int main(int argc, char **argv)
     *G(0x80070000u) = 0x87654321u;
     check(*G(0x00070000u) == 0x12345678u &&
           *G(0xF0070000u) == 0x87654321u,
-          "contiguous and tiled memory stay distinct from RAM mirrors", NULL);
+          "contiguous and tiled memory stay distinct from RAM", NULL);
+
+    /* Nothing above the mapped range aliases RAM: the first slot above it must
+     * fault, not read the byte at the same offset in low memory. The SEH to
+     * catch the fault is Windows-only. */
+#ifdef _WIN32
+    {
+        volatile uint32_t *above = G((uint32_t)xbox_GetMappedSize() + 0x70000u);
+        int faulted = 0;
+        __try {
+            (void)*above;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            faulted = 1;
+        }
+        check(faulted, "a read in the first slot above the map faults", NULL);
+    }
+#endif
 
     /* 1. A small request after a large free. */
     if (!ext) {
@@ -465,19 +481,20 @@ int main(int argc, char **argv)
         check(c1 && c2 == c1, "a freed contiguous block is reused in both modes", d);
     }
 
-    /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */
+    /* 4. Above RAM: [0x74000000, 0x7FFE0000) at 64 MB. */
     {
         const uint32_t hi = 0x76000000u;
         uint32_t base, size, st, mbi[7];
 
         if (ext128) {
             check(!guest_vmem_active(),
-                  "128 MB: the mirrors reach past user space, tracker stays off", NULL);
+                  "128 MB: the slots above RAM reach past user space, tracker stays off", NULL);
         } else if (!ext && !reclaim) {
             base = hi; size = 0x100000;
             st = nt_alloc_at(&base, &size, 0x2000);
             snprintf(d, sizeof d, "status 0x%08X, base 0x%08X", st, base);
-            check(base != hi, "default: an explicit high base is not honoured", d);
+            check(!(st == 0 && base == hi),
+                  "default: an explicit high base is not granted at that address", d);
         } else if (ext) {
             /* Reserve the exact address. */
             base = hi; size = 0x100000;
@@ -512,17 +529,17 @@ int main(int argc, char **argv)
             snprintf(d, sizeof d, "status 0x%08X", st);
             check(st == 0xC0000018u, "reserving it again is STATUS_CONFLICTING_ADDRESSES", d);
 
-            /* An address inside the mirrors would alias live memory. */
+            /* An address in the slots above RAM is not free to hand out. */
             base = 0x10000000u; size = 0x100000;
             st = nt_alloc_at(&base, &size, 0x2000);
             snprintf(d, sizeof d, "status 0x%08X", st);
-            check(st == 0xC0000018u, "an address inside the mirrors is refused", d);
+            check(st == 0xC0000018u, "an address in the slots above RAM is refused", d);
             st = nt_query(0x10000000u, mbi);
             snprintf(d, sizeof d, "state 0x%X", mbi[4]);
             check(st == 0 && mbi[4] == 0x2000,
-                  "query: the mirrors read as reserved, so a scanner moves on", d);
+                  "query: the slots read as reserved, so a scanner moves on", d);
 
-            /* base = 0 still comes from the heap, below the mirrors. */
+            /* base = 0 still comes from the heap, below the slots. */
             st = nt_alloc(0x10000, &base);
             snprintf(d, sizeof d, "status 0x%08X, base 0x%08X", st, base);
             check(st == 0 && base && base < 0x04000000u,

@@ -235,8 +235,12 @@ static void table_edges(void)
     CHECK(bridge_take_handle(token) == wide && bridge_take_handle(token) == NULL);
     CHECK(bridge_resolve_handle(0xFFFFFFFEu) == (HANDLE)(intptr_t)-2);
     CHECK(bridge_resolve_handle(0xFFFFFFFFu) == (HANDLE)(intptr_t)-1);
-    CHECK(bridge_resolve_handle(0xDEAD0001u) == (HANDLE)(uintptr_t)0xDEAD0001u);
-    CHECK(bridge_resolve_handle(0xFE000000u) == (HANDLE)(uintptr_t)0xFE000000u);
+    /* Untagged values pass through only when the bridge issues them as
+     * sentinels. 0xDEAD0001 and 0xBEEF0010 are no longer issued, and a synthetic
+     * thunk VA is never a handle, so all three are refused. */
+    CHECK(bridge_resolve_handle(0xDEAD0001u) == NULL);
+    CHECK(bridge_resolve_handle(0xFE000000u) == NULL);
+    CHECK(bridge_resolve_handle(0xBEEF0001u) == (HANDLE)(uintptr_t)0xBEEF0001u);
     CHECK(bridge_take_handle(0xDEAD0001u) == NULL);
     for (i = 0; i < sizeof invalid / sizeof *invalid; ++i) {
         *(uint32_t *)(memory + 0x18000) = invalid[i];
@@ -244,7 +248,7 @@ static void table_edges(void)
         CHECK(bridge_resolve_handle(invalid[i]) == NULL && bridge_take_handle(invalid[i]) == NULL);
     }
     *(uint32_t *)(memory + 0x18000) = 0xBEEF0010u;
-    CHECK(bridge_read_handle(0x18000) == (HANDLE)(uintptr_t)0xBEEF0010u);
+    CHECK(bridge_read_handle(0x18000) == NULL);
 
     /* Populate exact private bounds without O(N^2) registrations. Exhaustion
      * must retain the caller's ownership and still deduplicate existing slots.

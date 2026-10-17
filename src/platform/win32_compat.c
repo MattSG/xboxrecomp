@@ -1058,16 +1058,22 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
 /* Virtual memory                                                        */
 /* ===================================================================== */
 
+/* Win32 page protection to host PROT_*. PAGE_NOACCESS must stay PROT_NONE
+ * (0): a region reserved with it has to fault on access, and the Xbox memory
+ * model relies on that for the slots above the mapped range. An unknown value
+ * is ERROR_INVALID_PARAMETER, as on Win32, and returns -1 rather than a guess. */
 static int prot_from_page(DWORD protect)
 {
     switch (protect & 0xFF) {
     case PAGE_NOACCESS:          return PROT_NONE;
     case PAGE_READONLY:          return PROT_READ;
-    case PAGE_READWRITE:         return PROT_READ | PROT_WRITE;
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:         return PROT_READ | PROT_WRITE;
     case PAGE_EXECUTE:           return PROT_EXEC;
     case PAGE_EXECUTE_READ:      return PROT_READ | PROT_EXEC;
-    case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE | PROT_EXEC;
-    default:                     return PROT_READ | PROT_WRITE;
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY: return PROT_READ | PROT_WRITE | PROT_EXEC;
+    default:                     return -1;
     }
 }
 
@@ -1129,6 +1135,11 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
     int prot  = prot_from_page(protect);
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 
+    if (prot < 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+
     /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
      * just adjust protection. */
     if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address) {
@@ -1144,10 +1155,10 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
     void *p;
 #if defined(__APPLE__)
     if (address) {
-        p = mach_map_fixed(address, size, prot ? prot : PROT_READ | PROT_WRITE);
+        p = mach_map_fixed(address, size, prot);
     } else
 #endif
-    p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE, flags, -1, 0);
+    p = mmap(address, size, prot, flags, -1, 0);
     if (p == MAP_FAILED) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
@@ -1189,8 +1200,14 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
 
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
 {
+    int prot = prot_from_page(newProtect);
+
+    if (prot < 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     if (oldProtect) *oldProtect = PAGE_READWRITE;
-    return mprotect(address, size, prot_from_page(newProtect)) == 0;
+    return mprotect(address, size, prot) == 0;
 }
 
 /* ===================================================================== */
@@ -1540,7 +1557,7 @@ int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 }
 
 /* ===================================================================== */
-/* File mapping (memfd-backed) -- true aliased mirror views              */
+/* File mapping (memfd-backed)                                           */
 /* ===================================================================== */
 
 /* Registry of active views: UnmapViewOfFile takes no length, so we must
@@ -1650,8 +1667,8 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
 
     /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
      * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
-     * and succeeds. The Xbox memory model asks for 28 mirror views at computed
-     * addresses, so with a base the OS chose rather than one we picked, that
+     * and succeeds. The Xbox memory model maps its RAM view at an address it
+     * reserved, so with a base the OS chose rather than one we picked, that
      * difference is the process quietly destroying its own libraries and heap
      * and dying somewhere unrelated a moment later. */
     if (baseAddr) {
@@ -1748,6 +1765,36 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
     buffer->Protect          = PAGE_READWRITE;
     buffer->Type             = MEM_PRIVATE;
     return sizeof(*buffer);
+}
+
+/* Win32 GetComputerNameA. The host name stands in for the NetBIOS name; the
+ * only caller hashes it into a console MAC seed, so it is not cut to 15 chars,
+ * which would merge distinct hosts. Same contract as Win32: *size is the length
+ * without the NUL, and a short buffer fails with ERROR_BUFFER_OVERFLOW and
+ * *size set to what is needed. */
+BOOL GetComputerNameA(LPSTR buffer, LPDWORD size)
+{
+    char name[256];
+    size_t len;
+
+    if (!buffer || !size) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (gethostname(name, sizeof name) != 0) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return FALSE;
+    }
+    name[sizeof name - 1] = '\0';
+    len = strlen(name);
+    if (len + 1 > *size) {
+        *size = (DWORD)(len + 1);
+        SetLastError(ERROR_BUFFER_OVERFLOW);
+        return FALSE;
+    }
+    memcpy(buffer, name, len + 1);
+    *size = (DWORD)len;
+    return TRUE;
 }
 
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)

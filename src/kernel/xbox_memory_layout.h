@@ -9,14 +9,12 @@
  *
  * On Windows, we:
  * 1. Create a 64MB file mapping (CreateFileMapping)
- * 2. Map the base view + 28 mirror views at 64MB intervals
+ * 2. Map the base view; reserve, but do not map, the space above it
  * 3. Parse the XBE section table and copy sections to their Xbox VAs
  * 4. Set up simulated stack, heap, TIB, and kernel data area
  *
- * The mirror views ensure Xbox RAM wrapping works correctly: the Xbox
- * memory controller uses a 26-bit address bus, so ALL addresses wrap
- * modulo 64MB. File mapping views backed by the same section give us
- * true aliases where writes at one address are visible at all mirrors.
+ * An address above the mapped range is not an alias of RAM. It is unmapped,
+ * so a stray guest access faults and the fault handler reports the address.
  */
 
 #ifndef XBOX_MEMORY_LAYOUT_H
@@ -49,18 +47,17 @@ extern "C" {
 #define XBOX_GPU_RESERVED       (4 * 1024 * 1024)   /* ~4 MB for GPU */
 
 /* Actual mapped RAM for this run. Defaults to XBOX_TOTAL_RAM; a title with a
- * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top and
- * mirror stride derive from this, not from the compile-time constant. */
+ * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top
+ * derives from this, not from the compile-time constant. */
 extern size_t g_xbox_total_ram;
 
 /* How much guest address space to map, when that must exceed RAM.
  *
  * These are not the same quantity and conflating them is a bug. RAM is what
  * the console has and what the heap is carved out of; the mapped range is how
- * much guest address space is backed by distinct host pages. The runtime
- * mirrors RAM at intervals of the mapped size, because a real Xbox wraps
- * addresses on a 26-bit bus -- so anything a title allocates above the mapped
- * range silently shares storage with low memory.
+ * much guest address space is backed by distinct host pages. Anything a title
+ * allocates above the mapped range is not backed by anything: it faults, which
+ * is what an unmapped virtual address does on the console too.
  *
  * Half-Life 2 needs this: its allocator sub-allocates past the top of RAM, and
  * at 64 MB its first commit past the boundary (0x04F80000) aliases the base of
@@ -268,7 +265,6 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);
-void xbox_ProtectMirrorsForDebug(void);
 
 /* Dump the guest call stack and abort if the title has not exited within
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
@@ -481,12 +477,14 @@ extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_HEAP_TOP       ((uint32_t)(g_xbox_map_size ? g_xbox_map_size \
                                                         : g_xbox_total_ram))
 
-/** No static mirror/guard region. RAM mirror is handled via file mapping
- *  views that alias the same physical pages as the base 64 MB region. */
+/** No static mirror/guard region. */
 #define XBOX_MIRROR_SIZE    0
 #define XBOX_GUARD_SIZE     0
 
-/** Number of 64 MB mirror views to pre-map (covers 1.75 GB of address space). */
+/** Number of map-sized slots reserved above the mapped range (1.75 GB at a
+ *  128 MB map). They are reserved, never mapped, so an access faults: the
+ *  slots used to alias low RAM, which hid real corruption. See
+ *  xbox_memory_layout.c. */
 #define XBOX_NUM_MIRRORS    28
 
 /* Tiled / write-combined aperture. The NV2A shows physical RAM again here, and
@@ -524,7 +522,6 @@ int xbox_HeapReclaimEnabled(void);
 
 /**
  * Get the file mapping handle for the Xbox memory region.
- * Used by the VEH handler to map additional mirror views on demand.
  * Returns NULL if file mapping is not available.
  */
 HANDLE xbox_GetMappingHandle(void);
