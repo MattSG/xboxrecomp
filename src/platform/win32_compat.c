@@ -2767,23 +2767,6 @@ BOOL ReadProcessMemory(HANDLE process, LPCVOID address, LPVOID buffer, SIZE_T si
     return TRUE;
 }
 
-BOOL GetComputerNameA(LPSTR name, LPDWORD size)
-{
-    char host[256];
-    size_t len;
-    if (!name || !size || gethostname(host, sizeof host) != 0) return FALSE;
-    host[sizeof host - 1] = '\0';
-    len = strlen(host);
-    if (len + 1 > *size) {
-        *size = (DWORD)(len + 1);
-        SetLastError(ERROR_BUFFER_OVERFLOW);
-        return FALSE;
-    }
-    memcpy(name, host, len + 1);
-    *size = (DWORD)len;
-    return TRUE;
-}
-
 /* An empty value removes the variable, as on Windows. */
 int _putenv_s(const char *name, const char *value)
 {
