@@ -66,6 +66,9 @@ void xbox_Nv2aCaptureSnapshot(XBOX_NV2A_CAPTURE_STATE *out)
 
 void nv2a_d3d_kick(void) { kick_calls++; }
 void nv2a_pb_exec_report(void) {}
+static uint32_t sema_last, sema_releases;
+uint32_t nv2a_pb_exec_semaphore_last_value(void) { return sema_last; }
+uint32_t nv2a_pb_exec_semaphore_releases(void) { return sema_releases; }
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     if (command_count >= 64) ExitProcess(30);
@@ -82,6 +85,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         test_cpu += 400000; /* 40 ms of CPU within 80 ms of elapsed time. */
     }
     if (method == 0x0130) test_wall += 16000; /* Normal flip pacing. */
+    if (method == 0x1D70) { sema_last = param; sema_releases++; }
 }
 
 #define CHECK(condition) do { if (!(condition)) { \
@@ -210,37 +214,53 @@ int main(int argc, char **argv)
         CHECK(commands[3].method == 0x1804 && commands[3].param == 0x44);
     }
 
-    /* Sequential PFIFO reads and continuation aliases wrap on the26-bit bus. */
+    /* Nothing wraps at 64 MB: a read past the window, or a JUMP/CALL target
+     * outside it, stops the walk at PUT instead of executing whatever lies at
+     * the wrapped address (stop-and-salvage, as apexJCL's walker). */
     {
         uint32_t *last = (uint32_t *)(memory + XBOX_CONTIG_SIZE - 4);
         uint32_t *first = (uint32_t *)memory;
+        uint32_t stops = s_tot_stops;
         command_count = 0;
-        *last = (2u << 18) | 0x1D8C; first[0] = 0x1002; first[1] = 0x2001;
-        nv2a_pb_scan(XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - 4, XBOX_CONTIG_BASE);
-        CHECK(command_count == 0);
-        nv2a_pb_scan(XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE, XBOX_CONTIG_BASE + 8);
-        CHECK(command_count == 2);
-        CHECK(commands[0].method == 0x1D8C && commands[0].param == 0x1002);
-        CHECK(commands[1].method == 0x1D90 && commands[1].param == 0x2001);
 
-        /* A complete payload can cross the bus boundary within one scan. */
-        command_count = 0;
+        /* A payload that would run off the top of RAM: its in-window
+         * parameter runs, nothing is read from physical 0. */
         last[-1] = (3u << 18) | 0x1720; last[0] = 42;
         first[0] = 0x1002; first[1] = 0x2001;
         nv2a_pb_scan(XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - 8, XBOX_CONTIG_BASE + 8);
-        CHECK(command_count == 3 && commands[0].param == 42);
-        CHECK(commands[1].method == 0x1724 && commands[1].param == 0x1002);
-        CHECK(commands[2].method == 0x1728 && commands[2].param == 0x2001);
+        CHECK(command_count == 1 && commands[0].method == 0x1720 && commands[0].param == 42);
+        CHECK(s_tot_stops == stops + 1);
+        CHECK(s_fifo.pc == XBOX_CONTIG_BASE + 8 && !s_packet.active);
 
-        /* Called lists use their RETURN, not the caller's PUT, and may wrap
-         * physical RAM before that RETURN without losing caller position. */
+        /* A JUMP above 64 MB stops; the commands at the wrapped address
+         * do not run. */
         command_count = 0;
-        last[-1] = (1u << 18) | 0x17FC; last[0] = 0;
-        first[0] = 0x00020000;
+        first[0] = (1u << 18) | 0x17FC; first[1] = 0;
         root = (uint32_t *)(memory + 0x900);
-        root[0] = (XBOX_CONTIG_SIZE - 8) | 2;
-        nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x904);
-        CHECK(command_count == 1 && commands[0].method == 0x17FC);
+        root[0] = (XBOX_CONTIG_SIZE + 0) | 1;
+        root[1] = (1u << 18) | 0x1720; root[2] = 7;
+        nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x90C);
+        CHECK(command_count == 0 && s_tot_stops == stops + 2);
+
+        /* A CALL above 64 MB stops the same way and leaves no call open. */
+        root[0] = (XBOX_CONTIG_SIZE + 0) | 2;
+        nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x90C);
+        CHECK(command_count == 0 && s_tot_stops == stops + 3 && !s_fifo.in_call);
+
+        /* After a stop, the next fence release between it and PUT still
+         * runs (odd, after the last, within 128 of it), so the title's
+         * fence wait completes. A release that doesn't look like the next
+         * fence is left alone. */
+        sema_last = 5;
+        root[0] = (XBOX_CONTIG_SIZE + 0) | 1;
+        root[1] = 0x00041D70; root[2] = 7;
+        nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x90C);
+        CHECK(command_count == 1 && commands[0].method == 0x1D70 && commands[0].param == 7);
+        CHECK(s_tot_salvaged == 1);
+        command_count = 0;
+        root[2] = 0x9000;                  /* even and far ahead: data */
+        nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x90C);
+        CHECK(command_count == 0 && s_tot_salvaged == 1);
     }
 
     /* An explicitly discontinuous scan cannot inherit stale packet state. */
@@ -290,24 +310,23 @@ int main(int argc, char **argv)
         CHECK(command_count == 4 && !s_fifo.in_call);
     }
 
-    /* The PUT comparison also wraps correctly in a called payload. */
+    /* A called payload that runs off the top of RAM stops there too: the
+     * in-window parameter runs, the call is dropped, and the walk resumes
+     * at PUT rather than reading physical 0. */
     {
         uint32_t *last = (uint32_t *)(memory + XBOX_CONTIG_SIZE - 4);
         uint32_t *first = (uint32_t *)memory;
         uint32_t *caller = (uint32_t *)(memory + 0x9000);
         uint32_t *tail = (uint32_t *)(memory + 0x9400);
+        uint32_t stops = s_tot_stops;
         command_count = 0;
         caller[0] = (XBOX_CONTIG_SIZE - 8) | 2; caller[1] = 0x9401;
         last[-1] = (3u << 18) | 0x1720; last[0] = 11;
         first[0] = 22; first[1] = 33; first[2] = 0x00020000;
         tail[0] = (1u << 18) | 0x1D8C; tail[1] = 44;
-        CHECK(nv2a_pb_scan(XBOX_CONTIG_BASE + 0x9000, XBOX_CONTIG_BASE + 4));
-        CHECK(command_count == 2 && s_fifo.in_call && s_packet.remaining == 1);
-        CHECK(nv2a_pb_scan(XBOX_CONTIG_BASE + 4, XBOX_CONTIG_BASE + 0x9408));
-        CHECK(command_count == 4 && !s_fifo.in_call && !s_packet.active);
-        CHECK(commands[0].param == 11 && commands[1].param == 22);
-        CHECK(commands[2].method == 0x1728 && commands[2].param == 33);
-        CHECK(commands[3].method == 0x1D8C && commands[3].param == 44);
+        CHECK(nv2a_pb_scan(XBOX_CONTIG_BASE + 0x9000, XBOX_CONTIG_BASE + 0x9408));
+        CHECK(command_count == 1 && commands[0].param == 11);
+        CHECK(s_tot_stops == stops + 1 && !s_fifo.in_call && !s_packet.active);
     }
 
     /* RETURN is the exact00020000 word; reserved high bits cannot create a
