@@ -41,6 +41,7 @@
 #include "fb_window_sdl.h"
 #include "platform/recomp_profile.h"
 #include "../d3d/d3d8_swizzle.h"
+#include "../kernel/kernel.h"
 #include "nv2a_render_common.h"
 #include "nv2a_texture_hash.h"
 
@@ -1686,7 +1687,14 @@ static SDL_GPUTexture *texture_get_impl(const NvD3DTexture *t, int *guest_levels
     if (guest_levels) *guest_levels = 1;
     if (!tex_layout(t, &L)) return NULL;
     if (guest_levels) *guest_levels = L.levels;
-    if (!guest_ok(t->addr, L.total)) return NULL;
+    if (!guest_ok(t->addr, L.total)) {
+        texture_refused(t, "span_outside_ram", L.total);
+        return NULL;
+    }
+    if (t->color == 0x0B && (!pal_p || !guest_ok(pal_p, t->palette_len * 4))) {
+        texture_refused(t, pal_p ? "palette_outside_ram" : "palette_missing", t->palette_len * 4);
+        return NULL;
+    }
     for (e = *head; e; e = e->next)
         if (e->phys == p && e->format == t->format && e->pitch == t->pitch &&
             e->w == t->width && e->h == t->height && e->palette == pal_p &&
@@ -3376,17 +3384,35 @@ static void display_config(int now)
 
 static Surface *scan_surface(uint32_t va, uint32_t pitch)
 {
-    uint32_t bpp = pitch >= 640 * 4 ? 4 : 2;
-    uint32_t w = pitch / bpp, h = 480;
+    /* The size the title gave AvSetDisplayMode, when that scanout has this
+     * flip's pitch. Otherwise a 640x480 display is guessed from the pitch, and
+     * each distinct address (first 16) is logged so a wrong guess shows up. */
+    static uint32_t guessed[16];
+    static unsigned guessed_n;
+    uint32_t bpp, w, h, mpitch;
     Surface *s = surface_find(phys(va));
-    if (w > 640) w = 640;
+    if (!(xbox_GetDisplayMode(&mpitch, &bpp, &w, &h) && mpitch == pitch)) {
+        bpp = pitch >= 640 * 4 ? 4 : 2;
+        w = pitch / bpp; h = 480;
+        if (w > 640) w = 640;
+        if (!s) {
+            unsigned i;
+            for (i = 0; i < guessed_n && guessed[i] != va; i++) ;
+            if (i == guessed_n && guessed_n < 16) {
+                guessed[guessed_n++] = va;
+                fprintf(stderr, "[SCAN_GUESS] addr=%08X phys=%08X pitch=%u guessed=%ux%u bpp=%u (no surface at address)\n",
+                        va, phys(va), pitch, w, h, bpp);
+                fflush(stderr);
+            }
+        }
+    }
     if (!s || s->pitch != pitch)
         s = surface_get(va, pitch, bpp == 4 ? 0x5 : 0x3, w, h, 0);
     if (s) surface_sync(s, 1);
     return s;
 }
 
-void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
+void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
 {
     Surface *s;
     FlipPacing pacing = { 0, 0 };
@@ -3411,18 +3437,38 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
         int64_t t0 = s_prof_on > 0 ? qpc() : 0, t1;
         writeback_surfaces();
         t1 = s_prof_on > 0 ? qpc() : 0;
-        present_surface(s, &pacing);
+        if (show) present_surface(s, &pacing);
         if (s_prof_on > 0) {
             s_prof[PROF_WRITEBACK] += t1 - t0;
             s_prof[PROF_PRESENT] += qpc() - t1 - pacing.ticks;
         }
     }
-    pace_flip(&pacing);
-    frame_csv(pacing.ticks);
+    if (show) {
+        pace_flip(&pacing);
+        frame_csv(pacing.ticks);
+    }
     RECOMP_PROFILE_FRAME();
     prof_report();
     display_config(0);
     s_frame++;
+}
+
+void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
+{
+    nv2a_d3d_flip_present(surface_addr, pitch, 1);
+}
+
+/* Match D3D11's title-thread request/executor-thread replay handoff. */
+static SDL_AtomicInt s_interp_req;
+static float s_interp_t;
+void nv2a_d3d_interp_frame(float t, int need_new)
+{
+    extern void nv2a_pb_interp_enable(int);
+    (void)need_new; /* Replay the latest completed frame, as D3D11 does. */
+    nv2a_pb_interp_enable(1);
+    s_interp_t = t;
+    SDL_SetAtomicInt(&s_interp_req, 1);
+    while (SDL_GetAtomicInt(&s_interp_req)) SDL_Delay(0);
 }
 
 /* The last flipped frame shown again, paced like a flip (see nv2a_d3d11.c). */
@@ -3447,6 +3493,13 @@ void nv2a_d3d_tick(void)
     if (s_init_state <= 0 && !nv2a_d3d_init())
         return;
     fbw_sdl_pump();
+    if (SDL_GetAtomicInt(&s_interp_req)) {
+        extern int nv2a_pb_replay(float);
+        if (!nv2a_pb_replay(s_interp_t) && !present_kept_image(NULL))
+            present_surface(s_shown, NULL);
+        SDL_SetAtomicInt(&s_interp_req, 0);
+        return;
+    }
     if (SDL_GetAtomicInt(&s_repeat)) {
         int64_t t0;
         if (!present_kept_image(NULL))

@@ -202,4 +202,12 @@ static void nv2a_common_checks(void)
     check_shared_halving();
 }
 
+
+/* Standalone renderer fixtures do not request executor replay. */
+void nv2a_pb_interp_enable(int on) { (void)on; abort(); }
+int nv2a_pb_replay(float t) { (void)t; abort(); return 0; }
+int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp, uint32_t *w, uint32_t *h)
+{ (void)pitch; (void)bpp; (void)w; (void)h; return 0; }
+void xbox_FramebufferSdlHints(void) {}
+
 #endif
