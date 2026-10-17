@@ -209,7 +209,6 @@ void nv2a_stub_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
 /* DMA helpers */
 DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address);
-void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len);
 
 /* PGRAPH method dispatch (from push buffer commands) */
 void pgraph_method(NV2AState *d, uint32_t subchannel,

@@ -31,6 +31,13 @@
 #include <fnmatch.h>
 #endif
 
+/* Object handles and unsupported-code notes, defined in kernel_io.c. Declared
+ * here, not in kernel.h, because only this file and kernel_bridge.c use them. */
+extern NTSTATUS xbox_OpenSymbolicLink(const char* name, HANDLE* out);
+extern const char* xbox_SymbolicLinkHandleTarget(HANDLE h);
+extern int xbox_CloseObjectHandle(HANDLE h);
+extern void xbox_NoteUnsupportedIoctl(const char* what, ULONG code);
+
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
@@ -616,6 +623,8 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+    if (xbox_CloseObjectHandle(Handle))
+        return STATUS_SUCCESS;  /* object handle: a link or directory, nothing to close */
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         xbox_dir_context_drop(Handle);
         file_diag_close_native(Handle);
@@ -1231,6 +1240,8 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+    if (xbox_CloseObjectHandle(Handle))
+        return STATUS_SUCCESS;  /* object handle: a link or directory, nothing to close */
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         CloseHandle(Handle);
         return STATUS_SUCCESS;
@@ -1595,7 +1606,7 @@ NTSTATUS __stdcall xbox_NtFsControlFile(
 {
     (void)FileHandle; (void)Event; (void)ApcRoutine; (void)ApcContext;
     (void)InputBuffer; (void)InputBufferLength; (void)OutputBuffer; (void)OutputBufferLength;
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtFsControlFile(0x%X) - stub", FsControlCode);
+    xbox_NoteUnsupportedIoctl("NtFsControlFile", FsControlCode);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
         IoStatusBlock->Information = 0;
@@ -1611,7 +1622,7 @@ NTSTATUS __stdcall xbox_NtDeviceIoControlFile(
 {
     (void)FileHandle; (void)Event; (void)ApcRoutine; (void)ApcContext;
     (void)InputBuffer; (void)InputBufferLength; (void)OutputBuffer; (void)OutputBufferLength;
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtDeviceIoControlFile(0x%X) - stub", IoControlCode);
+    xbox_NoteUnsupportedIoctl("NtDeviceIoControlFile", IoControlCode);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
         IoStatusBlock->Information = 0;
@@ -1619,33 +1630,36 @@ NTSTATUS __stdcall xbox_NtDeviceIoControlFile(
     return STATUS_NOT_IMPLEMENTED;
 }
 
+/* The link's name comes from the OBJECT_ATTRIBUTES. Path translation (kernel_path.c)
+ * maps the drive letters; this only answers which link a handle names. */
 NTSTATUS __stdcall xbox_NtOpenSymbolicLinkObject(
     PHANDLE LinkHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
-    /*
-     * Xbox uses symbolic links for drive-letter mapping (D: -> \Device\CdRom0).
-     * Path translation handles this transparently, so return a dummy handle.
-     */
-    if (LinkHandle)
-        *LinkHandle = (HANDLE)(ULONG_PTR)0xDEAD0001;
-    XBOX_TRACE(XBOX_LOG_FILE, "NtOpenSymbolicLinkObject(%s) - stub",
-        get_xbox_path(ObjectAttributes) ? get_xbox_path(ObjectAttributes) : "?");
-    return STATUS_SUCCESS;
+    char name[128];
+    PXBOX_ANSI_STRING s;
+
+    if (!LinkHandle || !ObjectAttributes || !(s = ObjectAttributes->ObjectName) ||
+        !s->Buffer || s->Length >= sizeof(name))
+        return STATUS_INVALID_PARAMETER;
+    memcpy(name, s->Buffer, s->Length);
+    name[s->Length] = '\0';
+    return xbox_OpenSymbolicLink(name, LinkHandle);
 }
 
 NTSTATUS __stdcall xbox_NtQuerySymbolicLinkObject(
     HANDLE LinkHandle, PXBOX_ANSI_STRING LinkTarget, PULONG ReturnedLength)
 {
-    (void)LinkHandle;
-    const char* target = "\\Device\\CdRom0";
-    if (LinkTarget && LinkTarget->Buffer) {
-        USHORT len = (USHORT)strlen(target);
-        if (len < LinkTarget->MaximumLength) {
-            memcpy(LinkTarget->Buffer, target, len + 1);
-            LinkTarget->Length = len;
-        }
-    }
+    const char* target = xbox_SymbolicLinkHandleTarget(LinkHandle);
+    USHORT len;
+
+    if (!target)
+        return STATUS_INVALID_HANDLE;
+    len = (USHORT)strlen(target);
     if (ReturnedLength)
-        *ReturnedLength = (ULONG)strlen(target);
+        *ReturnedLength = (ULONG)len;
+    if (!LinkTarget || !LinkTarget->Buffer || len >= LinkTarget->MaximumLength)
+        return (NTSTATUS)0xC0000023L; /* STATUS_BUFFER_TOO_SMALL */
+    memcpy(LinkTarget->Buffer, target, len + 1);
+    LinkTarget->Length = len;
     return STATUS_SUCCESS;
 }

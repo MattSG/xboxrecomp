@@ -11,6 +11,9 @@ extern ptrdiff_t g_xbox_mem_offset;
 void *recomp_lookup(ULONG address) { (void)address; abort(); }
 void *recomp_lookup_manual(ULONG address) { (void)address; abort(); }
 int main(void) {
+    /* 0x80000000 + p maps to p for p inside the contiguous window (the Xbox
+     * convention). Everything else passes through unchanged and is never
+     * masked: 0x84000000 must not come back as 0x04000000. */
     const uint32_t cases[][2]={
         {0,0},{0x1000,0x1000},{0x03ffffff,0x03ffffff},
         {0x7fffffff,0x7fffffff},{0x80000000,0},

@@ -45,6 +45,8 @@ static uint32_t s_tot_calls;
 /* Walks that stopped short of PUT, and how many of those had their fence
  * release salvaged. Counted because after eight log lines a stop is silent. */
 static uint32_t s_tot_stops, s_tot_salvaged;
+/* Segments refused at entry because GET or PUT is outside the window. */
+static uint32_t s_tot_refused;
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
@@ -306,6 +308,9 @@ void nv2a_pb_scan_report(void)
         fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
         fprintf(stderr, "[PB] %u walks stopped short of PUT (%u with a fence"
                         " release salvaged)\n", s_tot_stops, s_tot_salvaged);
+        if (s_tot_refused)
+            fprintf(stderr, "[PB] %u segments refused: GET or PUT outside the"
+                            " contiguous window\n", s_tot_refused);
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
@@ -758,11 +763,20 @@ int nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     int completed;
     PB_HITCH trace, *hitch = NULL;
 
-    /* GET and PUT are bus addresses: canonicalise the published pointers
-     * (aliases above 64 MB name the same RAM). The walk's own targets and
-     * reads are not wrapped; see pb_in_window. */
-    start_va = XBOX_CONTIG_BASE | (start_va & (XBOX_CONTIG_SIZE - 1u));
-    end_va = XBOX_CONTIG_BASE | (end_va & (XBOX_CONTIG_SIZE - 1u));
+    /* GET and PUT must lie in the contiguous window. A value past it is not
+     * an alias of a low address: the walk cannot read it (see pb_in_window),
+     * and wrapping it would run whatever sits at the wrapped address. Refuse
+     * the segment and log the first few. Report it consumed, not incomplete:
+     * an incomplete scan is retried every tick with the same refusal and
+     * holds back every fence publish, which is the silent stall. */
+    if (!pb_in_window(start_va) || end_va - XBOX_CONTIG_BASE > XBOX_CONTIG_SIZE) {
+        s_tot_refused++;
+        if (s_tot_refused <= 8)
+            fprintf(stderr, "[PB] refused segment GET 0x%08X PUT 0x%08X: outside"
+                            " the 64 MB contiguous window (%u refused so far)\n",
+                    start_va, end_va, s_tot_refused);
+        return 1;
+    }
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;

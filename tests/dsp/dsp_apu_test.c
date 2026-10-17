@@ -413,6 +413,22 @@ int main(void)
     mcpx_apu_dsp_pcm_consumed(d);
     CHECK(!d->monitor.frame_mixed && d->monitor.ep_pcm_ready && !d->monitor.ep_pcm_queued);
     for (unsigned i = 0; i < 1024; i++) CHECK(((uint8_t *)d->monitor.frame_buf)[i] == 0x33);
+    /* A FIFO cursor below its ring is refused, not clamped to the base. The
+     * transfer is skipped and the DSP sees a DMA error; the guest page the
+     * clamped cursor would have written (0xc000) must keep its value. */
+    uint32_t fifo_cur = d->regs[NV_PAPU_EPOFCUR0];
+    d->regs[NV_PAPU_EPOFBASE0] = 0x1000;
+    d->regs[NV_PAPU_EPOFEND0] = 0x1800;
+    d->regs[NV_PAPU_EPOFCUR0] = 0x0800;
+    stl_le_phys(address_space_memory, 0xc000, 0x77777777);
+    uint8_t below[16];
+    memset(below, 0x99, sizeof(below));
+    d->ep.dsp->dma.error = false;
+    d->ep.dsp->dma.fifo_rw(d->ep.dsp->dma.rw_opaque, below, 0, sizeof(below), true);
+    CHECK(d->ep.dsp->dma.error && d->regs[NV_PAPU_EPOFCUR0] == 0x0800);
+    CHECK(ldl_le_phys(address_space_memory, 0xc000) == 0x77777777);
+    d->regs[NV_PAPU_EPOFCUR0] = fifo_cur;
+    d->ep.dsp->dma.error = false;
     /* A stalled native consumer cannot turn valid guest DMA into failure. */
     mcpx_apu_dsp_write(d, false, 0x22 * 4, 512, 4);
     mcpx_apu_dsp_write(d, false, 0x23 * 4, 0x100, 4);

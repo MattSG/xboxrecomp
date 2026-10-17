@@ -43,7 +43,13 @@ if(WIN32)
     )
     target_include_directories(d3d8_a8 PRIVATE ../../src/d3d)
     target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+    # Real d3d8_vsh.c: constant-index translation, and input-layout caching.
+    add_executable(d3d8_vsh test_vsh.c)
+    target_include_directories(d3d8_vsh PRIVATE ../../src/d3d)
+    target_link_libraries(d3d8_vsh PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+
     foreach(check d3d8_gamma d3d8_smoke d3d8_states_smoke d3d8_a8)
         add_test(NAME ${check} COMMAND ${check})
     endforeach()
+    add_test(NAME d3d8_vsh COMMAND d3d8_vsh all)
 endif()

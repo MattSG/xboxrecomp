@@ -66,22 +66,19 @@ void xbox_SetMapSize(size_t bytes)
 }
 
 /* File mapping handle for the Xbox memory region.
- * Using CreateFileMapping + MapViewOfFileEx allows mirror views to alias
- * the same physical pages as the base region, so writes to mirror addresses
- * (which wrap modulo 64 MB on real Xbox hardware) correctly modify the
- * underlying data. */
+ * Using CreateFileMapping + MapViewOfFileEx lets the base, the contiguous
+ * window and the tiled aperture be views of the same pages, so a write through
+ * 0xF0000000 reads back through the normal address. */
 static HANDLE g_mapping_handle = NULL;
 
-/* Mirror view pointers for cleanup */
-static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
+/* Slots above the mapped range reserved without a placeholder span (see
+ * xbox_MemoryLayoutInit). Released at shutdown. */
+static void *g_gap_reserved[XBOX_NUM_MIRRORS] = {0};
 
-/* The base view and its 28 mirrors occupy one contiguous span. Reserving that
- * span up front is what makes the mirrors placeable at all: each one sits at
- * base + N * 64 MB, and on a host that chose the base for us, those addresses
- * run through whatever the loader already owns. Placing them one at a time
- * means ~3 of 28 collide, and *which* three changes with ASLR. Claiming the
- * whole range first, then carving views out of ground we hold, removes the
- * question. */
+/* The base view and the slots above it occupy one contiguous span. Reserving
+ * that span up front keeps those addresses ours: on a host that chose the base
+ * for us they run through whatever the loader already owns, and a guest access
+ * there would read host memory instead of faulting. */
 static void *g_span_base = NULL;
 static size_t g_span_size = 0;
 static void *g_tiled_view = NULL;
@@ -678,6 +675,26 @@ static int fence_readable(uint32_t va, uint32_t bytes)
     return (size_t)va + bytes <= g_memory_size;
 }
 
+/* The fence paths skip what they cannot read, which is the safe answer, but a
+ * skipped fence is one the title waits on forever. Note each (mirror, site)
+ * once, with the address, so that stall has a line in the log. */
+enum {
+    FENCE_SKIP_RELEASE_DEVICE, FENCE_SKIP_RELEASE_DEV, FENCE_SKIP_RELEASE_GET,
+    FENCE_SKIP_RELEASE_TARGET, FENCE_SKIP_PUBLISH_FENCE, FENCE_SKIP_PUBLISH_TARGET,
+    FENCE_SKIP_TICK_CHAIN
+};
+static uint32_t s_fence_skip_noted[XBOX_MAX_FENCE_MIRRORS];
+
+static void fence_skip_note(int mirror, int site, const char *what, uint32_t va)
+{
+    if (s_fence_skip_noted[mirror] & (1u << site))
+        return;
+    s_fence_skip_noted[mirror] |= 1u << site;
+    fprintf(stderr, "  [NV2A] fence mirror %d: %s at 0x%08X is not readable; "
+                    "fence not published (logged once per site)\n",
+            mirror, what, va);
+}
+
 /*
  * Two counters inside the device, one of which the GPU owns.
  *
@@ -876,12 +893,19 @@ static void fence_mirrors_tick(int publish)
         dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
                                      + g_memory_offset);
         if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4)
-                || !fence_readable(dev + g_fence_mirrors[i].put_off, 4))
+                || !fence_readable(dev + g_fence_mirrors[i].put_off, 4)) {
+            /* dev is 0 until the title creates the device; that is not a stall. */
+            if (dev)
+                fence_skip_note(i, FENCE_SKIP_TICK_CHAIN, "GET/PUT slot",
+                                dev + g_fence_mirrors[i].get_ptr_off);
             continue;
+        }
         get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
                                          + g_memory_offset);
-        if (!fence_readable(get_ptr, 4))
+        if (!fence_readable(get_ptr, 4)) {
+            fence_skip_note(i, FENCE_SKIP_TICK_CHAIN, "fence", get_ptr);
             continue;
+        }
         {
             volatile uint32_t *fence =
                 (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
@@ -913,15 +937,29 @@ void xbox_Nv2aSemaphoreRelease(uint32_t dma_context,
         uint32_t dev, target;
         if (!g_fence_mirrors[i].command_mode ||
             g_fence_mirrors[i].command_dma != dma_context ||
-            g_fence_mirrors[i].command_offset != semaphore_offset ||
-            !fence_readable(g_fence_mirrors[i].device_ptr_va, 4)) continue;
+            g_fence_mirrors[i].command_offset != semaphore_offset) continue;
+        if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4)) {
+            fence_skip_note(i, FENCE_SKIP_RELEASE_DEVICE, "device pointer",
+                            g_fence_mirrors[i].device_ptr_va);
+            continue;
+        }
         dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
                                      + g_memory_offset);
-        if (!fence_readable(dev, 1) ||
-            !fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4)) continue;
+        if (!fence_readable(dev, 1)) {
+            fence_skip_note(i, FENCE_SKIP_RELEASE_DEV, "device struct", dev);
+            continue;
+        }
+        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4)) {
+            fence_skip_note(i, FENCE_SKIP_RELEASE_GET, "GET pointer slot",
+                            dev + g_fence_mirrors[i].get_ptr_off);
+            continue;
+        }
         target = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
                                         + g_memory_offset);
-        if (!fence_readable(target, 4)) continue;
+        if (!fence_readable(target, 4)) {
+            fence_skip_note(i, FENCE_SKIP_RELEASE_TARGET, "fence target", target);
+            continue;
+        }
         /* Consecutive releases to one address can retain the last value in
          * execution order, including uint32 wrap. A target change must retain
          * both writes; a fixed target needs no allocation at all. */
@@ -976,10 +1014,19 @@ static void command_fences_publish(void)
         volatile uint32_t *fence;
         XBOX_COMMAND_FENCE *next;
         int valid = 1;
-        if (!g_fence_mirrors[i].command_pending ||
-            !fence_readable(g_fence_mirrors[i].command_fence_va, 4)) continue;
+        if (!g_fence_mirrors[i].command_pending) continue;
+        if (!fence_readable(g_fence_mirrors[i].command_fence_va, 4)) {
+            fence_skip_note(i, FENCE_SKIP_PUBLISH_FENCE, "fence",
+                            g_fence_mirrors[i].command_fence_va);
+            continue;
+        }
         for (next = g_fence_mirrors[i].command_head; next; next = next->next)
-            if (!fence_readable(next->target, 4)) { valid = 0; break; }
+            if (!fence_readable(next->target, 4)) {
+                fence_skip_note(i, FENCE_SKIP_PUBLISH_TARGET, "queued fence target",
+                                next->target);
+                valid = 0;
+                break;
+            }
         if (!valid) continue;
         fence = (volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].command_fence_va
                                        + g_memory_offset);
@@ -2185,21 +2232,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     /* Map the full Xbox address space (covers all sections + stack + heap).
      * Size is runtime-configurable: retail 64 MB, devkit debug builds 128 MB. */
-    /* The mapped range, which is not necessarily RAM. Mirrors are placed
-     * at multiples of this, so growing it is what stops a title's
-     * above-RAM allocations from aliasing low memory. */
+    /* The mapped range, which is not necessarily RAM. Anything a title
+     * allocates above it is unmapped and faults, so growing it is what lets
+     * the title use that space at all. */
     g_memory_size = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
     /*
      * Create a file mapping backed by the page file.
      *
-     * Using file mapping instead of VirtualAlloc allows us to map the same
-     * physical pages at multiple virtual addresses via MapViewOfFileEx.
-     * This is critical for the Xbox RAM mirror: the Xbox memory controller
-     * uses a 26-bit address bus, so ALL addresses wrap modulo 64 MB.
-     * Code that writes to address 0x20000448 is really writing to 0x00000448.
-     * With file mapping views, we create aliased mappings at 64 MB intervals
-     * that all point to the same physical memory.
+     * Using file mapping instead of VirtualAlloc lets the contiguous window
+     * and the tiled aperture be views of the same physical pages via
+     * MapViewOfFileEx. Nothing above the mapped range is a view: see the
+     * slot reservation below.
      */
     g_mapping_handle = CreateFileMappingA(
         INVALID_HANDLE_VALUE,   /* page file backed */
@@ -2217,7 +2261,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /*
      * Map guest RAM at an OS-chosen host address first. Placing the base at
-     * 0x10000 can succeed while later Xbox RAM mirrors collide with unrelated
+     * 0x10000 can succeed while later above-RAM slots collide with unrelated
      * Windows mappings (for example, guest 0x78000000); guest accesses already
      * go through g_memory_offset, so there is no benefit to pinning the host
      * view to the guest address.
@@ -2238,7 +2282,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * tried the fixed addresses and gave up. Invisible on Windows, where
          * one of the low bases succeeds -- fatal on arm64 macOS, where all of
          * them sit inside the 4 GB __PAGEZERO segment and none can. */
-        /* Reserve base + mirrors as one range, and map the base at its head.
+        /* Reserve base + above-RAM slots as one range, and map the base at its head.
          * VirtualFree releases just the slice about to be used, so each view
          * replaces our own reservation rather than racing for free space.
          *
@@ -2265,7 +2309,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
             size_t ram_span = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
             size_t contig_end = (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
-            fprintf(stderr, "  RAM placeholders: APIs=%d/%d/%d map=%zu mirrors=%d contig-align=%d\n",
+            fprintf(stderr, "  RAM placeholders: APIs=%d/%d/%d map=%zu slots=%d contig-align=%d\n",
                 s_virtual_alloc2 != NULL, s_map_view_of_file3 != NULL,
                 s_unmap_view_of_file2 != NULL, g_memory_size, XBOX_NUM_MIRRORS,
                 (int)(XBOX_CONTIG_BASE % g_memory_size == 0));
@@ -3056,107 +3100,70 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             XBOX_HEAP_BASE, XBOX_HEAP_TOP);
 
     /*
-     * Map mirror views of the 64 MB region.
+     * Reserve the slots above the mapped range. They are not mapped.
      *
-     * On retail Xbox, physical RAM wraps at 64 MB due to the 26-bit
-     * address bus. Address 0x04070000 reads the same data as 0x00070000.
-     * The RenderWare engine's memory walker crosses 64 MB and accesses
-     * mirrored data for an extended walk covering 256+ MB of virtual
-     * addresses. Game init code also writes large data structures past
-     * 64 MB that on real hardware wrap into physical RAM.
+     * Each slot is map-sized and sits at a multiple of the mapped size. They
+     * used to be mapped as views of the RAM, so a guest address there read low
+     * memory: with a 128 MB map, 0x08000000 read 0x00000000. The console does
+     * not do that. The CPU translates a virtual address through page tables,
+     * and a page with no entry faults. The 26-bit bus wrap is a property of
+     * physical addresses, and the physical RAM the guest can reach is the
+     * contiguous window at 0x80000000. Half-Life 2 and Halo both built corrupt
+     * structures on the alias (4e03cab, 5362bc3, aa812ee), so the slots stay
+     * out: an access there faults, and the fault handler names the address.
      *
-     * We map additional views of the SAME file mapping section at 64 MB
-     * intervals. All views alias the same physical pages, so reads and
-     * writes at any mirror address correctly access the base data.
+     * With the placeholder span the reservation already exists. Without it,
+     * reserve each slot here, skipping the tiled aperture (mapped later) and
+     * the contiguous window (mapped later too).
      */
     {
-        int mirrors_ok = 0;
-        /* The tiled aperture is a specific architectural alias -- physical RAM
-         * a second time at 0xF0000000, which is where titles render -- while
-         * these mirrors are a generic emulation of the address wrap. When the
-         * mapped size is large enough that a mirror would cover 0xF0000000,
-         * the mirror wins the address and the tiled mapping fails with
-         * ERROR_INVALID_ADDRESS; Half-Life 2 then faults on its first surface
-         * write. The specific alias is worth more than one wrap mirror, so
-         * skip any that would overlap it.
-         *
-         * Guest addresses, not host: mirror m covers guest
-         * (m + 1) * g_memory_size. */
+        int slots_ok = 0;
         uint64_t tiled_lo = XBOX_TILED_BASE;
         uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
 
         for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
-            uintptr_t mirror_base = (uintptr_t)g_memory_base +
-                                    (uintptr_t)(m + 1) * g_memory_size;
             uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
             uint64_t guest_hi = guest_lo + g_memory_size;
+            uint64_t map_lo = guest_lo, map_hi = guest_hi;
+            void *slot;
 
             if (guest_lo < tiled_hi && tiled_lo < guest_hi) {
-                fprintf(stderr, "  Mirror %d: skipped, overlaps the tiled"
+                fprintf(stderr, "  Slot %d: left unreserved, overlaps the tiled"
                                 " aperture at 0x%08X\n",
                         m + 1, (unsigned)XBOX_TILED_BASE);
                 continue;
             }
-            /* Inside the reservation this hands back the slice we are about
-             * to use; outside it (no reservation) this is a no-op on an
-             * address we never held. */
-#ifdef _WIN32
-            if (g_placeholder_span) {
-                uint64_t map_lo = guest_lo;
-                uint64_t map_hi = guest_hi;
-                uint64_t contig_lo = XBOX_CONTIG_BASE;
-                uint64_t contig_hi = contig_lo + XBOX_CONTIG_SIZE;
-                if (map_lo < contig_hi && contig_lo < map_hi) {
-                    if (map_lo < contig_lo) map_hi = contig_lo;
-                    else map_lo = contig_hi;
-                }
-                if (map_lo < map_hi) {
-                    g_mirror_views[m] = xbox_map_placeholder(g_mapping_handle,
-                        (uintptr_t)g_memory_base + (uintptr_t)map_lo,
-                        map_lo - guest_lo, (size_t)(map_hi - map_lo));
-                    if (g_mirror_views[m]) mirrors_ok++;
-                    else fprintf(stderr, "  Mirror %d: FAILED (placeholder map, error %lu)\n", m + 1, GetLastError());
-                } else {
-                    mirrors_ok++;
-                }
+            if (g_span_base) {
+                slots_ok++;
                 continue;
             }
-#endif
-            uint64_t map_lo = guest_lo, map_hi = guest_hi;
             if (map_lo < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE &&
                 XBOX_CONTIG_BASE < map_hi) {
                 if (map_lo < XBOX_CONTIG_BASE) map_hi = XBOX_CONTIG_BASE;
                 else map_lo = (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
             }
             if (map_lo >= map_hi) {
-                mirrors_ok++;
+                slots_ok++;
                 continue;
             }
-            mirror_base = (uintptr_t)g_memory_base + (uintptr_t)map_lo;
-            if (g_span_base)
-                VirtualFree((LPVOID)mirror_base, map_hi - map_lo, MEM_RELEASE);
-            g_mirror_views[m] = MapViewOfFileEx(
-                g_mapping_handle,
-                FILE_MAP_ALL_ACCESS,
-                0, (DWORD)(map_lo - guest_lo),
-                map_hi - map_lo,
-                (LPVOID)mirror_base
-            );
-            if (g_mirror_views[m]) {
-                mirrors_ok++;
+            slot = VirtualAlloc((LPVOID)((uintptr_t)g_memory_base + (uintptr_t)map_lo),
+                                (SIZE_T)(map_hi - map_lo), MEM_RESERVE, PAGE_NOACCESS);
+            if (slot) {
+                g_gap_reserved[m] = slot;
+                slots_ok++;
             } else {
-                fprintf(stderr, "  Mirror %d: FAILED at %p (error %lu)\n",
-                        m + 1, (void *)mirror_base, GetLastError());
+                fprintf(stderr, "  Slot %d: not reserved (error %lu); a stray access"
+                                " there would read host memory\n",
+                        m + 1, GetLastError());
             }
         }
-        fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
-                mirrors_ok, XBOX_NUM_MIRRORS,
-                (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
+        fprintf(stderr, "  Above-RAM slots: %d/%d reserved, none mapped\n",
+                slots_ok, XBOX_NUM_MIRRORS);
     }
 
-    /* Guest address space above the mirrors, for titles that ask for a specific
+    /* Guest address space above the slots, for titles that ask for a specific
      * high address. RECOMP_EXT_VMA; a no-op without it. Straight after the
-     * mirrors, while a fixed host address is still likely to be free. */
+     * slots, while a fixed host address is still likely to be free. */
 #ifndef _WIN32
     if (g_span_base && getenv("RECOMP_EXT_VMA")) {
         uint64_t top = (uint64_t)g_memory_size * (1u + XBOX_NUM_MIRRORS);
@@ -3262,35 +3269,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     return TRUE;
 }
 
-/*
- * Make every RAM mirror read-only, for finding writes that reach low memory
- * through an alias.
- *
- * Xbox RAM is visible at 28 virtual addresses that alias the same pages, so a
- * store to 0x04000004 changes Xbox VA 4 without ever touching VA 4. Both a
- * page-protection watchpoint and a DR0 hardware watchpoint on VA 4 therefore
- * report nothing while the memory demonstrably changes -- which is exactly
- * what happened chasing Halo's fs:[4] corruption.
- *
- * Debug aid, not part of normal startup: a title that legitimately writes
- * through a mirror will fault here too, and the fault address names the alias
- * and the code.
- */
-void xbox_ProtectMirrorsForDebug(void)
-{
-    int n = 0;
-    for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
-        DWORD old;
-        if (g_mirror_views[m] &&
-            VirtualProtect(g_mirror_views[m], g_memory_size,
-                           PAGE_READONLY, &old)) {
-            n++;
-        }
-    }
-    fprintf(stderr, "  Mirrors: %d/%d made read-only (debug)\n",
-            n, XBOX_NUM_MIRRORS);
-}
-
 void xbox_MemoryLayoutShutdown(void)
 {
     if (g_kernel_memory && g_kernel_memory_owned) {
@@ -3309,16 +3287,11 @@ void xbox_MemoryLayoutShutdown(void)
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
         g_nv2a_memory = NULL;
     }
-    /* Unmap mirror views first */
+    /* Give back the slot reservations taken without a placeholder span. */
     for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
-        if (g_mirror_views[m]) {
-#ifdef _WIN32
-            if (g_placeholder_span)
-                s_unmap_view_of_file2(GetCurrentProcess(), g_mirror_views[m], MEM_PRESERVE_PLACEHOLDER);
-            else
-#endif
-                UnmapViewOfFile(g_mirror_views[m]);
-            g_mirror_views[m] = NULL;
+        if (g_gap_reserved[m]) {
+            VirtualFree(g_gap_reserved[m], 0, MEM_RELEASE);
+            g_gap_reserved[m] = NULL;
         }
     }
     /* Unmap base view */
@@ -3370,7 +3343,7 @@ void xbox_MemoryLayoutShutdown(void)
 
     guest_vmem_shutdown();
 
-    /* Whatever is left of the base+mirrors reservation. The views carved out
+    /* Whatever is left of the base+slots reservation. The views carved out
      * of it are already unmapped above; this releases the range itself. */
     if (g_span_base) {
 #ifdef _WIN32
@@ -3399,7 +3372,7 @@ void xbox_MemoryLayoutShutdown(void)
  * the RAM heap does not work: Half-Life 2 asks for 128 MB and then 200 MB, and
  * clamping those to what the heap can back left it sub-allocating across a
  * range it believed it owned, walking past the top of RAM and aliasing low
- * memory through the mirrors.
+ * memory.
  *
  * So reservations come from the mapped space *above* RAM instead. Those pages
  * are already backed and distinct, and a commit inside one is a no-op because

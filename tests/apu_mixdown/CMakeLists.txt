@@ -3,3 +3,5 @@ project(apu_mixdown_test C)
 enable_testing()
 # DSP programs now own mixdown. Run the real execution/PCM regression checks.
 add_subdirectory(../dsp dsp)
+
+add_subdirectory(../apu_phys apu_phys)

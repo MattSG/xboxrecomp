@@ -180,14 +180,23 @@ static void store_desc(uint32_t at, const Desc *d)
     memcpy(p + 6, &d->flags, 2);
 }
 
-/* The current descriptor of a ring: the next one, wrapped into the ring. */
-static uint32_t ring_current(uint32_t base_reg, uint32_t next_reg, uint32_t cur_reg, unsigned n)
+/* The current descriptor of a ring: the next one. A next pointer outside the
+ * ring is the driver's bug; it is refused (0 returned, nothing moves) and the
+ * ring stops until the driver rewrites its pointers, rather than being reset
+ * to the base. Wrapping past the end is ring_advance's job. */
+static int ring_current(uint32_t base_reg, uint32_t next_reg, uint32_t cur_reg, unsigned n, uint32_t *out)
 {
     uint32_t base = get(base_reg), cur = get(next_reg);
-    if (cur < base || cur + 8 > base + n * 8)
-        cur = base;
+    if (cur < base || (uint64_t)cur + 8 > (uint64_t)base + (uint64_t)n * 8) {
+        static unsigned bad_ptr;
+        if (bad_ptr++ < 8)
+            NIC_LOG("nvnet: ring pointer 0x%08X outside ring [0x%08X, +%u descs); ring stopped\n",
+                    cur, base, n);
+        return 0;
+    }
     put(cur_reg, cur);
-    return cur;
+    *out = cur;
+    return 1;
 }
 
 static void ring_advance(uint32_t base_reg, uint32_t next_reg, uint32_t cur_reg, unsigned n)
@@ -206,8 +215,10 @@ static void transmit(void)
         return;
     and_(R_TX_RX_CTL, ~TXRX_IDLE);
     for (unsigned i = 0; i < tx_ring_n(); i++) {
-        uint32_t at = ring_current(R_TX_RING, R_TX_NEXT_DESC, R_TX_CUR_DESC, tx_ring_n());
+        uint32_t at;
         Desc d;
+        if (!ring_current(R_TX_RING, R_TX_NEXT_DESC, R_TX_CUR_DESC, tx_ring_n(), &at))
+            break;
         if (!load_desc(at, &d) || !(d.flags & NV_TX_VALID))
             break;
         uint32_t len = (uint32_t)d.len + 1;
@@ -259,7 +270,9 @@ static int receive(const uint8_t *f, uint32_t n)
     Desc d;
     if (!(get(R_RECEIVER_CTL) & 1) || !dma_enabled() || !link_up())
         return 0;
-    uint32_t at = ring_current(R_RX_RING, R_RX_NEXT_DESC, R_RX_CUR_DESC, rx_ring_n());
+    uint32_t at;
+    if (!ring_current(R_RX_RING, R_RX_NEXT_DESC, R_RX_CUR_DESC, rx_ring_n(), &at))
+        return 0;
     if (!load_desc(at, &d) || !(d.flags & NV_RX_AVAIL))
         return 0;
     if ((uint32_t)d.len + 1 < n) { /* xemu asserts; drop instead */

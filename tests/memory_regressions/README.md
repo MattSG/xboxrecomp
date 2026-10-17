@@ -41,7 +41,7 @@ Each check fails without the change and passes with it.
 
 ## `RECOMP_EXT_VMA`
 
-A title that reserves a specific address above the RAM mirrors (`0x74000000` up
+A title that reserves a specific address above RAM (`0x74000000` up
 on a 64 MB map) and checks it got that address back. Without the switch the
 request is satisfied from the heap at a different address; the title notices and
 fails, and touching the address it asked for faults.
@@ -52,11 +52,11 @@ fails, and touching the address it asked for faults.
 | Commit inside it succeeds and the memory is usable | Access violation: nothing backs that host address. |
 | Query reports the committed part `MEM_COMMIT`, the rest `MEM_RESERVE`, one allocation base | "Everything above RAM is free", so a scanner is handed live memory. |
 | Reserving the same range again is `STATUS_CONFLICTING_ADDRESSES` | A second grant. |
-| An address inside the mirrors is refused, and queries report it reserved | It aliases low memory: a reservation there zeroed live `.rdata` on the title this came from. A scanner that is told "free" retries the same address forever. |
+| An address in the slots above RAM is refused, and queries report it reserved | Those slots are not backed by RAM. Before they were left unmapped they aliased low memory, and a reservation there zeroed live `.rdata`. A scanner that is told "free" retries the same address forever. |
 | `base = 0` still comes from the heap | (unchanged) |
 | Release, then query, then reserve again works, and the memory is zero | (n/a) |
 
-The 128 MB mode guards the case where the mirrors already reach past user space
+The 128 MB mode guards the case where the slots above RAM already reach past user space
 (`128 MB * 29` is 3.7 GB): there is nothing above them to track, and a tracker
 that subtracted anyway would ask for a range of negative size. It cannot fail on
 v0.12.0, which has no tracker; it exists for this tracker.

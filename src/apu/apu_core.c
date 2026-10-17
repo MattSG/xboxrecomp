@@ -72,6 +72,26 @@ void mcpx_debug_end_frame(void) {}
  * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
+/* An address that is none of the mappings below. Wrapping it into low RAM
+ * (the old fallback, a & 0x03FFFFFF) played whatever guest data sat there.
+ * Instead the access is refused: a read yields zeros, a write goes nowhere.
+ * The scratch page is re-zeroed on each refusal, so a stale write is not read
+ * back as data. The first few refusals are logged; then only counted. */
+static uint8_t s_unmapped_page[4096];
+static volatile LONG s_unmapped_count;
+
+static uint8_t *mcpx_apu_unmapped(uint64_t addr)
+{
+    LONG n = InterlockedIncrement(&s_unmapped_count);
+    if (n <= 8)
+        fprintf(stderr, "[APU] unmapped physical address 0x%08llX (not contiguous, image or reservation); access refused\n",
+                (unsigned long long)addr);
+    else if (n == 9)
+        fprintf(stderr, "[APU] further unmapped physical accesses refused (counting only)\n");
+    memset(s_unmapped_page, 0, sizeof s_unmapped_page);
+    return s_unmapped_page;
+}
+
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     /* Contiguous allocations are whole pages and positive coverage is
@@ -94,7 +114,12 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * they aliased, turning streamed audio into full-scale noise. */
     if (xbox_ReserveRangeAllocated(a))
         return g_apu_ram_ptr + a;
-    return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+    /* Ordinary heap pages are identity-mapped (MmGetPhysicalAddress hands a
+     * heap VA through), and MM3 streams voices from them. Only an address
+     * past the guest RAM map is unmapped. */
+    if (a < XBOX_HEAP_TOP)
+        return g_apu_ram_ptr + a;
+    return mcpx_apu_unmapped(addr);
 }
 
 /* The interrupt line, as the frame thread sees it. update_irq used to call
@@ -1032,7 +1057,9 @@ void apu_mixer_play(int slot, int looping)
     v->active = 1;
 
     static int play_log_count = 0;
-    if (play_log_count < 20) {
+    static int play_trace = -1;
+    if (play_trace < 0) play_trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (play_trace && play_log_count < 20) {
         fprintf(stderr, "[APU-MIX] Play voice %d: %u bytes, %u ch, %u Hz, vol=%.2f, loop=%d\n",
                 slot, v->pcm_bytes, v->num_channels, v->sample_rate, v->volume, looping);
         play_log_count++;

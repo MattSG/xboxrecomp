@@ -12,6 +12,25 @@
 void *recomp_lookup(ULONG address) { (void)address; abort(); }
 void *recomp_lookup_manual(ULONG address) { (void)address; abort(); }
 
+/* The bridge seam: the guest entry in the thunk table at entry_va is looked up
+ * on each call, because recomp_lookup_kernel records the slot as it returns. */
+typedef void (*guest_fn)(void);
+extern guest_fn recomp_lookup_kernel(uint32_t xbox_va);
+extern RECOMP_TLS uint32_t g_eax, g_esp;
+static uint32_t guest_call(uint32_t entry_va, uint32_t sp_va, uint32_t nargs,
+                           const uint32_t *args)
+{
+    uint32_t *sp = (uint32_t *)((uintptr_t)sp_va + g_memory_offset);
+    uint32_t i;
+    sp[0] = 0xBEEF0001u;
+    for (i = 0; i < nargs; i++)
+        sp[1 + i] = args[i];
+    g_esp = sp_va;
+    g_eax = 0xDEADBEEFu;
+    recomp_lookup_kernel(*(uint32_t *)((uintptr_t)entry_va + g_memory_offset))();
+    return g_eax;
+}
+
 #define CHECK(expr) do { if (!(expr)) { \
     fprintf(stderr, "line %d: %s\n", __LINE__, #expr); exit(1); \
 } } while (0)
@@ -159,6 +178,78 @@ int main(void)
     CHECK(g_reserve_alloc_count == THREADS / 2 * ALLOCS_PER_THREAD);
     CHECK(g_heap_block_count == THREADS / 2 * ALLOCS_PER_THREAD);
     check_ownership();
+
+    /* NtAllocateVirtualMemory through the bridge, on this allocator. A reserve
+     * that neither the arena above RAM nor the heap can back is refused with
+     * STATUS_NO_MEMORY, not clamped to a smaller block that reports success. A
+     * commit above the mapping is refused: nothing there is backed. A reserve
+     * above it is granted inside the arena, and the write-back says where. */
+    {
+        enum { ALLOC_VA = 0x10000, BASE_PTR = 0x20000, SIZE_PTR = 0x20004, SP = 0x30000 };
+        uint32_t a[5], status, base, size;
+
+        reset_allocators();
+        g_heap_next = XBOX_HEAP_BASE;
+        g_xbox_mem_offset = g_memory_offset;
+        *(uint32_t *)bytes(ALLOC_VA) = 0x80000000u | 184u;
+        xbox_kernel_set_thunk_address(ALLOC_VA, 1);
+        xbox_kernel_bridge_init();
+
+        /* 16 MB pure reserve: the arena above RAM takes it. */
+        *(uint32_t *)bytes(BASE_PTR) = 0;
+        *(uint32_t *)bytes(SIZE_PTR) = 0x01000000u;
+        a[0] = BASE_PTR; a[1] = 0; a[2] = SIZE_PTR; a[3] = 0x2000; a[4] = 0x04;
+        status = guest_call(ALLOC_VA, SP, 5, a);
+        base = *(uint32_t *)bytes(BASE_PTR);
+        size = *(uint32_t *)bytes(SIZE_PTR);
+        CHECK(status == 0);
+        CHECK(base >= RAM_END && (uint64_t)base + size <= MAP_END && size == 0x01000000u);
+        check_ownership();
+
+        /* 256 MB pure reserve: the arena has 48 MB left and the heap about 127 MB.
+         * Refused, and neither out-parameter is written. */
+        *(uint32_t *)bytes(BASE_PTR) = 0;
+        *(uint32_t *)bytes(SIZE_PTR) = 0x10000000u;
+        status = guest_call(ALLOC_VA, SP, 5, a);
+        CHECK(status == 0xC0000017u);
+        CHECK(*(uint32_t *)bytes(SIZE_PTR) == 0x10000000u);
+        CHECK(*(uint32_t *)bytes(BASE_PTR) == 0);
+        check_ownership();
+
+        /* Commit above the mapping with no reservation behind it would claim
+         * pages nobody reserved, and their RAM alias is live. Refused. */
+        *(uint32_t *)bytes(BASE_PTR) = MAP_END + 0x100000u;
+        *(uint32_t *)bytes(SIZE_PTR) = 4096;
+        a[0] = BASE_PTR; a[1] = 0; a[2] = SIZE_PTR; a[3] = 0x1000; a[4] = 0x04;
+        status = guest_call(ALLOC_VA, SP, 5, a);
+        CHECK(status == 0xC0000018u);
+        CHECK(*(uint32_t *)bytes(BASE_PTR) == MAP_END + 0x100000u);
+
+        /* Reserve above the mapping at an address that would have aliased RAM
+         * under the old mirror layout. There is no alias now, so the allocator
+         * grants it from backed memory inside the mapping (here the heap, the
+         * reserve being under the arena threshold), and the write-back reports
+         * that address, not the requested one. */
+        *(uint32_t *)bytes(BASE_PTR) = MAP_END + 0x100000u;
+        *(uint32_t *)bytes(SIZE_PTR) = 0x10000;
+        a[3] = 0x2000;
+        status = guest_call(ALLOC_VA, SP, 5, a);
+        base = *(uint32_t *)bytes(BASE_PTR);
+        CHECK(status == 0);
+        CHECK(base != MAP_END + 0x100000u);
+        CHECK((uint64_t)base + 0x10000u <= MAP_END);
+        CHECK(*(uint32_t *)bytes(SIZE_PTR) == 0x10000u);
+        check_ownership();
+
+        /* Reserve above the mapping at an address past RAM: granted, and the
+         * write-back reports wherever the allocator put it. */
+        *(uint32_t *)bytes(BASE_PTR) = MAP_END + RAM_END + 0x10000u;
+        *(uint32_t *)bytes(SIZE_PTR) = 0x10000;
+        status = guest_call(ALLOC_VA, SP, 5, a);
+        CHECK(status == 0);
+        CHECK(*(uint32_t *)bytes(SIZE_PTR) == 0x10000u);
+        check_ownership();
+    }
 
     /* A retail-sized mapping still has no above-RAM reserve arena. */
     g_memory_size = RAM_END;

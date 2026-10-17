@@ -877,21 +877,63 @@ VOID __stdcall xbox_AvSetSavedDataAddress(ULONG Address)
     g_av_saved_data_address = Address;
 }
 
+/* The last scanout AvSetDisplayMode was given. Only valid once set. The
+ * framebuffer address is not kept here: the bridge already records the resolved
+ * one through xbox_SetDisplayFramebuffer. */
+static struct {
+    int set;
+    ULONG mode, format, pitch;
+} g_av_scanout;
+
 VOID __stdcall xbox_AvSetDisplayMode(
     PVOID RegisterBase, ULONG Step, ULONG Mode,
     ULONG Format, ULONG Pitch, ULONG FrameBuffer)
 {
     (void)RegisterBase;
     (void)Step;
-    (void)Format;
-    (void)Pitch;
-    (void)FrameBuffer;
 
     g_av_display_mode = Mode;
+    g_av_scanout.set = 1;
+    g_av_scanout.mode = Mode;
+    g_av_scanout.format = Format;
+    g_av_scanout.pitch = Pitch;
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "AvSetDisplayMode: step=%u mode=0x%X format=0x%X pitch=%u fb=0x%X",
         Step, Mode, Format, Pitch, FrameBuffer);
+}
+
+/* Size of the scanout the title last set. Returns 0 when AvSetDisplayMode has
+ * never been called, or when its format or standard is one this table does not
+ * decode; the caller must then not assume a size.
+ *
+ * Width is the pitch over the bytes per pixel of the format. Format values are
+ * the LIN D3DFMT codes from the Xbox table in d3d8_xbox.h; that the title passes
+ * those to AvSetDisplayMode is unverified (unknown codes are refused).
+ * Height comes from the standard in Mode's 0x0000FF00 byte: the Mode word has
+ * no resolution field (see AV_STANDARD_SHIFT), so a 720p title reading as 480
+ * lines is the known limit here. */
+int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp_out, uint32_t *w, uint32_t *h)
+{
+    uint32_t bpp, lines;
+
+    if (!g_av_scanout.set || !g_av_scanout.pitch)
+        return 0;
+    switch (g_av_scanout.format) {
+    case 0x10: case 0x11: case 0x1C: bpp = 2; break;  /* LIN A1R5G5B5, R5G6B5, X1R5G5B5 */
+    case 0x12: case 0x1E:            bpp = 4; break;  /* LIN A8R8G8B8, X8R8G8B8 */
+    default: return 0;
+    }
+    switch ((g_av_scanout.mode >> AV_STANDARD_SHIFT) & 0xFF) {
+    case AV_STANDARD_NTSC_M: case AV_STANDARD_NTSC_J: lines = 480; break;
+    case AV_STANDARD_PAL_I:  lines = 576; break;
+    default: return 0;
+    }
+    if (pitch) *pitch = g_av_scanout.pitch;
+    if (bpp_out) *bpp_out = bpp;
+    if (w) *w = g_av_scanout.pitch / bpp;
+    if (h) *h = lines;
+    return 1;
 }
 
 /* ============================================================================

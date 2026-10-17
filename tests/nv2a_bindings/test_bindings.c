@@ -53,6 +53,7 @@ HWND xbox_FramebufferWindowHandle(void) { return test_window; }
 int xbox_FramebufferScanSource(uint32_t *va, uint32_t *pitch) { return 0; }
 int xbox_FramebufferOverlay(XboxOverlay *ovl) { return 0; }
 void xbox_FramebufferNoteFlip(uint32_t draws) {}
+int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp, uint32_t *w, uint32_t *h) { (void)pitch; (void)bpp; (void)w; (void)h; return 0; }
 void xbox_FramebufferRenderHostOverlay(void *device, void *context, void *target) {}
 const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4] { return NULL; }
 const float (*nv2a_vsh_constants(uint32_t *version))[4] { return NULL; }

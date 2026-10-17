@@ -2575,8 +2575,9 @@ class FunctionTranslator:
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
 
-        # Validate: comment out goto targets that reference missing labels
-        # (dead code after unconditional jumps may reference non-existent labels)
+        # Validate: goto targets that reference missing labels (dead code after
+        # unconditional jumps may reference non-existent labels) become
+        # RECOMP_DEAD_BRANCH, which reports a reached one and falls through.
         import re
         defined_labels = set()
         goto_lines = []
@@ -2591,7 +2592,7 @@ class FunctionTranslator:
             if target not in defined_labels:
                 lines[idx] = lines[idx].replace(
                     f"goto {target};",
-                    f"(void)0; /* goto {target} - dead code, label not in function */")
+                    f"RECOMP_DEAD_BRANCH(0x{int(target[4:], 16):08X}u); /* goto {target} - label not in function */")
 
         # Ensure labels at end of function have a statement after them.
         # In C, a label must be followed by a statement; a comment alone is not

@@ -125,7 +125,18 @@ static void fifo_rw(MCPXAPUState *d, bool gp, uint8_t *ptr, unsigned index,
     uint32_t end = GET_MASK(d->regs[reg + 4], NV_PAPU_GPOFEND0_VALUE);
     uint32_t cur = GET_MASK(d->regs[reg + 8], NV_PAPU_GPOFCUR0_VALUE);
     if (base >= end) { dsp->dma.error = true; return; }
-    if (cur < base) cur = base;
+    /* Below the ring is a guest bug, not a position to wrap or clamp to.
+     * Refuse the transfer and let the DSP see a DMA error. */
+    if (cur < base) {
+        static volatile LONG bad_cursor_count;
+        LONG n = InterlockedIncrement(&bad_cursor_count);
+        if (n <= 8)
+            fprintf(stderr, "[APU] %s FIFO %u cursor 0x%08X below base 0x%08X; transfer refused\n",
+                    gp ? "GP" : "EP", index, cur, base);
+        dsp->dma.error = true;
+        return;
+    }
+    /* Past the end the FIFO ring wraps to its base. */
     if (cur >= end) cur = base + (cur - base) % (end - base);
 
     bool publish_pcm = !gp && dir && index == 0 &&

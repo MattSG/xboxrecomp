@@ -941,6 +941,8 @@ ULONG   __stdcall xbox_AvGetSavedDataAddress(void);
 VOID    __stdcall xbox_AvSendTVEncoderOption(PVOID RegisterBase, ULONG Option, ULONG Param, PULONG Result);
 VOID    __stdcall xbox_AvSetSavedDataAddress(ULONG Address);
 VOID    __stdcall xbox_AvSetDisplayMode(PVOID RegisterBase, ULONG Step, ULONG Mode, ULONG Format, ULONG Pitch, ULONG FrameBuffer);
+/* Pitch, bytes per pixel and width/height of the last AvSetDisplayMode; 0 if none was set or it is undecodable. */
+int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp, uint32_t *w, uint32_t *h);
 
 /* SMBus (HalReadSMBusValue / HalWriteSMBusValue) */
 NTSTATUS __stdcall xbox_HalReadSMBusValue(UCHAR SlaveAddress, UCHAR CommandCode, BOOLEAN ReadWordValue, PULONG DataValue);
