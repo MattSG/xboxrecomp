@@ -2,7 +2,9 @@
  * pointer outside its ring stops that ring: nothing is transferred and the
  * pointer is left as the driver wrote it, rather than reset to the base. The
  * legitimate wrap past the last descriptor still happens. */
+#if defined(_WIN32)
 #include <winsock2.h>
+#endif
 /* nvnet.c has its own static accept() (the NIC), which Winsock also declares. */
 #define accept nic_accept
 #include "../../src/net/nvnet.c"
@@ -49,7 +51,7 @@ int xbox_IrqlEnterInterrupt(int level) { (void)level; unexpected_call("xbox_Irql
 void xbox_IrqlLeaveInterrupt(int saved) { (void)saved; unexpected_call("xbox_IrqlLeaveInterrupt"); }
 int xbox_worker_stack_alloc(void) { unexpected_call("xbox_worker_stack_alloc"); return -1; }
 void xbox_worker_stack_free(int slot) { (void)slot; unexpected_call("xbox_worker_stack_free"); }
-__declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_fs_base;
+RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_fs_base;
 
 static void desc_put(uint32_t at, uint32_t buf, uint16_t len, uint16_t flags)
 {

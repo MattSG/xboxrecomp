@@ -45,6 +45,8 @@ void mcpx_apu_vp_finalize(MCPXAPUState *d) { (void)d; unexpected_call("mcpx_apu_
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 { (void)d; (void)mixbins; unexpected_call("mcpx_apu_vp_frame"); }
 void mcpx_apu_vp_init(MCPXAPUState *d) { (void)d; unexpected_call("mcpx_apu_vp_init"); }
+void mcpx_apu_vp_reset(MCPXAPUState *d) { (void)d; unexpected_call("mcpx_apu_vp_reset"); }
+void dsp_reset(DSPState *dsp) { (void)dsp; unexpected_call("dsp_reset"); }
 uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
 { (void)opaque; (void)addr; (void)size; unexpected_call("mcpx_apu_vp_read"); return 0; }
 void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
@@ -61,7 +63,7 @@ int xbox_IrqlEnterInterrupt(int level) { (void)level; unexpected_call("xbox_Irql
 void xbox_IrqlLeaveInterrupt(int saved) { (void)saved; unexpected_call("xbox_IrqlLeaveInterrupt"); }
 int xbox_worker_stack_alloc(void) { unexpected_call("xbox_worker_stack_alloc"); return -1; }
 void xbox_worker_stack_free(int slot) { (void)slot; unexpected_call("xbox_worker_stack_free"); }
-__declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_fs_base;
+RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_fs_base;
 
 int main(void)
 {
