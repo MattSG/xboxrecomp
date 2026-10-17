@@ -9,8 +9,8 @@ int  xbox_HostHardwareInit(void);
 void xbox_HostHardwareShutdown(void);
 
 /* Opens the game window, creates the D3D8 device the NV2A executor draws
- * through, and traps PVIDEO so its register writes take effect. Returns 0 on
- * failure. */
+ * through (D3D11 builds; the SDL3 GPU renderer makes its own), and traps
+ * PVIDEO so its register writes take effect. Returns 0 on failure. */
 int  xbox_HostGraphicsInit(const char *window_title);
 
 #endif

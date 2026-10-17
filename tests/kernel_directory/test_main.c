@@ -1,6 +1,7 @@
 #include "../../src/kernel/kernel_file.c"
 /* Include the file backend to inspect its private enumeration ownership. */
 #include "xbox_memory_layout.h"
+#include "../kernel_test_host.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,10 +14,16 @@ void *recomp_lookup(ULONG a) { (void)a; abort(); }
 void *recomp_lookup_manual(ULONG a) { (void)a; abort(); }
 static uint8_t *mem;
 static guest_fn query, close_guest, map_status;
+/* A context is searching when its native enumeration is open. Windows keeps a
+ * FindFirstFile handle there; POSIX keeps the DIR stream. */
 static unsigned active_searches(void) {
     unsigned count = 0;
     for (unsigned i = 0; i < MAX_DIR_CONTEXTS; i++)
+#if defined(_WIN32)
         if (s_dir_contexts[i].find_handle && s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+#else
+        if (s_dir_contexts[i].dir)
+#endif
             count++;
     return count;
 }
@@ -72,11 +79,23 @@ static int invoke(HANDLE h, const char *pattern, unsigned restart, unsigned klas
     if(*(uint32_t *)(mem+0x30000)!=g_eax) { puts("FAIL I/O status differs"); return 0; }
     return 1;
 }
+/* Closing the first search: a raw native handle on Windows, a guest token on POSIX. */
+#if defined(_WIN32)
+#define CLOSE_FIRST(h) (xbox_NtClose(h)==STATUS_SUCCESS)
+#else
+#define CLOSE_FIRST(h) guest_close(h)
+#endif
 int main(void) {
-    char root[MAX_PATH], path[MAX_PATH];
-    GetTempPathA(MAX_PATH,root); sprintf(path,"%sxml1-dir-test-%lu",root,GetCurrentProcessId());
-    if(!CreateDirectoryA(path,NULL)) return 10;
-    char child[MAX_PATH]; sprintf(child,"%s\\SaveSlot",path); CreateDirectoryA(child,NULL);
+    char path[MAX_PATH], child[MAX_PATH];
+    if(!xt_make_temp_dir(path,sizeof path)) return 10;
+    xt_join(child,sizeof child,path,"SaveSlot"); xt_make_dir(child);
+#if !defined(_WIN32)
+    /* The default save root and its partition images go in a sibling directory,
+     * so the searched directory holds only the entries this test creates. */
+    char save_root[MAX_PATH];
+    if(!xt_make_temp_dir(save_root,sizeof save_root)) return 10;
+    setenv("XDG_DATA_HOME", save_root, 1);
+#endif
     mem=VirtualAlloc(NULL,16*1024*1024,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE); if(!mem) return 12;
     g_xbox_mem_offset=(ptrdiff_t)mem;
     *(uint32_t *)(mem+0x10000)=0x800000CF;
@@ -122,7 +141,13 @@ int main(void) {
     h=guest_open();
     if(ok) ok=active_searches()==0 && invoke(h,"Save*",0,1) && g_eax==0;
     if(h!=INVALID_HANDLE_VALUE) guest_close(h);
-    RemoveDirectoryA(child); RemoveDirectoryA(path); VirtualFree(mem,0,MEM_RELEASE);
+#if defined(_WIN32)
+    xt_remove_dir(child); xt_remove_dir(path);
+#else
+    xt_remove_tree(path);
+    xt_remove_tree(save_root);
+#endif
+    VirtualFree(mem,0,MEM_RELEASE);
     if(!ok) return 1;
     puts("PASS: directory ABI/filter/restart/status, guest/direct close, 144 slot-reuse cycles and fresh searches"); return 0;
 }

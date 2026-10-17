@@ -21,15 +21,7 @@
  * them behind the same 10.0.2.0/24 never collide.
  */
 #include "net.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#if defined(_WIN32)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <iphlpapi.h>
-#include <windows.h>
+#include "net_platform.h"
 
 #define FRAME_MAX   1536
 #define QUEUE_LEN   256
@@ -74,7 +66,7 @@ static struct {
     uint8_t data[QUEUE_LEN][FRAME_MAX];
     uint32_t len[QUEUE_LEN];
     unsigned head, tail;   /* head: next out; tail: next in */
-} q = {SRWLOCK_INIT};
+} q = {.lock = SRWLOCK_INIT};
 
 static void deliver(const uint8_t *f, uint32_t n)
 {
@@ -131,7 +123,7 @@ static struct {
     struct sockaddr_in peer[MAX_PEERS];
     int npeers;
     unsigned out, in;
-} st = {SRWLOCK_INIT};
+} st = {.lock = SRWLOCK_INIT};
 
 /* ---- packet building --------------------------------------------------- */
 
@@ -265,8 +257,6 @@ static SOCKET udp_socket(uint16_t port)
 {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     struct sockaddr_in a;
-    u_long nb = 1;
-    BOOL yes = TRUE;
     if (s == INVALID_SOCKET)
         return s;
     memset(&a, 0, sizeof a);
@@ -276,14 +266,9 @@ static SOCKET udp_socket(uint16_t port)
         a.sin_port = 0;                      /* taken: any port */
         bind(s, (struct sockaddr *)&a, sizeof a);
     }
-    ioctlsocket(s, FIONBIO, &nb);
-    setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *)&yes, sizeof yes);
-    {   /* an ICMP port-unreachable must not turn into an error on the next read */
-        BOOL off = FALSE;
-        DWORD ret;
-        WSAIoctl(s, _WSAIOW(IOC_VENDOR, 12) /* SIO_UDP_CONNRESET */, &off, sizeof off,
-                 NULL, 0, &ret, NULL, NULL);
-    }
+    net_sock_set_nonblocking(s, 1);
+    net_sock_set_broadcast(s);
+    net_sock_ignore_udp_reset(s);
     return s;
 }
 
@@ -294,23 +279,23 @@ static SOCKET nat_socket(uint16_t guest_port)
     SOCKET s;
     AcquireSRWLockExclusive(&st.lock);
     for (int i = 0; i < MAX_NAT; i++) {
-        if (st.nat[i].s && st.nat[i].guest_port == guest_port) {
+        if (st.nat[i].s != INVALID_SOCKET && st.nat[i].guest_port == guest_port) {
             st.nat[i].used = GetTickCount();
             s = st.nat[i].s;
             ReleaseSRWLockExclusive(&st.lock);
             return s;
         }
-        if (!st.nat[i].s && free_i < 0)
+        if (st.nat[i].s == INVALID_SOCKET && free_i < 0)
             free_i = i;
         if (st.nat[i].used < st.nat[oldest].used)
             oldest = i;
     }
     if (free_i < 0) {   /* full: reuse the least recently used */
-        closesocket(st.nat[oldest].s);
+        net_sock_close(st.nat[oldest].s);
         free_i = oldest;
     }
     s = udp_socket(guest_port);
-    st.nat[free_i].s = s == INVALID_SOCKET ? 0 : s;
+    st.nat[free_i].s = s;
     st.nat[free_i].guest_port = guest_port;
     st.nat[free_i].used = GetTickCount();
     ReleaseSRWLockExclusive(&st.lock);
@@ -398,7 +383,7 @@ static void udp_out(const uint8_t *ip, const uint8_t *udp, uint32_t len)
     if ((dst & 0xFFFFFF00u) == NET_PREFIX || dst == 0xFFFFFFFFu)
         return;
     SOCKET s = nat_socket(sport);
-    if (s == INVALID_SOCKET || !s)
+    if (s == INVALID_SOCKET)
         return;
     to.sin_addr.s_addr = htonl(dst);
     to.sin_port = htons(dport);
@@ -486,25 +471,27 @@ static DWORD WINAPI net_thread(LPVOID unused)
         uint16_t ports[MAX_NAT];
         int nn = 0;
         struct timeval tv = {0, 5000};
+        NetWatch w = {0, 0};
         FD_ZERO(&rd);
-        if (st.dns != INVALID_SOCKET) FD_SET(st.dns, &rd);
-        if (st.tunnel != INVALID_SOCKET) FD_SET(st.tunnel, &rd);
+        if (st.dns != INVALID_SOCKET) net_watch(&rd, &w, st.dns);
+        if (st.tunnel != INVALID_SOCKET) net_watch(&rd, &w, st.tunnel);
         AcquireSRWLockShared(&st.lock);
         for (int i = 0; i < MAX_NAT; i++)
-            if (st.nat[i].s) {
+            if (st.nat[i].s != INVALID_SOCKET) {
                 socks[nn] = st.nat[i].s;
                 ports[nn++] = st.nat[i].guest_port;
-                FD_SET(st.nat[i].s, &rd);
+                net_watch(&rd, &w, st.nat[i].s);
             }
         ReleaseSRWLockShared(&st.lock);
-        if (rd.fd_count == 0) {
+        if (w.count == 0) {
             Sleep(5);
             continue;
         }
-        if (select(0, &rd, NULL, NULL, &tv) <= 0)
+        if (select(w.nfds, &rd, NULL, NULL, &tv) <= 0)
             continue;
         struct sockaddr_in from;
-        int fl = sizeof from, n;
+        net_socklen_t fl = sizeof from;
+        int n;
         if (st.dns != INVALID_SOCKET && FD_ISSET(st.dns, &rd)) {
             while ((n = recvfrom(st.dns, (char *)buf, FRAME_MAX - 64, 0, (struct sockaddr *)&from, &fl)) > 0) {
                 send_udp_to_guest(st.guest_mac, DNS_IP, 53, st.guest_ip, st.dns_guest_port, buf, (uint32_t)n);
@@ -534,6 +521,11 @@ static DWORD WINAPI net_thread(LPVOID unused)
             }
         }
     }
+#if defined(__GNUC__) || defined(__clang__)
+    /* The loop above never exits; stating that silences -Wreturn-type. MSVC
+     * warns about code after an endless loop, so it gets nothing here. */
+    __builtin_unreachable();
+#endif
 }
 
 /* The host's first DNS server, unless RECOMP_NET_DNS names one. */
@@ -543,27 +535,20 @@ static uint32_t upstream_dns(void)
     struct in_addr a;
     if (env && *env && inet_pton(AF_INET, env, &a) == 1)
         return a.s_addr;
-    ULONG size = 0;
-    GetNetworkParams(NULL, &size);
-    FIXED_INFO *info = (FIXED_INFO *)malloc(size);
-    uint32_t r = 0;
-    if (info && GetNetworkParams(info, &size) == NO_ERROR &&
-        inet_pton(AF_INET, info->DnsServerList.IpAddress.String, &a) == 1)
-        r = a.s_addr;
-    free(info);
-    return r;
+    return net_host_dns_first();
 }
 
 int net_backend_init(const char *mode)
 {
-    WSADATA wsa;
     (void)mode;   /* "nat" (or "1"): the only mode; peers come on top */
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+    if (!net_sock_startup())
         return 0;
     q.event = CreateEventA(NULL, FALSE, FALSE, NULL);
     st.dns = udp_socket(0);
     st.dns_upstream = upstream_dns();
     st.tunnel = INVALID_SOCKET;
+    for (int i = 0; i < MAX_NAT; i++)
+        st.nat[i].s = INVALID_SOCKET;
     st.guest_ip = NET_PREFIX | 15;
 
     const char *peers = getenv("RECOMP_NET_PEERS");
@@ -589,7 +574,7 @@ int net_backend_init(const char *mode)
         }
         {
             struct sockaddr_in me;
-            int l = sizeof me;
+            net_socklen_t l = sizeof me;
             getsockname(st.tunnel, (struct sockaddr *)&me, &l);
             fprintf(stderr, "  NET: peer tunnel on UDP %u\n", ntohs(me.sin_port));
         }
@@ -606,11 +591,3 @@ int net_backend_init(const char *mode)
     CloseHandle(th);
     return 1;
 }
-
-#else
-int net_backend_init(const char *mode) { (void)mode; return 0; }
-void net_backend_send(const uint8_t *f, uint32_t n) { (void)f; (void)n; }
-uint32_t net_backend_peek(uint8_t *b, uint32_t c) { (void)b; (void)c; return 0; }
-void net_backend_pop(void) {}
-void net_backend_wait(unsigned ms) { (void)ms; }
-#endif

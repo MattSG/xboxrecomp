@@ -1,5 +1,6 @@
 /* Real event/file imports share the bridge's actual private handle table. */
 #include "../../src/kernel/kernel_bridge.c"
+#include "../kernel_test_host.h"
 
 #define WORKERS 12
 #define ROUNDS 32
@@ -16,7 +17,7 @@ static const uint32_t ordinals[SERVICES] = {187, 189, 190, 219, 225, 233, 236};
 static uint32_t services[SERVICES];
 static uint8_t *memory;
 static uint32_t root_token;
-static wchar_t directory[MAX_PATH];
+static char directory[MAX_PATH];
 
 typedef struct {
     CRITICAL_SECTION lock;
@@ -65,16 +66,15 @@ static void close_token(uint32_t token, uint32_t stack)
 
 static void file_name(unsigned id, unsigned round, char *name, size_t bytes)
 {
-    CHECK(sprintf_s(name, bytes, "worker-%02u-%02u.bin", id, round) > 0);
+    CHECK(snprintf(name, bytes, "worker-%02u-%02u.bin", id, round) > 0);
 }
 
 static void delete_file(unsigned id, unsigned round)
 {
-    char name[40];
-    wchar_t path[MAX_PATH];
+    char name[40], path[MAX_PATH];
     file_name(id, round, name, sizeof name);
-    CHECK(swprintf_s(path, MAX_PATH, L"%s\\%hs", directory, name) > 0);
-    CHECK(DeleteFileW(path));
+    CHECK(xt_join(path, MAX_PATH, directory, name) > 0);
+    CHECK(xt_delete_file(path));
 }
 
 static void open_pair(unsigned id, unsigned round, uint32_t *event_token, uint32_t *file_token)
@@ -280,7 +280,6 @@ static void table_edges(void)
 int main(void)
 {
     HANDLE root, threads[WORKERS];
-    wchar_t temporary[MAX_PATH];
     DWORD count, live_count = 0;
     unsigned i, round;
     CHECK(_putenv_s("RECOMP_KERNEL_LOG_BUDGET", "0") == 0);
@@ -295,10 +294,8 @@ int main(void)
     xbox_kernel_bridge_init();
     for (i = 0; i < SERVICES; ++i) services[i] = guest_word(0x10000 + i * 4);
     table_edges();
-    CHECK(GetTempPathW(MAX_PATH, temporary));
-    CHECK(GetTempFileNameW(temporary, L"xht", 0, directory));
-    CHECK(DeleteFileW(directory) && CreateDirectoryW(directory, NULL));
-    root = CreateFileW(directory, FILE_LIST_DIRECTORY,
+    CHECK(xt_make_temp_dir(directory, sizeof directory));
+    root = CreateFileA(directory, FILE_LIST_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     CHECK(root != INVALID_HANDLE_VALUE);
@@ -311,19 +308,23 @@ int main(void)
         rendezvous();
         rendezvous();
         check_live_pairs();
+#ifdef _WIN32   /* POSIX events are not descriptors; see kernel_test_host.h */
         CHECK(GetProcessHandleCount(GetCurrentProcess(), &count));
         if (!round) live_count = count;
         CHECK(count == live_count);
+#endif
         rendezvous();
     }
     rendezvous();
     rendezvous();
+#ifdef _WIN32
     CHECK(GetProcessHandleCount(GetCurrentProcess(), &count) && count + WORKERS * 2 == live_count);
+#endif
     CHECK(WaitForMultipleObjects(WORKERS, threads, TRUE, 10000) == WAIT_OBJECT_0);
     for (i = 0; i < WORKERS; ++i) CHECK(CloseHandle(threads[i]));
     CHECK(bridge_take_handle(root_token) == root && CloseHandle(root));
     for (i = 1; i < BRIDGE_HANDLE_MAX; ++i) CHECK(bridge_handle_load(i) == NULL);
-    CHECK(RemoveDirectoryW(directory));
+    CHECK(xt_remove_dir(directory));
     DeleteCriticalSection(&barrier.lock);
     CHECK(VirtualFree(memory, 0, MEM_RELEASE));
     puts("PASS: concurrent event/file imports retain unique tokens, exact identities/data and no native-handle leaks");

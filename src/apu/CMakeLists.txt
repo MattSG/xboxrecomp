@@ -69,7 +69,7 @@ if(WIN32)
     # XAudio2Create rather than at build time here.
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
-    # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
-    find_package(SDL2 REQUIRED)
-    target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
+    # Elsewhere: platform layer (Win32 primitives on POSIX) + SDL3 audio + libm
+    include(Sdl3)
+    target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
 endif()

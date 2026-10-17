@@ -2,6 +2,7 @@
  * A private arena replaces only memory-layout initialization, not allocation. */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "../kernel_test_host.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

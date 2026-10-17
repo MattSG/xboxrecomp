@@ -1,7 +1,7 @@
 /* Exercise the real dispatcher across guest threads with no game assets. */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
-#include <io.h>
+#include "../kernel_test_host.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

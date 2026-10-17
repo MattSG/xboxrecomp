@@ -9,6 +9,9 @@
 #include <stdio.h>
 #include <string.h>
 
+/* fb_present.c is not linked: never paused. */
+int xbox_FramebufferPaused(void) { return 0; }
+
 static HRESULT com_result, create_result, callback_result, master_result, source_result;
 static HRESULT start_result, submit_result;
 static int com_refs, releases, master_destroys, source_destroys, failures;
@@ -168,6 +171,17 @@ int main(void)
     CHECK(queue_count == 0 && g_xa2_next_buf == 0 && g_xa2_frames_written == 0);
     memset(samples, 1, sizeof(samples));
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+    /* An empty queue gets XA2_CUSHION silent buffers in front of the first real one. */
+    CHECK(XA2_CUSHION == 8);
+    CHECK(queue_count == XA2_CUSHION + 1 && g_xa2_frames_written == 1 && g_xa2_next_buf == 1);
+    for (UINT32 i = 0; i < XA2_CUSHION; i++) {
+        CHECK(queued_bytes[i] == 1024 * 2 * sizeof(int16_t));
+        CHECK(queued[i] != (const BYTE *)g_xa2_bufs[0]);
+        for (UINT32 b = 0; b < queued_bytes[i]; b++) if (queued[i][b]) { CHECK(!"cushion not silent"); break; }
+    }
+    CHECK(queued[XA2_CUSHION] == (const BYTE *)g_xa2_bufs[0]);
+    CHECK(queued[XA2_CUSHION][0] == 1);
+    check_queued();
     submit_result = E_FAIL;
     for (int i = 0; i < 3; i++) {
         memset(samples, 2 + i, sizeof(samples));
@@ -177,21 +191,28 @@ int main(void)
     }
     submit_result = S_OK;
     CHECK(XA2_NUM_BUFS == 64);
-    for (int i = 1; i < XA2_NUM_BUFS; i++)
+    /* The cushion takes slots of the 64-buffer queue: 56 real buffers fit. */
+    for (int i = 1; i < XA2_NUM_BUFS - XA2_CUSHION; i++)
         CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 0);
-    CHECK(g_xa2_frames_written == XA2_NUM_BUFS);
+    CHECK(queue_count == XA2_NUM_BUFS);
+    CHECK(g_xa2_frames_written == XA2_NUM_BUFS - XA2_CUSHION && g_xa2_next_buf == XA2_NUM_BUFS - XA2_CUSHION);
     check_queued();
-    /* Complete the oldest buffer, then wrap the ring into that free slot. */
-    for (UINT32 i = 0; i + 1 < queue_count; i++) {
-        queued[i] = queued[i + 1];
-        queued_bytes[i] = queued_bytes[i + 1];
-        memcpy(snapshots[i], snapshots[i + 1], queued_bytes[i]);
+    /* Retire the oldest buffer, then submit into the slot it freed. The first
+     * retirements are silence; after 64 submissions the ring has wrapped. */
+    for (int i = 0; i < XA2_NUM_BUFS; i++) {
+        for (UINT32 j = 0; j + 1 < queue_count; j++) {
+            queued[j] = queued[j + 1];
+            queued_bytes[j] = queued_bytes[j + 1];
+            memcpy(snapshots[j], snapshots[j + 1], queued_bytes[j]);
+        }
+        queue_count--;
+        memset(samples, 9, sizeof(samples));
+        CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+        check_queued();
     }
-    queue_count--;
-    memset(samples, 9, sizeof(samples));
-    CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
-    check_queued();
+    CHECK(g_xa2_next_buf == XA2_NUM_BUFS - XA2_CUSHION);
+    CHECK(g_xa2_frames_written == 2 * XA2_NUM_BUFS - XA2_CUSHION);
     xa2_critical_error(&g_xa2_callback, E_FAIL);
     CHECK(g_xa2_error == (LONG)E_FAIL && g_xa2_error_reported == 0);
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == -1);

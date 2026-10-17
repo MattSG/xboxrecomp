@@ -11,8 +11,8 @@ cmake --build build/kernel-regressions --config Release
 ctest --test-dir build/kernel-regressions -C Release --output-on-failure
 ```
 
-Windows only, like `tests/kernel_irql_abi`: the pseudo-handle check needs
-`DuplicateHandle`.
+Runs on Windows and Linux. The pseudo-handle check goes through `DuplicateHandle`,
+which on Linux is the POSIX shim in `src/platform/win32_compat.c`.
 
 ## What it guarantees
 

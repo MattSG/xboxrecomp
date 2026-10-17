@@ -7,16 +7,18 @@
 
 typedef struct {
     volatile LONG generation;
-#ifdef _WIN32
     BOOL (WINAPI *wait_address)(volatile VOID *, PVOID, SIZE_T, DWORD);
     VOID (WINAPI *wake_all)(PVOID);
-#endif
 } XBOX_NV2A_WAKE;
 
 static void xbox_nv2a_wake_init(XBOX_NV2A_WAKE *wake)
 {
     wake->generation = 0;
-#ifdef _WIN32
+#ifndef _WIN32
+    /* win32_compat provides both (futex or condvar buckets). */
+    wake->wait_address = WaitOnAddress;
+    wake->wake_all = WakeByAddressAll;
+#else
     /* Resolve together so older hosts retain their existing yield fallback.
      * No new library dependency is required by applications using the runtime. */
     HMODULE module = GetModuleHandleW(L"kernelbase.dll");
@@ -38,19 +40,13 @@ static void xbox_nv2a_wake_publish(XBOX_NV2A_WAKE *wake)
 {
     /* Publish after the corresponding guest-visible completion stores. */
     InterlockedIncrement(&wake->generation);
-#ifdef _WIN32
     if (wake->wait_address) wake->wake_all((PVOID)&wake->generation);
-#endif
 }
 
 static BOOL xbox_nv2a_wake_wait(XBOX_NV2A_WAKE *wake, LONG observed)
 {
-#ifdef _WIN32
     if (wake->wait_address)
         return wake->wait_address(&wake->generation, &observed, sizeof observed, 1);
-#else
-    (void)wake; (void)observed;
-#endif
     SwitchToThread();
     return TRUE;
 }

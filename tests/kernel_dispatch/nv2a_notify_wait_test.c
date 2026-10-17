@@ -12,7 +12,7 @@ typedef struct {
 } FIXTURE;
 static FIXTURE *active_fixture;
 static BOOL (WINAPI *real_wait)(volatile VOID *, PVOID, SIZE_T, DWORD);
-static __declspec(thread) int t_wait_reported;
+static XBOX_THREAD_LOCAL int t_wait_reported;
 static volatile LONG bad_timeout, missed_wake;
 
 static BOOL WINAPI observed_wait(volatile VOID *address, PVOID observed,

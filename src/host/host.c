@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "platform/xbox_winnt.h"
 
 #include <d3d/d3d8_xbox.h>
 #include "xbox_memory_layout.h"
@@ -29,8 +29,10 @@ extern bool apu_hook_handle_mmio(PCONTEXT context, uintptr_t fault_address,
                                  uint32_t guest_address, int is_write);
 
 static PVOID s_mmio_veh;
+#if !defined(XBOXRECOMP_SDL3)
 static IDirect3D8 *s_d3d;
 static IDirect3DDevice8 *s_device;
+#endif
 
 static LONG CALLBACK mmio_handler(PEXCEPTION_POINTERS info)
 {
@@ -108,6 +110,22 @@ void xbox_HostHardwareShutdown(void)
     }
 }
 
+#if defined(XBOXRECOMP_SDL3)
+/* The SDL3 GPU renderer opens its own window and device with the pushbuffer
+ * executor; there is no D3D8 device to make. */
+int xbox_HostGraphicsInit(const char *window_title)
+{
+    DWORD old_protect;
+    (void)window_title;
+    nv2a_hook_init(g_xbox_mem_offset);
+    if (!VirtualProtect((void *)((uintptr_t)g_xbox_mem_offset + PVIDEO_PAGE),
+                        0x1000, PAGE_NOACCESS, &old_protect)) {
+        fprintf(stderr, "[NV2A] could not trap PVIDEO page\n");
+        return 0;
+    }
+    return 1;
+}
+#else
 static LRESULT CALLBACK graphics_wndproc(HWND window, UINT message,
                                          WPARAM wparam, LPARAM lparam)
 {
@@ -172,3 +190,4 @@ int xbox_HostGraphicsInit(const char *window_title)
     }
     return 1;
 }
+#endif

@@ -29,7 +29,8 @@ else()
     target_compile_options(xbox_nv2a PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
 
-target_link_libraries(xbox_nv2a PRIVATE platform)
+# nv2a_pgraph_d3d11.c draws through the D3D8 device (xbox_GetD3DDevice).
+target_link_libraries(xbox_nv2a PRIVATE platform xbox_d3d8)
 if(WIN32)
     target_link_libraries(xbox_nv2a PRIVATE kernel32)
 endif()

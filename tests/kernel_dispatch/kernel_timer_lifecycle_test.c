@@ -1,6 +1,6 @@
 /* Timer state must be published before callbacks can rearm or retire it. */
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "platform/xbox_winnt.h"
 static int expire_on_reset;
 static LONGLONG system_now = 133000000000000000LL;
 static ULONGLONG tick_now = 100000;

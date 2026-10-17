@@ -279,61 +279,10 @@ static int test_palette_bounds(void)
     return 0;
 }
 
-static uint32_t random_word(uint32_t *state)
-{
-    *state ^= *state << 13; *state ^= *state >> 17; *state ^= *state << 5;
-    return *state;
-}
-
+/* Shared CPU cases (decode equivalence, in-place mips): texture_cpu_tests.h. */
+#include "texture_cpu_tests.h"
 #include "native_bc_tests.h"
 #include "mip_generation_tests.h"
-
-static int test_decode_equivalence(void)
-{
-    uint32_t state = 0x12345678u;
-    uint8_t *data = malloc(65536 + 64);
-    uint32_t *allocation = malloc(65536 + 16), *decoded;
-    const unsigned formats[] = { 0x06, 0x07, 0x0C, 0x0E, 0x0F };
-    const unsigned dimensions[] = { 1, 2, 3, 4, 5, 7, 8, 12, 16, 20, 64, 128 };
-    unsigned i, offset, format, width, height, w, h, x, y;
-    CHECK(data);
-    CHECK(allocation);
-    decoded = allocation + 1;
-    for (i = 0; i < 65536 + 64; i++) data[i] = (uint8_t)random_word(&state);
-    /* Validate complete rectangles, unaligned sources, short mips and both
-     * compressed alpha modes against independent per-texel addressing. */
-    for (format = 0; format < 5; format++)
-        for (width = 0; width < sizeof dimensions / sizeof dimensions[0]; width++)
-            for (height = 0; height < sizeof dimensions / sizeof dimensions[0]; height++)
-                for (offset = 0; offset < 8; offset++) {
-                    NvD3DTexture texture = {0};
-                    TexLayout layout;
-                    w = dimensions[width]; h = dimensions[height];
-                    if (format < 2 && ((w & (w - 1)) || (h & (h - 1)))) continue;
-                    texture.color = formats[format];
-                    texture.width = w; texture.height = h; texture.levels = 1;
-                    CHECK(tex_layout(&texture, &layout));
-                    decoded[-1] = decoded[w * h] = 0xDEADC0DEu;
-                    decode_level(&texture, &layout, data + offset, 0, NULL, decoded);
-                    CHECK(decoded[-1] == 0xDEADC0DEu && decoded[w * h] == 0xDEADC0DEu);
-                    for (y = 0; y < h; y++)
-                        for (x = 0; x < w; x++) {
-                            uint32_t expected;
-                            if (layout.kind == K_DXT)
-                                CHECK(d3d8_dxt_decode_texel(data + offset, texture.color,
-                                                           x, y, w, &expected));
-                            else {
-                                uint32_t address = swizzle_offset(x, y, w, h);
-                                expected = texel(texture.color, data + offset + address * 4, NULL, 0);
-                            }
-                            CHECK(decoded[y * w + x] == expected);
-                        }
-        }
-    free(data);
-    free(allocation);
-    puts("PASS: tiled32-bit and DXT uploads match per-texel decoding across sizes, mips and alignments");
-    return 0;
-}
 
 /* Original row-by-row implementation retained only as a benchmark reference. */
 static void decode_before(const NvD3DTexture *t, const TexLayout *L, const uint8_t *src,

@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <io.h>
+#include "../kernel_test_host.h"
 
 typedef void (*guest_fn)(void);
 extern guest_fn recomp_lookup_kernel(uint32_t);
@@ -120,7 +120,7 @@ done:
 
 int main(void)
 {
-    wchar_t base[MAX_PATH], dir[MAX_PATH] = {0}, path[MAX_PATH] = {0};
+    char dir[MAX_PATH] = {0}, path[MAX_PATH] = {0};
     HANDLE exclusive = INVALID_HANDLE_VALUE, root = INVALID_HANDLE_VALUE, opened = NULL;
     XBOX_ANSI_STRING name;
     XBOX_OBJECT_ATTRIBUTES oa;
@@ -133,17 +133,16 @@ int main(void)
     MissingOpen missing = {0};
     HANDLE worker = NULL;
 
-    if (!GetTempPathW(MAX_PATH, base) ||
-        !GetTempFileNameW(base, L"xfs", 0, dir))
-        goto done;
-    if (!DeleteFileW(dir) || !CreateDirectoryW(dir, NULL))
+    /* Narrow paths: the host helpers create the unique directory on either
+     * platform, and CreateFileA is the same share-mode call as CreateFileW. */
+    if (!xt_make_temp_dir(dir, sizeof dir))
         goto done;
     directory_created = 1;
-    if (swprintf_s(path, MAX_PATH, L"%s\\sharing.bin", dir) < 0)
+    if (xt_join(path, sizeof path, dir, "sharing.bin") < 0)
         goto done;
-    exclusive = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+    exclusive = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
                             CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-    root = CreateFileW(dir, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    root = CreateFileA(dir, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     if (exclusive == INVALID_HANDLE_VALUE || root == INVALID_HANDLE_VALUE)
         goto done;
@@ -259,7 +258,7 @@ done:
     if (root != INVALID_HANDLE_VALUE) CloseHandle(root);
     if (exclusive != INVALID_HANDLE_VALUE) CloseHandle(exclusive);
     if (memory) VirtualFree(memory, 0, MEM_RELEASE);
-    if (*path) DeleteFileW(path);
-    if (directory_created) RemoveDirectoryW(dir);
+    if (*path) xt_delete_file(path);
+    if (directory_created) xt_remove_dir(dir);
     return result;
 }

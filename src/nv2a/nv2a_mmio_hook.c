@@ -28,7 +28,7 @@ static int g_mmio_decode_fail = 0;
  * (regardless of whether the MMIO hook is active). Keep its definition
  * outside the Win32 guard. */
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__x86_64__)
 
 static SRWLOCK g_pvideo_lock = SRWLOCK_INIT;
 
@@ -448,7 +448,7 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
     return false;
 }
 
-#else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
+#else /* no x86-64 instruction decoder for this host */
 
 bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
 { (void)regs; return false; }
@@ -464,4 +464,4 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
 { (void)fault_addr; (void)fault_xbox_va; return false; }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || __x86_64__ */

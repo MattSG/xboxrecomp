@@ -1713,17 +1713,12 @@ static int bridge_async_wait_trace_enabled(void)
 
 static int bridge_async_wait_read(uint32_t va, void *out, size_t size)
 {
-#ifdef _WIN32
+    /* ReadProcessMemory is checked on every host (win32_compat uses
+     * process_vm_readv or mach_vm_read_overwrite on POSIX). */
     SIZE_T copied = 0;
     if (!size || size > 128 || !bridge_va_mapped(va, (uint32_t)size)) return 0;
     return ReadProcessMemory(GetCurrentProcess(), XBOX_TO_NATIVE(va), out,
                              size, &copied) && copied == size;
-#else
-    /* Pointer snapshots are unavailable on hosts without a checked read.
-     * Status, resolution kind and timing remain useful there. */
-    (void)va; (void)out; (void)size;
-    return 0;
-#endif
 }
 
 static void bridge_async_wait_log(unsigned ordinal, uint32_t requested,

@@ -3,6 +3,12 @@
  * A title's keyboard hook sees the pad last, with the menu state. */
 #include "../../src/input/xinput_device.c"
 #include <stdio.h>
+#include <stdlib.h>
+#ifdef _WIN32
+#define set_env(name, value) _putenv_s(name, value)
+#else
+#define set_env(name, value) setenv(name, value, 1)
+#endif
 
 static unsigned char held[256];
 int xbox_FramebufferKeyDown(int vk) { return vk >= 0 && vk < 256 && held[vk]; }
@@ -26,7 +32,7 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "default-padmap")) {
         XINPUT_GAMEPAD g = {0};
         XBOX_GAMEPAD out;
-        _putenv_s("RECOMP_PADMAP", "");
+        set_env("RECOMP_PADMAP", "");
         g.wButtons = XINPUT_GAMEPAD_RIGHT_SHOULDER;
         pad_buttons(&g, &out);
         if (out.bAnalogButtons[XBOX_BUTTON_BLACK] != 255 || out.bAnalogButtons[XBOX_BUTTON_WHITE]) return 21;
@@ -36,8 +42,8 @@ int main(int argc, char **argv)
         puts("PASS: right shoulder is Black and left shoulder is White by default");
         return 0;
     }
-    _putenv_s("RECOMP_KEYMAP", "A:57,RX-:2,LX-:41,START:0");
-    _putenv_s("RECOMP_MENU_KEYS", "1"); /* read once, like the keymap */
+    set_env("RECOMP_KEYMAP", "A:57,RX-:2,LX-:41,START:0");
+    set_env("RECOMP_MENU_KEYS", "1"); /* read once, like the keymap */
     xbox_InputSetMenuProbe(probe_menu);
     held['W'] = held[VK_RBUTTON] = held['Z'] = held[VK_RETURN] = held['A'] = 1;
     keyboard_state(&s);
@@ -65,7 +71,7 @@ int main(int argc, char **argv)
     {
         XINPUT_GAMEPAD g = {0};
         XBOX_GAMEPAD out;
-        _putenv_s("RECOMP_PADMAP", "BLACK:LB,WHITE:RB,A:RT,START:A");
+        set_env("RECOMP_PADMAP", "BLACK:LB,WHITE:RB,A:RT,START:A");
         g.wButtons = XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B;
         g.bRightTrigger = 200;
         pad_buttons(&g, &out);

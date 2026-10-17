@@ -81,6 +81,21 @@ static void *g_gap_reserved[XBOX_NUM_MIRRORS] = {0};
  * there would read host memory instead of faulting. */
 static void *g_span_base = NULL;
 static size_t g_span_size = 0;
+
+/* POSIX: a fixed window inside the span replaces that slice of our own
+ * reservation, as the RAM mirrors do, instead of racing other host mappings
+ * (a GPU driver's, a library's) for the address. Win32 reservations cannot be
+ * split this way; the placeholder path there does its own thing. */
+static void span_release(uintptr_t native, size_t size)
+{
+#ifndef _WIN32
+    uintptr_t lo = (uintptr_t)g_span_base;
+    if (g_span_base && native >= lo && native + size <= lo + g_span_size)
+        VirtualFree((void *)native, size, MEM_RELEASE);
+#else
+    (void)native; (void)size;
+#endif
+}
 static void *g_tiled_view = NULL;
 #ifdef _WIN32
 #ifndef MEM_REPLACE_PLACEHOLDER
@@ -2335,9 +2350,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
         }
 #else
+        /* At least the whole 32-bit guest space: the apertures at the top
+         * (tiled 0xF0000000, NV2A, MCPX, flash) have to stay ours between
+         * mappings, and across a shutdown and re-init. */
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-        if (g_span_size < (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-            g_span_size = (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+        if (g_span_size < ((size_t)1 << 32))
+            g_span_size = (size_t)1 << 32;
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
@@ -2888,6 +2906,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
+        span_release(nv2a_native, XBOX_NV2A_SIZE);
         g_nv2a_memory = VirtualAlloc(
             (LPVOID)nv2a_native,
             XBOX_NV2A_SIZE,
@@ -2952,6 +2971,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
+        span_release(mcpx_native, XBOX_MCPX_SIZE);
         g_mcpx_memory = VirtualAlloc(
             (LPVOID)mcpx_native,
             XBOX_MCPX_SIZE,
@@ -3035,6 +3055,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     {
         uintptr_t flash_native = XBOX_FLASH_BASE + g_memory_offset;
 
+        span_release(flash_native, XBOX_FLASH_SIZE);
         g_flash_memory = VirtualAlloc(
             (LPVOID)flash_native,
             XBOX_FLASH_SIZE,
@@ -3217,6 +3238,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          */
         if (tiled_size > XBOX_CONTIG_SIZE)
             tiled_size = XBOX_CONTIG_SIZE;
+        span_release(tiled_native, tiled_size);
         g_tiled_view = g_contig_mapping
             ? MapViewOfFileEx(
                 g_contig_mapping,
@@ -3271,18 +3293,30 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
 void xbox_MemoryLayoutShutdown(void)
 {
+    /* The acknowledgement thread runs the pushbuffer executor and the
+     * renderer, and reads guest memory throughout: stop it before releasing
+     * anything. A frame on a slow device (a software Vulkan driver) can take
+     * longer than a second, and releasing the memory under a thread still
+     * inside one crashed the process on its way out. If it does not stop at
+     * all, leave the memory mapped -- a leak at exit, not a fault. */
+    if (g_nv2a_ack_thread) {
+        DWORD waited;
+        InterlockedExchange(&g_nv2a_ack_stop, 1);
+        xbox_nv2a_wake_publish(&g_nv2a_wake);
+        waited = WaitForSingleObject(g_nv2a_ack_thread, 30000);
+        CloseHandle(g_nv2a_ack_thread);
+        g_nv2a_ack_thread = NULL;
+        if (waited != WAIT_OBJECT_0) {
+            fprintf(stderr, "xbox_MemoryLayoutShutdown: the NV2A thread did not stop;"
+                            " guest memory stays mapped\n");
+            return;
+        }
+    }
     if (g_kernel_memory && g_kernel_memory_owned) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
     }
     g_kernel_memory = NULL;
     g_kernel_memory_owned = 0;
-    if (g_nv2a_ack_thread) {
-        InterlockedExchange(&g_nv2a_ack_stop, 1);
-        xbox_nv2a_wake_publish(&g_nv2a_wake);
-        WaitForSingleObject(g_nv2a_ack_thread, 1000);
-        CloseHandle(g_nv2a_ack_thread);
-        g_nv2a_ack_thread = NULL;
-    }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
         g_nv2a_memory = NULL;

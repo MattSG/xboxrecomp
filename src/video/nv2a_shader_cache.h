@@ -3,12 +3,19 @@
 #ifndef NV2A_SHADER_CACHE_H
 #define NV2A_SHADER_CACHE_H
 
-#include <windows.h>
-#include <d3dcompiler.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#if defined(_WIN32)
+#include <windows.h>
+#include <d3dcompiler.h>
+#else
+/* Off Windows only the SHA-256 and the cache key are used: D3D_SHADER_MACRO
+ * keeps the Windows layout (name, definition) so the key is the same type. */
+#include "platform/xbox_winnt.h"
+typedef struct { const char *Name; const char *Definition; } D3D_SHADER_MACRO;
+#endif
 
 #define NV_SHADER_CACHE_SCHEMA 1u
 #define NV_SHADER_CACHE_MAX_CODE (16u * 1024u * 1024u)
@@ -139,6 +146,7 @@ static void nv_shader_cache_key(const void *source, size_t size, const char *nam
     nv_shader_hash_finish(&hash, key);
 }
 
+#if defined(_WIN32)
 static int nv_shader_cache_path(const uint8_t key[32], wchar_t path[NV_SHADER_CACHE_PATH])
 {
     wchar_t dir[NV_SHADER_CACHE_PATH], full[NV_SHADER_CACHE_PATH], enabled[8];
@@ -268,5 +276,6 @@ static HRESULT nv_shader_cache_compile(const void *source, size_t size, const ch
     if (SUCCEEDED(hr) && cache) nv_shader_cache_write(path, key, *code);
     return hr;
 }
+#endif /* _WIN32: the file cache and D3DCompile */
 
 #endif

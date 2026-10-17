@@ -4,7 +4,6 @@
 #ifndef NV2A_PACING_H
 #define NV2A_PACING_H
 
-#include <windows.h>
 #include <stdint.h>
 #include <limits.h>
 
@@ -27,6 +26,11 @@ static int nv_pacing_deadline(int64_t *next, int64_t now, int64_t frequency, int
     return 1;
 }
 
+#if defined(_WIN32)
+#include <windows.h>
+
+/* The wait: a high-resolution timer, then a short spin (Windows). The SDL3
+ * renderer waits with SDL_DelayPrecise instead. */
 static HANDLE nv_pacing_create_timer(void)
 {
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -35,10 +39,12 @@ static HANDLE nv_pacing_create_timer(void)
     return timer;
 }
 
+#endif /* the pure conversion below is portable; the timer wait is Windows-only */
+
 /* Convert QPC ticks to relative 100 ns units. The ordinary path is exactly
  * the original integer conversion. Binary division handles only products
  * that would overflow it, without changing the deadline or using floats. */
-static int64_t nv_pacing_timer_units(int64_t ticks, int64_t frequency)
+static inline int64_t nv_pacing_timer_units(int64_t ticks, int64_t frequency)
 {
     const uint64_t scale = 10000000;
     uint64_t t = (uint64_t)ticks, f = (uint64_t)frequency, units;
@@ -68,6 +74,7 @@ static int64_t nv_pacing_timer_units(int64_t ticks, int64_t frequency)
     return units ? (int64_t)units : 1;
 }
 
+#if defined(_WIN32)
 static int64_t nv_pacing_qpc(void)
 {
     LARGE_INTEGER now;
@@ -100,5 +107,6 @@ static void nv_pacing_wait(HANDLE timer, int64_t frequency, int64_t deadline, in
     }
     while (nv_pacing_qpc() < deadline) YieldProcessor();
 }
+#endif
 
 #endif

@@ -2,6 +2,7 @@
  * ordinary heap must never grant the same bytes, in either allocation order. */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "../kernel_test_host.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

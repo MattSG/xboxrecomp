@@ -12,8 +12,8 @@
 #include <string.h>
 #include "apu_xaudio2.h"
 
-/* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
- * stubbed to report inactive; real audio output via SDL2 comes later. */
+/* XAudio2 on Windows; elsewhere the same contract over an SDL3 audio
+ * stream (one queue, no callback). */
 #if defined(_WIN32)
 
 #define COBJMACROS
@@ -39,6 +39,8 @@ static IXAudio2MasteringVoice *g_xa2_master = NULL;
 static IXAudio2SourceVoice    *g_xa2_source = NULL;
 static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
 static int                     g_xa2_next_buf = 0;
+static float                   g_xa2_gain = 1.0f;  /* 0 under RECOMP_AUDIO_MUTE */
+static int                     g_xa2_muted;        /* pause state last applied */
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 static FILE                   *g_xa2_pcm_dump = NULL;
@@ -97,7 +99,9 @@ int xa2_init(void)
     {   /* RECOMP_AUDIO_MUTE=1: the device runs and paces as usual, at volume 0
          * (scripted runs). */
         const char *mute = getenv("RECOMP_AUDIO_MUTE");
-        if (mute && *mute && *mute != '0')
+        g_xa2_gain = (mute && *mute && *mute != '0') ? 0.0f : 1.0f;
+        g_xa2_muted = 0;
+        if (g_xa2_gain == 0.0f)
             IXAudio2MasteringVoice_SetVolume(g_xa2_master, 0.0f, XAUDIO2_COMMIT_NOW);
     }
 
@@ -198,11 +202,12 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     {   /* Paused in the background (fb_present.c): quiet, not a held note. */
         extern int xbox_FramebufferPaused(void);
-        static int muted;
         int paused = xbox_FramebufferPaused();
-        if (paused != muted && g_xa2_master) {
-            g_xa2_master->lpVtbl->SetVolume(g_xa2_master, paused ? 0.0f : 1.0f, XAUDIO2_COMMIT_NOW);
-            muted = paused;
+        if (paused != g_xa2_muted && g_xa2_master) {
+            /* Back to the configured gain, not to 1: a muted run stays muted. */
+            g_xa2_master->lpVtbl->SetVolume(g_xa2_master, paused ? 0.0f : g_xa2_gain,
+                                            XAUDIO2_COMMIT_NOW);
+            g_xa2_muted = paused;
         }
     }
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
@@ -249,12 +254,111 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+#else /* !_WIN32 -- SDL3 audio stream */
 
-int  xa2_init(void)                                   { return 0; }
-void xa2_shutdown(void)                               {}
-int  xa2_is_active(void)                              { return 0; }
-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return -1; }
-int  xa2_get_buffer_size(void)                        { return 0; }
+#include <SDL3/SDL.h>
+
+#define XA2_SAMPLE_RATE   48000
+#define XA2_CHANNELS      2
+#define XA2_BUF_SAMPLES   1024
+/* Same depth as the XAudio2 queue: 64 submissions, ~341 ms at 256 samples. */
+#define XA2_NUM_BUFS      64
+#define XA2_CUSHION       8
+
+static SDL_AudioStream *g_stream;
+static float g_gain = 1.0f;
+static int g_frames_written;
+static FILE *g_pcm_dump;
+static int g_muted;   /* last pause state applied to the stream gain */
+
+int xa2_init(void)
+{
+    const SDL_AudioSpec spec = { SDL_AUDIO_S16LE, XA2_CHANNELS, XA2_SAMPLE_RATE };
+    const char *mute = getenv("RECOMP_AUDIO_MUTE");
+    const char *path = getenv("RECOMP_XA2_PCM_DUMP");
+
+    if (g_stream) return 1;
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        fprintf(stderr, "[XA2] SDL audio init failed: %s\n", SDL_GetError());
+        return 0;
+    }
+    g_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!g_stream) {
+        fprintf(stderr, "[XA2] SDL audio stream failed: %s\n", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        return 0;
+    }
+    g_gain = (mute && *mute && *mute != '0') ? 0.0f : 1.0f;
+    SDL_SetAudioStreamGain(g_stream, g_gain);
+    SDL_ResumeAudioStreamDevice(g_stream);
+    g_frames_written = 0;
+    g_muted = 0;   /* gain is g_gain now; re-apply the pause state on submit */
+    if (path && *path) {
+        g_pcm_dump = fopen(path, "wb");
+        fprintf(stderr, "[XA2] PCM capture %s: %s (s16le stereo 48000 Hz)\n",
+                g_pcm_dump ? "opened" : "failed", path);
+    }
+    fprintf(stderr, "[XA2] SDL audio initialized (%d Hz stereo 16-bit, %s)\n",
+            XA2_SAMPLE_RATE, SDL_GetCurrentAudioDriver());
+    return 1;
+}
+
+void xa2_shutdown(void)
+{
+    if (g_pcm_dump) {
+        fclose(g_pcm_dump);
+        g_pcm_dump = NULL;
+    }
+    if (!g_stream) return;
+    SDL_DestroyAudioStream(g_stream);
+    g_stream = NULL;
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_frames_written);
+}
+
+int xa2_is_active(void)
+{
+    return g_stream != NULL;
+}
+
+int xa2_submit_samples(const int16_t *samples, int num_samples)
+{
+    const int bytes = num_samples * XA2_CHANNELS * (int)sizeof(int16_t);
+    int queued;
+
+    if (!samples || num_samples <= 0 || num_samples > XA2_BUF_SAMPLES) return -1;
+    if (!g_stream) return -1;
+    {   /* Paused in the background (fb_present.c): quiet, not a held note. */
+        extern int xbox_FramebufferPaused(void);
+        int paused = xbox_FramebufferPaused();
+        if (paused != g_muted) {
+            SDL_SetAudioStreamGain(g_stream, paused ? 0.0f : g_gain);
+            g_muted = paused;
+        }
+    }
+    queued = SDL_GetAudioStreamQueued(g_stream);
+    if (queued < 0) return -1;
+    if (queued >= XA2_NUM_BUFS * bytes) return 0;
+    /* Ran dry: a short cushion of silence first, as the XAudio2 path does. */
+    if (queued == 0) {
+        static const int16_t silence[XA2_BUF_SAMPLES][2];
+        if (g_frames_written)
+            fprintf(stderr, "[XA2] underrun after %d buffers\n", g_frames_written);
+        for (int i = 0; i < XA2_CUSHION; i++)
+            SDL_PutAudioStreamData(g_stream, silence, bytes);
+    }
+    if (!SDL_PutAudioStreamData(g_stream, samples, bytes)) return -1;
+    if (g_pcm_dump) {
+        fwrite(samples, 1, (size_t)bytes, g_pcm_dump);
+        fflush(g_pcm_dump);
+    }
+    g_frames_written++;
+    return 1;
+}
+
+int xa2_get_buffer_size(void)
+{
+    return XA2_BUF_SAMPLES;
+}
 
 #endif /* _WIN32 */

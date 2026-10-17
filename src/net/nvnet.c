@@ -32,17 +32,16 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <mmsystem.h>
+#else
+#include "../platform/win32_compat.h"
+#endif
 
-extern ptrdiff_t xbox_GetMemoryOffset(void);
 typedef void (*recomp_func_t)(void);
 extern recomp_func_t recomp_lookup(uint32_t xbox_va);
-extern int  xbox_worker_stack_alloc(void);
-extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
-extern __declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern __declspec(thread) uint32_t g_ebx, g_esi, g_edi;
-extern __declspec(thread) uint32_t g_fs_base;
-extern uint32_t xbox_AllocThreadTib(void);
+extern XBOX_THREAD_LOCAL uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern XBOX_THREAD_LOCAL uint32_t g_ebx, g_esi, g_edi;
+extern XBOX_THREAD_LOCAL uint32_t g_fs_base;
 
 #define NIC_BASE    0xFEF00000u
 #define NIC_SIZE    0x1000u     /* the page; the registers are the first 0x400 */
@@ -418,7 +417,9 @@ static DWORD WINAPI nic_thread(LPVOID unused)
         NIC_LOG("  [NIC] no TIB for the NIC thread; no interrupts\n");
         return 0;
     }
-    timeBeginPeriod(1);
+#if defined(_WIN32)
+    timeBeginPeriod(1);     /* the wait below is only as fine as the timer */
+#endif
     for (;;) {
         uint32_t n;
         int pending;
@@ -457,6 +458,11 @@ void xbox_NicInit(void)
     DWORD old;
     if (!mode || !*mode || !strcmp(mode, "0"))
         return;
+#if !defined(_WIN32) && !defined(__x86_64__)
+    /* The aperture is trapped and decoded by mmio_decode.h, which is x86-64 only. */
+    NIC_LOG("  NIC: needs an x86-64 host; network off\n");
+    return;
+#endif
     if (!off || !net_backend_init(mode)) {
         NIC_LOG("  NIC: backend '%s' unavailable; network off\n", mode);
         return;
@@ -467,7 +473,7 @@ void xbox_NicInit(void)
     or_(R_ADAPTER_CTL, ADAPTER_LINKUP);
     if (!VirtualProtect((LPVOID)((uintptr_t)off + NIC_BASE), NIC_SIZE, PAGE_NOACCESS, &old)) {
         NIC_LOG("  NIC: cannot trap 0x%08X (error %lu); network off\n",
-                NIC_BASE, GetLastError());
+                NIC_BASE, (unsigned long)GetLastError());
         return;
     }
     s.enabled = 1;
@@ -485,6 +491,7 @@ int xbox_NicOwnsAddress(uint32_t va)
 
 int xbox_NicHandleMmio(void *ctx, uint32_t va)
 {
+#if defined(_WIN32) || defined(__x86_64__)
     int ok = mmio_emulate((PCONTEXT)ctx, va - NIC_BASE, NULL, nic_read, nic_write);
     if (!ok && s.decode_fail++ < 20) {
         const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
@@ -493,6 +500,10 @@ int xbox_NicHandleMmio(void *ctx, uint32_t va)
         fflush(stderr);
     }
     return ok;
+#else
+    (void)ctx; (void)va;
+    return 0;
+#endif
 }
 
 void xbox_NicReport(void)
@@ -501,10 +512,3 @@ void xbox_NicReport(void)
         NIC_LOG("  NIC: %u frames out, %u in, %u dropped, %u interrupts\n",
                 s.tx_frames, s.rx_frames, s.rx_dropped, s.irqs);
 }
-
-#else
-void xbox_NicInit(void) {}
-int xbox_NicOwnsAddress(uint32_t va) { (void)va; return 0; }
-int xbox_NicHandleMmio(void *ctx, uint32_t va) { (void)ctx; (void)va; return 0; }
-void xbox_NicReport(void) {}
-#endif
