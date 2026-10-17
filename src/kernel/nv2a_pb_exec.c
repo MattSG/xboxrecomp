@@ -844,7 +844,7 @@ static void clear_surface(uint32_t param)
 }
 
 
-/* ── Rasteriser ──────────────────────────────────────────────────────────
+/* â”€â”€ Rasteriser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  *
  * Fills triangles straight into the guest framebuffer, the same memory
  * clear_surface() writes and the framebuffer window already shows. That is the
@@ -2784,6 +2784,11 @@ static int d3d_screen_pos(uint32_t guest_idx, int program, float out[4])
 
 /* The batch, drawn by the GPU: its vertex program (program) or its
  * pre-transformed vertices, straight from the title's arrays. */
+/* Interpolation (see nv2a_pb_replay): a recorded frame keeps a copy of each
+ * draw's vertices, since by the time it is drawn again the title may be
+ * filling the same buffers for the next one; a replayed draw reads them. */
+static void pb_draw_vertices(NvD3DAttrib attr[NV_VERTEX_ATTRS], uint32_t lo, uint32_t hi);
+
 static void d3d_draw_batch(int program)
 {
     NvD3DAttrib attr[NV_VERTEX_ATTRS];
@@ -2807,15 +2812,16 @@ static void d3d_draw_batch(int program)
                      : s_gpu.inline_active ? (const uint8_t *)s_gpu.inline_buf + a->offset
                      : a->offset ? mem + a->offset : NULL;
     }
-    memcpy(def, s_gpu.imm_attr, sizeof def);
-    /* Pre-transformed batches with no diffuse at all are white. */
-    if (!program && !s_gpu.attr[3].size && !s_gpu.attr[3].offset)
-        def[3][0] = def[3][1] = def[3][2] = def[3][3] = 1.0f;
     lo = hi = s_gpu.idx[0];
     for (i = 1; i < n; i++) {
         if (s_gpu.idx[i] < lo) lo = s_gpu.idx[i];
         if (s_gpu.idx[i] > hi) hi = s_gpu.idx[i];
     }
+    pb_draw_vertices(attr, lo, hi);
+    memcpy(def, s_gpu.imm_attr, sizeof def);
+    /* Pre-transformed batches with no diffuse at all are white. */
+    if (!program && !s_gpu.attr[3].size && !s_gpu.attr[3].offset)
+        def[3][0] = def[3][1] = def[3][2] = def[3][3] = 1.0f;
     if (!grow((void **)&s_di, &s_di_cap, n * 6 + 6, sizeof *s_di))
         return;
     ni = build_list(n, s_gpu.idx, s_di, &topo);
@@ -3553,11 +3559,268 @@ static void tex_stage_method(uint32_t method, uint32_t param)
 static uint32_t s_semaphore_last, s_semaphore_releases;
 uint32_t nv2a_pb_exec_semaphore_last_value(void) { return s_semaphore_last; }
 uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_semaphore_releases; }
+/* ---- Frames between a title's own: interpolation ----------------------
+ *
+ * A title whose world updates at a fixed rate (MM3's console-rate mod) draws
+ * only when it updates. Between updates, the last frame is drawn again from
+ * what the GPU was told: every method of each finished frame is recorded,
+ * and replayed with every vertex-program constant (the matrices, among them)
+ * part way from its value in the frame before to its value in this one --
+ * what a game with its own fixed timestep does with its objects' states, done
+ * where every drawn object's transform is plain.
+ *
+ * Constants are matched between the two frames by the draw they precede,
+ * keyed on what it draws (vertex array addresses, primitive, the constant
+ * registers loaded) and how many such draws came before, so an object
+ * appearing or going does not pair its neighbours with the wrong matrices.
+ * A draw with no partner keeps its own values. Nothing the title can read is
+ * touched: a replay writes no notify, frame counter or flip state, and the
+ * constant file is put back as the frame left it. */
+void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+typedef struct { uint32_t sm, param; } PbCmd;          /* sm: subch<<16 | method */
+typedef struct { uint32_t key, occ, tc0, ntc; } PbSeg;
+typedef struct {
+    PbCmd *cmd; uint32_t ncmd, capcmd;
+    uint32_t *tc; uint32_t ntc, captc;                 /* the constant words, in order */
+    PbSeg *seg; uint32_t nseg, capseg;
+    float *prev; uint8_t *has;                         /* per constant word: partner */
+    uint32_t capprev;
+    uint8_t *vdata; uint32_t nvdata, capvdata;         /* each draw's vertices, copied */
+    uint32_t (*voff)[NV_VERTEX_ATTRS]; uint32_t ndraw, capdraw;  /* +1; 0: not copied */
+} PbFrame;
+static PbFrame s_frames[3];                            /* recording, last, previous */
+static PbFrame *s_rec_f = &s_frames[0], *s_last_f = &s_frames[1], *s_prev_f = &s_frames[2];
+static volatile LONG s_interp_ms;                     /* last request, GetTickCount */
+/* Interpolating: a frame between was asked for lately. A load or a movie,
+ * which ask for none, show their own frames. */
+static int interp_on(void) { LONG ms = s_interp_ms; return ms && GetTickCount() - (DWORD)ms < 250; }
+static int s_replaying;
+static uint32_t s_replay_draw;                         /* draws replayed so far */
+static volatile LONG s_frames_done;                    /* frames finished recording */
+
+static int pb_grow(void **p, uint32_t *cap, uint32_t need, size_t elem)
+{
+    if (need <= *cap) return 1;
+    uint32_t n = *cap ? *cap : 4096;
+    while (n < need) n *= 2;
+    void *q = realloc(*p, (size_t)n * elem);
+    if (!q) return 0;
+    *p = q; *cap = n;
+    return 1;
+}
+
+static void pb_record(uint32_t subch, uint32_t method, uint32_t param)
+{
+    PbFrame *f = s_rec_f;
+    if (!pb_grow((void **)&f->cmd, &f->capcmd, f->ncmd + 1, sizeof *f->cmd)) return;
+    f->cmd[f->ncmd].sm = subch << 16 | method;
+    f->cmd[f->ncmd++].param = param;
+}
+
+static uint32_t pb_mix(uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; }
+
+/* The frame's constant words and the draws they belong to. */
+static void pb_segment(PbFrame *f)
+{
+    uint32_t va[4] = {0}, loads = 2166136261u, i;
+    PbSeg cur = {0};
+    f->ntc = f->nseg = 0;
+    for (i = 0; i < f->ncmd; i++) {
+        uint32_t m = f->cmd[i].sm & 0xFFFF, p = f->cmd[i].param;
+        if (f->cmd[i].sm >> 16) continue;
+        if (m >= 0x1720 && m < 0x1730) va[(m - 0x1720) / 4] = p;
+        else if (m == 0x1EA4) loads = pb_mix(loads, p);
+        else if (m >= 0x0B80 && m < 0x0C00) {
+            if (!pb_grow((void **)&f->tc, &f->captc, f->ntc + 1, sizeof *f->tc)) return;
+            if (!cur.ntc) cur.tc0 = f->ntc;
+            f->tc[f->ntc++] = p;
+            cur.ntc++;
+        } else if (m == 0x17FC && p && cur.ntc) {       /* BEGIN: the draw they are for */
+            uint32_t k = pb_mix(pb_mix(pb_mix(pb_mix(pb_mix(loads, cur.ntc), va[0]), va[1]), va[2]), p);
+            if (!pb_grow((void **)&f->seg, &f->capseg, f->nseg + 1, sizeof *f->seg)) return;
+            cur.key = k;
+            cur.occ = 0;
+            for (uint32_t s = 0; s < f->nseg; s++)        /* ponytail: O(n^2), a hash map if frames grow */
+                if (f->seg[s].key == k) cur.occ++;
+            f->seg[f->nseg++] = cur;
+            cur.ntc = 0;
+            loads = 2166136261u;
+        }
+    }
+}
+
+/* Pair the last frame's constant words with the previous frame's. */
+static uint32_t s_dbg_keyed, s_dbg_close;   /* DIAG */
+static void pb_pair(PbFrame *l, const PbFrame *p)
+{
+    if (!pb_grow((void **)&l->prev, &l->capprev, l->ntc + 1, sizeof *l->prev)) return;
+    free(l->has);
+    l->has = (uint8_t *)calloc(l->ntc + 1, 1);
+    if (!l->has) return;
+    for (uint32_t s = 0; s < l->nseg; s++) {
+        const PbSeg *a = &l->seg[s];
+        for (uint32_t t = 0; t < p->nseg; t++) {
+            const PbSeg *b = &p->seg[t];
+            if (b->key != a->key || b->occ != a->occ || b->ntc != a->ntc) continue;
+            s_dbg_keyed++;
+            /* Between two ticks an object's constants move a little. Any
+             * that moved a lot (a HUD piece paired with the next one drawn
+             * from the same buffer) say this is not its partner. */
+            uint32_t w;
+            for (w = 0; w < a->ntc; w++) {
+                float x, y;
+                memcpy(&x, &l->tc[a->tc0 + w], 4);
+                memcpy(&y, &p->tc[b->tc0 + w], 4);
+                float d = x > y ? x - y : y - x, m = (x > 0 ? x : -x) + (y > 0 ? y : -y);
+                if (!(d <= 0.1f || d <= 0.2f * m)) break;
+            }
+            if (w < a->ntc) break;
+            s_dbg_close++;
+            for (w = 0; w < a->ntc; w++) {
+                memcpy(&l->prev[a->tc0 + w], &p->tc[b->tc0 + w], 4);
+                l->has[a->tc0 + w] = 1;
+            }
+            break;
+        }
+    }
+}
+
+/* A flip ended the frame being recorded. */
+static void pb_frame_done(void)
+{
+    static DWORD last_ms;
+    DWORD now = GetTickCount();
+    PbFrame *t = s_prev_f;
+    s_prev_f = s_last_f;
+    s_last_f = s_rec_f;
+    s_rec_f = t;
+    s_rec_f->ncmd = 0;
+    s_rec_f->nvdata = s_rec_f->ndraw = 0;
+    pb_segment(s_last_f);
+    DWORD gap = now - last_ms;
+    if (now - last_ms > 200)          /* after a pause: nothing to come from */
+        s_prev_f->nseg = 0;
+    last_ms = now;
+    s_dbg_keyed = s_dbg_close = 0;
+    pb_pair(s_last_f, s_prev_f);
+    if (s_frames_done % 30 == 0)   /* DIAG */
+        fprintf(stderr, "[INTERP] gap %lu cmds %u consts %u draws %u prev %u keyed %u close %u\n",
+                (unsigned long)gap, s_last_f->ncmd, s_last_f->ntc, s_last_f->nseg, s_prev_f->nseg, s_dbg_keyed, s_dbg_close);
+    InterlockedIncrement(&s_frames_done);
+}
+
+void nv2a_pb_interp_enable(int on)
+{
+    InterlockedExchange(&s_interp_ms, on ? (LONG)(GetTickCount() | 1) : 0);
+}
+
+long nv2a_pb_frames_done(void) { return s_frames_done; }
+
+static void pb_draw_vertices(NvD3DAttrib attr[NV_VERTEX_ATTRS], uint32_t lo, uint32_t hi)
+{
+    uint32_t i;
+    if (s_replaying) {
+        PbFrame *f = s_last_f;
+        uint32_t d = s_replay_draw++;
+        if (d >= f->ndraw) return;
+        for (i = 0; i < NV_VERTEX_ATTRS; i++)
+            if (f->voff[d][i])
+                attr[i].data = f->vdata + (f->voff[d][i] - 1) - (size_t)lo * attr[i].stride;
+        return;
+    }
+    if (!interp_on()) return;
+    PbFrame *f = s_rec_f;
+    if (!pb_grow((void **)&f->voff, &f->capdraw, f->ndraw + 1, sizeof *f->voff)) return;
+    memset(f->voff[f->ndraw], 0, sizeof *f->voff);
+    for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+        uint32_t st = attr[i].stride, len = st ? (hi - lo + 1) * st : 16;
+        if (!attr[i].enabled || !attr[i].data || s_gpu.inline_active || len > (64u << 20)) continue;
+        if (!pb_grow((void **)&f->vdata, &f->capvdata, f->nvdata + len + 16, 1)) break;
+        memcpy(f->vdata + f->nvdata, attr[i].data + (size_t)lo * st, len);
+        f->voff[f->ndraw][i] = f->nvdata + 1;
+        f->nvdata = (f->nvdata + len + 15) & ~15u;
+    }
+    f->ndraw++;
+}
+
+/* The executor as a frame in progress left it, around a replay: the state
+ * every method sets, the texture registers, the vertex programs and
+ * constants, and a batch begun but not ended. A title draws to textures in
+ * its world update, so a replay can fall between commands of the next frame,
+ * which must go on as if it had not. */
+typedef struct {
+    uint8_t *head, *mid, *tail;          /* s_gpu around idx[] and inline_buf[] */
+    uint32_t *idx, *inl;
+    uint8_t *vsh;
+    uint32_t tex_reg[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
+    uint8_t tex_set[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
+    uint8_t *surface;
+} PbState;
+
+#define GPU_AT(f) ((size_t)((uint8_t *)&s_gpu.f - (uint8_t *)&s_gpu))
+static void pb_state(PbState *st, int save)
+{
+    size_t a = GPU_AT(idx), b0 = GPU_AT(idx_count), b1 = GPU_AT(inline_buf);
+    size_t c0 = GPU_AT(inline_count), c1 = sizeof s_gpu;
+    uint8_t *g = (uint8_t *)&s_gpu;
+    if (!st->head) {
+        st->head = (uint8_t *)malloc(a); st->mid = (uint8_t *)malloc(b1 - b0);
+        st->tail = (uint8_t *)malloc(c1 - c0); st->vsh = (uint8_t *)malloc(nv2a_vsh_state_size());
+        st->idx = (uint32_t *)malloc(sizeof s_gpu.idx); st->inl = (uint32_t *)malloc(sizeof s_gpu.inline_buf);
+    }
+    if (save) {
+        memcpy(st->head, g, a); memcpy(st->mid, g + b0, b1 - b0); memcpy(st->tail, g + c0, c1 - c0);
+        memcpy(st->idx, s_gpu.idx, s_gpu.idx_count * sizeof *s_gpu.idx);
+        memcpy(st->inl, s_gpu.inline_buf, s_gpu.inline_count * sizeof *s_gpu.inline_buf);
+        memcpy(st->tex_reg, s_tex_reg, sizeof s_tex_reg); memcpy(st->tex_set, s_tex_set, sizeof s_tex_set);
+        st->surface = s_surface;
+        nv2a_vsh_state_save(st->vsh);
+    } else {
+        memcpy(g, st->head, a); memcpy(g + b0, st->mid, b1 - b0); memcpy(g + c0, st->tail, c1 - c0);
+        memcpy(s_gpu.idx, st->idx, s_gpu.idx_count * sizeof *s_gpu.idx);
+        memcpy(s_gpu.inline_buf, st->inl, s_gpu.inline_count * sizeof *s_gpu.inline_buf);
+        memcpy(s_tex_reg, st->tex_reg, sizeof s_tex_reg); memcpy(s_tex_set, st->tex_set, sizeof s_tex_set);
+        s_surface = st->surface;
+        nv2a_vsh_state_restore(st->vsh);
+    }
+}
+
+/* The last frame again, at t between the previous one (0) and it (1).
+ * 0 if there is none to draw. */
+int nv2a_pb_replay(float t)
+{
+    static PbState saved;
+    PbFrame *f = s_last_f;
+    uint32_t i, k = 0;
+    if (!f->ncmd || !f->has) return 0;
+    pb_state(&saved, 1);
+    if (!saved.head || !saved.mid || !saved.tail || !saved.vsh || !saved.idx || !saved.inl) return 0;
+    s_replaying = 1;
+    s_replay_draw = 0;
+    for (i = 0; i < f->ncmd; i++) {
+        uint32_t sm = f->cmd[i].sm, m = sm & 0xFFFF, p = f->cmd[i].param;
+        if (!(sm >> 16) && m >= 0x0B80 && m < 0x0C00) {
+            if (k < f->ntc && f->has[k]) {
+                float a = f->prev[k], b, v;
+                memcpy(&b, &p, 4);
+                v = a + (b - a) * t;
+                if (v == v && v - v == 0.0f) memcpy(&p, &v, 4);   /* finite only */
+            }
+            k++;
+        }
+        nv2a_pb_exec_method(sm >> 16, m, p);
+    }
+    s_replaying = 0;
+    pb_state(&saved, 0);
+    return 1;
+}
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
     static uint32_t semaphore_dma, semaphore_offset;
+    if (!s_replaying && interp_on())
+        pb_record(subch, method, param);
     if (!inited) {
         inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
@@ -3637,12 +3900,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     switch (method) {
     case NV097_SET_CONTEXT_DMA_SEMAPHORE:
+        if (s_replaying) return;
         semaphore_dma = param;
         return;
     case NV097_SET_SEMAPHORE_OFFSET:
+        if (s_replaying) return;
         semaphore_offset = param;
         return;
     case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        if (s_replaying) return;
         xbox_Nv2aSemaphoreRelease(semaphore_dma, semaphore_offset, param);
         s_semaphore_last = param;
         s_semaphore_releases++;
@@ -3846,6 +4112,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_INCREMENT_WRITE:
+        if (s_replaying) return;
         s_gpu.flip_write = s_gpu.flip_modulo
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
@@ -3854,7 +4121,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_NO_OPERATION:
-        xbox_Nv2aNop(param);
+        if (!s_replaying)                  /* a notify the title waits on */
+            xbox_Nv2aNop(param);
         return;
 
     case NV097_FLIP_STALL:
@@ -3865,8 +4133,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
         /* And this is a completed swap, which is what a title's own swap
-         * counter counts -- see xbox_Nv2aFrameCounterFlip. */
-        xbox_Nv2aFrameCounterFlip();
+         * counter counts -- see xbox_Nv2aFrameCounterFlip. A replay is not
+         * one of the title's. */
+        if (!s_replaying)
+            xbox_Nv2aFrameCounterFlip();
+        if (!s_replaying && interp_on())   /* this method was the last recorded */
+            pb_frame_done();
         /* Hand the window a copy of the frame just finished.
          *
          * The buffer the title has finished is the one the last batch drew
@@ -3888,9 +4160,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                 : s_gpu.pitch;
             if (done) {
+                extern void nv2a_d3d_flip_present(uint32_t, uint32_t, int);
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                 xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-                nv2a_d3d_flip(dma_resolve(done), pitch);
+                /* Interpolating, the title's own frame is not shown: the
+                 * replays of it are (nv2a_pb_replay). */
+                nv2a_d3d_flip_present(dma_resolve(done), pitch, s_replaying || !interp_on());
             }
         }
         {

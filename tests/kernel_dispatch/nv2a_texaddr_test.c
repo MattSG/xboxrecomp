@@ -29,14 +29,18 @@ uint32_t g_xbox_image_lo, g_xbox_image_hi;
 void xbox_Nv2aFrameCounterFlip(void) { STUB_HIT("xbox_Nv2aFrameCounterFlip"); }
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
 { (void)physical_offset; (void)size; STUB_HIT("xbox_ContiguousRangeAllocated"); return 0; }
+static uint32_t released_dma, released_offset, release_count;
 void xbox_Nv2aSemaphoreRelease(uint32_t dma_context, uint32_t semaphore_offset, uint32_t value)
-{ (void)dma_context; (void)semaphore_offset; (void)value; STUB_HIT("xbox_Nv2aSemaphoreRelease"); }
+{ released_dma = dma_context; released_offset = semaphore_offset; (void)value; release_count++; }
 void xbox_Nv2aNop(uint32_t param) { (void)param; STUB_HIT("xbox_Nv2aNop"); }
 void nv2a_vsh_set_load_slot(uint32_t slot) { (void)slot; STUB_HIT("nv2a_vsh_set_load_slot"); }
 void nv2a_vsh_program_word(uint32_t word) { (void)word; STUB_HIT("nv2a_vsh_program_word"); }
 void nv2a_vsh_set_start_slot(uint32_t slot) { (void)slot; STUB_HIT("nv2a_vsh_set_start_slot"); }
 void nv2a_vsh_set_constant_load(uint32_t index) { (void)index; STUB_HIT("nv2a_vsh_set_constant_load"); }
 void nv2a_vsh_constant_word(uint32_t word) { (void)word; STUB_HIT("nv2a_vsh_constant_word"); }
+size_t nv2a_vsh_state_size(void) { STUB_HIT("nv2a_vsh_state_size"); return 0; }
+void nv2a_vsh_state_save(void *out) { (void)out; STUB_HIT("nv2a_vsh_state_save"); }
+void nv2a_vsh_state_restore(const void *in) { (void)in; STUB_HIT("nv2a_vsh_state_restore"); }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { (void)enable; STUB_HIT("nv2a_vsh_set_cxt_write"); }
 int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 { (void)in; (void)out; STUB_HIT("nv2a_vsh_run"); return 0; }
@@ -160,6 +164,19 @@ static void test_border(void)
 int main(int argc, char **argv)
 {
     const char *which = argc > 1 ? argv[1] : "all";
+
+    nv2a_pb_exec_method(0, NV097_SET_CONTEXT_DMA_SEMAPHORE, 7);
+    nv2a_pb_exec_method(0, NV097_SET_SEMAPHORE_OFFSET, 16);
+    s_replaying = 1;
+    nv2a_pb_exec_method(0, NV097_SET_CONTEXT_DMA_SEMAPHORE, 9);
+    nv2a_pb_exec_method(0, NV097_SET_SEMAPHORE_OFFSET, 32);
+    nv2a_pb_exec_method(0, NV097_BACK_END_WRITE_SEMAPHORE_RELEASE, 1);
+    CHECK_EQ("replay never publishes a semaphore", release_count, 0);
+    s_replaying = 0;
+    nv2a_pb_exec_method(0, NV097_BACK_END_WRITE_SEMAPHORE_RELEASE, 2);
+    CHECK_EQ("title publishes once", release_count, 1);
+    CHECK_EQ("replay preserves semaphore DMA", released_dma, 7);
+    CHECK_EQ("replay preserves semaphore offset", released_offset, 16);
 
     if (strcmp(which, "wrap") == 0 || strcmp(which, "all") == 0)
         test_wrap_and_mirror();

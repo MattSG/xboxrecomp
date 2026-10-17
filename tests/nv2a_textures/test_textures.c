@@ -449,3 +449,8 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "benchmark_native_bc")) return benchmark_native_bc();
     CHECK(0);
 }
+
+/* These renderer-only fixtures never request executor frame replay. */
+void nv2a_pb_interp_enable(int on) { (void)on; abort(); }
+long nv2a_pb_frames_done(void) { abort(); return 0; }
+int nv2a_pb_replay(float t) { (void)t; abort(); return 0; }

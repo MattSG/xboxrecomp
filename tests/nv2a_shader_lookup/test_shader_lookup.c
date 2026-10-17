@@ -178,3 +178,8 @@ int main(int argc,char **argv)
     else CHECK(0);
     return 0;
 }
+
+/* These renderer-only fixtures never request executor frame replay. */
+void nv2a_pb_interp_enable(int on) { (void)on; abort(); }
+long nv2a_pb_frames_done(void) { abort(); return 0; }
+int nv2a_pb_replay(float t) { (void)t; abort(); return 0; }
