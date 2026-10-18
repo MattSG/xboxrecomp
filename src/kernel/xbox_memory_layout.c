@@ -114,7 +114,6 @@ static XBOX_VirtualAlloc2 s_virtual_alloc2;
 static XBOX_MapViewOfFile3 s_map_view_of_file3;
 static XBOX_UnmapViewOfFile2 s_unmap_view_of_file2;
 static int g_placeholder_span = 0;
-static int g_contig_is_view = 0;
 
 static int xbox_split_placeholder(void *address, size_t size)
 {
@@ -153,6 +152,7 @@ static void *xbox_map_placeholder(HANDLE mapping, uintptr_t address,
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
  * the same numbers for MmClaimGpuInstanceMemory. */
 static void *g_contig_memory = NULL;
+static int g_contig_is_view = 0;
 static int g_kernel_memory_owned = 0;
 
 /* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
@@ -160,11 +160,13 @@ static int g_kernel_memory_owned = 0;
 #define XBOX_NV2A_BASE 0xFD000000u
 #define XBOX_NV2A_SIZE (16u * 1024u * 1024u)
 static void *g_nv2a_memory = NULL;
+static HANDLE g_nv2a_mapping = NULL;
 
 /* MCPX southbridge register span: APU 0xFE800000 through NIC 0xFEF00000. */
 #define XBOX_MCPX_BASE 0xFE800000u
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
 static void *g_mcpx_memory = NULL;
+static HANDLE g_mcpx_mapping = NULL;
 
 /* Flash ROM. The console's 256 KB flash is mirrored through the top of the
  * address space, and the MCPX span above stops one page short of it -- so a
@@ -184,6 +186,18 @@ static void *g_mcpx_memory = NULL;
 #define XBOX_FLASH_BASE 0xFF000000u
 #define XBOX_FLASH_SIZE (1u * 1024u * 1024u)
 static void *g_flash_memory = NULL;
+static HANDLE g_flash_mapping = NULL;
+
+#define XBOX_IOMAP_START 0xE8000000u
+#define XBOX_IOMAP_END   0xF0000000u
+#define XBOX_IOMAP_MAX   128
+static SRWLOCK g_iomap_lock = SRWLOCK_INIT;
+static int g_iomap_available;
+static struct {
+    void *view, *address;
+    uint32_t physical, view_bytes, bytes, protect;
+    uint16_t *page_protect;
+} g_iomaps[XBOX_IOMAP_MAX];
 /* The contiguous window's backing section. It is a file mapping rather than
  * plain committed memory for one reason: the tiled aperture has to be a
  * second view of the very same bytes, and only a mapping can be mapped
@@ -221,6 +235,15 @@ static volatile LONG g_contig_alloc_count;
 size_t xbox_GetMappedSize(void)
 {
     return g_memory_size;
+}
+
+int xbox_IsContiguousMemoryAvailable(void)
+{
+    int available;
+    AcquireSRWLockShared(&g_iomap_lock);
+    available = g_iomap_available && g_memory_base && g_contig_memory;
+    ReleaseSRWLockShared(&g_iomap_lock);
+    return available;
 }
 
 static size_t xbox_TiledApertureSize(void)
@@ -439,8 +462,9 @@ void xbox_Nv2aDmaPublish(uint32_t put_va, uint32_t value)
 static void *g_ac97_page = NULL;      /* host address of the trapped page */
 static void *g_ac97_veh  = NULL;
 static RECOMP_TLS int s_ac97_stepping = 0;
+static RECOMP_TLS void *s_ac97_step_page;
 
-static void ac97_clear_reset_bits(void)
+static void ac97_clear_reset_bits(void *page)
 {
     /* Every bus-master channel, not the three a PC AC'97 has.
      *
@@ -454,7 +478,7 @@ static void ac97_clear_reset_bits(void)
     uint32_t off;
 
     for (off = 0x10B; off < 0x180; off += 0x10) {
-        volatile uint8_t *r = (volatile uint8_t *)((char *)g_ac97_page + off);
+        volatile uint8_t *r = (volatile uint8_t *)((char *)page + off);
         if (*r & AC97_RR)
             *r = (uint8_t)(*r & ~AC97_RR);
     }
@@ -475,8 +499,9 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
      * mid-step. */
     if (code == EXCEPTION_SINGLE_STEP && s_ac97_stepping) {
         s_ac97_stepping = 0;
-        ac97_clear_reset_bits();
-        VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
+        ac97_clear_reset_bits(s_ac97_step_page);
+        VirtualProtect(s_ac97_step_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
+        s_ac97_step_page = NULL;
         ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -484,12 +509,20 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     if (code == EXCEPTION_ACCESS_VIOLATION
             && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
         uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+        uint32_t physical;
+        int alias = fault >= (uintptr_t)g_memory_offset &&
+                    fault - (uintptr_t)g_memory_offset <= UINT32_MAX
+            ? xbox_IoMappingResolve((uint32_t)(fault - (uintptr_t)g_memory_offset), 1, &physical) : 0;
+        uintptr_t canonical = alias == 1 ? (uintptr_t)physical + g_memory_offset : fault;
+        if (alias < 0) return EXCEPTION_CONTINUE_SEARCH;
 
-        if (fault >= (uintptr_t)g_ac97_page
-                && fault < (uintptr_t)g_ac97_page + AC97_TRAP_BYTES) {
-            if (!VirtualProtect(g_ac97_page, AC97_TRAP_BYTES,
+        if (canonical >= (uintptr_t)g_ac97_page
+                && canonical < (uintptr_t)g_ac97_page + AC97_TRAP_BYTES) {
+            void *page = (void *)(fault & ~(uintptr_t)(AC97_TRAP_BYTES - 1));
+            if (!VirtualProtect(page, AC97_TRAP_BYTES,
                                 PAGE_READWRITE, &old))
                 return EXCEPTION_CONTINUE_SEARCH;
+            s_ac97_step_page = page;
             s_ac97_stepping = 1;
             ep->ContextRecord->EFlags |= 0x100u;   /* TF: step the write */
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -2209,6 +2242,197 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+int xbox_IoMappingQuery(const void *address, uint32_t *physical,
+                        uint32_t *protect, uint32_t *remaining)
+{
+    uintptr_t p = (uintptr_t)address;
+    int found = 0;
+    AcquireSRWLockShared(&g_iomap_lock);
+    for (int i = 0; i < XBOX_IOMAP_MAX; i++) {
+        uintptr_t base = (uintptr_t)g_iomaps[i].view;
+        if (base && p >= base && p - base < g_iomaps[i].view_bytes) {
+            uint32_t offset = (uint32_t)(p - base);
+            if (physical) *physical = g_iomaps[i].physical + offset;
+            if (protect) *protect = g_iomaps[i].page_protect
+                ? g_iomaps[i].page_protect[offset / 4096] : g_iomaps[i].protect;
+            if (remaining) *remaining = g_iomaps[i].view_bytes - offset;
+            found = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_iomap_lock);
+    return found;
+}
+
+int xbox_IoMappingResolve(uint32_t va, int access, uint32_t *physical)
+{
+    uint32_t protect;
+    if (!xbox_IoMappingQuery((void *)((uintptr_t)va + g_memory_offset),
+                              physical, &protect, NULL))
+        return 0;
+    if ((protect & 0xff) == PAGE_NOACCESS || access == 8 ||
+        (access == 1 && (protect & 0xff) != PAGE_READWRITE))
+        return -1;
+    return 1;
+}
+
+static int xbox_iomap_valid_protect(uint32_t protect)
+{
+    DWORD base = protect & 0xff;
+    return !(protect & ~0x6ffu) && (protect & 0x600u) != 0x600u &&
+        (base == PAGE_NOACCESS || base == PAGE_READONLY || base == PAGE_READWRITE);
+}
+
+static DWORD xbox_iomap_page_protect(uint32_t canonical, uint32_t protect)
+{
+    DWORD result = protect & 0xff;
+    if (canonical < XBOX_NV2A_BASE) return result; /* Physical RAM. */
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION info;
+    if (!VirtualQuery((void *)((uintptr_t)canonical + g_memory_offset), &info, sizeof info))
+        return 0;
+    if ((info.Protect & 0xff) == PAGE_NOACCESS) result = PAGE_NOACCESS;
+    else if ((info.Protect & 0xff) == PAGE_READONLY && result == PAGE_READWRITE)
+        result = PAGE_READONLY;
+#else
+    if (canonical == XBOX_NV2A_BASE + 0x8000 ||
+        (g_apu_mmio_trapped && canonical >= XBOX_MCPX_BASE && canonical < XBOX_MCPX_BASE + 0x80000))
+        result = PAGE_NOACCESS;
+#endif
+    return result;
+}
+
+int xbox_IoMappingSetProtect(void *address, uint32_t bytes, uint32_t protect)
+{
+    uintptr_t p = (uintptr_t)address;
+    int result = 0;
+    DWORD old;
+    AcquireSRWLockExclusive(&g_iomap_lock);
+    for (int i = 0; i < XBOX_IOMAP_MAX; i++) {
+        uintptr_t base = (uintptr_t)g_iomaps[i].view;
+        uint32_t first, last, count;
+        if (!base || p < base || p - base >= g_iomaps[i].view_bytes) continue;
+        result = -1;
+        if (!bytes || (uint64_t)(p - base) + bytes > g_iomaps[i].view_bytes ||
+            !xbox_iomap_valid_protect(protect)) break;
+        count = g_iomaps[i].view_bytes / 4096;
+        if (!g_iomaps[i].page_protect) {
+            g_iomaps[i].page_protect = malloc(count * sizeof(uint16_t));
+            if (!g_iomaps[i].page_protect) break;
+            for (uint32_t j = 0; j < count; j++)
+                g_iomaps[i].page_protect[j] = (uint16_t)g_iomaps[i].protect;
+        }
+        first = (uint32_t)(p - base) / 4096;
+        last = (uint32_t)(((uint64_t)(p - base) + bytes + 4095) / 4096);
+        result = 1;
+        for (uint32_t j = first; j < last; j++) {
+            DWORD host = xbox_iomap_page_protect(g_iomaps[i].physical + j * 4096, protect);
+            if (!host || !VirtualProtect((char *)g_iomaps[i].view + j * 4096, 4096, host, &old)) {
+                result = -1;
+                break;
+            }
+            g_iomaps[i].page_protect[j] = (uint16_t)protect;
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_iomap_lock);
+    return result;
+}
+
+void *xbox_MapPhysicalMemory(uint32_t physical, uint32_t bytes, uint32_t protect)
+{
+    HANDLE mapping = NULL;
+    uint32_t source = 0, limit = 0, offset, prefix, view_bytes;
+    uint64_t end = (uint64_t)physical + bytes;
+    DWORD host_protect = protect & 0xff, old;
+    int slot;
+    void *view = NULL, *answer = NULL;
+    /* Cache-policy flags do not alter the host section's memory semantics.
+     * Reject executable/COW/guard mappings rather than inventing support. */
+    if (!bytes || end > 0x100000000ULL || !xbox_iomap_valid_protect(protect))
+        return NULL;
+    AcquireSRWLockExclusive(&g_iomap_lock);
+    if (!g_iomap_available || !g_memory_base) goto done;
+    if (physical < XBOX_CONTIG_SIZE && end <= XBOX_CONTIG_SIZE && g_contig_is_view) {
+        mapping = g_contig_mapping; limit = XBOX_CONTIG_SIZE;
+    } else if (physical >= XBOX_NV2A_BASE && end <= (uint64_t)XBOX_NV2A_BASE + XBOX_NV2A_SIZE) {
+        mapping = g_nv2a_mapping; source = XBOX_NV2A_BASE; limit = XBOX_NV2A_SIZE;
+    } else if (physical >= XBOX_MCPX_BASE && end <= (uint64_t)XBOX_MCPX_BASE + XBOX_MCPX_SIZE) {
+        mapping = g_mcpx_mapping; source = XBOX_MCPX_BASE; limit = XBOX_MCPX_SIZE;
+    } else if (physical >= XBOX_FLASH_BASE && end <= (uint64_t)XBOX_FLASH_BASE + XBOX_FLASH_SIZE) {
+        mapping = g_flash_mapping; source = XBOX_FLASH_BASE; limit = XBOX_FLASH_SIZE;
+    }
+    if (!mapping) goto done;
+    offset = (physical - source) & ~0xffffu;
+    prefix = physical - source - offset;
+    view_bytes = (uint32_t)(((uint64_t)prefix + bytes + 4095) & ~4095ULL);
+    if ((uint64_t)offset + view_bytes > limit) goto done;
+    for (slot = 0; slot < XBOX_IOMAP_MAX && g_iomaps[slot].view; slot++) {}
+    if (slot == XBOX_IOMAP_MAX) goto done;
+    /* Existing fixed-address map helpers refuse occupied ranges. No reservation
+     * is released here: a competing view or a host allocation stays intact. */
+    for (uint64_t va = XBOX_IOMAP_START; va + view_bytes <= XBOX_IOMAP_END; va += 0x10000) {
+        view = MapViewOfFileEx(mapping, FILE_MAP_ALL_ACCESS, 0, offset, view_bytes,
+                              (void *)((uintptr_t)va + g_memory_offset));
+        if (view) break;
+    }
+    if (!view) goto done;
+    if (!VirtualProtect(view, view_bytes, host_protect, &old)) goto failed;
+    if (source) {
+        /* Preserve hardware traps as well as the caller's own protection.
+         * Device handlers resolve the alias back to its canonical register. */
+        for (uint32_t p = 0; p < view_bytes; p += 4096) {
+            uint32_t canonical = source + offset + p;
+            DWORD page_protect = xbox_iomap_page_protect(canonical, protect);
+            if (!page_protect) goto failed;
+            if (page_protect != host_protect &&
+                !VirtualProtect((char *)view + p, 4096, page_protect, &old)) goto failed;
+        }
+    }
+    answer = (char *)view + prefix;
+    g_iomaps[slot].view = view;
+    g_iomaps[slot].address = answer;
+    g_iomaps[slot].physical = source + offset;
+    g_iomaps[slot].view_bytes = view_bytes;
+    g_iomaps[slot].bytes = bytes;
+    g_iomaps[slot].protect = protect;
+    goto done;
+failed:
+    UnmapViewOfFile(view);
+done:
+    ReleaseSRWLockExclusive(&g_iomap_lock);
+    return answer;
+}
+
+int xbox_UnmapPhysicalMemory(void *address, uint32_t bytes)
+{
+    int result = 0;
+    AcquireSRWLockExclusive(&g_iomap_lock);
+    for (int i = 0; i < XBOX_IOMAP_MAX; i++) {
+        if (g_iomaps[i].view && g_iomaps[i].address == address && g_iomaps[i].bytes == bytes) {
+            result = UnmapViewOfFile(g_iomaps[i].view) != 0;
+            if (result) {
+                free(g_iomaps[i].page_protect);
+                memset(&g_iomaps[i], 0, sizeof g_iomaps[i]);
+            }
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_iomap_lock);
+    return result;
+}
+
+static void *xbox_map_device_section(HANDLE *mapping, uint32_t base, uint32_t bytes)
+{
+    void *view;
+    *mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, bytes, NULL);
+    if (!*mapping) return NULL;
+    view = MapViewOfFileEx(*mapping, FILE_MAP_ALL_ACCESS, 0, 0, bytes,
+                           (void *)((uintptr_t)base + g_memory_offset));
+    if (!view) { CloseHandle(*mapping); *mapping = NULL; }
+    return view;
+}
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     if (!g_allocator_lock_initialized) {
@@ -2844,9 +3068,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             ? MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS,
                               0, 0, XBOX_CONTIG_SIZE, (LPVOID)contig_native)
             : NULL;
-#ifdef _WIN32
         g_contig_is_view = g_contig_memory != NULL;
-#endif
         if (!g_contig_memory)
             g_contig_memory = VirtualAlloc(
                 (LPVOID)contig_native,
@@ -2887,13 +3109,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * emulating NV2A. Nothing has needed that yet.
      */
     {
-        uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
-        g_nv2a_memory = VirtualAlloc(
-            (LPVOID)nv2a_native,
-            XBOX_NV2A_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        g_nv2a_memory = xbox_map_device_section(&g_nv2a_mapping,
+                                                XBOX_NV2A_BASE, XBOX_NV2A_SIZE);
         /* Rendering does not need the periodic survey. Its texture inventory
          * and optional RAM scans/captures run on the GPU acknowledgement
          * thread, delaying DMA_GET and fences until the report is finished.
@@ -2951,13 +3168,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * emulating the device.
      */
     {
-        uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
-        g_mcpx_memory = VirtualAlloc(
-            (LPVOID)mcpx_native,
-            XBOX_MCPX_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        g_mcpx_memory = xbox_map_device_section(&g_mcpx_mapping,
+                                                XBOX_MCPX_BASE, XBOX_MCPX_SIZE);
         g_mcpx_regs = g_mcpx_memory;
         if (g_mcpx_memory) {
             /* AC'97 codec ready.
@@ -3033,14 +3245,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /* Flash ROM aperture -- see XBOX_FLASH_BASE for why. */
     {
-        uintptr_t flash_native = XBOX_FLASH_BASE + g_memory_offset;
-
-        g_flash_memory = VirtualAlloc(
-            (LPVOID)flash_native,
-            XBOX_FLASH_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        g_flash_memory = xbox_map_device_section(&g_flash_mapping,
+                                                XBOX_FLASH_BASE, XBOX_FLASH_SIZE);
         if (g_flash_memory) {
             fprintf(stderr, "  Flash ROM aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, not a real BIOS image)\n",
@@ -3265,12 +3471,23 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     xbox_WatchInit();
+    AcquireSRWLockExclusive(&g_iomap_lock);
+    g_iomap_available = 1;
+    ReleaseSRWLockExclusive(&g_iomap_lock);
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }
 
 void xbox_MemoryLayoutShutdown(void)
 {
+    AcquireSRWLockExclusive(&g_iomap_lock);
+    g_iomap_available = 0;
+    for (int i = 0; i < XBOX_IOMAP_MAX; i++) {
+        if (g_iomaps[i].view) UnmapViewOfFile(g_iomaps[i].view);
+        free(g_iomaps[i].page_protect);
+        memset(&g_iomaps[i], 0, sizeof g_iomaps[i]);
+    }
+    ReleaseSRWLockExclusive(&g_iomap_lock);
     if (g_kernel_memory && g_kernel_memory_owned) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
     }
@@ -3283,10 +3500,15 @@ void xbox_MemoryLayoutShutdown(void)
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
     }
+    if (g_ac97_veh) { RemoveVectoredExceptionHandler(g_ac97_veh); g_ac97_veh = NULL; }
+    g_ac97_page = NULL;
+    g_apu_mmio_trapped = 0;
+    g_mcpx_regs = NULL;
     if (g_nv2a_memory) {
-        VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
+        UnmapViewOfFile(g_nv2a_memory);
         g_nv2a_memory = NULL;
     }
+    if (g_nv2a_mapping) { CloseHandle(g_nv2a_mapping); g_nv2a_mapping = NULL; }
     /* Give back the slot reservations taken without a placeholder span. */
     for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
         if (g_gap_reserved[m]) {
@@ -3327,13 +3549,15 @@ void xbox_MemoryLayoutShutdown(void)
     }
     if (g_contig_mapping) { CloseHandle(g_contig_mapping); g_contig_mapping = NULL; }
     if (g_mcpx_memory) {
-        VirtualFree(g_mcpx_memory, 0, MEM_RELEASE);
+        UnmapViewOfFile(g_mcpx_memory);
         g_mcpx_memory = NULL;
     }
+    if (g_mcpx_mapping) { CloseHandle(g_mcpx_mapping); g_mcpx_mapping = NULL; }
     if (g_flash_memory) {
-        VirtualFree(g_flash_memory, 0, MEM_RELEASE);
+        UnmapViewOfFile(g_flash_memory);
         g_flash_memory = NULL;
     }
+    if (g_flash_mapping) { CloseHandle(g_flash_mapping); g_flash_mapping = NULL; }
 
     /* Close file mapping handle */
     if (g_mapping_handle) {

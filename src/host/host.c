@@ -43,8 +43,18 @@ static LONG CALLBACK mmio_handler(PEXCEPTION_POINTERS info)
         return EXCEPTION_CONTINUE_SEARCH;
 
     fault_address = info->ExceptionRecord->ExceptionInformation[1];
+    if (fault_address < (uintptr_t)g_xbox_mem_offset ||
+        fault_address - (uintptr_t)g_xbox_mem_offset > UINT32_MAX)
+        return EXCEPTION_CONTINUE_SEARCH;
     guest_address = (uint32_t)(fault_address - (uintptr_t)g_xbox_mem_offset);
-    is_write = info->ExceptionRecord->ExceptionInformation[0] ? 1 : 0;
+    is_write = (int)info->ExceptionRecord->ExceptionInformation[0];
+    if (is_write == 8) return EXCEPTION_CONTINUE_SEARCH;
+    {
+        uint32_t physical;
+        int alias = xbox_IoMappingResolve(guest_address, is_write, &physical);
+        if (alias < 0) return EXCEPTION_CONTINUE_SEARCH;
+        if (alias) guest_address = physical;
+    }
     if (xbox_NicOwnsAddress(guest_address))
         return xbox_NicHandleMmio(info->ContextRecord, guest_address)
             ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;

@@ -105,7 +105,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * layer can catch it, because xbox_NtReadFile receives a host pointer and a
  * count and cannot know where the mapping ends.
  */
-static int bridge_va_mapped(uint32_t va, uint32_t bytes)
+static int bridge_va_mapped(uint32_t va, uint32_t bytes, int write_access)
 {
     uint64_t end = (uint64_t)va + bytes;
     uint64_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
@@ -114,8 +114,31 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
         return 0;
     if (end <= mapped)
         return 1;
-    return va >= XBOX_CONTIG_BASE
-        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    if (va >= XBOX_CONTIG_BASE &&
+        end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return 1;
+    {
+        uint32_t physical, remaining;
+        if (xbox_IoMappingQuery(XBOX_TO_NATIVE(va), &physical, NULL, &remaining) &&
+            bytes <= remaining && (uint64_t)physical + bytes <= XBOX_CONTIG_SIZE) {
+            uint32_t checked = 0;
+            while (checked < bytes) {
+                uint32_t page_physical, protect, left;
+                uint32_t at = va + checked;
+                uint32_t chunk = 4096 - (at & 4095);
+                if (chunk > bytes - checked) chunk = bytes - checked;
+                if (!xbox_IoMappingQuery(XBOX_TO_NATIVE(at), &page_physical,
+                                         &protect, &left) || left < chunk ||
+                    (uint64_t)page_physical + chunk > XBOX_CONTIG_SIZE ||
+                    (protect & 0xff) == PAGE_NOACCESS ||
+                    (write_access && (protect & 0xff) != PAGE_READWRITE))
+                    return 0;
+                checked += chunk;
+            }
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* STATUS_ACCESS_VIOLATION is what NT answers for a user buffer it cannot
@@ -123,7 +146,8 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
  * fails, the guest gets a status it has a branch for, and the log names the
  * export, the buffer and the length. Warned once per export so a title that
  * does this in a loop does not bury the rest of the log. */
-static int bridge_buf_ok(uint32_t va, uint32_t bytes, const char *export_name)
+static int bridge_buf_ok(uint32_t va, uint32_t bytes, int write_access,
+                         const char *export_name)
 {
     static const char *seen[16];
     static int distinct;
@@ -131,7 +155,7 @@ static int bridge_buf_ok(uint32_t va, uint32_t bytes, const char *export_name)
 
     if (!bytes)                                   /* nothing is accessed */
         return 1;
-    if (va && bridge_va_mapped(va, bytes))
+    if (va && bridge_va_mapped(va, bytes, write_access))
         return 1;
 
     for (i = 0; i < distinct; ++i)
@@ -1715,7 +1739,7 @@ static int bridge_async_wait_read(uint32_t va, void *out, size_t size)
 {
 #ifdef _WIN32
     SIZE_T copied = 0;
-    if (!size || size > 128 || !bridge_va_mapped(va, (uint32_t)size)) return 0;
+    if (!size || size > 128 || !bridge_va_mapped(va, (uint32_t)size, 0)) return 0;
     return ReadProcessMemory(GetCurrentProcess(), XBOX_TO_NATIVE(va), out,
                              size, &copied) && copied == size;
 #else
@@ -2099,13 +2123,11 @@ static void bridge_NtYieldExecution(void)
 /* ── MmGetPhysicalAddress (ordinal 173) ──────────────────── */
 static void bridge_MmGetPhysicalAddress(void)
 {
-    uint32_t addr = STACK_ARG(0);
+uint32_t addr = STACK_ARG(0);
     /* Calls the same xbox_* the thunk table exposes, so there is one
      * implementation rather than two that have to be kept in agreement.
-     * Note this bridge itself is not covered by any test: bridge functions
-     * are static and driven by guest CPU state, and nothing in tests/ can
-     * reach them. */
-    g_eax = (uint32_t)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)addr);
+     * Physical-address and I/O-mapping regressions exercise this dispatcher. */
+g_eax = (uint32_t)xbox_MmGetPhysicalAddress(XBOX_TO_NATIVE(addr));
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
@@ -2685,7 +2707,7 @@ static void bridge_KeInitializeDpc(void)
      * makes this memset write through NULL inside the bridge. The export
      * returns void, so refusing is doing nothing -- which is what the real
      * kernel does with an object it cannot write. */
-    if (!bridge_buf_ok(dpc_va, 28, "KeInitializeDpc")) {
+    if (!bridge_buf_ok(dpc_va, 28, 1, "KeInitializeDpc")) {
         g_eax = 0;
         return;
     }
@@ -2741,7 +2763,7 @@ static void bridge_KeInitializeInterrupt(void)
     uint32_t context      = STACK_ARG(2);
     uint32_t vector       = STACK_ARG(3);
 
-    if (!bridge_buf_ok(interrupt_va, 44, "KeInitializeInterrupt")) {
+    if (!bridge_buf_ok(interrupt_va, 44, 1, "KeInitializeInterrupt")) {
         g_eax = 0;
         return;
     }
@@ -3191,7 +3213,7 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     /* Length <= MaximumLength says the string is self-consistent; it does not
      * say the buffer it names is inside the mapping. Without this, a string
      * near the top of guest memory reads up to 64 KB off the end. */
-    if (length && !bridge_va_mapped(buf_va, length)) return NULL;
+    if (length && !bridge_va_mapped(buf_va, length, 0)) return NULL;
     memcpy(path,XBOX_TO_NATIVE(buf_va),length);
     path[length]='\0';
     return path;
@@ -3905,7 +3927,7 @@ static void bridge_NtReadFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
-    if (!bridge_buf_ok(buffer_va, length, "NtReadFile")) {
+    if (!bridge_buf_ok(buffer_va, length, 1, "NtReadFile")) {
         bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
@@ -3988,7 +4010,7 @@ static void bridge_NtWriteFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
-    if (!bridge_buf_ok(buffer_va, length, "NtWriteFile")) {
+    if (!bridge_buf_ok(buffer_va, length, 0, "NtWriteFile")) {
         bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
@@ -4016,7 +4038,7 @@ static void bridge_NtQueryInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
-    if (!bridge_buf_ok(info_va, length, "NtQueryInformationFile")) {
+    if (!bridge_buf_ok(info_va, length, 1, "NtQueryInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
@@ -4038,7 +4060,7 @@ static void bridge_NtSetInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
-    if (!bridge_buf_ok(info_va, length, "NtSetInformationFile")) {
+    if (!bridge_buf_ok(info_va, length, 0, "NtSetInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
@@ -4060,7 +4082,7 @@ static void bridge_NtQueryVolumeInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
-    if (!bridge_buf_ok(info_va, length, "NtQueryVolumeInformationFile")) {
+    if (!bridge_buf_ok(info_va, length, 1, "NtQueryVolumeInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
@@ -4576,21 +4598,13 @@ static void bridge_RtlRaiseException(void)
 /* ── MmMapIoSpace (ordinal 177) ──────────────────────────
  * PVOID MmMapIoSpace(ULONG_PTR PhysicalAddress, ULONG NumberOfBytes, ULONG Protect)
  *
- * Maps physical I/O memory (GPU registers, etc.) into virtual address space.
- * Allocate from Xbox heap so the returned pointer is a valid Xbox VA.
+ * The shared mapper owns independent views of the physical/device sections.
+ * Return the guest address of that view, never a truncated host pointer.
  */
 static void bridge_MmMapIoSpace(void)
 {
-    uint32_t phys_addr = STACK_ARG(0);
-    uint32_t num_bytes = STACK_ARG(1);
-    uint32_t protect = STACK_ARG(2);
-    uint32_t xbox_va = xbox_HeapAlloc(num_bytes, 4096);
-
-    fprintf(stderr, "  [KERNEL] MmMapIoSpace: phys=0x%08X size=%u → Xbox VA 0x%08X\n",
-            phys_addr, num_bytes, xbox_va);
-    fflush(stderr);
-
-    g_eax = xbox_va;
+    void *mapping = xbox_MmMapIoSpace(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2));
+    g_eax = mapping ? (uint32_t)((uintptr_t)mapping - (uintptr_t)g_xbox_mem_offset) : 0;
 }
 
 /* ── MmPersistContiguousMemory (ordinal 178) ─────────────
@@ -4939,13 +4953,10 @@ static void bridge_ExSaveNonVolatileSetting(void)
 
 /* ── MmUnmapIoSpace (ordinal 183, 2 args)
  *
- * Deliberately does NOT call xbox_MmUnmapIoSpace: that one VirtualFrees its
- * argument, but the mapping coming back out of bridge_MmMapIoSpace was carved
- * from the guest heap, so only the guest heap can release it. xbox_HeapFree
- * matches against the block table and takes the raw 32-bit guest VA. */
+ * Only the exact view issued by the shared mapper can be released. */
 static void bridge_MmUnmapIoSpace(void)
 {
-    xbox_HeapFree(STACK_ARG(0));
+    xbox_MmUnmapIoSpace(XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1));
     g_eax = 0;
 }
 
@@ -6798,7 +6809,7 @@ static int ke_inline_event_enabled(void)
 static int ke_guest_event_header(uint32_t guest_va, uint32_t header[4])
 {
     uintptr_t cursor, end;
-    if (guest_va < 0x10000u || (guest_va & 3u) || !bridge_va_mapped(guest_va, 16)) return 0;
+    if (guest_va < 0x10000u || (guest_va & 3u) || !bridge_va_mapped(guest_va, 16, 0)) return 0;
     if (guest_va >= 0x04000000u && (guest_va < 0x80000000u || guest_va >= 0x84000000u))
         return 0;
     cursor = (uintptr_t)XBOX_TO_NATIVE(guest_va);
