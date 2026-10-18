@@ -80,7 +80,7 @@ int main(int argc, char **argv)
     unsigned char *xbe;
     volatile uint32_t *ram, *a, *b, *ro, *device, *foreign, *dpc_rw, *dpc_ro, *mmio_buffer;
     volatile uint32_t *low_alias, *low_ro, *edge;
-    uint32_t physical, protect, scratch, *stack, va, low_base, low_phys, descriptor_va;
+    uint32_t physical, protect, scratch, *stack, va, low_base, low_phys, descriptor_va, foreign_va;
     void *contig_probe, *low_native_probe;
     if (argc != 2 || !(file = fopen(argv[1], "rb"))) return 10;
     fseek(file, 0, SEEK_END); length = ftell(file); rewind(file);
@@ -108,9 +108,17 @@ int main(int argc, char **argv)
     CHECK(edge != NULL && edge && *edge == 0x27182818);
     if (edge) xbox_MmUnmapIoSpace((PVOID)edge, 4);
     ram = native(0x80011234u);
-    foreign = VirtualAlloc(native(0xe8000000u), 0x10000,
-                            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    /* Reserve a host-free slot in the I/O alias arena. Some POSIX process
+     * layouts already occupy the first guest slot, so probe the arena rather
+     * than assuming 0xE8000000 is available in the host address space. */
+    foreign = NULL;
+    for (foreign_va = 0xe8000000u; foreign_va < 0xf0000000u; foreign_va += 0x10000u) {
+        foreign = VirtualAlloc(native(foreign_va), 0x10000,
+                               MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (foreign) break;
+    }
     CHECK(foreign != NULL);
+    CHECK(foreign && guest((const void *)foreign) == foreign_va);
     if (!foreign) return 13;
     *foreign = 0xcafef00d;
     a = xbox_MmMapIoSpace(0x11234, 32, PAGE_READWRITE);
