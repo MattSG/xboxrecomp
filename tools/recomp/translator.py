@@ -1868,15 +1868,36 @@ class FunctionTranslator:
 
         self.lifter.imm_code_refs = imm_refs
 
-        # Linear decoding can swallow a direct target inside another
-        # instruction. Both streams are legal x86: resync would delete the
-        # fallthrough instruction, so recover both paths from their CFG edges.
-        starts = {insn.address for insn in instructions}
-        if any(insn.jump_target is not None
-               and start <= insn.jump_target < end
-               and insn.jump_target not in starts for insn in instructions):
+        # Only a reachable edge can prove the linear decode swallowed code.
+        # Immediate code-looking values and jumps in unreachable data are not
+        # independent entry points. Preserve those bytes without inventing roots.
+        by_address = {insn.address: insn for insn in instructions}
+        pending, reached, recovery_roots = [start], set(), {start}
+        missing_direct = False
+        while pending:
+            address = pending.pop()
+            if address in reached or address not in by_address:
+                continue
+            reached.add(address)
+            insn = by_address[address]
+            if insn.jump_target is not None and start <= insn.jump_target < end:
+                missing_direct |= insn.jump_target not in by_address
+                pending.append(insn.jump_target)
+            for target in computed_jump_edges.get(address, ()):
+                recovery_roots.add(target)
+                pending.append(target)
+            bypass = debug_slide_bypasses.get(address)
+            if bypass is not None:
+                recovery_roots.add(bypass)
+                pending.append(bypass)
+            elif not insn.is_ret and not insn.is_jump and not (
+                    coalesced and insn.mnemonic in ("ud2", "hlt", "int3")):
+                pending.append(insn.end_address)
+        if missing_direct:
+            # Overlapping x86 streams are both legal; resync would delete the
+            # original fallthrough instruction, so decode both architectural paths.
             instructions = self.disasm.disassemble_cfg(
-                raw_bytes, start, end, {start, *switch_leaders, *imm_refs},
+                raw_bytes, start, end, recovery_roots,
                 stop_mnemonics=("ud2", "hlt", "iret", "iretd")
                 if coalesced else ("iret", "iretd"))
 
