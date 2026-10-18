@@ -43,6 +43,7 @@
 #include "../d3d/d3d8_swizzle.h"
 #include "../kernel/kernel.h"
 #include "nv2a_render_common.h"
+#include "nv2a_sampler_cache.h"
 #include "nv2a_texture_hash.h"
 
 #include "sdlgpu/ub_vs.spirv.h"
@@ -970,7 +971,7 @@ static void pipe_key_plain(PipeKey *k, uint8_t vs, uint8_t ps, uint8_t color, ui
 
 /* ---------------------------------------------------------------- samplers */
 
-typedef struct { uint64_t key; SDL_GPUSampler *smp; } SampSlot;
+typedef Nv2aSamplerSlot SampSlot;
 #define SAMP_SLOTS 1024
 static SampSlot s_samp[SAMP_SLOTS];
 static SDL_GPUSampler *s_linear_clamp, *s_point_clamp;
@@ -985,26 +986,26 @@ static SDL_GPUSamplerAddressMode addr_mode(uint32_t m)
     }
 }
 
-static SDL_GPUSampler *sampler(const NvD3DTexture *t, int levels, int reduce)
+static SDL_GPUSampler *sampler(const NvD3DTexture *t, int levels, int reduce,
+                               void *const *pinned)
 {
     uint32_t minf = (t->filter >> 16) & 0xFF, magf = (t->filter >> 24) & 0xF;
     int bias13 = (int)(t->filter & 0x1FFF);
     uint64_t key;
-    uint32_t i, n;
+    uint32_t i;
+    size_t slot;
+    int found;
     if (bias13 & 0x1000) bias13 -= 0x2000;
     key = (uint64_t)minf | ((uint64_t)magf << 8) | ((uint64_t)(bias13 & 0x1FFF) << 12) |
           ((uint64_t)(levels & 15) << 25) | ((uint64_t)(reduce != 0) << 29) |
           ((uint64_t)(t->address & 0xFFFFF) << 31);
     key ^= (uint64_t)((t->control0 >> 6) & 0xFFFFFF) * 0xFF51AFD7ED558CCDull;
     i = (uint32_t)(key ^ (key >> 29) ^ (key >> 47)) * 2654435761u;
-    for (n = 0; n < SAMP_SLOTS; n++) {
-        SampSlot *s = &s_samp[(i + n) & (SAMP_SLOTS - 1)];
-        if (s->smp && s->key == key) return s->smp;
-        if (!s->smp) break;
-    }
-    if (n == SAMP_SLOTS) {
-        SampSlot *home = &s_samp[i & (SAMP_SLOTS - 1)];
-        n = 0;
+    slot = nv2a_sampler_slot(s_samp, SAMP_SLOTS, i & (SAMP_SLOTS - 1), key,
+                             pinned, 4, &found);
+    if (slot == SAMP_SLOTS) return NULL;
+    if (found) return (SDL_GPUSampler *)s_samp[slot].resource;
+    if (s_samp[slot].resource) {
         if (s_samp_graveyard_n == s_samp_graveyard_cap) {
             size_t cap = s_samp_graveyard_cap ? s_samp_graveyard_cap * 2 : 16;
             SDL_GPUSampler **g = (SDL_GPUSampler **)realloc(s_samp_graveyard, cap * sizeof *g);
@@ -1012,11 +1013,10 @@ static SDL_GPUSampler *sampler(const NvD3DTexture *t, int levels, int reduce)
             s_samp_graveyard = g;
             s_samp_graveyard_cap = cap;
         }
-        s_samp_graveyard[s_samp_graveyard_n++] = home->smp;
-        home->smp = NULL;
+        s_samp_graveyard[s_samp_graveyard_n++] = (SDL_GPUSampler *)s_samp[slot].resource;
     }
     {
-        SampSlot *s = &s_samp[(i + n) & (SAMP_SLOTS - 1)];
+        SampSlot *s = &s_samp[slot];
         SDL_GPUSamplerCreateInfo d;
         int min_lin = minf == 2 || minf == 4 || minf == 6;
         int mip_lin = minf == 5 || minf == 6;
@@ -1043,10 +1043,10 @@ static SDL_GPUSampler *sampler(const NvD3DTexture *t, int levels, int reduce)
             d.min_lod = 0;
             d.max_lod = 1000.0f;
         }
-        s->smp = SDL_CreateGPUSampler(s_dev, &d);
+        s->resource = SDL_CreateGPUSampler(s_dev, &d);
         s->key = key;
-        if (!s->smp) fail("SDL_CreateGPUSampler");
-        return s->smp;
+        if (!s->resource) fail("SDL_CreateGPUSampler");
+        return (SDL_GPUSampler *)s->resource;
     }
 }
 
@@ -2047,7 +2047,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     PSConsts pc;
     PSBorder pb;
     SDL_GPUTexture *srv[8] = { 0 };
-    SDL_GPUSampler *smp[4] = { 0 };
+    void *smp[4] = { 0 };
     SDL_GPUTexture *fb = NULL;
     int cull = 0, bias = 0, flare_depth = flare_needs_depth(st);
     float slope = 0, bf[4];
@@ -2152,7 +2152,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         }
         if (!view) continue;
         if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
-        smp[n] = sampler(t, levels, reduce);
+        smp[n] = sampler(t, levels, reduce, smp);
         if (n == 0 && !rt && !t->cube && kind == K_DXT && t->color == 0x0F &&
             t->width == 256 && t->height == 256 && levels > 4 &&
             (((t->filter >> 16) & 0xFF) == 2 || ((t->filter >> 16) & 0xFF) == 4 ||
@@ -2300,9 +2300,9 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         SDL_GPUTextureSamplerBinding b[9];
         for (n = 0; n < 4; n++) {
             b[n].texture = srv[n] ? srv[n] : s_dummy_2d;
-            b[n].sampler = smp[n];
+            b[n].sampler = (SDL_GPUSampler *)smp[n];
             b[4 + n].texture = srv[4 + n] ? srv[4 + n] : s_dummy_cube;
-            b[4 + n].sampler = smp[n];
+            b[4 + n].sampler = (SDL_GPUSampler *)smp[n];
         }
         b[8].texture = fb ? fb : s_dummy_2d;
         b[8].sampler = s_linear_clamp;
