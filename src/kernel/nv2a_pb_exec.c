@@ -3758,7 +3758,7 @@ typedef struct {
 } PbState;
 
 #define GPU_AT(f) ((size_t)((uint8_t *)&s_gpu.f - (uint8_t *)&s_gpu))
-static void pb_state(PbState *st, int save)
+static int pb_state(PbState *st, int save)
 {
     size_t a = GPU_AT(idx), b0 = GPU_AT(idx_count), b1 = GPU_AT(inline_buf);
     size_t c0 = GPU_AT(inline_count), c1 = sizeof s_gpu;
@@ -3767,6 +3767,13 @@ static void pb_state(PbState *st, int save)
         st->head = (uint8_t *)malloc(a); st->mid = (uint8_t *)malloc(b1 - b0);
         st->tail = (uint8_t *)malloc(c1 - c0); st->vsh = (uint8_t *)malloc(nv2a_vsh_state_size());
         st->idx = (uint32_t *)malloc(sizeof s_gpu.idx); st->inl = (uint32_t *)malloc(sizeof s_gpu.inline_buf);
+        if (!st->head || !st->mid || !st->tail || !st->vsh || !st->idx || !st->inl) {
+            free(st->head); free(st->mid); free(st->tail);
+            free(st->vsh); free(st->idx); free(st->inl);
+            memset(st, 0, sizeof *st);
+            fprintf(stderr, "[INTERP] cannot allocate GPU state snapshot; replay refused\n");
+            return 0;
+        }
     }
     if (save) {
         memcpy(st->head, g, a); memcpy(st->mid, g + b0, b1 - b0); memcpy(st->tail, g + c0, c1 - c0);
@@ -3783,6 +3790,7 @@ static void pb_state(PbState *st, int save)
         s_surface = st->surface;
         nv2a_vsh_state_restore(st->vsh);
     }
+    return 1;
 }
 
 /* The last frame again, at t between the previous one (0) and it (1).
@@ -3793,8 +3801,7 @@ int nv2a_pb_replay(float t)
     PbFrame *f = s_last_f;
     uint32_t i, k = 0;
     if (!f->ncmd || !f->has) return 0;
-    pb_state(&saved, 1);
-    if (!saved.head || !saved.mid || !saved.tail || !saved.vsh || !saved.idx || !saved.inl) return 0;
+    if (!pb_state(&saved, 1)) return 0;
     s_replaying = 1;
     s_replay_draw = 0;
     for (i = 0; i < f->ncmd; i++) {

@@ -652,3 +652,19 @@ translate:
 }
 
 #endif /* _WIN32 */
+
+BOOL xbox_get_save_directory(xbox_host_char* buffer, DWORD capacity)
+{
+    size_t length;
+    if (!buffer || !capacity) return FALSE;
+    if (!s_initialized) xbox_path_init(NULL, NULL);
+#if defined(_WIN32)
+    length = wcslen(s_save_dir);
+#else
+    mkdir_p(s_save_dir);
+    length = strlen(s_save_dir);
+#endif
+    if (length >= capacity) return FALSE;
+    memcpy(buffer, s_save_dir, (length + 1) * sizeof(*buffer));
+    return TRUE;
+}

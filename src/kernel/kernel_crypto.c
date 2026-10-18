@@ -313,15 +313,18 @@ VOID __stdcall xbox_XcHMAC(
 /* ============================================================================
  * Public Key Operations
  *
- * Used for Xbox Live authentication and content signing verification.
- * These are not needed for PC operation (no Xbox Live), so they're
- * stubbed to return failure/zero.
+ * Xbox RSA1 blobs contain five little-endian ULONGs (magic, buffer bytes,
+ * modulus bits, maximum plaintext bytes, public exponent), then the modulus.
+ * Signatures and raw RSA operands are little-endian too. See XboxDev/xbedump
+ * xboxlib.c and xbox_kernel_test_suite/src/tests/xc/suite/PK.c.
  * ============================================================================ */
 
 ULONG __stdcall xbox_XcPKGetKeyLen(PVOID PublicKey)
 {
-    (void)PublicKey;
-    return 0;
+    ULONG length = 0;
+    if (PublicKey)
+        memcpy(&length, (const UCHAR *)PublicKey + 4, sizeof length);
+    return length;
 }
 
 ULONG __stdcall xbox_XcPKDecPrivate(PVOID PrivateKey, PVOID Input, PVOID Output)
@@ -335,20 +338,89 @@ ULONG __stdcall xbox_XcPKDecPrivate(PVOID PrivateKey, PVOID Input, PVOID Output)
 
 ULONG __stdcall xbox_XcPKEncPublic(PVOID PublicKey, PVOID Input, PVOID Output)
 {
-    (void)PublicKey;
-    (void)Input;
-    (void)Output;
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_CRYPTO, "XcPKEncPublic: stubbed (no Xbox Live)");
-    return 0;
+    ULONG header[5], bytes, n, *work, *base, *exponent, *modulus;
+    ULONG ok;
+    if (!PublicKey || !Input || !Output)
+        return 0;
+    memcpy(header, PublicKey, sizeof header);
+    bytes = header[2] / 8;
+    if (header[0] != 0x31415352u || !bytes || bytes > 4096 ||
+        (header[2] & 31) || header[1] < bytes || header[1] > bytes + 8 ||
+        !header[4])
+        return 0;
+    n = bytes / 4;
+    work = (ULONG *)calloc((size_t)n * 4, sizeof(ULONG));
+    if (!work)
+        return 0;
+    base = work + n; exponent = base + n; modulus = exponent + n;
+    memcpy(base, Input, bytes);
+    memcpy(modulus, (const UCHAR *)PublicKey + 20, bytes);
+    exponent[0] = header[4];
+    /* An all-zero/even modulus is not an RSA key. */
+    ok = (modulus[0] & 1) && ((const UCHAR *)modulus)[bytes - 1] &&
+        xbox_XcModExp(work, base, exponent, modulus, n);
+    if (ok) {
+        memcpy(Output, work, bytes);
+        memset((UCHAR *)Output + bytes, 0, header[1] - bytes);
+    }
+    free(work);
+    return ok;
 }
 
-BOOLEAN __stdcall xbox_XcVerifyPKCS1Signature(PVOID Hash, PVOID PublicKey, PVOID Signature)
+BOOLEAN __stdcall xbox_XcVerifyPKCS1Signature(PVOID Signature, PVOID PublicKey, PVOID Hash)
 {
-    (void)Hash;
-    (void)PublicKey;
-    (void)Signature;
-    /* Return TRUE to bypass signature checks */
-    return TRUE;
+    static const UCHAR sha1_der[] = {
+        0x30,0x21,0x30,0x09,0x06,0x05,0x2b,0x0e,0x03,0x02,0x1a,0x05,0x00,0x04,0x14
+    };
+    static const UCHAR sha1_der_no_null[] = {
+        0x30,0x1f,0x30,0x07,0x06,0x05,0x2b,0x0e,0x03,0x02,0x1a,0x04,0x14
+    };
+    ULONG header[5], bytes, i, tail;
+    UCHAR *decoded;
+    int less = 0;
+    BOOLEAN valid = FALSE;
+    if (!Hash || !PublicKey || !Signature)
+        return FALSE;
+    memcpy(header, PublicKey, sizeof header);
+    bytes = header[2] / 8;
+    if (header[0] != 0x31415352u || bytes < 32 || bytes > 4096 ||
+        (header[2] & 31) || header[1] < bytes || header[1] > bytes + 8)
+        return FALSE;
+    /* RSAVP1 rejects s >= n; reducing it would accept equivalent signatures. */
+    for (i = bytes; i-- > 0;) {
+        UCHAR s = ((const UCHAR *)Signature)[i];
+        UCHAR m = ((const UCHAR *)PublicKey)[20 + i];
+        if (s != m) { less = s < m; break; }
+    }
+    if (!less)
+        return FALSE;
+    decoded = (UCHAR *)malloc(header[1]);
+    if (!decoded)
+        return FALSE;
+    if (!xbox_XcPKEncPublic(PublicKey, Signature, decoded))
+        goto done;
+    /* Work in network order for the PKCS#1 block; Xbox accepts SHA1 DER
+     * with/without NULL and the historical raw-digest form. */
+    for (i = 0; i < bytes / 2; i++) {
+        UCHAR t = decoded[i]; decoded[i] = decoded[bytes - 1 - i]; decoded[bytes - 1 - i] = t;
+    }
+    if (decoded[0] || decoded[1] != 1)
+        goto done;
+    for (i = 2; i < bytes && decoded[i] == 0xff; i++) {}
+    if (i < 10 || i >= bytes || decoded[i++] != 0)
+        goto done;
+    tail = bytes - i;
+    if (tail == 20)
+        valid = memcmp(decoded + i, Hash, 20) == 0;
+    else if (tail == sizeof sha1_der + 20)
+        valid = !memcmp(decoded + i, sha1_der, sizeof sha1_der) &&
+                !memcmp(decoded + i + sizeof sha1_der, Hash, 20);
+    else if (tail == sizeof sha1_der_no_null + 20)
+        valid = !memcmp(decoded + i, sha1_der_no_null, sizeof sha1_der_no_null) &&
+                !memcmp(decoded + i + sizeof sha1_der_no_null, Hash, 20);
+done:
+    free(decoded);
+    return valid;
 }
 
 /* ============================================================================
@@ -430,7 +502,7 @@ ULONG __stdcall xbox_XcModExp(PULONG Result, PULONG Base, PULONG Exponent, PULON
 
 /* ============================================================================
  * DES / 3DES (FIPS 46-3). XNet encrypts secure LAN traffic with 3DES-CBC.
- * CipherSelect 0 = DES, 1 = 3DES (EDE, 24-byte key); Operation 1 = encrypt,
+ * CipherSelect 0 = DES, 1 = two-key 3DES (EDE, 16-byte K1,K2; K3=K1); Operation 1 = encrypt,
  * 0 = decrypt. The key table is opaque to titles (XC_SERVICE_DES_TABLESIZE
  * 128, 3DES 384): here 16 round subkeys per DES key.
  * ============================================================================ */
@@ -557,7 +629,7 @@ VOID __stdcall xbox_XcKeyTable(ULONG CipherSelect, PVOID KeyTable, const UCHAR* 
     if (!KeyTable || !Key)
         return;
     for (i = 0; i < keys; i++)
-        des_schedule(k[i], Key + 8 * i);
+        des_schedule(k[i], Key + 8 * (i == 2 ? 0 : i));
     memcpy(KeyTable, k, sizeof k[0] * keys);
 }
 

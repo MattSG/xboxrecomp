@@ -38,9 +38,10 @@ void nv2a_vsh_program_word(uint32_t word) { (void)word; STUB_HIT("nv2a_vsh_progr
 void nv2a_vsh_set_start_slot(uint32_t slot) { (void)slot; STUB_HIT("nv2a_vsh_set_start_slot"); }
 void nv2a_vsh_set_constant_load(uint32_t index) { (void)index; STUB_HIT("nv2a_vsh_set_constant_load"); }
 void nv2a_vsh_constant_word(uint32_t word) { (void)word; STUB_HIT("nv2a_vsh_constant_word"); }
-size_t nv2a_vsh_state_size(void) { STUB_HIT("nv2a_vsh_state_size"); return 0; }
-void nv2a_vsh_state_save(void *out) { (void)out; STUB_HIT("nv2a_vsh_state_save"); }
-void nv2a_vsh_state_restore(const void *in) { (void)in; STUB_HIT("nv2a_vsh_state_restore"); }
+static uint32_t test_vsh_state;
+size_t nv2a_vsh_state_size(void) { return sizeof test_vsh_state; }
+void nv2a_vsh_state_save(void *out) { memcpy(out, &test_vsh_state, sizeof test_vsh_state); }
+void nv2a_vsh_state_restore(const void *in) { memcpy(&test_vsh_state, in, sizeof test_vsh_state); }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { (void)enable; STUB_HIT("nv2a_vsh_set_cxt_write"); }
 int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 { (void)in; (void)out; STUB_HIT("nv2a_vsh_run"); return 0; }
@@ -82,13 +83,51 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; STUB_HIT("x
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 { (void)fb_va; (void)pitch; STUB_HIT("xbox_FramebufferWindowPresent"); }
 
+static unsigned allocation_count, fail_allocation;
+static void *test_malloc(size_t size)
+{
+    if (++allocation_count == fail_allocation) return NULL;
+    return malloc(size);
+}
+#define malloc test_malloc
 #include "../../src/kernel/nv2a_pb_exec.c"
+#undef malloc
 
 static int failures;
 #define CHECK_EQ(name, got, want) do { \
     uint32_t g_ = (uint32_t)(got), w_ = (uint32_t)(want); \
     if (g_ != w_) { fprintf(stderr, "FAIL %s: got %u want %u\n", name, g_, w_); failures++; } \
 } while (0)
+
+static void test_state_snapshot(void)
+{
+    PbState state = {0};
+    s_gpu.idx_count = s_gpu.inline_count = 1;
+    s_gpu.idx[0] = 17;
+    s_gpu.inline_buf[0] = 23;
+    test_vsh_state = 31;
+    for (unsigned fail = 1; fail <= 6; fail++) {
+        allocation_count = 0;
+        fail_allocation = fail;
+        CHECK_EQ("snapshot refuses each failed allocation", pb_state(&state, 1), 0);
+        CHECK_EQ("failed snapshot releases partial storage",
+                 !state.head && !state.mid && !state.tail && !state.vsh && !state.idx && !state.inl, 1);
+        CHECK_EQ("failed snapshot preserves GPU indices", s_gpu.idx[0], 17);
+        CHECK_EQ("failed snapshot preserves shader state", test_vsh_state, 31);
+    }
+    fail_allocation = 0;
+    CHECK_EQ("snapshot retries after allocation failure", pb_state(&state, 1), 1);
+    s_gpu.idx_count = s_gpu.inline_count = 0;
+    s_gpu.idx[0] = s_gpu.inline_buf[0] = test_vsh_state = 0;
+    CHECK_EQ("snapshot restores", pb_state(&state, 0), 1);
+    CHECK_EQ("restores index count", s_gpu.idx_count, 1);
+    CHECK_EQ("restores inline count", s_gpu.inline_count, 1);
+    CHECK_EQ("restores indices", s_gpu.idx[0], 17);
+    CHECK_EQ("restores inline data", s_gpu.inline_buf[0], 23);
+    CHECK_EQ("restores shader state", test_vsh_state, 31);
+    free(state.head); free(state.mid); free(state.tail);
+    free(state.vsh); free(state.idx); free(state.inl);
+}
 
 /* Coordinates are passed as the uint32 the sampler computes (signed in
  * practice), so -1 is 0xFFFFFFFF. */
@@ -164,6 +203,8 @@ static void test_border(void)
 int main(int argc, char **argv)
 {
     const char *which = argc > 1 ? argv[1] : "all";
+
+    test_state_snapshot();
 
     nv2a_pb_exec_method(0, NV097_SET_CONTEXT_DMA_SEMAPHORE, 7);
     nv2a_pb_exec_method(0, NV097_SET_SEMAPHORE_OFFSET, 16);
