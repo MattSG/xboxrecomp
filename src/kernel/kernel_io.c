@@ -10,6 +10,8 @@
  */
 
 #include "kernel.h"
+#include "kernel_guest_io.h"
+#include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,11 +107,34 @@ VOID __stdcall xbox_IoDeleteDevice(PVOID DeviceObject)
  * Since we don't use real drivers, these are all stubs.
  * ============================================================================ */
 
+int xbox_IoInitializeIrpGuest(uint32_t guest_va, PVOID Irp, USHORT PacketSize, CCHAR StackSize)
+{
+    uint32_t required;
+    XBOX_GUEST_IRP *irp = (XBOX_GUEST_IRP *)Irp;
+
+    if (!irp || StackSize <= 0)
+        return 0;
+    required = XBOX_IRP_SIZE + (uint32_t)(uint8_t)StackSize * XBOX_IO_STACK_LOCATION_SIZE;
+    if (PacketSize < required || guest_va > UINT32_MAX - required)
+        return 0;
+
+    memset(irp, 0, PacketSize);
+    irp->type = XBOX_IO_TYPE_IRP;
+    irp->size = PacketSize;
+    irp->stack_count = StackSize;
+    irp->current_location = (int8_t)(StackSize + 1);
+    irp->current_stack_location = guest_va + XBOX_IRP_SIZE +
+        (uint32_t)(uint8_t)StackSize * XBOX_IO_STACK_LOCATION_SIZE;
+    return 1;
+}
+
 VOID __stdcall xbox_IoInitializeIrp(PVOID Irp, USHORT PacketSize, CCHAR StackSize)
 {
-    (void)StackSize;
-    if (Irp)
-        memset(Irp, 0, PacketSize);
+    uint32_t guest_va;
+    if (!Irp)
+        return;
+    guest_va = (uint32_t)((uintptr_t)Irp - (uintptr_t)xbox_GetMemoryOffset());
+    (void)xbox_IoInitializeIrpGuest(guest_va, Irp, PacketSize, StackSize);
 }
 
 VOID __stdcall xbox_IoStartNextPacket(PVOID DeviceObject, BOOLEAN Cancelable)
