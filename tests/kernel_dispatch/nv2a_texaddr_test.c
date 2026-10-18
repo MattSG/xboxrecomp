@@ -73,6 +73,8 @@ void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color, uint32
   STUB_HIT("nv2a_d3d_clear"); }
 void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
 { (void)surface_addr; (void)pitch; STUB_HIT("nv2a_d3d_flip"); }
+void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
+{ (void)surface_addr; (void)pitch; (void)show; STUB_HIT("nv2a_d3d_flip_present"); }
 void nv2a_d3d_zpass_enable(int on) { (void)on; STUB_HIT("nv2a_d3d_zpass_enable"); }
 void nv2a_d3d_zpass_clear(void) { STUB_HIT("nv2a_d3d_zpass_clear"); }
 uint32_t nv2a_d3d_zpass_read(void) { STUB_HIT("nv2a_d3d_zpass_read"); return 0; }
