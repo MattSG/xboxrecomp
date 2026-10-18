@@ -7,40 +7,6 @@ gameplay acceptance belong to the consuming game's audit.
 
 ## Corrected in this pass
 
-- `MmMapIoSpace` native and guest bridge paths now share owned, independent
-  section views of physical contiguous RAM, NV2A/MCPX registers and flash.
-  Device apertures retain their canonical state; aliases preserve existing
-  PVIDEO/APU/USB/NIC traps and AC97 reset behavior. Unmapping requires the exact
-  issued address/extent and never frees canonical memory or another view.
-  Protection queries/changes preserve independent per-page rights and traps.
-  Windows Release and Linux Release mapping tests pass; Windows also exercises
-  actual NV2A model state and repeated AC97 single-step writes. Tests check
-  read-only faults, unrelated-address canaries, overlapping aliases, per-page
-  changes, guest stdcall dispatch, RAM alias buffer access checks, MMIO alias
-  rejection, invalid ranges/protections and concurrent map/shutdown. Existing
-  Windows memory regressions pass all seven modes; the existing Linux memory
-  layout test passes, including teardown/reinitialization. Native physical
-  address checks reject uninitialized and post-shutdown contiguous pointers.
-  Current explicit limits: 128 live mappings within the 128 MB alias arena;
-  supported protection bases are no-access, read-only and read/write, with
-  noncached/write-combine policy flags. Executable, COW and guard requests are
-  rejected, as are unmodeled physical address ranges. Linux device-model
-  functionality remains limited by the separately listed missing host handlers.
-  `MmGetPhysicalAddress` translates owned aliases, the contiguous window and
-  ordinary guest RAM into a coherent runtime-virtualized physical namespace.
-  Low-RAM IDs start at the next 64 MB boundary after the mapped guest VA range;
-  they map back to the same guest RAM bytes, while physical IDs below 64 MB
-  resolve to the independent contiguous arena, including backed offsets the
-  allocator has not handed out. OHCI, NV2A DMA and APU paths use the shared
-  low-RAM resolver while preserving their established allocation/image rules;
-  the APU still enforces its 28-bit bus limit. NV2A method parameters retain
-  their 32-bit guest value, but wider hardware DMA-field conformance is not
-  established.
-  This namespace is an internal backing contract, not a claim that the IDs
-  reproduce Xbox hardware page numbering. Mapping regressions cover range
-  bounds, low-RAM round trips, identical-offset backing independence, an OHCI
-  descriptor read/write, bridge buffer protections, concurrent shutdown and
-  existing device aliases.
 - Non-volatile OS settings now persist a checksummed 96-byte HLE user block
   under the configured save root. Short buffers, unsupported settings, corrupt
   storage and failed writes return errors. Shared reader/exclusive writer locks
@@ -84,9 +50,9 @@ The test embeds data; it does not download dependencies at runtime.
 
 | Priority | Source | Evidence / correct implementation | Regression needed |
 |---|---|---|---|
-| High | `src/kernel/kernel_memory.c`, `xbox_MmGetPhysicalAddress` | Runtime physical IDs are now coherent across ordinary RAM, contiguous storage, OHCI, NV2A DMA, APU reads and `MmMapIoSpace`. The IDs intentionally virtualize the physical namespace to avoid collisions between separate host backing sections; hardware-accurate Xbox page numbering and DMA masks above the supported consumer width remain open. | Compare representative physical-page numbering, bus-visible RAM and DMA field widths with hardware or an authoritative emulator trace before claiming Xbox physical-address conformance. |
 | High | `src/kernel/kernel_crypto.c`, `xbox_XcPKDecPrivate` | Returns failure for every key. Implement the Xbox private blob layout and actual private RSA operation; do not substitute unconditional success. | Independent private/public roundtrip and invalid blob tests; real hardware vector where available. |
 | High | `src/kernel/kernel_crypto.c`, `xbox_XcUpdateCrypto` | Discards both vectors; titles cannot install crypto implementations or retrieve originals. Requires guest-function dispatch in the bridge, not calling guest addresses as host pointers. | Install one replacement, verify only that function changes, retrieve originals, null entries preserve current replacements. |
+| High | `src/kernel/kernel_bridge.c:4582`, `src/kernel/kernel_memory.c:151` | Both `MmMapIoSpace` paths return unrelated RAM, ignoring physical address/protection. Ordinal 177 routes here; hardware accesses via its returned pointer cannot reach MMIO. | Map known device register, read/write through alias and verify device state; unmap must preserve ownership. |
 | High | `src/kernel/kernel_io.c:149-303`, `src/kernel/kernel_bridge.c:5305-5416` | Completion, synchronous I/O and driver dispatch exports return success without doing I/O or completing an IRP. Builds are not a substitute for guest driver behavior. | Real IRP layouts, queued dispatch/completion and events, transfer counts/status, invalid devices. Trace actual callers before choosing device implementations. |
 | Medium | `src/platform/win32_compat.c:980-1013` | POSIX `SetWaitableTimer` ignores period and completion APC but returns success. | Two observed expirations, cancellation/rearm, manual/auto reset, alertable callback execution. |
 | Medium | `src/platform/win32_compat.c:550-557` | POSIX wait-all consumes auto-reset/semaphore/mutex signals sequentially before knowing every object is ready. Timeouts lose signals. | Set only first auto-reset event: wait-all times out and first event remains set; then atomic all-object acquisition succeeds. |
