@@ -1,7 +1,6 @@
 #include "../../src/kernel/kernel_file.c"
 /* Include the file backend to inspect its private enumeration ownership. */
 #include "xbox_memory_layout.h"
-#include "../kernel_test_host.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,16 +13,15 @@ void *recomp_lookup(ULONG a) { (void)a; abort(); }
 void *recomp_lookup_manual(ULONG a) { (void)a; abort(); }
 static uint8_t *mem;
 static guest_fn query, close_guest, map_status;
-/* A context is searching when its native enumeration is open. Windows keeps a
- * FindFirstFile handle there; POSIX keeps the DIR stream. */
+static int fail(const char *message, NTSTATUS status, ULONG_PTR information) {
+    fprintf(stderr, "FAIL: %s (status=%08X information=%llu)\n", message,
+            (unsigned)status, (unsigned long long)information);
+    return 0;
+}
 static unsigned active_searches(void) {
     unsigned count = 0;
     for (unsigned i = 0; i < MAX_DIR_CONTEXTS; i++)
-#if defined(_WIN32)
         if (s_dir_contexts[i].find_handle && s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
-#else
-        if (s_dir_contexts[i].dir)
-#endif
             count++;
     return count;
 }
@@ -79,23 +77,95 @@ static int invoke(HANDLE h, const char *pattern, unsigned restart, unsigned klas
     if(*(uint32_t *)(mem+0x30000)!=g_eax) { puts("FAIL I/O status differs"); return 0; }
     return 1;
 }
-/* Closing the first search: a raw native handle on Windows, a guest token on POSIX. */
-#if defined(_WIN32)
-#define CLOSE_FIRST(h) (xbox_NtClose(h)==STATUS_SUCCESS)
-#else
-#define CLOSE_FIRST(h) guest_close(h)
-#endif
+static int short_buffer_contract(void) {
+    const ULONG header = (ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName);
+    XBOX_ANSI_STRING path = { .Buffer = "D:\\", .Length = 3, .MaximumLength = 4 };
+    XBOX_ANSI_STRING pattern = { .Buffer = "Overflow9", .Length = 9, .MaximumLength = 10 };
+    XBOX_OBJECT_ATTRIBUTES oa = {0};
+    XBOX_IO_STATUS_BLOCK ios = {0};
+    unsigned char buffer[512];
+    HANDLE directory = NULL;
+    oa.ObjectName = &path;
+    NTSTATUS status = xbox_NtCreateFile(&directory, XBOX_GENERIC_READ, &oa, &ios,
+        NULL, 0, 1, XBOX_FILE_OPEN, XBOX_FILE_DIRECTORY_FILE);
+    if (status != STATUS_SUCCESS || !directory)
+        return fail("open direct directory handle", status, ios.Information);
+    char long_pattern[MAX_PATH + 1];
+    memset(long_pattern, 'a', sizeof(long_pattern));
+    pattern.Buffer = long_pattern;
+    pattern.Length = MAX_PATH;
+    pattern.MaximumLength = sizeof(long_pattern);
+    memset(buffer, 0xA5, sizeof(buffer));
+    status = xbox_NtQueryDirectoryFile(directory, NULL, NULL, NULL, &ios,
+        buffer, sizeof(buffer), XboxFileDirectoryInformation, &pattern, TRUE);
+    if (status != STATUS_INVALID_PARAMETER || ios.Status != status || ios.Information)
+        return fail("overlong counted ANSI pattern status/info", status, ios.Information);
+    for (size_t i = 0; i < sizeof(buffer); i++)
+        if (buffer[i] != 0xA5)
+            return fail("overlong pattern modified output", status, ios.Information);
+    pattern.Buffer = "Overflow9";
+    pattern.Length = 9;
+    pattern.MaximumLength = 10;
+    memset(buffer, 0xA5, sizeof(buffer));
+    const ULONG minimum = sizeof(XBOX_FILE_DIRECTORY_INFORMATION);
+    status = xbox_NtQueryDirectoryFile(directory, NULL, NULL, NULL, &ios,
+        buffer, minimum - 1, XboxFileDirectoryInformation, &pattern, TRUE);
+    if (status != STATUS_INFO_LENGTH_MISMATCH || ios.Status != status || ios.Information)
+        return fail("short directory structure status/info", status, ios.Information);
+    for (size_t i = 0; i < sizeof(buffer); i++)
+        if (buffer[i] != 0xA5)
+            return fail("short directory header modified buffer", status, ios.Information);
+    status = xbox_NtQueryDirectoryFile(directory, NULL, NULL, NULL, &ios,
+        buffer, minimum, XboxFileDirectoryInformation, &pattern, TRUE);
+    XBOX_FILE_DIRECTORY_INFORMATION *entry = (void *)buffer;
+    if (status != STATUS_BUFFER_OVERFLOW || ios.Status != status ||
+        ios.Information != minimum || entry->FileNameLength != 9 ||
+        memcmp(entry->FileName, "Overflow", 8))
+        return fail("fixed header overflow status/info", status, ios.Information);
+    memset(buffer, 0xA5, sizeof(buffer));
+    status = xbox_NtQueryDirectoryFile(directory, NULL, NULL, NULL, &ios,
+        buffer, minimum, XboxFileDirectoryInformation, &pattern, FALSE);
+    if (status != STATUS_SUCCESS || ios.Status != status || ios.Information)
+        return fail("subsequent short entry reports success with no structure", status, ios.Information);
+    for (size_t i = 0; i < sizeof(buffer); i++)
+        if (buffer[i] != 0xA5)
+            return fail("subsequent short entry modified output", status, ios.Information);
+    memset(buffer, 0xA5, sizeof(buffer));
+    status = xbox_NtQueryDirectoryFile(directory, NULL, NULL, NULL, &ios,
+        buffer, header + 9, XboxFileDirectoryInformation, &pattern, FALSE);
+    entry = (void *)buffer;
+    if (status != STATUS_SUCCESS || ios.Status != status || ios.Information != header + 9 ||
+        entry->FileNameLength != 9 || memcmp(entry->FileName, "Overflow9", 9))
+        return fail("overflow retry did not return pending entry", status, ios.Information);
+    for (size_t i = header + 9; i < sizeof(buffer); i++)
+        if (buffer[i] != 0xA5)
+            return fail("query modified bytes past returned record", status, ios.Information);
+    status = xbox_NtQueryDirectoryFile(directory, NULL, NULL, NULL, &ios,
+        buffer, header + 9, XboxFileDirectoryInformation, &pattern, FALSE);
+    if (status != STATUS_NO_MORE_FILES || ios.Status != status || ios.Information)
+        return fail("repeated EOF status/info", status, ios.Information);
+    status = xbox_NtQueryDirectoryFile(directory, NULL, NULL, NULL, &ios,
+        buffer, header + 9, XboxFileDirectoryInformation, &pattern, FALSE);
+    if (status != STATUS_NO_MORE_FILES || ios.Status != status || ios.Information)
+        return fail("repeated EOF stays exhausted until restart", status, ios.Information);
+    pattern.Buffer = "Save*";
+    pattern.Length = 5;
+    pattern.MaximumLength = 6;
+    status = xbox_NtQueryDirectoryFile(directory, NULL, NULL, NULL, &ios,
+        buffer, header + 9, XboxFileDirectoryInformation, &pattern, TRUE);
+    entry = (void *)buffer;
+    if (status != STATUS_SUCCESS || ios.Status != status || entry->FileNameLength != 9 ||
+        memcmp(entry->FileName, "Overflow9", 9))
+        return fail("restart after EOF returns first match", status, ios.Information);
+    xbox_NtClose(directory);
+    return 1;
+}
 int main(void) {
-    char path[MAX_PATH], child[MAX_PATH];
-    if(!xt_make_temp_dir(path,sizeof path)) return 10;
-    xt_join(child,sizeof child,path,"SaveSlot"); xt_make_dir(child);
-#if !defined(_WIN32)
-    /* The default save root and its partition images go in a sibling directory,
-     * so the searched directory holds only the entries this test creates. */
-    char save_root[MAX_PATH];
-    if(!xt_make_temp_dir(save_root,sizeof save_root)) return 10;
-    setenv("XDG_DATA_HOME", save_root, 1);
-#endif
+    char root[MAX_PATH], path[MAX_PATH];
+    GetTempPathA(MAX_PATH,root); sprintf(path,"%sxml1-dir-test-%lu",root,GetCurrentProcessId());
+    if(!CreateDirectoryA(path,NULL)) return 10;
+    char child[MAX_PATH]; sprintf(child,"%s\\SaveSlot",path); CreateDirectoryA(child,NULL);
+    char overflow_child[MAX_PATH]; sprintf(overflow_child,"%s\\Overflow9",path); CreateDirectoryA(overflow_child,NULL);
     mem=VirtualAlloc(NULL,16*1024*1024,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE); if(!mem) return 12;
     g_xbox_mem_offset=(ptrdiff_t)mem;
     *(uint32_t *)(mem+0x10000)=0x800000CF;
@@ -111,7 +181,7 @@ int main(void) {
      * refused by bridge_resolve_handle. D:\ maps to the game directory, which is path. */
     HANDLE h=guest_open();
     if(h==INVALID_HANDLE_VALUE) return 11;
-    int ok=invoke(h,"Save*",1,1);
+    int ok=short_buffer_contract() && invoke(h,"Save*",1,1);
     XBOX_FILE_DIRECTORY_INFORMATION *e=(void *)(mem+0x31000);
     if(ok && (g_eax || e->FileNameLength!=8 || memcmp(e->FileName,"SaveSlot",8) || !(e->FileAttributes&16))) {
         fprintf(stderr,"FAIL filtered directory: status=%08X length=%lu\n",g_eax,e->FileNameLength); ok=0;
@@ -141,13 +211,7 @@ int main(void) {
     h=guest_open();
     if(ok) ok=active_searches()==0 && invoke(h,"Save*",0,1) && g_eax==0;
     if(h!=INVALID_HANDLE_VALUE) guest_close(h);
-#if defined(_WIN32)
-    xt_remove_dir(child); xt_remove_dir(path);
-#else
-    xt_remove_tree(path);
-    xt_remove_tree(save_root);
-#endif
-    VirtualFree(mem,0,MEM_RELEASE);
+    RemoveDirectoryA(overflow_child); RemoveDirectoryA(child); RemoveDirectoryA(path); VirtualFree(mem,0,MEM_RELEASE);
     if(!ok) return 1;
     puts("PASS: directory ABI/filter/restart/status, guest/direct close, 144 slot-reuse cycles and fresh searches"); return 0;
 }
