@@ -179,11 +179,10 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
         if (va >= XBOX_CONTIG_BASE &&
             (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
             return va - XBOX_CONTIG_BASE;
-        if (va < xbox_GetMappedSize() && address >= ram) {
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
-                "MmGetPhysicalAddress: low guest RAM has no coherent physical mapping; returning 0");
-            return 0;
-        }
+    }
+    if (ram && address >= ram && address - ram < xbox_GetMappedSize()) {
+        uint32_t base = xbox_GetRamPhysicalBase();
+        if (base) return (ULONG_PTR)(base + (uint32_t)(address - ram));
     }
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
         "MmGetPhysicalAddress: unsupported native address %p; returning 0", BaseAddress);

@@ -44,4 +44,8 @@ int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 /* Report counts at exit, so a run says whether the driver ever looked. */
 void xbox_OhciReport(void);
 
+/* Resolve one physical descriptor/buffer address to the guest VA used by the
+ * OHCI model. Exposed so memory mapping regressions exercise the same path. */
+uint32_t xbox_OhciResolvePhysical(uint32_t physical, uint32_t bytes);
+
 #endif /* XBOX_OHCI_H */
