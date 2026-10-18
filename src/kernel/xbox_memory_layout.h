@@ -265,6 +265,19 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);
+int xbox_IsContiguousMemoryAvailable(void);
+/* Independent, owned views of physical RAM/device sections. Native pointers
+ * are returned; guest bridges subtract the memory offset. Unmap only accepts
+ * the exact pointer and byte count issued by MapPhysicalMemory. */
+void *xbox_MapPhysicalMemory(uint32_t physical, uint32_t bytes, uint32_t protect);
+int xbox_UnmapPhysicalMemory(void *address, uint32_t bytes);
+int xbox_IoMappingQuery(const void *address, uint32_t *physical,
+                        uint32_t *protect, uint32_t *remaining);
+/* 0: not an alias; 1: translated; -1: protection denies this access.
+ * access is 0 for read, 1 for write, 8 for execute (Windows AV convention). */
+int xbox_IoMappingResolve(uint32_t guest_va, int access, uint32_t *physical);
+/* 0: not ours; 1: changed; -1: invalid range/protection or host failure. */
+int xbox_IoMappingSetProtect(void *address, uint32_t bytes, uint32_t protect);
 
 /* Dump the guest call stack and abort if the title has not exited within
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
