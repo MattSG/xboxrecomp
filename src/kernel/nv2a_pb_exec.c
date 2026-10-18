@@ -3582,6 +3582,9 @@ uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_semaphore_releases; }
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 typedef struct { uint32_t sm, param; } PbCmd;          /* sm: subch<<16 | method */
 typedef struct { uint32_t key, occ, tc0, ntc; } PbSeg;
+typedef struct PbState PbState;
+static int pb_frame_state_capture(PbState **state);
+static int pb_frame_state_load(const PbState *state);
 typedef struct {
     PbCmd *cmd; uint32_t ncmd, capcmd;
     uint32_t *tc; uint32_t ntc, captc;                 /* the constant words, in order */
@@ -3590,16 +3593,26 @@ typedef struct {
     uint32_t capprev;
     uint8_t *vdata; uint32_t nvdata, capvdata;         /* each draw's vertices, copied */
     uint32_t (*voff)[NV_VERTEX_ATTRS]; uint32_t ndraw, capdraw;  /* +1; 0: not copied */
+    PbState *start;                                    /* state before the first recorded method */
+    uint8_t start_valid, invalid;
 } PbFrame;
 static PbFrame s_frames[3];                            /* recording, last, previous */
 static PbFrame *s_rec_f = &s_frames[0], *s_last_f = &s_frames[1], *s_prev_f = &s_frames[2];
 static volatile LONG s_interp_ms;                     /* last request, GetTickCount */
+static volatile LONG s_interp_enabled;
 /* Interpolating: a frame between was asked for lately. A load or a movie,
  * which ask for none, show their own frames. */
-static int interp_on(void) { LONG ms = s_interp_ms; return ms && GetTickCount() - (DWORD)ms < 250; }
+static int interp_on(void)
+{
+    LONG ms;
+    if (!s_interp_enabled) return 0;
+    ms = s_interp_ms;
+    return GetTickCount() - (DWORD)ms < 250;
+}
 static int s_replaying;
 static uint32_t s_replay_draw;                         /* draws replayed so far */
 static volatile LONG s_frames_done;                    /* frames finished recording */
+static uint32_t s_methods_since_flip;
 
 static int pb_grow(void **p, uint32_t *cap, uint32_t need, size_t elem)
 {
@@ -3607,7 +3620,10 @@ static int pb_grow(void **p, uint32_t *cap, uint32_t need, size_t elem)
     uint32_t n = *cap ? *cap : 4096;
     while (n < need) n *= 2;
     void *q = realloc(*p, (size_t)n * elem);
-    if (!q) return 0;
+    if (!q) {
+        fprintf(stderr, "[INTERP] recorder buffer allocation failed; frame rejected\n");
+        return 0;
+    }
     *p = q; *cap = n;
     return 1;
 }
@@ -3615,7 +3631,20 @@ static int pb_grow(void **p, uint32_t *cap, uint32_t need, size_t elem)
 static void pb_record(uint32_t subch, uint32_t method, uint32_t param)
 {
     PbFrame *f = s_rec_f;
-    if (!pb_grow((void **)&f->cmd, &f->capcmd, f->ncmd + 1, sizeof *f->cmd)) return;
+    if (f->invalid) return;
+    if (!f->start_valid) {
+        /* Enabling from the guest thread may land in the middle of a frame.
+         * A suffix must not be replayed as if it were a whole image. */
+        if (s_methods_since_flip || !pb_frame_state_capture(&f->start)) {
+            f->invalid = 1;
+            return;
+        }
+        f->start_valid = 1;
+    }
+    if (!pb_grow((void **)&f->cmd, &f->capcmd, f->ncmd + 1, sizeof *f->cmd)) {
+        f->invalid = 1;
+        return;
+    }
     f->cmd[f->ncmd].sm = subch << 16 | method;
     f->cmd[f->ncmd++].param = param;
 }
@@ -3634,13 +3663,19 @@ static void pb_segment(PbFrame *f)
         if (m >= 0x1720 && m < 0x1730) va[(m - 0x1720) / 4] = p;
         else if (m == 0x1EA4) loads = pb_mix(loads, p);
         else if (m >= 0x0B80 && m < 0x0C00) {
-            if (!pb_grow((void **)&f->tc, &f->captc, f->ntc + 1, sizeof *f->tc)) return;
+            if (!pb_grow((void **)&f->tc, &f->captc, f->ntc + 1, sizeof *f->tc)) {
+                f->invalid = 1;
+                return;
+            }
             if (!cur.ntc) cur.tc0 = f->ntc;
             f->tc[f->ntc++] = p;
             cur.ntc++;
         } else if (m == 0x17FC && p && cur.ntc) {       /* BEGIN: the draw they are for */
             uint32_t k = pb_mix(pb_mix(pb_mix(pb_mix(pb_mix(loads, cur.ntc), va[0]), va[1]), va[2]), p);
-            if (!pb_grow((void **)&f->seg, &f->capseg, f->nseg + 1, sizeof *f->seg)) return;
+            if (!pb_grow((void **)&f->seg, &f->capseg, f->nseg + 1, sizeof *f->seg)) {
+                f->invalid = 1;
+                return;
+            }
             cur.key = k;
             cur.occ = 0;
             for (uint32_t s = 0; s < f->nseg; s++)        /* ponytail: O(n^2), a hash map if frames grow */
@@ -3656,10 +3691,21 @@ static void pb_segment(PbFrame *f)
 static uint32_t s_dbg_keyed, s_dbg_close;   /* DIAG */
 static void pb_pair(PbFrame *l, const PbFrame *p)
 {
-    if (!pb_grow((void **)&l->prev, &l->capprev, l->ntc + 1, sizeof *l->prev)) return;
+    if (l->invalid) return;
+    if (!pb_grow((void **)&l->prev, &l->capprev, l->ntc + 1, sizeof *l->prev)) {
+        l->invalid = 1;
+        return;
+    }
     free(l->has);
     l->has = (uint8_t *)calloc(l->ntc + 1, 1);
-    if (!l->has) return;
+    if (!l->has) {
+        l->invalid = 1;
+        fprintf(stderr, "[INTERP] pair mask allocation failed; frame rejected\n");
+        return;
+    }
+    /* A reused frame can carry an old mask. Clear it even when its new
+     * predecessor was incomplete, so stale matches never leak through. */
+    if (p->invalid) return;
     for (uint32_t s = 0; s < l->nseg; s++) {
         const PbSeg *a = &l->seg[s];
         for (uint32_t t = 0; t < p->nseg; t++) {
@@ -3699,7 +3745,8 @@ static void pb_frame_done(void)
     s_rec_f = t;
     s_rec_f->ncmd = 0;
     s_rec_f->nvdata = s_rec_f->ndraw = 0;
-    pb_segment(s_last_f);
+    s_rec_f->invalid = s_rec_f->start_valid = 0;
+    if (!s_last_f->invalid) pb_segment(s_last_f);
     DWORD gap = now - last_ms;
     if (now - last_ms > 200)          /* after a pause: nothing to come from */
         s_prev_f->nseg = 0;
@@ -3712,9 +3759,23 @@ static void pb_frame_done(void)
     InterlockedIncrement(&s_frames_done);
 }
 
+/* Discard a recording when interpolation was off for the frame just drawn.
+ * Keep the old last complete frame available for the next interpolation run. */
+static void pb_discard_recording(void)
+{
+    s_rec_f->ncmd = s_rec_f->ntc = s_rec_f->nseg = 0;
+    s_rec_f->nvdata = s_rec_f->ndraw = 0;
+    s_rec_f->invalid = s_rec_f->start_valid = 0;
+}
+
 void nv2a_pb_interp_enable(int on)
 {
-    InterlockedExchange(&s_interp_ms, on ? (LONG)(GetTickCount() | 1) : 0);
+    if (on) {
+        InterlockedExchange(&s_interp_ms, (LONG)GetTickCount());
+        InterlockedExchange(&s_interp_enabled, 1);
+    } else {
+        InterlockedExchange(&s_interp_enabled, 0);
+    }
 }
 
 long nv2a_pb_frames_done(void) { return s_frames_done; }
@@ -3731,14 +3792,24 @@ static void pb_draw_vertices(NvD3DAttrib attr[NV_VERTEX_ATTRS], uint32_t lo, uin
                 attr[i].data = f->vdata + (f->voff[d][i] - 1) - (size_t)lo * attr[i].stride;
         return;
     }
-    if (!interp_on()) return;
+    if (!interp_on()) {
+        if (s_rec_f->start_valid) s_rec_f->invalid = 1;
+        return;
+    }
     PbFrame *f = s_rec_f;
-    if (!pb_grow((void **)&f->voff, &f->capdraw, f->ndraw + 1, sizeof *f->voff)) return;
+    if (f->invalid) return;
+    if (!pb_grow((void **)&f->voff, &f->capdraw, f->ndraw + 1, sizeof *f->voff)) {
+        f->invalid = 1;
+        return;
+    }
     memset(f->voff[f->ndraw], 0, sizeof *f->voff);
     for (i = 0; i < NV_VERTEX_ATTRS; i++) {
         uint32_t st = attr[i].stride, len = st ? (hi - lo + 1) * st : 16;
         if (!attr[i].enabled || !attr[i].data || s_gpu.inline_active || len > (64u << 20)) continue;
-        if (!pb_grow((void **)&f->vdata, &f->capvdata, f->nvdata + len + 16, 1)) break;
+        if (!pb_grow((void **)&f->vdata, &f->capvdata, f->nvdata + len + 16, 1)) {
+            f->invalid = 1;
+            return;
+        }
         memcpy(f->vdata + f->nvdata, attr[i].data + (size_t)lo * st, len);
         f->voff[f->ndraw][i] = f->nvdata + 1;
         f->nvdata = (f->nvdata + len + 15) & ~15u;
@@ -3751,14 +3822,14 @@ static void pb_draw_vertices(NvD3DAttrib attr[NV_VERTEX_ATTRS], uint32_t lo, uin
  * constants, and a batch begun but not ended. A title draws to textures in
  * its world update, so a replay can fall between commands of the next frame,
  * which must go on as if it had not. */
-typedef struct {
+struct PbState {
     uint8_t *head, *mid, *tail;          /* s_gpu around idx[] and inline_buf[] */
     uint32_t *idx, *inl;
     uint8_t *vsh;
     uint32_t tex_reg[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
     uint8_t tex_set[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
     uint8_t *surface;
-} PbState;
+};
 
 #define GPU_AT(f) ((size_t)((uint8_t *)&s_gpu.f - (uint8_t *)&s_gpu))
 static int pb_state(PbState *st, int save)
@@ -3796,6 +3867,24 @@ static int pb_state(PbState *st, int save)
     return 1;
 }
 
+static int pb_frame_state_capture(PbState **state)
+{
+    if (!*state) {
+        *state = (PbState *)malloc(sizeof **state);
+        if (!*state) {
+            fprintf(stderr, "[INTERP] frame-start state allocation failed; frame rejected\n");
+            return 0;
+        }
+        memset(*state, 0, sizeof **state);
+    }
+    return pb_state(*state, 1);
+}
+
+static int pb_frame_state_load(const PbState *state)
+{
+    return state && pb_state((PbState *)state, 0);
+}
+
 /* The last frame again, at t between the previous one (0) and it (1).
  * 0 if there is none to draw. */
 int nv2a_pb_replay(float t)
@@ -3803,8 +3892,12 @@ int nv2a_pb_replay(float t)
     static PbState saved;
     PbFrame *f = s_last_f;
     uint32_t i, k = 0;
-    if (!f->ncmd || !f->has) return 0;
+    if (f->invalid || !f->start_valid || !f->start || !f->ncmd || !f->has) return 0;
     if (!pb_state(&saved, 1)) return 0;
+    if (!pb_frame_state_load(f->start)) {
+        pb_state(&saved, 0);
+        return 0;
+    }
     s_replaying = 1;
     s_replay_draw = 0;
     for (i = 0; i < f->ncmd; i++) {
@@ -3829,8 +3922,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
     static uint32_t semaphore_dma, semaphore_offset;
-    if (!s_replaying && interp_on())
-        pb_record(subch, method, param);
+    int record_frame = !s_replaying && interp_on();
     if (!inited) {
         inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
@@ -3841,6 +3933,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
+    }
+    if (!s_replaying) {
+        if (record_frame) pb_record(subch, method, param);
+        else if (s_rec_f->start_valid) s_rec_f->invalid = 1;
+        if (!subch && method == NV097_FLIP_STALL) {
+            if (!record_frame) pb_discard_recording();
+            s_methods_since_flip = 0;
+        } else if (s_methods_since_flip != UINT32_MAX) {
+            s_methods_since_flip++;
+        }
     }
     /* Host postprocessing is ordered with guest draws, never a title-thread
      * call into the render context or a policy applied to later draw calls. */
@@ -4147,7 +4249,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * one of the title's. */
         if (!s_replaying)
             xbox_Nv2aFrameCounterFlip();
-        if (!s_replaying && interp_on())   /* this method was the last recorded */
+        if (!s_replaying && record_frame)  /* this method was the last recorded */
             pb_frame_done();
         /* Hand the window a copy of the frame just finished.
          *
