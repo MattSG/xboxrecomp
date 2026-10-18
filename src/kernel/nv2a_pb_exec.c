@@ -98,6 +98,9 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  */
 static uint32_t dma_resolve(uint32_t offset)
 {
+    uint32_t guest_va;
+    if (xbox_PhysicalAddressResolve(offset, 1, &guest_va) == 1)
+        return guest_va;
     /* Only offsets inside a block returned by the contiguous allocator use
      * the separate window. Gaps below its bump pointer are ordinary RAM. */
     if (xbox_ContiguousRangeAllocated(offset, 1))

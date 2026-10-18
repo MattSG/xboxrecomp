@@ -99,11 +99,25 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * stays so. The voice processor resolves every voice field and sample it
      * reads; skip the lookup for known pages. Bytes are only ever set: no lock. */
     static uint8_t known_contig[(64u << 20) >> 12];     /* XBOX_CONTIG_SIZE (kernel.h) */
-    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
-    if (a >> 12 < sizeof(known_contig) && known_contig[a >> 12])
+    uint32_t raw = (uint32_t)addr, guest_va;
+    if (addr <= UINT32_MAX &&
+        xbox_PhysicalAddressResolve(raw, 1, &guest_va) == 1) {
+        /* Check the bus width before masking: otherwise a valid high runtime
+         * ID could wrap onto a cached low contiguous page. */
+        if (raw > 0x0FFFFFFFu) {
+            static volatile LONG warned;
+            if (InterlockedIncrement(&warned) == 1)
+                fprintf(stderr, "[APU] runtime physical address 0x%08X exceeds 28-bit bus; access refused\n", raw);
+            return mcpx_apu_unmapped(addr);
+        }
+        return g_apu_ram_ptr + guest_va;
+    }
+    uint32_t a = raw & 0x0FFFFFFFu;
+    if (a < (64u << 20) && a >> 12 < sizeof(known_contig) &&
+        known_contig[a >> 12])
         return g_apu_ram_ptr + 0x80000000u + a;
-    if (xbox_ContiguousRangeAllocated(a, 1)) {
-        if (a >> 12 < sizeof(known_contig)) known_contig[a >> 12] = 1;
+    if (a < (64u << 20) && xbox_ContiguousRangeAllocated(a, 1)) {
+        known_contig[a >> 12] = 1;
         return g_apu_ram_ptr + 0x80000000u + a;
     }
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)

@@ -496,8 +496,20 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
  * again, forever. */
-static uint32_t bus_resolve(uint32_t addr, uint32_t bytes)
+uint32_t xbox_OhciResolvePhysical(uint32_t addr, uint32_t bytes)
 {
+    uint32_t guest_va;
+    int kind;
+    /* Runtime physical IDs for ordinary RAM resolve to the same bytes the
+     * CPU maps at its guest VA. The namespace sits beyond the complete mapped
+     * VA range, so this is unambiguous even for enlarged development maps. */
+    kind = xbox_PhysicalAddressResolve(addr, bytes, &guest_va);
+    if (kind == 1)
+        return guest_va;
+    /* Legacy titles still pass a guest VA as a DMA pointer. Keep the loaded
+     * image ahead of the old low physical/contiguous heuristic: image statics
+     * must remain in ordinary RAM even when their numeric VA matches a
+     * contiguous allocation. */
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     /* XPP's private arena ends at 0x80001000 and bypasses the contiguous
@@ -506,28 +518,28 @@ static uint32_t bus_resolve(uint32_t addr, uint32_t bytes)
      * identify these buffers; their bytes live in the contiguous view. */
     if (addr < 0x1000u && (uint64_t)addr + bytes <= 0x1000u)
         return OHCI_CONTIG_BASE + addr;
-    if (xbox_ContiguousRangeAllocated(addr, bytes))
-        return OHCI_CONTIG_BASE + addr;
+    if (kind == 2)
+        return guest_va;
     return addr;
 }
 
 static uint32_t rd32(uint32_t va)
 {
-    va = bus_resolve(va, 4);
+    va = xbox_OhciResolvePhysical(va, 4);
     if (!guest_ok(va, 4))
         return 0;
     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
 }
 static void wr32(uint32_t va, uint32_t v)
 {
-    va = bus_resolve(va, 4);
+    va = xbox_OhciResolvePhysical(va, 4);
     if (!guest_ok(va, 4))
         return;
     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
-    va = bus_resolve(va, bytes);
+    va = xbox_OhciResolvePhysical(va, bytes);
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }

@@ -195,7 +195,7 @@ static SRWLOCK g_iomap_lock = SRWLOCK_INIT;
 static int g_iomap_available;
 static struct {
     void *view, *address;
-    uint32_t physical, view_bytes, bytes, protect;
+    uint32_t physical, canonical, view_bytes, bytes, protect;
     uint16_t *page_protect;
 } g_iomaps[XBOX_IOMAP_MAX];
 /* The contiguous window's backing section. It is a file mapping rather than
@@ -244,6 +244,56 @@ int xbox_IsContiguousMemoryAvailable(void)
     available = g_iomap_available && g_memory_base && g_contig_memory;
     ReleaseSRWLockShared(&g_iomap_lock);
     return available;
+}
+
+static uint32_t xbox_ram_physical_base_unlocked(void)
+{
+    uint64_t base;
+    if (!g_iomap_available || !g_memory_base || !g_memory_size) return 0;
+    base = ((uint64_t)g_memory_size + XBOX_CONTIG_SIZE - 1u) &
+           ~((uint64_t)XBOX_CONTIG_SIZE - 1u);
+    /* Keep the synthetic RAM range disjoint from guest VAs and all current
+     * device apertures. A too-large layout remains usable through guest VAs;
+     * it simply has no 32-bit runtime physical namespace. */
+    if (!base || base + g_memory_size > XBOX_NV2A_BASE ||
+        base + g_memory_size > UINT32_MAX)
+        return 0;
+    return (uint32_t)base;
+}
+
+uint32_t xbox_GetRamPhysicalBase(void)
+{
+    uint32_t base;
+    AcquireSRWLockShared(&g_iomap_lock);
+    base = xbox_ram_physical_base_unlocked();
+    ReleaseSRWLockShared(&g_iomap_lock);
+    return base;
+}
+
+int xbox_PhysicalAddressResolve(uint32_t physical, uint32_t bytes,
+                                uint32_t *guest_va)
+{
+    uint64_t end = (uint64_t)physical + bytes;
+    uint32_t ram_base;
+    if (!bytes || end > 0x100000000ULL) return 0;
+    AcquireSRWLockShared(&g_iomap_lock);
+    ram_base = xbox_ram_physical_base_unlocked();
+    if (ram_base && physical >= ram_base &&
+        end <= (uint64_t)ram_base + g_memory_size) {
+        if (guest_va) *guest_va = physical - ram_base;
+        ReleaseSRWLockShared(&g_iomap_lock);
+        return 1;
+    }
+    ReleaseSRWLockShared(&g_iomap_lock);
+    /* MapPhysicalMemory exposes the complete backed contiguous section. Its
+     * unallocated pages still resolve to that section; callers that model
+     * allocation ownership can retain their narrower policy separately. */
+    if (physical < XBOX_CONTIG_SIZE && end <= XBOX_CONTIG_SIZE &&
+        xbox_IsContiguousMemoryAvailable()) {
+        if (guest_va) *guest_va = XBOX_CONTIG_BASE + physical;
+        return 2;
+    }
+    return 0;
 }
 
 static size_t xbox_TiledApertureSize(void)
@@ -2266,10 +2316,23 @@ int xbox_IoMappingQuery(const void *address, uint32_t *physical,
 
 int xbox_IoMappingResolve(uint32_t va, int access, uint32_t *physical)
 {
-    uint32_t protect;
-    if (!xbox_IoMappingQuery((void *)((uintptr_t)va + g_memory_offset),
-                              physical, &protect, NULL))
-        return 0;
+    uint32_t protect = 0;
+    int found = 0;
+    uintptr_t address = (uintptr_t)va + g_memory_offset;
+    AcquireSRWLockShared(&g_iomap_lock);
+    for (int i = 0; i < XBOX_IOMAP_MAX; i++) {
+        uintptr_t base = (uintptr_t)g_iomaps[i].view;
+        if (base && address >= base && address - base < g_iomaps[i].view_bytes) {
+            uint32_t offset = (uint32_t)(address - base);
+            if (physical) *physical = g_iomaps[i].canonical + offset;
+            protect = g_iomaps[i].page_protect
+                ? g_iomaps[i].page_protect[offset / 4096] : g_iomaps[i].protect;
+            found = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_iomap_lock);
+    if (!found) return 0;
     if ((protect & 0xff) == PAGE_NOACCESS || access == 8 ||
         (access == 1 && (protect & 0xff) != PAGE_READWRITE))
         return -1;
@@ -2326,7 +2389,7 @@ int xbox_IoMappingSetProtect(void *address, uint32_t bytes, uint32_t protect)
         last = (uint32_t)(((uint64_t)(p - base) + bytes + 4095) / 4096);
         result = 1;
         for (uint32_t j = first; j < last; j++) {
-            DWORD host = xbox_iomap_page_protect(g_iomaps[i].physical + j * 4096, protect);
+            DWORD host = xbox_iomap_page_protect(g_iomaps[i].canonical + j * 4096, protect);
             if (!host || !VirtualProtect((char *)g_iomaps[i].view + j * 4096, 4096, host, &old)) {
                 result = -1;
                 break;
@@ -2342,10 +2405,11 @@ int xbox_IoMappingSetProtect(void *address, uint32_t bytes, uint32_t protect)
 void *xbox_MapPhysicalMemory(uint32_t physical, uint32_t bytes, uint32_t protect)
 {
     HANDLE mapping = NULL;
-    uint32_t source = 0, limit = 0, offset, prefix, view_bytes;
+    uint32_t backing_offset = 0, canonical = 0, limit = 0;
+    uint32_t offset, prefix, view_bytes, ram_base;
     uint64_t end = (uint64_t)physical + bytes;
     DWORD host_protect = protect & 0xff, old;
-    int slot;
+    int slot, device = 0;
     void *view = NULL, *answer = NULL;
     /* Cache-policy flags do not alter the host section's memory semantics.
      * Reject executable/COW/guard mappings rather than inventing support. */
@@ -2355,16 +2419,24 @@ void *xbox_MapPhysicalMemory(uint32_t physical, uint32_t bytes, uint32_t protect
     if (!g_iomap_available || !g_memory_base) goto done;
     if (physical < XBOX_CONTIG_SIZE && end <= XBOX_CONTIG_SIZE && g_contig_is_view) {
         mapping = g_contig_mapping; limit = XBOX_CONTIG_SIZE;
+        backing_offset = physical; canonical = XBOX_CONTIG_BASE + physical;
+    } else if ((ram_base = xbox_ram_physical_base_unlocked()) && physical >= ram_base &&
+               end <= (uint64_t)ram_base + g_memory_size) {
+        mapping = g_mapping_handle; limit = (uint32_t)g_memory_size;
+        backing_offset = physical - ram_base; canonical = backing_offset;
     } else if (physical >= XBOX_NV2A_BASE && end <= (uint64_t)XBOX_NV2A_BASE + XBOX_NV2A_SIZE) {
-        mapping = g_nv2a_mapping; source = XBOX_NV2A_BASE; limit = XBOX_NV2A_SIZE;
+        mapping = g_nv2a_mapping; limit = XBOX_NV2A_SIZE;
+        backing_offset = physical - XBOX_NV2A_BASE; canonical = physical; device = 1;
     } else if (physical >= XBOX_MCPX_BASE && end <= (uint64_t)XBOX_MCPX_BASE + XBOX_MCPX_SIZE) {
-        mapping = g_mcpx_mapping; source = XBOX_MCPX_BASE; limit = XBOX_MCPX_SIZE;
+        mapping = g_mcpx_mapping; limit = XBOX_MCPX_SIZE;
+        backing_offset = physical - XBOX_MCPX_BASE; canonical = physical; device = 1;
     } else if (physical >= XBOX_FLASH_BASE && end <= (uint64_t)XBOX_FLASH_BASE + XBOX_FLASH_SIZE) {
-        mapping = g_flash_mapping; source = XBOX_FLASH_BASE; limit = XBOX_FLASH_SIZE;
+        mapping = g_flash_mapping; limit = XBOX_FLASH_SIZE;
+        backing_offset = physical - XBOX_FLASH_BASE; canonical = physical; device = 1;
     }
     if (!mapping) goto done;
-    offset = (physical - source) & ~0xffffu;
-    prefix = physical - source - offset;
+    offset = backing_offset & ~0xffffu;
+    prefix = backing_offset - offset;
     view_bytes = (uint32_t)(((uint64_t)prefix + bytes + 4095) & ~4095ULL);
     if ((uint64_t)offset + view_bytes > limit) goto done;
     for (slot = 0; slot < XBOX_IOMAP_MAX && g_iomaps[slot].view; slot++) {}
@@ -2378,12 +2450,12 @@ void *xbox_MapPhysicalMemory(uint32_t physical, uint32_t bytes, uint32_t protect
     }
     if (!view) goto done;
     if (!VirtualProtect(view, view_bytes, host_protect, &old)) goto failed;
-    if (source) {
+    if (device) {
         /* Preserve hardware traps as well as the caller's own protection.
          * Device handlers resolve the alias back to its canonical register. */
         for (uint32_t p = 0; p < view_bytes; p += 4096) {
-            uint32_t canonical = source + offset + p;
-            DWORD page_protect = xbox_iomap_page_protect(canonical, protect);
+            uint32_t page_canonical = canonical - prefix + p;
+            DWORD page_protect = xbox_iomap_page_protect(page_canonical, protect);
             if (!page_protect) goto failed;
             if (page_protect != host_protect &&
                 !VirtualProtect((char *)view + p, 4096, page_protect, &old)) goto failed;
@@ -2392,7 +2464,8 @@ void *xbox_MapPhysicalMemory(uint32_t physical, uint32_t bytes, uint32_t protect
     answer = (char *)view + prefix;
     g_iomaps[slot].view = view;
     g_iomaps[slot].address = answer;
-    g_iomaps[slot].physical = source + offset;
+    g_iomaps[slot].physical = physical - prefix;
+    g_iomaps[slot].canonical = canonical - prefix;
     g_iomaps[slot].view_bytes = view_bytes;
     g_iomaps[slot].bytes = bytes;
     g_iomaps[slot].protect = protect;
