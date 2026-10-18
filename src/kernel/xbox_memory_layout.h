@@ -266,14 +266,6 @@ ptrdiff_t xbox_GetMemoryOffset(void);
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);
 int xbox_IsContiguousMemoryAvailable(void);
-/* Runtime virtualized physical address space. Low RAM IDs are placed after
- * the complete guest VA range so a raw guest VA can never alias an ID. The
- * resolver returns 1 for low RAM and 2 for the backed contiguous section
- * (including currently unallocated offsets). Consumers may apply additional
- * allocation or legacy guest-VA precedence rules. */
-uint32_t xbox_GetRamPhysicalBase(void);
-int xbox_PhysicalAddressResolve(uint32_t physical, uint32_t bytes,
-                                uint32_t *guest_va);
 /* Independent, owned views of physical RAM/device sections. Native pointers
  * are returned; guest bridges subtract the memory offset. Unmap only accepts
  * the exact pointer and byte count issued by MapPhysicalMemory. */

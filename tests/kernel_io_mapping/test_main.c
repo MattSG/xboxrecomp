@@ -1,6 +1,5 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
-#include "../../src/usb/ohci.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,9 +78,8 @@ int main(int argc, char **argv)
     long length;
     unsigned char *xbe;
     volatile uint32_t *ram, *a, *b, *ro, *device, *foreign, *dpc_rw, *dpc_ro, *mmio_buffer;
-    volatile uint32_t *low_alias, *low_ro, *edge;
-    uint32_t physical, protect, scratch, *stack, va, low_base, low_phys, descriptor_va, foreign_va;
-    void *contig_probe, *low_native_probe;
+    uint32_t physical, protect, scratch, *stack, va;
+    void *contig_probe;
     if (argc != 2 || !(file = fopen(argv[1], "rb"))) return 10;
     fseek(file, 0, SEEK_END); length = ftell(file); rewind(file);
     xbe = malloc((size_t)length);
@@ -92,33 +90,11 @@ int main(int argc, char **argv)
 #endif
     if (!xbox_MemoryLayoutInit(xbe, (size_t)length)) return 12;
     free(xbe);
-    low_base = xbox_GetRamPhysicalBase();
-    CHECK(low_base && low_base >= xbox_GetMappedSize() &&
-          low_base % XBOX_CONTIG_SIZE == 0);
-    low_phys = low_base + 0x11234;
-    low_native_probe = native(0x11234);
     contig_probe = native(0x80001000u);
-    *(volatile uint32_t *)contig_probe = 0x31415926;
-    descriptor_va = xbox_OhciResolvePhysical(0x1000, 4);
-    CHECK(descriptor_va == 0x80001000 &&
-          *(volatile uint32_t *)native(descriptor_va) == 0x31415926);
-    *(volatile uint32_t *)native(descriptor_va) = 0x27182818;
-    CHECK(*(volatile uint32_t *)contig_probe == 0x27182818);
-    edge = xbox_MmMapIoSpace(0x1000, 4, PAGE_READWRITE);
-    CHECK(edge != NULL && edge && *edge == 0x27182818);
-    if (edge) xbox_MmUnmapIoSpace((PVOID)edge, 4);
     ram = native(0x80011234u);
-    /* Reserve a host-free slot in the I/O alias arena. Some POSIX process
-     * layouts already occupy the first guest slot, so probe the arena rather
-     * than assuming 0xE8000000 is available in the host address space. */
-    foreign = NULL;
-    for (foreign_va = 0xe8000000u; foreign_va < 0xf0000000u; foreign_va += 0x10000u) {
-        foreign = VirtualAlloc(native(foreign_va), 0x10000,
-                               MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (foreign) break;
-    }
+    foreign = VirtualAlloc(native(0xe8000000u), 0x10000,
+                            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     CHECK(foreign != NULL);
-    CHECK(foreign && guest((const void *)foreign) == foreign_va);
     if (!foreign) return 13;
     *foreign = 0xcafef00d;
     a = xbox_MmMapIoSpace(0x11234, 32, PAGE_READWRITE);
@@ -127,39 +103,11 @@ int main(int argc, char **argv)
     CHECK(a && b && ro && a != b && a != ro);
     CHECK(a != foreign && *foreign == 0xcafef00d);
     if (!a || !b || !ro) return 13;
-    low_alias = xbox_MmMapIoSpace(low_phys, 32, PAGE_READWRITE);
-    CHECK(low_alias != NULL);
-    if (!low_alias) return 13;
-    *low_alias = 0x0badc0de;
-    CHECK(*(volatile uint32_t *)native(0x11234) == 0x0badc0de);
-    CHECK(xbox_MmGetPhysicalAddress(native(0x11234)) == low_phys);
-    CHECK(xbox_MmGetPhysicalAddress((PVOID)low_alias) == low_phys);
-    descriptor_va = xbox_OhciResolvePhysical(low_phys, 4);
-    CHECK(descriptor_va == 0x11234 &&
-          *(volatile uint32_t *)native(descriptor_va) == 0x0badc0de);
-    *(volatile uint32_t *)native(descriptor_va) = 0xfaceb00c;
-    CHECK(*low_alias == 0xfaceb00c);
-    low_ro = xbox_MmMapIoSpace(low_phys, 32, PAGE_READONLY);
-    CHECK(low_ro != NULL);
-    if (low_ro) {
-        CHECK(*low_ro == 0xfaceb00c && write_faults(low_ro));
-    }
-    edge = xbox_MmMapIoSpace(low_base, 4, PAGE_READWRITE);
-    CHECK(edge != NULL); if (edge) xbox_MmUnmapIoSpace((PVOID)edge, 4);
-    edge = xbox_MmMapIoSpace(low_base + (uint32_t)xbox_GetMappedSize() - 4,
-                             4, PAGE_READWRITE);
-    CHECK(edge != NULL); if (edge) xbox_MmUnmapIoSpace((PVOID)edge, 4);
-    CHECK(!xbox_MmMapIoSpace(low_base + (uint32_t)xbox_GetMappedSize() - 2,
-                             4, PAGE_READWRITE));
-    /* The same numeric RAM offset denotes separate virtualized low-RAM and
-     * contiguous physical stores, with independent coherent aliases. */
-    CHECK(*ram == 0);
     *ram = 0x12345678; CHECK(*a == *ram && *b == *ram && *ro == *ram);
-    CHECK(*low_alias == 0xfaceb00c && *(volatile uint32_t *)native(0x11234) == *low_alias);
     *a = 0x87654321; CHECK(*ram == *a && *b == *a);
     CHECK(xbox_MmGetPhysicalAddress((PVOID)a) == 0x11234);
     CHECK(xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)guest((PVOID)a)) == 0);
-    CHECK(xbox_MmGetPhysicalAddress(native(0x11234)) == low_phys);
+    CHECK(xbox_MmGetPhysicalAddress(native(0x11234)) == 0);
     CHECK(xbox_MmQueryAddressProtect((PVOID)ro) == PAGE_READONLY);
     CHECK(write_faults(ro) && *ram == 0x87654321);
     xbox_MmSetAddressProtect((PVOID)a, 4, PAGE_READONLY);
@@ -228,7 +176,7 @@ int main(int argc, char **argv)
     CHECK(g_eax == 0x11234 && g_esp == scratch + 0x1008);
     stack[0] = 0x12345678; stack[1] = 0x00011234; g_esp = scratch + 0x1000;
     recomp_lookup_kernel(*(uint32_t *)native(scratch + 8))();
-    CHECK(g_eax == low_phys && g_esp == scratch + 0x1008);
+    CHECK(g_eax == 0 && g_esp == scratch + 0x1008);
     dpc_rw = xbox_MmMapIoSpace(0x30000, 32, PAGE_READWRITE);
     dpc_ro = xbox_MmMapIoSpace(0x31000, 32, PAGE_READONLY);
     CHECK(dpc_rw && dpc_ro);
@@ -239,23 +187,11 @@ int main(int argc, char **argv)
     recomp_lookup_kernel(*(uint32_t *)native(scratch + 12))();
     CHECK(g_esp == scratch + 0x1010);
     CHECK(*(uint16_t *)dpc_rw == 0x13 && *(uint32_t *)((char *)dpc_rw + 12) == 0x12345678);
-    stack[0] = 0x12345678; stack[1] = guest((PVOID)low_alias);
-    stack[2] = 0x76543210; stack[3] = 0xabcdef01;
-    g_esp = scratch + 0x1000;
-    recomp_lookup_kernel(*(uint32_t *)native(scratch + 12))();
-    CHECK(*(uint16_t *)low_alias == 0x13 &&
-          *(uint32_t *)((char *)low_alias + 12) == 0x76543210);
     stack[0] = 0x12345678; stack[1] = guest((PVOID)dpc_ro);
     stack[2] = 0x12345678; stack[3] = 0xabcdef01;
     g_esp = scratch + 0x1000;
     recomp_lookup_kernel(*(uint32_t *)native(scratch + 12))();
     CHECK(*(uint16_t *)dpc_ro == 0);
-    stack[0] = 0x12345678; stack[1] = guest((PVOID)low_ro);
-    stack[2] = 0x12345678; stack[3] = 0xabcdef01;
-    *low_alias = 0;
-    g_esp = scratch + 0x1000;
-    recomp_lookup_kernel(*(uint32_t *)native(scratch + 12))();
-    CHECK(*(uint16_t *)low_ro == 0);
     xbox_MmUnmapIoSpace((PVOID)dpc_rw, 32);
     xbox_MmUnmapIoSpace((PVOID)dpc_ro, 32);
     mmio_buffer = xbox_MmMapIoSpace(0xfd001234, 32, PAGE_READWRITE);
@@ -309,8 +245,6 @@ int main(int argc, char **argv)
     xbox_HostHardwareShutdown();
 #endif
     xbox_MmUnmapIoSpace((PVOID)b, 32); xbox_MmUnmapIoSpace((PVOID)ro, 32);
-    xbox_MmUnmapIoSpace((PVOID)low_alias, 32);
-    if (low_ro) xbox_MmUnmapIoSpace((PVOID)low_ro, 32);
     CHECK(*ram == 0x87654321);
     CHECK(*foreign == 0xcafef00d);
     VirtualFree((PVOID)foreign, 0, MEM_RELEASE);
@@ -342,7 +276,6 @@ int main(int argc, char **argv)
 #endif
     CHECK(xbox_MapPhysicalMemory(0x12000, 32, PAGE_READWRITE) == NULL);
     CHECK(xbox_MmGetPhysicalAddress(contig_probe) == 0);
-    CHECK(xbox_MmGetPhysicalAddress(low_native_probe) == 0);
     xbox_MemoryLayoutShutdown();
     printf("I/O mapping regressions: %d failures\n", failed);
     return failed != 0;
