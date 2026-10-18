@@ -80,6 +80,43 @@ The two-key DES contract is also documented in
 [Cxbx's kernel implementation](https://github.com/Cxbx-Reloaded/Cxbx-Reloaded/blob/master/src/core/kernel/exports/EmuKrnlXc.cpp).
 The test embeds data; it does not download dependencies at runtime.
 
+## 2026-10-18 execution updates
+
+- The physical-address mapping gates pass on Windows and Linux. Fresh main
+  runtime driving completed in 54.584 s and 62.7096 s with normal gameplay
+  captures. The SDL runtime also completed a 53.0497 s driving run after the
+  mapping and sampler-lifetime fixes, with a normal capture; its visible
+  launcher smoke passed at 760x720 and closed normally. These runs establish
+  playable-path integration for the tested build and scenario, not complete
+  physical-address or device conformance.
+- The SDL sampler-cache selector regression passes on Windows and Linux. The
+  Linux test compiles with `-Wall -Wextra -Werror`; the `--legacy` control
+  fails because it evicts a sampler pinned by the active draw. The test models
+  the mid-setup flush and subsequent bind; the fresh SDL driving run supplies
+  the integration evidence for the actual renderer path.
+- Pushbuffer replay now captures the full frame-start GPU state on the
+  executor thread, loads it for replay, then restores the in-progress next
+  frame. Real-executor regressions pass for inherited clear color, next-frame
+  restoration, actual `NV097_FLIP_STALL` boundaries, activation after a frame
+  starts, disable/skip/re-enable, timeout during vertex capture, and recording
+  allocation failures. A deterministic clock test covers an even tick and
+  the 250 ms cutoff. These tests establish the state and rejection contracts;
+  they do not establish general visual interpolation correctness. The main
+  runtime's old-generator smooth+uncapped run passed at 63.0004 s with three
+  normal captures. The replay-fixed refined candidate also passed smooth+uncapped
+  in main (`run-e46_z31k`, 3 normal captures) and SDL (`run-3y069j9u`, 3 normal
+  captures showing normal geometry and driving/AI motion). These bounded runs
+  are native gameplay evidence for the tested scenario, not broad interpolation
+  correctness. Logs and captures are archived at
+  `C:\Users\Matt\Documents\MM3-Recovery-20261017\Audit-evidence-20261018`.
+- Refined CFG generator commit `34330f4ae0d2c7dcea1d1173c202f18620bd3291` is
+  now the MM3 generator pin. It passed the replay-fixed main and SDL
+  smooth+uncapped comparisons. Earlier one-off distortion remains
+  unexplained; repeat candidate and old-generator controls were visually
+  normal. The candidate generated 26 dead-branch guards and leaves 345
+  unresolved functions, with none removed from baseline. This bounded evidence
+  does not establish interpolation correctness across all scenes.
+
 ## Remaining implementation gaps
 
 | Priority | Source | Evidence / correct implementation | Regression needed |
