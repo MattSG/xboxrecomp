@@ -26,7 +26,8 @@ int xbox_FramebufferPaused(void) { return 0; }
 void recomp_sampler_watch_current_thread(void) {}
 void recomp_sampler_report(double ms) { (void)ms; }
 uint32_t g_xbox_image_lo, g_xbox_image_hi;
-void xbox_Nv2aFrameCounterFlip(void) { STUB_HIT("xbox_Nv2aFrameCounterFlip"); }
+static uint32_t test_frame_flips;
+void xbox_Nv2aFrameCounterFlip(void) { test_frame_flips++; }
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
 { (void)physical_offset; (void)size; STUB_HIT("xbox_ContiguousRangeAllocated"); return 0; }
 void xbox_Nv2aSemaphoreRelease(uint32_t dma_context, uint32_t semaphore_offset, uint32_t value)
@@ -36,7 +37,7 @@ void nv2a_vsh_set_load_slot(uint32_t slot) { (void)slot; STUB_HIT("nv2a_vsh_set_
 void nv2a_vsh_program_word(uint32_t word) { (void)word; STUB_HIT("nv2a_vsh_program_word"); }
 void nv2a_vsh_set_start_slot(uint32_t slot) { (void)slot; STUB_HIT("nv2a_vsh_set_start_slot"); }
 void nv2a_vsh_set_constant_load(uint32_t index) { (void)index; STUB_HIT("nv2a_vsh_set_constant_load"); }
-void nv2a_vsh_constant_word(uint32_t word) { (void)word; STUB_HIT("nv2a_vsh_constant_word"); }
+void nv2a_vsh_constant_word(uint32_t word) { (void)word; }
 static uint32_t test_vsh_state;
 size_t nv2a_vsh_state_size(void) { return sizeof test_vsh_state; }
 void nv2a_vsh_state_save(void *out) { memcpy(out, &test_vsh_state, sizeof test_vsh_state); }
@@ -60,16 +61,17 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
 int nv2a_d3d_widescreen(void) { STUB_HIT("nv2a_d3d_widescreen"); return 0; }
 int nv2a_d3d_menu_rects_on(void) { STUB_HIT("nv2a_d3d_menu_rects_on"); return 0; }
 void nv2a_d3d_set_menu_tints(const uint32_t *tints) { (void)tints; STUB_HIT("nv2a_d3d_set_menu_tints"); }
-int nv2a_d3d_init(void) { STUB_HIT("nv2a_d3d_init"); return 0; }
+int nv2a_d3d_init(void) { return 1; }
 void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip,
                            float start, float end, uint32_t argb, uint32_t flags,
                            const float sky_fade[4])
 { (void)st; (void)depth_to_world; (void)far_clip; (void)start; (void)end; (void)argb;
   (void)flags; (void)sky_fade; STUB_HIT("nv2a_d3d_distance_fog"); }
+static uint32_t replay_observed_color;
 void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color, uint32_t zstencil,
                     uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
 { (void)st; (void)flags; (void)color; (void)zstencil; (void)x0; (void)y0; (void)x1; (void)y1;
-  STUB_HIT("nv2a_d3d_clear"); }
+  replay_observed_color = color; }
 void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
 { (void)surface_addr; (void)pitch; STUB_HIT("nv2a_d3d_flip"); }
 void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
@@ -80,25 +82,59 @@ uint32_t nv2a_d3d_zpass_read(void) { STUB_HIT("nv2a_d3d_zpass_read"); return 0; 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 { (void)fb_va; (void)pitch; STUB_HIT("xbox_FramebufferWindowSet"); }
 void xbox_FramebufferWindowStart(void) { STUB_HIT("xbox_FramebufferWindowStart"); }
-void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; STUB_HIT("xbox_FramebufferWindowFrameStats"); }
+void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 { (void)fb_va; (void)pitch; STUB_HIT("xbox_FramebufferWindowPresent"); }
+int xbox_PhysicalAddressResolve(uint32_t physical_address, uint32_t bytes, uint32_t *guest_va)
+{ (void)physical_address; (void)bytes; (void)guest_va; STUB_HIT("xbox_PhysicalAddressResolve"); return 0; }
 
 static unsigned allocation_count, fail_allocation;
+static unsigned realloc_count, fail_reallocation;
+static unsigned calloc_count, fail_calloc;
+static DWORD test_tick;
+static DWORD test_get_tick_count(void) { return test_tick; }
 static void *test_malloc(size_t size)
 {
     if (++allocation_count == fail_allocation) return NULL;
     return malloc(size);
 }
+static void *test_realloc(void *ptr, size_t size)
+{
+    if (++realloc_count == fail_reallocation) return NULL;
+    return realloc(ptr, size);
+}
+static void *test_calloc(size_t count, size_t size)
+{
+    if (++calloc_count == fail_calloc) return NULL;
+    return calloc(count, size);
+}
 #define malloc test_malloc
+#define realloc test_realloc
+#define calloc test_calloc
+#define GetTickCount test_get_tick_count
 #include "../../src/kernel/nv2a_pb_exec.c"
 #undef malloc
+#undef realloc
+#undef calloc
+#undef GetTickCount
 
 static int failures;
 #define CHECK_EQ(name, got, want) do { \
     uint32_t g_ = (uint32_t)(got), w_ = (uint32_t)(want); \
     if (g_ != w_) { fprintf(stderr, "FAIL %s: got %u want %u\n", name, g_, w_); failures++; } \
 } while (0)
+
+static void test_even_tick_interpolation_timestamp(void)
+{
+    test_tick = 2000;
+    nv2a_pb_interp_enable(1);
+    CHECK_EQ("even tick starts interpolation", interp_on(), 1);
+    test_tick = 2249;
+    CHECK_EQ("interpolation remains enabled for 249ms", interp_on(), 1);
+    test_tick = 2250;
+    CHECK_EQ("interpolation expires at 250ms", interp_on(), 0);
+    nv2a_pb_interp_enable(0);
+}
 
 static void test_state_snapshot(void)
 {
@@ -201,9 +237,181 @@ static void test_border(void)
     CHECK_EQ("v border colour", argb, 0xFF112233u);
 }
 
+static void test_replay_state(void)
+{
+    const uint32_t recorded_color = 0xFF112233u, next_color = 0xFFAABBCCu;
+    NvD3DAttrib attr[NV_VERTEX_ATTRS] = {0};
+    uint8_t vertex[16] = {0};
+
+    /* The first frame inherits clear color from its predecessor. The test
+     * begins recording at a frame boundary and captures only the clear. */
+    test_tick = 3000;
+    nv2a_pb_interp_enable(0);
+    pb_discard_recording();
+    nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+    nv2a_pb_exec_method(0, 0x1D90, recorded_color);
+    nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+    nv2a_pb_interp_enable(1);
+    CHECK_EQ("interpolation enabled before capture", interp_on(), 1);
+    nv2a_pb_exec_method(0, NV097_CLEAR_SURFACE, 0);
+    CHECK_EQ("recording captures method", s_rec_f->ncmd > 0, 1);
+    CHECK_EQ("recorded clear uses inherited color", replay_observed_color, recorded_color);
+    nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+    CHECK_EQ("recorded completed frame is valid", s_last_f->invalid, 0);
+    CHECK_EQ("recorded completed frame has start state", s_last_f->start_valid, 1);
+    CHECK_EQ("recorded completed frame has commands", s_last_f->ncmd > 0, 1);
+    CHECK_EQ("recorded completed frame has pair mask", s_last_f->has != NULL, 1);
+
+    /* The next frame has already changed executor state when the prior frame
+     * is replayed between guest commands. Replay must temporarily load the
+     * recorded frame's starting state, then restore this newer state. */
+    nv2a_pb_exec_method(0, 0x1D90, next_color);
+    CHECK_EQ("next-frame color is installed", s_gpu.clear_color, next_color);
+    CHECK_EQ("recorded frame replays", nv2a_pb_replay(1.0f), 1);
+    CHECK_EQ("replay clear uses recorded inherited color", replay_observed_color, recorded_color);
+    CHECK_EQ("replay restores in-progress next-frame color", s_gpu.clear_color, next_color);
+
+    /* If interpolation is enabled after this frame has already begun, its
+     * recorded suffix is incomplete and must never be offered for replay. */
+    nv2a_pb_interp_enable(0);
+    pb_discard_recording();
+    nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+    nv2a_pb_exec_method(0, 0x1D90, recorded_color);
+    nv2a_pb_interp_enable(1);
+    nv2a_pb_exec_method(0, NV097_CLEAR_SURFACE, 0);
+    nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+    CHECK_EQ("mid-frame activation refuses a partial replay", nv2a_pb_replay(1.0f), 0);
+
+    /* A recording can also become incomplete if interpolation expires or is
+     * disabled after its first methods, then is re-enabled before the flip. */
+    test_tick = 4000;
+    nv2a_pb_interp_enable(0);
+    pb_discard_recording();
+    nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+    nv2a_pb_interp_enable(1);
+    nv2a_pb_exec_method(0, 0x1D90, recorded_color);
+    nv2a_pb_interp_enable(0);
+    nv2a_pb_exec_method(0, NV097_CLEAR_SURFACE, 0);
+    nv2a_pb_interp_enable(1);
+    nv2a_pb_exec_method(0, 0x1D90, next_color);
+    nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+    CHECK_EQ("disable and re-enable invalidates partial recording", s_last_f->invalid, 1);
+    CHECK_EQ("partial recording after re-enable is not replayed", nv2a_pb_replay(1.0f), 0);
+
+    /* The method can be recorded at dispatch entry while its draw payload is
+     * captured later. Expiration between those points must invalidate it. */
+    test_tick = 6000;
+    nv2a_pb_interp_enable(0);
+    pb_discard_recording();
+    nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+    nv2a_pb_interp_enable(1);
+    nv2a_pb_exec_method(0, 0x1D90, recorded_color);
+    test_tick = 6250;
+    attr[0] = (NvD3DAttrib){ 1, 2, 4, 16, vertex };
+    pb_draw_vertices(attr, 0, 0);
+    CHECK_EQ("expired vertex capture invalidates in-progress frame", s_rec_f->invalid, 1);
+    nv2a_pb_interp_enable(1);
+    nv2a_pb_exec_method(0, 0x1D90, next_color);
+    nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+    CHECK_EQ("expired vertex-capture frame remains invalid", s_last_f->invalid, 1);
+    CHECK_EQ("expired vertex-capture frame is not replayed", nv2a_pb_replay(1.0f), 0);
+    CHECK_EQ("real flip stalls were exercised", test_frame_flips > 0, 1);
+}
+
+static void test_invalid_predecessor_clears_pair_mask(void)
+{
+    PbFrame later = {0}, previous = {0};
+    PbSeg later_seg = { 0x1234, 0, 0, 1 }, previous_seg = { 0x1234, 0, 0, 1 };
+    uint32_t later_word = 0x3F800000u, previous_word = 0x3F800000u;
+
+    later.tc = &later_word;
+    previous.tc = &previous_word;
+    later.seg = &later_seg;
+    previous.seg = &previous_seg;
+    later.ntc = previous.ntc = later.nseg = previous.nseg = 1;
+    later.has = (uint8_t *)malloc(1);
+    if (!later.has) { failures++; return; }
+    *later.has = 0;
+
+    pb_pair(&later, &previous);
+    CHECK_EQ("valid predecessor pairs constants", later.has[0], 1);
+    previous.invalid = 1;
+    pb_pair(&later, &previous);
+    CHECK_EQ("invalid predecessor clears reused pair mask", later.has[0], 0);
+    previous.invalid = 0;
+    pb_pair(&later, &previous);
+    CHECK_EQ("valid predecessor pairs after invalid frame", later.has[0], 1);
+    free(later.prev);
+    free(later.has);
+}
+
+static void test_recording_allocation_failures(void)
+{
+    NvD3DAttrib attr[NV_VERTEX_ATTRS] = {0};
+    uint8_t vertex[16] = {0};
+    unsigned stage;
+
+    for (stage = 0; stage < 4; ++stage) {
+        test_tick = 5000 + stage;
+        nv2a_pb_interp_enable(0);
+        pb_discard_recording();
+        nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+        nv2a_pb_interp_enable(1);
+        fail_allocation = fail_reallocation = fail_calloc = 0;
+        realloc_count = calloc_count = 0;
+
+        /* The first recorded method exercises pb_record's command growth. */
+        if (stage == 0) {
+            realloc_count = 0;
+            fail_reallocation = 1;
+            nv2a_pb_exec_method(0, 0x1D90, 0xFF112233u);
+            fail_reallocation = 0;
+        } else {
+            nv2a_pb_exec_method(0, 0x1D90, 0xFF112233u);
+            if (stage == 1) {
+                /* A recorded constant causes pb_segment to grow its words. */
+                nv2a_pb_exec_method(0, 0x0B80, 0x3F800000u);
+                realloc_count = 0;
+                fail_reallocation = 1;
+            } else {
+                attr[0] = (NvD3DAttrib){ 1, 2, 4, 16, vertex };
+                realloc_count = 0;
+                fail_reallocation = stage == 2 ? 1 : 2;
+                pb_draw_vertices(attr, 0, 0);
+            }
+        }
+        nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+        fail_reallocation = fail_calloc = 0;
+        CHECK_EQ("allocation failure invalidates incomplete frame", s_last_f->invalid, 1);
+        CHECK_EQ("incomplete frame is not replayed", nv2a_pb_replay(0.5f), 0);
+    }
+}
+
+static void test_first_frame_captures_initialized_state(void)
+{
+    uint32_t mask = 0;
+    test_tick = 7000;
+    nv2a_pb_interp_enable(1);
+    nv2a_pb_exec_method(0, NV097_CLEAR_SURFACE, 0);
+    nv2a_pb_exec_method(0, NV097_FLIP_STALL, 0);
+    CHECK_EQ("first recorded frame is replayable", nv2a_pb_replay(1.0f), 1);
+    if (s_last_f->start && s_last_f->start->tail)
+        memcpy(&mask, s_last_f->start->tail + GPU_AT(color_mask) - GPU_AT(inline_count), sizeof mask);
+    CHECK_EQ("first snapshot includes executor defaults", mask, 0x01010101u);
+}
+
 int main(int argc, char **argv)
 {
     const char *which = argc > 1 ? argv[1] : "all";
+
+    test_even_tick_interpolation_timestamp();
+
+    if (strcmp(which, "first-frame") == 0) {
+        test_first_frame_captures_initialized_state();
+        if (failures) return 1;
+        puts("nv2a-texaddr: first-frame passed");
+        return 0;
+    }
 
     test_state_snapshot();
 
@@ -224,6 +432,13 @@ int main(int argc, char **argv)
         test_wrap_and_mirror();
     if (strcmp(which, "border") == 0 || strcmp(which, "all") == 0)
         test_border();
+    if (strcmp(which, "replay") == 0)
+    {
+        test_replay_state();
+        test_invalid_predecessor_clears_pair_mask();
+    }
+    if (strcmp(which, "allocation") == 0)
+        test_recording_allocation_failures();
 
     if (failures) {
         fprintf(stderr, "nv2a-texaddr: %d failure(s)\n", failures);
