@@ -2026,6 +2026,18 @@ class FunctionTranslator:
 
         self.lifter.imm_code_refs = imm_refs
 
+        # Linear decoding can swallow a direct target inside another
+        # instruction. Both streams are legal x86: resync would delete the
+        # fallthrough instruction, so recover both paths from their CFG edges.
+        starts = {insn.address for insn in instructions}
+        if any(insn.jump_target is not None
+               and start <= insn.jump_target < end
+               and insn.jump_target not in starts for insn in instructions):
+            instructions = self.disasm.disassemble_cfg(
+                raw_bytes, start, end, {start, *switch_leaders, *imm_refs},
+                stop_mnemonics=("ud2", "hlt", "iret", "iretd")
+                if coalesced else ("iret", "iretd"))
+
         # Build basic blocks
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
@@ -2427,8 +2439,8 @@ class FunctionTranslator:
                 "jmp", "ud2", "hlt", "iret", "iretd")
                       or (last.mnemonic == "int3"
                           and last.address not in debug_slide_int3s))
-            if not leaves and i + 1 < len(blocks):
-                preds[blocks[i + 1].start].add(bb.start)
+            if not leaves and last.end_address in preds:
+                preds[last.end_address].add(bb.start)
 
         # Settle the flag state before emitting anything.
         #
@@ -2485,8 +2497,9 @@ class FunctionTranslator:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
                 unseen_entries.update(self.lifter._analyze_switch_table(insn.operands))
         edge_vars, edge_sets, block_lines = [], [], {}
+        block_starts = {bb.start for bb in blocks}
 
-        for bb in blocks:
+        for block_index, bb in enumerate(blocks):
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
                 # The trailing ';' is load-bearing: C requires a statement after
@@ -2531,6 +2544,14 @@ class FunctionTranslator:
             last = bb.instructions[-1] if bb.instructions else None
             block_lines[bb.start] = (first, len(lines),
                                      bool(last and (last.is_branch or last.is_ret)))
+            # C emission order need not match either overlapping guest stream.
+            # Make the not-taken/sequential edge explicit when they differ.
+            if (last is not None and not last.is_ret and not last.is_jump
+                    and last.mnemonic not in ("ud2", "hlt", "iret", "iretd")
+                    and last.end_address in block_starts
+                    and (block_index + 1 == len(blocks)
+                         or blocks[block_index + 1].start != last.end_address)):
+                lines.append(f"    goto loc_{last.end_address:08X}; /* guest fallthrough */")
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
             if bypass is not None:
                 lines.append(
@@ -2577,7 +2598,7 @@ class FunctionTranslator:
 
         # Validate: goto targets that reference missing labels (dead code after
         # unconditional jumps may reference non-existent labels) become
-        # RECOMP_DEAD_BRANCH, which reports a reached one and falls through.
+        # RECOMP_DEAD_BRANCH, which reports and stops a residual reached one.
         import re
         defined_labels = set()
         goto_lines = []
