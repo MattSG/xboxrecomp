@@ -255,11 +255,23 @@ typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
 
 #define W32_MAX_APC 16
 
-typedef struct w32_object {
+typedef struct w32_object w32_object;
+typedef enum { W32_APC_USER, W32_APC_TIMER } w32_apc_kind;
+typedef struct {
+    w32_apc_kind kind;
+    PAPCFUNC user_func;
+    ULONG_PTR user_data;
+    w32_object *timer;
+    ULONGLONG timer_generation;
+} w32_apc;
+
+struct w32_object {
     w32_kind        kind;
     LONG            refcount;
     pthread_mutex_t lock;
     pthread_cond_t  cond;
+    pthread_cond_t  waitable_cond;
+    int             waitable_cond_monotonic;
 
     /* event */
     int             signaled;
@@ -284,8 +296,7 @@ typedef struct w32_object {
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
-    PAPCFUNC        apc_func[W32_MAX_APC];
-    ULONG_PTR       apc_data[W32_MAX_APC];
+    w32_apc         apcs[W32_MAX_APC];
     int             apc_count;
 
     /* timer-queue timer */
@@ -298,14 +309,26 @@ typedef struct w32_object {
     /* waitable timer */
     int             waitable_manual_reset;
     struct timespec waitable_due_time;
+    clockid_t       waitable_clock;
     int             waitable_triggered;
     int             waitable_armed;
+    LONG            waitable_period;
+    PTIMERAPCROUTINE waitable_completion;
+    PVOID           waitable_arg;
+    LONGLONG        waitable_apc_due;
+    w32_object     *waitable_apc_owner;
+    ULONGLONG       waitable_generation;
+    int             waitable_apc_queued;
+    int             waitable_apc_due_pending;
+    int             waitable_registered;
+    LONG            waitable_handle_count;
+    w32_object     *waitable_next;
 
     /* file mapping / fd-backed file handle */
     int             fd;
     SIZE_T          map_size;
     char           *file_path;
-} w32_object;
+};
 
 /* pseudo handles for "current thread"/"current process" */
 #define PSEUDO_CURRENT_PROCESS ((HANDLE)(LONG_PTR)-1)
@@ -315,6 +338,14 @@ typedef struct w32_object {
 static __thread w32_object *t_self_obj = NULL;
 static __thread DWORD       t_tid      = 0;
 static volatile LONG        s_next_tid = 1000;
+static pthread_mutex_t s_waitable_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static w32_object *s_waitable_registry;
+static pthread_key_t s_apc_context_key;
+static pthread_once_t s_apc_context_once = PTHREAD_ONCE_INIT;
+
+static void service_waitable_timers(void);
+static void cancel_thread_timers(w32_object *thread);
+static int timespec_before(const struct timespec *a, const struct timespec *b);
 
 DWORD GetCurrentThreadId(void)
 {
@@ -330,10 +361,20 @@ HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
+    if (!o) return NULL;
     o->kind     = kind;
     o->refcount = 1;
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
+#if defined(__linux__)
+    pthread_condattr_t waitable_attr;
+    pthread_condattr_init(&waitable_attr);
+    o->waitable_cond_monotonic = pthread_condattr_setclock(&waitable_attr, CLOCK_MONOTONIC) == 0;
+    pthread_cond_init(&o->waitable_cond, o->waitable_cond_monotonic ? &waitable_attr : NULL);
+    pthread_condattr_destroy(&waitable_attr);
+#else
+    pthread_cond_init(&o->waitable_cond, NULL);
+#endif
     pthread_cond_init(&o->gate, NULL);
     return o;
 }
@@ -352,8 +393,206 @@ static void obj_release(w32_object *o)
     }
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
+    pthread_cond_destroy(&o->waitable_cond);
     pthread_cond_destroy(&o->gate);
     free(o);
+}
+
+static void apc_context_destroy(void *value)
+{
+    w32_object *o = (w32_object *)value;
+    if (!o) return;
+    cancel_thread_timers(o);
+    obj_release(o);
+}
+
+static void make_apc_context_key(void)
+{
+    pthread_key_create(&s_apc_context_key, apc_context_destroy);
+}
+
+static w32_object *current_apc_object(void)
+{
+    if (t_self_obj) return t_self_obj;
+    pthread_once(&s_apc_context_once, make_apc_context_key);
+    w32_object *o = pthread_getspecific(s_apc_context_key);
+    if (!o) {
+        o = obj_alloc(K_THREAD);
+        if (!o) return NULL;
+        o->tid = GetCurrentThreadId();
+        if (pthread_setspecific(s_apc_context_key, o) != 0) {
+            obj_release(o);
+            return NULL;
+        }
+    }
+    return o;
+}
+
+static void timer_remove_apcs_locked(w32_object *timer, w32_object *owner)
+{
+    if (!owner) return;
+    pthread_mutex_lock(&owner->lock);
+    for (int i = 0; i < owner->apc_count;) {
+        w32_apc *entry = &owner->apcs[i];
+        if (entry->kind == W32_APC_TIMER && entry->timer == timer) {
+            memmove(entry, entry + 1,
+                    (size_t)(owner->apc_count - i - 1) * sizeof(*entry));
+            owner->apc_count--;
+            obj_release(timer); /* queued APC reference; caller still owns one */
+        } else {
+            i++;
+        }
+    }
+    pthread_mutex_unlock(&owner->lock);
+}
+
+static void timer_register_locked(w32_object *timer)
+{
+    if (timer->waitable_registered || !timer->waitable_armed) return;
+    timer->waitable_next = s_waitable_registry;
+    s_waitable_registry = timer;
+    timer->waitable_registered = 1;
+    InterlockedIncrement(&timer->refcount); /* registry reference */
+}
+
+static int timer_unlink_locked(w32_object *timer)
+{
+    w32_object **link = &s_waitable_registry;
+    while (*link && *link != timer) link = &(*link)->waitable_next;
+    if (!*link) return 0;
+    *link = timer->waitable_next;
+    timer->waitable_next = NULL;
+    timer->waitable_registered = 0;
+    return 1;
+}
+
+static int timer_refresh_locked(w32_object *timer)
+{
+    if (!timer->waitable_armed || timer->waitable_triggered) return timer->waitable_triggered;
+    struct timespec now;
+    clock_gettime(timer->waitable_clock, &now);
+    if (timespec_before(&now, &timer->waitable_due_time)) return 0;
+    timer->waitable_triggered = 1;
+    return 1;
+}
+
+/* Both ordinary object waits and waitable-timer waits share timer state. */
+static void timer_notify_locked(w32_object *timer)
+{
+    pthread_cond_broadcast(&timer->cond);
+    pthread_cond_broadcast(&timer->waitable_cond);
+}
+
+static void timer_add_period(struct timespec *due, LONG period, const struct timespec *now)
+{
+    int64_t behind_sec = (int64_t)now->tv_sec - (int64_t)due->tv_sec;
+    int64_t behind_ms = behind_sec * 1000 + (now->tv_nsec - due->tv_nsec) / 1000000;
+    int64_t steps = behind_ms >= 0 ? behind_ms / period + 1 : 1;
+    int64_t advance_ms = steps * period;
+    due->tv_sec += (time_t)(advance_ms / 1000);
+    due->tv_nsec += (long)(advance_ms % 1000) * 1000000L;
+    if (due->tv_nsec >= 1000000000L) { due->tv_sec++; due->tv_nsec -= 1000000000L; }
+}
+
+/* Registry is always acquired before timer/APC locks. Never call while holding an object lock. */
+static void service_waitable_timers(void)
+{
+    pthread_mutex_lock(&s_waitable_registry_lock);
+    w32_object **link = &s_waitable_registry;
+    while (*link) {
+        w32_object *timer = *link;
+        pthread_mutex_lock(&timer->lock);
+        int expired = 0;
+        if (timer->waitable_armed) {
+            struct timespec now;
+            clock_gettime(timer->waitable_clock, &now);
+            expired = !timespec_before(&now, &timer->waitable_due_time);
+        }
+        if (expired) {
+            timer->waitable_triggered = 1;
+            /* A timer has at most one completion APC outstanding. Expiries
+             * while that APC is queued are coalesced, not replayed later. */
+            if (timer->waitable_completion && timer->waitable_apc_owner &&
+                !timer->waitable_apc_queued && !timer->waitable_apc_due_pending) {
+                timer->waitable_apc_due_pending = 1;
+                struct timespec realtime;
+                clock_gettime(CLOCK_REALTIME, &realtime);
+                timer->waitable_apc_due =
+                    ((LONGLONG)realtime.tv_sec + 11644473600LL) * 10000000LL +
+                    realtime.tv_nsec / 100LL;
+            }
+            if (timer->waitable_period > 0) {
+                struct timespec now;
+                clock_gettime(timer->waitable_clock, &now);
+                timer_add_period(&timer->waitable_due_time, timer->waitable_period, &now);
+            } else {
+                timer->waitable_armed = 0;
+            }
+        }
+        if (timer->waitable_apc_due_pending && timer->waitable_completion &&
+            timer->waitable_apc_owner && !timer->waitable_apc_queued) {
+            w32_object *owner = timer->waitable_apc_owner;
+            pthread_mutex_lock(&owner->lock);
+            if (owner->apc_count < W32_MAX_APC) {
+                w32_apc *entry = &owner->apcs[owner->apc_count++];
+                memset(entry, 0, sizeof(*entry));
+                entry->kind = W32_APC_TIMER;
+                entry->timer = timer;
+                entry->timer_generation = timer->waitable_generation;
+                timer->waitable_apc_queued = 1;
+                timer->waitable_apc_due_pending = 0;
+                InterlockedIncrement(&timer->refcount);
+                pthread_cond_broadcast(&owner->cond);
+            }
+            pthread_mutex_unlock(&owner->lock);
+        }
+        timer_notify_locked(timer);
+        if (!timer->waitable_armed && !timer->waitable_apc_queued &&
+            !timer->waitable_apc_due_pending) {
+            *link = timer->waitable_next;
+            timer->waitable_next = NULL;
+            timer->waitable_registered = 0;
+            pthread_mutex_unlock(&timer->lock);
+            obj_release(timer); /* registry reference, still under registry lock */
+        } else {
+            pthread_mutex_unlock(&timer->lock);
+            link = &timer->waitable_next;
+        }
+    }
+    pthread_mutex_unlock(&s_waitable_registry_lock);
+}
+
+static void cancel_thread_timers(w32_object *thread)
+{
+    pthread_mutex_lock(&s_waitable_registry_lock);
+    w32_object **link = &s_waitable_registry;
+    while (*link) {
+        w32_object *timer = *link;
+        pthread_mutex_lock(&timer->lock);
+        if (timer->waitable_apc_owner == thread && timer->waitable_completion) {
+            timer_refresh_locked(timer);
+            timer->waitable_armed = 0;
+            timer->waitable_completion = NULL;
+            timer->waitable_apc_owner = NULL;
+            timer->waitable_apc_queued = 0;
+            timer->waitable_apc_due_pending = 0;
+            timer->waitable_generation++;
+            timer_remove_apcs_locked(timer, thread);
+            timer_notify_locked(timer);
+        }
+        if (!timer->waitable_armed && !timer->waitable_apc_queued &&
+            !timer->waitable_apc_due_pending) {
+            *link = timer->waitable_next;
+            timer->waitable_next = NULL;
+            timer->waitable_registered = 0;
+            pthread_mutex_unlock(&timer->lock);
+            obj_release(timer); /* registry reference, still under registry lock */
+        } else {
+            pthread_mutex_unlock(&timer->lock);
+            link = &timer->waitable_next;
+        }
+    }
+    pthread_mutex_unlock(&s_waitable_registry_lock);
 }
 
 /* ---- fd-backed file handle (for the file-I/O HLE) -------------------- */
@@ -382,7 +621,27 @@ BOOL CloseHandle(HANDLE h)
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
         h == INVALID_HANDLE_VALUE)
         return TRUE;
-    obj_release((w32_object *)h);
+    w32_object *o = (w32_object *)h;
+    if (o->kind == K_WAITABLE_TIMER) {
+        int drop_registry = 0;
+        pthread_mutex_lock(&s_waitable_registry_lock);
+        pthread_mutex_lock(&o->lock);
+        if (--o->waitable_handle_count == 0) {
+            if (!o->waitable_completion) {
+                timer_refresh_locked(o);
+                o->waitable_armed = 0;
+                o->waitable_generation++;
+                o->waitable_apc_queued = 0;
+                o->waitable_apc_due_pending = 0;
+                drop_registry = timer_unlink_locked(o);
+            }
+        }
+        timer_notify_locked(o);
+        pthread_mutex_unlock(&o->lock);
+        pthread_mutex_unlock(&s_waitable_registry_lock);
+        if (drop_registry) obj_release(o);
+    }
+    obj_release(o);
     return TRUE;
 }
 
@@ -395,10 +654,17 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
     w32_object *o = (w32_object *)src;
-    InterlockedIncrement(&o->refcount);
+    if (o->kind == K_WAITABLE_TIMER) {
+        pthread_mutex_lock(&s_waitable_registry_lock);
+        o->waitable_handle_count++;
+        InterlockedIncrement(&o->refcount);
+        pthread_mutex_unlock(&s_waitable_registry_lock);
+    } else {
+        InterlockedIncrement(&o->refcount);
+    }
     *dst = src;
     if (options & DUPLICATE_CLOSE_SOURCE)
-        obj_release(o);
+        CloseHandle(src);
     return TRUE;
 }
 
@@ -411,21 +677,44 @@ static void deadline_from_ms(DWORD ms, struct timespec *ts)
     if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
 }
 
-/* Run any pending user-APCs for the calling thread. Returns count run. */
+/* Run pending user/timer APCs for the calling thread. Returns count run. */
 static int drain_apcs(void)
 {
-    w32_object *o = t_self_obj;
+    w32_object *o = current_apc_object();
     int run = 0;
     if (!o) return 0;
     pthread_mutex_lock(&o->lock);
     while (o->apc_count > 0) {
-        PAPCFUNC  f = o->apc_func[0];
-        ULONG_PTR d = o->apc_data[0];
-        memmove(o->apc_func, o->apc_func + 1, sizeof(PAPCFUNC) * (o->apc_count - 1));
-        memmove(o->apc_data, o->apc_data + 1, sizeof(ULONG_PTR) * (o->apc_count - 1));
+        w32_apc entry = o->apcs[0];
+        memmove(o->apcs, o->apcs + 1, sizeof(w32_apc) * (o->apc_count - 1));
         o->apc_count--;
         pthread_mutex_unlock(&o->lock);
-        f(d);
+        if (entry.kind == W32_APC_USER) {
+            if (entry.user_func) entry.user_func(entry.user_data);
+        } else {
+            w32_object *timer = entry.timer;
+            PTIMERAPCROUTINE callback = NULL;
+            PVOID arg = NULL;
+            DWORD low = 0, high = 0;
+            pthread_mutex_lock(&timer->lock);
+            if (timer->waitable_generation == entry.timer_generation &&
+                timer->waitable_apc_owner == o && timer->waitable_completion &&
+                timer->waitable_apc_queued) {
+                callback = timer->waitable_completion;
+                arg = timer->waitable_arg;
+                low = (DWORD)(ULONGLONG)timer->waitable_apc_due;
+                high = (DWORD)((ULONGLONG)timer->waitable_apc_due >> 32);
+                timer->waitable_apc_queued = 0;
+                if (!timer->waitable_armed && timer->waitable_period == 0) {
+                    timer->waitable_completion = NULL;
+                    timer->waitable_apc_owner = NULL;
+                }
+            }
+            pthread_mutex_unlock(&timer->lock);
+            if (callback) callback(arg, low, high);
+            obj_release(timer); /* queued APC reference */
+            service_waitable_timers();
+        }
         run++;
         pthread_mutex_lock(&o->lock);
     }
@@ -442,86 +731,148 @@ static int timespec_before(const struct timespec *a, const struct timespec *b)
  * signalled until it is set or cancelled again. Caller holds o->lock. */
 static int waitable_due(w32_object *o)
 {
-    struct timespec now;
-    if (o->waitable_triggered) return 1;
-    if (!o->waitable_armed) return 0;
-    clock_gettime(CLOCK_REALTIME, &now);
-    if (timespec_before(&now, &o->waitable_due_time)) return 0;
-    o->waitable_triggered = 1;
-    return 1;
+    return timer_refresh_locked(o);
+}
+
+static int object_ready_locked(w32_object *o)
+{
+    switch (o->kind) {
+    case K_EVENT: return o->signaled;
+    case K_THREAD: return o->exited;
+    case K_SEM: return o->sem_count > 0;
+    case K_MUTEX: return o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId();
+    case K_WAITABLE_TIMER: return waitable_due(o);
+    default: return 1;
+    }
+}
+
+static void object_consume_locked(w32_object *o)
+{
+    switch (o->kind) {
+    case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+    case K_WAITABLE_TIMER:
+        if (!o->waitable_manual_reset) o->waitable_triggered = 0;
+        break;
+    case K_SEM: o->sem_count--; break;
+    case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
+    default: break;
+    }
 }
 
 /*
  * Wait on a single object. The object lock must NOT be held.
  * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
  */
-static DWORD wait_single(w32_object *o, DWORD ms)
+static DWORD wait_single_impl(w32_object *o, DWORD ms, int consume)
 {
-    struct timespec ts;
+    struct timespec ts = {0, 0};
     int timed = (ms != INFINITE);
-    if (timed) deadline_from_ms(ms, &ts);
-
-    pthread_mutex_lock(&o->lock);
-    DWORD result = WAIT_OBJECT_0;
+    int timer_wait = o->kind == K_WAITABLE_TIMER;
+    clockid_t timeout_clock = timer_wait && o->waitable_cond_monotonic
+                            ? CLOCK_MONOTONIC : CLOCK_REALTIME;
+    if (timed) {
+        clock_gettime(timeout_clock, &ts);
+        ts.tv_sec += ms / 1000;
+        ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    }
 
     for (;;) {
-        int ready = 0;
-        switch (o->kind) {
-        case K_EVENT:  ready = o->signaled; break;
-        case K_THREAD: ready = o->exited;   break;
-        case K_SEM:    ready = (o->sem_count > 0); break;
-        case K_MUTEX:
-            ready = (o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId());
-            break;
-        case K_WAITABLE_TIMER: ready = waitable_due(o); break;
-        default:       ready = 1; break;
+        service_waitable_timers();
+        pthread_mutex_lock(&o->lock);
+        int ready = object_ready_locked(o);
+        if (ready) {
+            if (consume) object_consume_locked(o);
+            pthread_mutex_unlock(&o->lock);
+            service_waitable_timers();
+            return WAIT_OBJECT_0;
         }
-        if (ready) break;
+        struct timespec now;
+        clock_gettime(timeout_clock, &now);
+        if (timed && !timespec_before(&now, &ts)) {
+            pthread_mutex_unlock(&o->lock);
+            service_waitable_timers();
+            return WAIT_TIMEOUT;
+        }
 
-        /* An armed timer has its own deadline. Waiting on the caller's alone
-         * would sleep straight past the due time, so take whichever comes
-         * first and re-test. */
+        /* Timer/APC state is serviced outside object locks, so cap sleeps to
+         * keep the deadline visible without introducing registry lock inversions. */
         struct timespec until = ts;
         int bounded = timed;
-        if (o->kind == K_WAITABLE_TIMER && o->waitable_armed &&
-            (!timed || timespec_before(&o->waitable_due_time, &ts))) {
+        int use_timer_deadline = timer_wait && o->waitable_armed &&
+                                 o->waitable_clock == timeout_clock;
+        if (timer_wait && o->waitable_armed && !use_timer_deadline) {
+            struct timespec poll = now;
+            poll.tv_nsec += 5000000L;
+            if (poll.tv_nsec >= 1000000000L) { poll.tv_sec++; poll.tv_nsec -= 1000000000L; }
+            if (!bounded || timespec_before(&poll, &until)) until = poll;
+            bounded = 1;
+        } else if (use_timer_deadline &&
+                   (!bounded || timespec_before(&o->waitable_due_time, &until))) {
             until = o->waitable_due_time;
             bounded = 1;
         }
-        int rc = bounded ? pthread_cond_timedwait(&o->cond, &o->lock, &until)
-                         : pthread_cond_wait(&o->cond, &o->lock);
-        if (rc == ETIMEDOUT && timed && !timespec_before(&until, &ts)) {
-            result = WAIT_TIMEOUT; break;
-        }
+        int rc = bounded ? pthread_cond_timedwait(timer_wait ? &o->waitable_cond : &o->cond,
+                                                  &o->lock, &until)
+                         : pthread_cond_wait(timer_wait ? &o->waitable_cond : &o->cond,
+                                             &o->lock);
+        pthread_mutex_unlock(&o->lock);
+        (void)rc;
     }
+}
 
-    if (result == WAIT_OBJECT_0) {
-        switch (o->kind) {
-        case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
-        case K_WAITABLE_TIMER:
-            if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
-            break;
-        case K_SEM:   o->sem_count--; break;
-        case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
-        default: break;
-        }
-    }
-    pthread_mutex_unlock(&o->lock);
-    return result;
+static DWORD wait_single(w32_object *o, DWORD ms)
+{
+    return wait_single_impl(o, ms, 1);
 }
 
 DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
+    service_waitable_timers();
     return wait_single((w32_object *)h, ms);
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
 {
-    if (alertable && drain_apcs() > 0)
-        return WAIT_IO_COMPLETION;
-    return WaitForSingleObject(h, ms);
+    if (!alertable) return WaitForSingleObject(h, ms);
+    service_waitable_timers();
+    if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+        return drain_apcs() > 0 ? WAIT_IO_COMPLETION : WAIT_OBJECT_0;
+    struct timespec end = {0, 0};
+    int timed = ms != INFINITE;
+    if (timed) deadline_from_ms(ms, &end);
+    w32_object *o = (w32_object *)h;
+    for (;;) {
+        service_waitable_timers();
+        if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+        if (wait_single_impl(o, 0, 0) == WAIT_OBJECT_0) {
+            service_waitable_timers();
+            if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+            if (wait_single_impl(o, 0, 1) == WAIT_OBJECT_0) return WAIT_OBJECT_0;
+        }
+        DWORD slice = 5;
+        if (timed) {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            if (!timespec_before(&now, &end)) return WAIT_TIMEOUT;
+            int64_t left_ms = ((int64_t)end.tv_sec - now.tv_sec) * 1000 +
+                              (end.tv_nsec - now.tv_nsec + 999999) / 1000000;
+            if (left_ms < slice) slice = (DWORD)left_ms;
+        }
+        DWORD result = wait_single_impl(o, slice, 0);
+        service_waitable_timers();
+        if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+        if (result == WAIT_OBJECT_0) {
+            if (wait_single_impl(o, 0, 1) == WAIT_OBJECT_0) return WAIT_OBJECT_0;
+        }
+        if (timed) {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            if (!timespec_before(&now, &end)) return WAIT_TIMEOUT;
+        }
+    }
 }
 
 /*
@@ -536,23 +887,106 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, D
 DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                                DWORD ms, BOOL alertable)
 {
-    struct timespec ts;
+    if (!handles || count == 0 || count > MAXIMUM_WAIT_OBJECTS) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
+    for (DWORD i = 0; i < count; i++) {
+        if (!handles[i]) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return WAIT_FAILED;
+        }
+        for (DWORD j = 0; j < i; j++) {
+            if (handles[i] == handles[j]) {
+                SetLastError(ERROR_INVALID_PARAMETER);
+                return WAIT_FAILED;
+            }
+        }
+    }
+
+    struct timespec ts = {0, 0};
     int timed = (ms != INFINITE);
     if (timed) deadline_from_ms(ms, &ts);
 
+    w32_object *ordered[MAXIMUM_WAIT_OBJECTS];
+    if (waitAll) {
+        for (DWORD i = 0; i < count; i++) {
+            ordered[i] = (w32_object *)handles[i];
+        }
+        /* Insertion sort is bounded by MAXIMUM_WAIT_OBJECTS and gives every
+         * wait-all call the same lock order, including reversed arrays. */
+        for (DWORD i = 1; i < count; i++) {
+            w32_object *item = ordered[i];
+            DWORD j = i;
+            while (j > 0 && (uintptr_t)ordered[j - 1] > (uintptr_t)item) {
+                ordered[j] = ordered[j - 1];
+                j--;
+            }
+            ordered[j] = item;
+        }
+    }
+
     for (;;) {
+        service_waitable_timers();
         if (alertable && drain_apcs() > 0)
             return WAIT_IO_COMPLETION;
 
         if (waitAll) {
-            DWORD got = 0;
-            for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) got++;
-            if (got == count) return WAIT_OBJECT_0;
+            DWORD locked = 0;
+            for (; locked < count; locked++) {
+                if (ordered[locked] == (w32_object *)PSEUDO_CURRENT_PROCESS ||
+                    ordered[locked] == (w32_object *)PSEUDO_CURRENT_THREAD) continue;
+                pthread_mutex_lock(&ordered[locked]->lock);
+            }
+            int ready = 1;
+            for (DWORD i = 0; i < count; i++) {
+                if (handles[i] == PSEUDO_CURRENT_PROCESS || handles[i] == PSEUDO_CURRENT_THREAD) continue;
+                if (!object_ready_locked((w32_object *)handles[i])) { ready = 0; break; }
+            }
+            if (ready && alertable) {
+                for (DWORD i = count; i > 0; i--) {
+                    if (ordered[i - 1] == (w32_object *)PSEUDO_CURRENT_PROCESS ||
+                        ordered[i - 1] == (w32_object *)PSEUDO_CURRENT_THREAD) continue;
+                    pthread_mutex_unlock(&ordered[i - 1]->lock);
+                }
+                service_waitable_timers();
+                if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+                for (locked = 0; locked < count; locked++) {
+                    if (ordered[locked] == (w32_object *)PSEUDO_CURRENT_PROCESS ||
+                        ordered[locked] == (w32_object *)PSEUDO_CURRENT_THREAD) continue;
+                    pthread_mutex_lock(&ordered[locked]->lock);
+                }
+                for (DWORD i = 0; i < count; i++) {
+                    if (handles[i] == PSEUDO_CURRENT_PROCESS || handles[i] == PSEUDO_CURRENT_THREAD) continue;
+                    if (!object_ready_locked((w32_object *)handles[i])) { ready = 0; break; }
+                }
+            }
+            if (ready) {
+                for (DWORD i = 0; i < count; i++) {
+                    if (handles[i] == PSEUDO_CURRENT_PROCESS || handles[i] == PSEUDO_CURRENT_THREAD) continue;
+                    object_consume_locked((w32_object *)handles[i]);
+                }
+            }
+            for (DWORD i = count; i > 0; i--) {
+                if (ordered[i - 1] == (w32_object *)PSEUDO_CURRENT_PROCESS ||
+                    ordered[i - 1] == (w32_object *)PSEUDO_CURRENT_THREAD) continue;
+                pthread_mutex_unlock(&ordered[i - 1]->lock);
+            }
+            if (ready) return WAIT_OBJECT_0;
         } else {
-            for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0)
+            for (DWORD i = 0; i < count; i++) {
+                HANDLE h = handles[i];
+                int ready = h == PSEUDO_CURRENT_PROCESS || h == PSEUDO_CURRENT_THREAD;
+                if (!ready) ready = wait_single_impl((w32_object *)h, 0, 0) == WAIT_OBJECT_0;
+                if (ready) {
+                    service_waitable_timers();
+                    if (alertable && drain_apcs() > 0) return WAIT_IO_COMPLETION;
+                    if (h != PSEUDO_CURRENT_PROCESS && h != PSEUDO_CURRENT_THREAD &&
+                        wait_single_impl((w32_object *)h, 0, 1) != WAIT_OBJECT_0)
+                        continue;
                     return WAIT_OBJECT_0 + i;
+                }
+            }
         }
 
         if (timed) {
@@ -705,6 +1139,7 @@ static void *thread_trampoline(void *arg)
 
     DWORD rc = o->start ? o->start(o->start_param) : 0;
 
+    cancel_thread_timers(o);
     pthread_mutex_lock(&o->lock);
     o->exit_code = rc;
     o->exited    = 1;
@@ -712,6 +1147,7 @@ static void *thread_trampoline(void *arg)
     pthread_cond_broadcast(&o->cond);
     pthread_mutex_unlock(&o->lock);
 
+    t_self_obj = NULL;
     obj_release(o);   /* drop the trampoline's reference */
     return NULL;
 }
@@ -751,12 +1187,14 @@ VOID ExitThread(DWORD exitCode)
 {
     w32_object *o = t_self_obj;
     if (o) {
+        cancel_thread_timers(o);
         pthread_mutex_lock(&o->lock);
         o->exit_code = exitCode;
         o->exited    = 1;
         o->signaled  = 1;
         pthread_cond_broadcast(&o->cond);
         pthread_mutex_unlock(&o->lock);
+        t_self_obj = NULL;
         obj_release(o);
     }
     pthread_exit(NULL);
@@ -828,13 +1266,16 @@ VOID SwitchToThread(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
-    if (!o || o->kind != K_THREAD) return 0;
+    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? current_apc_object() : (w32_object *)thread;
+    if (!o || o->kind != K_THREAD || !func) return 0;
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
     if (o->apc_count < W32_MAX_APC) {
-        o->apc_func[o->apc_count] = func;
-        o->apc_data[o->apc_count] = data;
+        w32_apc *entry = &o->apcs[o->apc_count];
+        memset(entry, 0, sizeof(*entry));
+        entry->kind = W32_APC_USER;
+        entry->user_func = func;
+        entry->user_data = data;
         o->apc_count++;
         ok = 1;
     }
@@ -848,19 +1289,34 @@ DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 
 VOID Sleep(DWORD ms)
 {
-    if (ms == 0) { sched_yield(); return; }
+    if (ms == 0) { sched_yield(); service_waitable_timers(); return; }
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
+    service_waitable_timers();
 }
 
 DWORD SleepEx(DWORD ms, BOOL alertable)
 {
-    if (alertable && drain_apcs() > 0)
-        return WAIT_IO_COMPLETION;
-    Sleep(ms);
-    if (alertable && drain_apcs() > 0)
-        return WAIT_IO_COMPLETION;
-    return 0;
+    if (!alertable) { Sleep(ms); return 0; }
+    if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+    struct timespec end;
+    int timed = ms != INFINITE;
+    if (timed) deadline_from_ms(ms, &end);
+    for (;;) {
+        service_waitable_timers();
+        if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+        int64_t left_ns = 5000000LL;
+        if (timed) {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            if (!timespec_before(&now, &end)) return 0;
+            left_ns = ((int64_t)end.tv_sec - now.tv_sec) * 1000000000LL +
+                      end.tv_nsec - now.tv_nsec;
+            if (left_ns > 5000000LL) left_ns = 5000000LL;
+        }
+        struct timespec delay = { (time_t)(left_ns / 1000000000LL), (long)(left_ns % 1000000000LL) };
+        while (nanosleep(&delay, &delay) == -1 && errno == EINTR) { }
+    }
 }
 
 /* ===================================================================== */
@@ -974,6 +1430,7 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
     (void)name;
     w32_object *o = obj_alloc(K_WAITABLE_TIMER);
     o->waitable_manual_reset = manualReset;
+    o->waitable_handle_count = 1;
     return (HANDLE)o;
 }
 
@@ -981,46 +1438,89 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
                       PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
 {
     w32_object *o = (w32_object *)h;
-    (void)completion; (void)arg; (void)resume;
-    if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
-    pthread_mutex_lock(&o->lock);
-    /* Win32 100ns units: negative is relative to now, positive is an absolute
-     * FILETIME. ponytail: period is ignored -- one-shot only, revisit if a
-     * title actually arms a repeating timer. */
-    if (dueTime->QuadPart <= 0) {
-        clock_gettime(CLOCK_REALTIME, &o->waitable_due_time);
-        LONGLONG ns = -dueTime->QuadPart * 100LL;
-        o->waitable_due_time.tv_sec  += (time_t)(ns / 1000000000LL);
-        o->waitable_due_time.tv_nsec += (long)(ns % 1000000000LL);
-        if (o->waitable_due_time.tv_nsec >= 1000000000L) {
-            o->waitable_due_time.tv_sec++;
-            o->waitable_due_time.tv_nsec -= 1000000000L;
-        }
+    if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (period < 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    LONGLONG value = dueTime->QuadPart;
+    clockid_t clock = value < 0 ? CLOCK_MONOTONIC : CLOCK_REALTIME;
+    struct timespec deadline;
+    if (value < 0) {
+        uint64_t ticks = (uint64_t)(-(value + 1)) + 1;
+        uint64_t seconds = ticks / 10000000ULL;
+        uint64_t remainder = ticks % 10000000ULL;
+        clock_gettime(clock, &deadline);
+        deadline.tv_sec += (time_t)seconds;
+        deadline.tv_nsec += (long)(remainder * 100ULL);
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
     } else {
         /* FILETIME epoch is 1601-01-01; Unix is 1970-01-01. */
-        LONGLONG unix100ns = dueTime->QuadPart - 116444736000000000LL;
-        o->waitable_due_time.tv_sec  = (time_t)(unix100ns / 10000000LL);
-        o->waitable_due_time.tv_nsec = (long)((unix100ns % 10000000LL) * 100LL);
+        LONGLONG unix100ns = value - 116444736000000000LL;
+        LONGLONG seconds = unix100ns / 10000000LL;
+        LONGLONG remainder = unix100ns % 10000000LL;
+        if (remainder < 0) { seconds--; remainder += 10000000LL; }
+        deadline.tv_sec = (time_t)seconds;
+        deadline.tv_nsec = (long)(remainder * 100LL);
     }
-    (void)period;
+    w32_object *owner = completion ? current_apc_object() : NULL;
+    if (completion && !owner) {
+        SetLastError(8 /* ERROR_NOT_ENOUGH_MEMORY */);
+        return FALSE;
+    }
+
+    pthread_mutex_lock(&s_waitable_registry_lock);
+    pthread_mutex_lock(&o->lock);
+    timer_refresh_locked(o);
+    timer_remove_apcs_locked(o, o->waitable_apc_owner);
+    o->waitable_apc_queued = 0;
+    o->waitable_apc_due_pending = 0;
+    o->waitable_generation++;
+    o->waitable_clock = clock;
+    o->waitable_due_time = deadline;
+    o->waitable_period = period;
+    o->waitable_completion = completion;
+    o->waitable_arg = arg;
+    o->waitable_apc_due = value;
+    o->waitable_apc_owner = owner;
     o->waitable_armed = 1;
     o->waitable_triggered = 0;
+    timer_register_locked(o);
+    timer_notify_locked(o);
     pthread_mutex_unlock(&o->lock);
-    pthread_cond_broadcast(&o->cond);
+    pthread_mutex_unlock(&s_waitable_registry_lock);
+    if (resume) SetLastError(ERROR_NOT_SUPPORTED);
     return TRUE;
 }
 
 BOOL CancelWaitableTimer(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
+    if (!o || o->kind != K_WAITABLE_TIMER) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    pthread_mutex_lock(&s_waitable_registry_lock);
     pthread_mutex_lock(&o->lock);
-    o->waitable_triggered = 0;
+    timer_refresh_locked(o);
     o->waitable_armed = 0;
+    o->waitable_generation++;
+    timer_remove_apcs_locked(o, o->waitable_apc_owner);
+    o->waitable_apc_queued = 0;
+    o->waitable_apc_due_pending = 0;
+    o->waitable_completion = NULL;
+    o->waitable_apc_owner = NULL;
+    int drop_registry = timer_unlink_locked(o);
+    timer_notify_locked(o);
     pthread_mutex_unlock(&o->lock);
+    pthread_mutex_unlock(&s_waitable_registry_lock);
+    if (drop_registry) obj_release(o);
     return TRUE;
 }
-
 /* ===================================================================== */
 /* Heap (thin wrapper over malloc; the single process heap)              */
 /* ===================================================================== */
