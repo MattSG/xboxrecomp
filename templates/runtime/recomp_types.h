@@ -362,24 +362,18 @@ void recomp_icall_not_code_log(uint32_t va);
 
 /* A conditional jump whose target label is outside its function. The
  * translator emits RECOMP_DEAD_BRANCH for it (it used to be `(void)0`), and
- * the branch is reached only when its condition holds. Reporting only: the
- * caller falls through exactly as before, and the first hit per target is
- * logged. Each chunk keeps its own record (static inline, no link step), so a
- * target can log once per translation unit; a target lives in one function,
- * so in practice once. Define RECOMP_DEAD_BRANCH before this header to
+ * the branch is reached only when its condition holds. A residual target is
+ * missing translated code: report it and stop rather than execute the wrong
+ * fallthrough path. Define RECOMP_DEAD_BRANCH before this header to
  * route it elsewhere. */
 #ifndef RECOMP_DEAD_BRANCH
 #include <stdio.h>
+#include <stdlib.h>
 static inline void recomp_dead_branch_log(uint32_t target)
 {
-    static uint32_t seen[512];
-    static int n;
-    int i;
-    for (i = 0; i < n; i++)
-        if (seen[i] == target) return;
-    if (n < 512) seen[n++] = target;
-    fprintf(stderr, "[DEAD-BRANCH] taken jump to 0x%08X, label outside its function\n", target);
+    fprintf(stderr, "[DEAD-BRANCH] taken jump to 0x%08X, label outside its function; stopping\n", target);
     fflush(stderr);
+    abort();
 }
 #define RECOMP_DEAD_BRANCH(target) recomp_dead_branch_log(target)
 #endif

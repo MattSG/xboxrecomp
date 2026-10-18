@@ -328,16 +328,16 @@ class Disassembler:
         blocks = []
         for i, leader in enumerate(sorted_leaders):
             bb = BasicBlock(start=leader)
-            idx = addr_to_idx[leader]
+            address = leader
 
-            # Add instructions until next leader or terminator
-            next_leader = sorted_leaders[i + 1] if i + 1 < len(sorted_leaders) else func_end
-            while idx < len(instructions):
-                insn = instructions[idx]
-                if insn.address >= next_leader and insn.address != leader:
+            # Overlapping x86 streams have interleaved instruction starts.
+            # Follow the encoded length, never the next sorted instruction.
+            while address in addr_to_idx:
+                if address != leader and address in leaders:
                     break
+                insn = instructions[addr_to_idx[address]]
                 bb.instructions.append(insn)
-                idx += 1
+                address = insn.end_address
 
                 # Block ends at terminators
                 if insn.is_ret or insn.is_jump or insn.mnemonic in stop_mnemonics:
