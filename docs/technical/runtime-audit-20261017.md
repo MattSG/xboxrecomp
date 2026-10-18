@@ -82,6 +82,65 @@ The test embeds data; it does not download dependencies at runtime.
 
 ## 2026-10-18 execution updates
 
+- IRP allocation and initialization now use fixed-width guest layouts checked
+  by compiling pinned nxdk `14d5ee97e73347c973f1f57b68b79ec08c9e77f2`
+  headers for `i386-pc-win32`: IRP `0x68`, current stack pointer `0x5c`,
+  device `0x48`, device stack count `0x1e`. Ordinal 59 consumes one argument.
+  Complete device headers precede extensions; malformed names and invalid
+  initialization ranges fail without corrupting adjacent memory. Windows and
+  Linux Release dispatcher tests pass, covering initialized fields, stack
+  cleanup, free accounting, invalid packet preservation and device queue/lock
+  fields. This is allocation/initialization support; builders, guest driver
+  callbacks and completion still need actual implementation.
+- Directory enumeration now bounds fixed fields and partial names, retains
+  an overflowing entry for retry, distinguishes initial overflow from later
+  too-small queries, captures the mask once and retains EOF until restart.
+  Queries and close share enumeration ownership under one initialized lock.
+  POSIX metadata errors propagate instead of reporting fabricated zero data.
+  Windows native directory and renderer controls pass 6/6; the Linux directory
+  integration test passes 1/1. Minimum size `0x48` and filename offset `0x40`
+  match the compiled nxdk layout; Windows native probes also checked partial
+  retry behavior. Full original-Xbox filesystem conformance remains unproven.
+- POSIX waitable timers now repeat and deliver APCs on the arming thread in
+  alertable waits. Relative deadlines use monotonic time; cancellation retains
+  an expired signal and removes pending APCs. Native Windows probes confirmed
+  callback delivery after last-handle close. Tests cover queue saturation,
+  coalescing, normal armer exit, rearm to an earlier deadline, zero-time
+  alertable waits and extreme relative values. Three registered tests pass
+  independently under ASan/UBSan. Cooperative servicing has bounded polling
+  latency; power resume reports `ERROR_NOT_SUPPORTED`, and forced
+  `TerminateThread` timer-owner rundown remains open.
+- The final consuming Windows build passed extended fresh-profile driving
+  (72.797 s) and saved-profile Cruise with draw-every-frame plus uncapped
+  pacing (56.328 s, 95.05 m player motion). Captures were inspected. Start
+  presses did not visibly open pause UI, so pause/resume remains unverified.
+  These runs do not prove POSIX gameplay, DSP/audio fidelity or general
+  render-queue ownership. Logs/captures and the independently repeated pinned
+  nxdk compiler probe are retained under the consuming project's
+  `build/audit-continuation`.
+
+- The two I/O builder bridges now marshal native IOSBs into the guest's two
+  32-bit fields using the existing helper. Directly casting guest memory to
+  the 16-byte host structure previously overwrote memory after the guest's
+  8-byte IOSB. Actual dispatcher tests pass on MSVC and Linux Release; linking
+  the old bridge into the same test fails both field and adjacent-canary
+  checks for both builders. Null IOSBs and stdcall cleanup are covered. The
+  stale ordinal-173 fixture now expects rejection of an uninitialized alias,
+  consistent with the existing mapping contract. This fixes memory corruption,
+  not the missing IRP/driver semantics. The shared guest IOSB writer still
+  needs full-span write validation and an explicit caller error policy.
+
+- POSIX wait-all now locks all participating objects in stable address order,
+  checks readiness, then acquires them together. Failed waits preserve event,
+  semaphore, mutex and auto-reset timer state. Single waits share the same
+  readiness/acquisition helpers; infinite waits no longer copy an uninitialized
+  deadline. The standalone `tests/platform_wait_all` regression fails against
+  the old source at its event-preservation assertion. Ubuntu Release and
+  ASan/UBSan CTest pass; independent WSL `mm3-gpu-test` Release CTest passed ten
+  consecutive runs. Delayed acquisition, opposite lock orders and wait-any
+  index ordering are included. Periodic timers, APC behavior, abandoned mutexes
+  and pseudo-handle semantics are outside this correction.
+
 - The physical-address mapping gates pass on Windows and Linux. Fresh main
   runtime driving completed in 54.584 s and 62.7096 s with normal gameplay
   captures. The SDL runtime also completed a 53.0497 s driving run after the
@@ -125,8 +184,8 @@ The test embeds data; it does not download dependencies at runtime.
 | High | `src/kernel/kernel_crypto.c`, `xbox_XcPKDecPrivate` | Returns failure for every key. Implement the Xbox private blob layout and actual private RSA operation; do not substitute unconditional success. | Independent private/public roundtrip and invalid blob tests; real hardware vector where available. |
 | High | `src/kernel/kernel_crypto.c`, `xbox_XcUpdateCrypto` | Discards both vectors; titles cannot install crypto implementations or retrieve originals. Requires guest-function dispatch in the bridge, not calling guest addresses as host pointers. | Install one replacement, verify only that function changes, retrieve originals, null entries preserve current replacements. |
 | High | `src/kernel/kernel_io.c:149-303`, `src/kernel/kernel_bridge.c:5305-5416` | Completion, synchronous I/O and driver dispatch exports return success without doing I/O or completing an IRP. Builds are not a substitute for guest driver behavior. | Real IRP layouts, queued dispatch/completion and events, transfer counts/status, invalid devices. Trace actual callers before choosing device implementations. |
-| Medium | `src/platform/win32_compat.c:980-1013` | POSIX `SetWaitableTimer` ignores period and completion APC but returns success. | Two observed expirations, cancellation/rearm, manual/auto reset, alertable callback execution. |
-| Medium | `src/platform/win32_compat.c:550-557` | POSIX wait-all consumes auto-reset/semaphore/mutex signals sequentially before knowing every object is ready. Timeouts lose signals. | Set only first auto-reset event: wait-all times out and first event remains set; then atomic all-object acquisition succeeds. |
+| Medium | `src/platform/win32_compat.c`, timer/thread lifecycle | Periodic timers and alertable APC delivery are implemented and tested. Forced `TerminateThread` still uses cancellation without timer-owner rundown; power resume is unsupported. | Forced owner cancellation while armed/queued, without leaks or stale callbacks; normal-exit tests do not prove this path. |
+| Medium | `src/platform/win32_compat.c`, host waits | Wait-all signal loss is corrected and covered by `tests/platform_wait_all`. Abandoned mutexes and pseudo-process/thread handles still need separate semantic investigation. | Compare owner-thread exit and current-process/current-thread waits against the host API; the focused acquisition test does not establish those behaviors. |
 | Medium | `src/platform/win32_compat.c:1948-1964` | POSIX exception helpers are inert; `RaiseException` logs then returns. Guest RtlUnwind has a separate bridge implementation, so do not confuse these two paths. | Host shim noncontinuable dispatch/unwind tests and guest bridge exception tests independently. |
 | Medium | `src/input/xinput_device.c:533-551` | POSIX controller discovery runs only at initialization. Late attach/replacement cannot acquire a usable slot; rumble discards SDL failure. | Mock controller attach/disconnect/reconnect and failed rumble propagation. |
 | Medium | `src/d3d/d3d8_device.c:406-429` | GetDeviceCaps/GetDisplayMode/GetCreationParameters return success without output; Reset does nothing. COM vtable routes to these implementations. | Fill outputs with poison, call public interfaces and validate real data; resize/reset then render and read back. |
