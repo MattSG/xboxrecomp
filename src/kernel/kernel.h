@@ -568,6 +568,8 @@ typedef char  xbox_host_char;
 const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
+/* Native save root for host-owned persistent console state, not guest assets. */
+BOOL xbox_get_save_directory(xbox_host_char* buffer, DWORD capacity);
 
 /* Optional: a project sets this to see the guest paths the kernel translates
  * (for example to print who opened a file). NULL by default; called before the
@@ -917,7 +919,7 @@ VOID    __stdcall xbox_XcHMAC(const UCHAR* Key, ULONG KeyLength, const UCHAR* Da
 ULONG   __stdcall xbox_XcPKGetKeyLen(PVOID PublicKey);
 ULONG   __stdcall xbox_XcPKDecPrivate(PVOID PrivateKey, PVOID Input, PVOID Output);
 ULONG   __stdcall xbox_XcPKEncPublic(PVOID PublicKey, PVOID Input, PVOID Output);
-BOOLEAN __stdcall xbox_XcVerifyPKCS1Signature(PVOID Hash, PVOID PublicKey, PVOID Signature);
+BOOLEAN __stdcall xbox_XcVerifyPKCS1Signature(PVOID Signature, PVOID PublicKey, PVOID Hash);
 ULONG   __stdcall xbox_XcModExp(PULONG Result, PULONG Base, PULONG Exponent, PULONG Modulus, ULONG ModulusLength);
 
 VOID    __stdcall xbox_XcDESKeyParity(PUCHAR Key, ULONG KeyLength);
