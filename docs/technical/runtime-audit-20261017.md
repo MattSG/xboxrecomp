@@ -26,9 +26,21 @@ gameplay acceptance belong to the consuming game's audit.
   noncached/write-combine policy flags. Executable, COW and guard requests are
   rejected, as are unmodeled physical address ranges. Linux device-model
   functionality remains limited by the separately listed missing host handlers.
-  `MmGetPhysicalAddress` translates owned aliases and the contiguous window;
-  low guest RAM has no coherent physical-address model and returns 0 with a
-  diagnostic.
+  `MmGetPhysicalAddress` translates owned aliases, the contiguous window and
+  ordinary guest RAM into a coherent runtime-virtualized physical namespace.
+  Low-RAM IDs start at the next 64 MB boundary after the mapped guest VA range;
+  they map back to the same guest RAM bytes, while physical IDs below 64 MB
+  resolve to the independent contiguous arena, including backed offsets the
+  allocator has not handed out. OHCI, NV2A DMA and APU paths use the shared
+  low-RAM resolver while preserving their established allocation/image rules;
+  the APU still enforces its 28-bit bus limit. NV2A method parameters retain
+  their 32-bit guest value, but wider hardware DMA-field conformance is not
+  established.
+  This namespace is an internal backing contract, not a claim that the IDs
+  reproduce Xbox hardware page numbering. Mapping regressions cover range
+  bounds, low-RAM round trips, identical-offset backing independence, an OHCI
+  descriptor read/write, bridge buffer protections, concurrent shutdown and
+  existing device aliases.
 - Non-volatile OS settings now persist a checksummed 96-byte HLE user block
   under the configured save root. Short buffers, unsupported settings, corrupt
   storage and failed writes return errors. Shared reader/exclusive writer locks
@@ -72,7 +84,7 @@ The test embeds data; it does not download dependencies at runtime.
 
 | Priority | Source | Evidence / correct implementation | Regression needed |
 |---|---|---|---|
-| High | `src/kernel/kernel_memory.c`, `xbox_MmGetPhysicalAddress` | Owned I/O aliases and the contiguous window translate; low guest RAM currently returns 0 because its guest virtual range has no coherent physical-page model. Do not restore identity fallback: it can map unrelated backing. | Establish a RAM physical-page model and verify known low-RAM pages through both native and guest bridge calls, including relocated host bases and alias identity. Current mapping tests cover alias and contiguous translation plus explicit unsupported low RAM. |
+| High | `src/kernel/kernel_memory.c`, `xbox_MmGetPhysicalAddress` | Runtime physical IDs are now coherent across ordinary RAM, contiguous storage, OHCI, NV2A DMA, APU reads and `MmMapIoSpace`. The IDs intentionally virtualize the physical namespace to avoid collisions between separate host backing sections; hardware-accurate Xbox page numbering and DMA masks above the supported consumer width remain open. | Compare representative physical-page numbering, bus-visible RAM and DMA field widths with hardware or an authoritative emulator trace before claiming Xbox physical-address conformance. |
 | High | `src/kernel/kernel_crypto.c`, `xbox_XcPKDecPrivate` | Returns failure for every key. Implement the Xbox private blob layout and actual private RSA operation; do not substitute unconditional success. | Independent private/public roundtrip and invalid blob tests; real hardware vector where available. |
 | High | `src/kernel/kernel_crypto.c`, `xbox_XcUpdateCrypto` | Discards both vectors; titles cannot install crypto implementations or retrieve originals. Requires guest-function dispatch in the bridge, not calling guest addresses as host pointers. | Install one replacement, verify only that function changes, retrieve originals, null entries preserve current replacements. |
 | High | `src/kernel/kernel_io.c:149-303`, `src/kernel/kernel_bridge.c:5305-5416` | Completion, synchronous I/O and driver dispatch exports return success without doing I/O or completing an IRP. Builds are not a substitute for guest driver behavior. | Real IRP layouts, queued dispatch/completion and events, transfer counts/status, invalid devices. Trace actual callers before choosing device implementations. |
