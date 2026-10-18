@@ -120,20 +120,22 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes, int write_access)
         end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
         return 1;
     {
-        uint32_t physical, remaining;
-        if (xbox_IoMappingQuery(XBOX_TO_NATIVE(va), &physical, NULL, &remaining) &&
-            bytes <= remaining && (uint64_t)physical + bytes <= XBOX_CONTIG_SIZE) {
+        uint32_t remaining;
+        if (xbox_IoMappingQuery(XBOX_TO_NATIVE(va), NULL, NULL, &remaining) &&
+            bytes <= remaining) {
             uint32_t checked = 0;
             while (checked < bytes) {
-                uint32_t page_physical, protect, left;
+                uint32_t canonical, left;
                 uint32_t at = va + checked;
                 uint32_t chunk = 4096 - (at & 4095);
                 if (chunk > bytes - checked) chunk = bytes - checked;
-                if (!xbox_IoMappingQuery(XBOX_TO_NATIVE(at), &page_physical,
-                                         &protect, &left) || left < chunk ||
-                    (uint64_t)page_physical + chunk > XBOX_CONTIG_SIZE ||
-                    (protect & 0xff) == PAGE_NOACCESS ||
-                    (write_access && (protect & 0xff) != PAGE_READWRITE))
+                if (!xbox_IoMappingQuery(XBOX_TO_NATIVE(at), NULL, NULL, &left) ||
+                    left < chunk ||
+                    xbox_IoMappingResolve(at, write_access ? 1 : 0, &canonical) != 1 ||
+                    !((uint64_t)canonical + chunk <= mapped ||
+                      (canonical >= XBOX_CONTIG_BASE &&
+                       (uint64_t)canonical + chunk <=
+                           (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)))
                     return 0;
                 checked += chunk;
             }
