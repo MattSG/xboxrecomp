@@ -31,6 +31,20 @@ def test_both_overlapping_streams_are_preserved():
     assert "SET_LO8(eax, 1)" in code, code
 
 
+def test_unreachable_missing_edge_does_not_trigger_recovery():
+    code = translated(b"\xc3" + IMAGE)
+    assert "eax = 0xC301B090" in code, code
+    assert "loc_00010008:" not in code, code
+
+
+def test_immediate_code_value_does_not_seed_recovery():
+    # EDX merely contains a code-looking value; no branch/call uses it.
+    image = b"\xba" + (BASE + 19).to_bytes(4, "little") + IMAGE
+    image += b"\x90" * 3 + bytes.fromhex("B8 09 03 00 00 C3")
+    code = translated(image)
+    assert "0x309" not in code, code
+
+
 def test_compiled_paths_match_x86():
     # Unicorn handles an internal Windows exception during initialization.
     # Keep that native setup outside pytest's process-wide faulthandler.
@@ -94,5 +108,7 @@ if __name__ == "__main__":
         _compiled_paths_match_x86()
     else:
         test_both_overlapping_streams_are_preserved()
+        test_unreachable_missing_edge_does_not_trigger_recovery()
+        test_immediate_code_value_does_not_seed_recovery()
         test_compiled_paths_match_x86()
     print("PASS: taken and untaken overlapping branch streams match x86 EAX/ESP")
