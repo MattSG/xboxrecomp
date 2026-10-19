@@ -494,6 +494,7 @@ static void rec_samplers(const SDL_GPUTextureSamplerBinding *b, uint32_t n)
 
 static void submit(SDL_GPUFence **fence);
 static void graveyard_empty(void);
+static void copy_end(void);
 
 /* End the open batch: upload its vertex/index data, then replay its draws in
  * one render pass. */
@@ -510,6 +511,8 @@ static void flush_batch(void)
     int vp_set = 0, sc_set = 0, blend_set = 0, ref_set = -1;
     size_t i;
     if (!s_b.open) return;
+    /* Texture uploads may leave a copy pass open before a target change. */
+    copy_end();
     s_b.open = 0;
     if (!s_b.nops && !s_b.color_clear && !s_b.depth_clear) goto reset;
     if (!(c = cmd())) goto reset;

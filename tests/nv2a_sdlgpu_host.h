@@ -133,6 +133,8 @@ static void check_shared_layouts(void)
     CHECK(!tex_layout(&t, &L));
 }
 
+static void *const no_pinned_samplers[4] = { NULL };
+
 /* Single texels and their channel expansion (argb = BGRA bytes). */
 static void check_shared_texels(void)
 {
@@ -141,16 +143,16 @@ static void check_shared_texels(void)
     uint32_t v;
     CHECK(x5(31) == 255 && x5(0) == 0 && x6(63) == 255 && x4(15) == 255);
     CHECK(argb(0x80, 1, 2, 3) == 0x80010203u);
-    CHECK(texel(0x05, px16, NULL) == 0xFF0000FFu);          /* R5G6B5 blue */
-    CHECK(texel(0x04, px16, NULL) == argb(0, 0, x4(1), 255));  /* A4R4G4B4: g=1, b=15 */
-    CHECK(texel(0x06, px32, NULL) == 0x40302010u);          /* A8R8G8B8 */
-    CHECK(texel(0x07, px32, NULL) == 0xFF302010u);          /* X8R8G8B8 */
-    CHECK(texel(0x00, px32, NULL) == 0xFF101010u);          /* Y8 */
-    CHECK(texel(0x0B, px32, NULL) == 0xFF101010u);          /* I8, no palette */
-    v = texel(0x19, px32, NULL);                             /* A8: white with alpha */
+    CHECK(texel(0x05, px16, NULL, 0) == 0xFF0000FFu);          /* R5G6B5 blue */
+    CHECK(texel(0x04, px16, NULL, 0) == argb(0, 0, x4(1), 255));  /* A4R4G4B4: g=1, b=15 */
+    CHECK(texel(0x06, px32, NULL, 0) == 0x40302010u);          /* A8R8G8B8 */
+    CHECK(texel(0x07, px32, NULL, 0) == 0xFF302010u);          /* X8R8G8B8 */
+    CHECK(texel(0x00, px32, NULL, 0) == 0xFF101010u);          /* Y8 */
+    CHECK(texel(0x0B, px32, NULL, 0) == 0);          /* I8 refuses missing palette */
+    v = texel(0x19, px32, NULL, 0);                             /* A8: white with alpha */
     CHECK(v == 0x10FFFFFFu);
-    CHECK(texel(0x1A, px32, NULL) == 0x20101010u);          /* A8Y8 */
-    CHECK(texel(0x99, px32, NULL) == 0xFFFF00FFu);          /* unknown: magenta */
+    CHECK(texel(0x1A, px32, NULL, 0) == 0x20101010u);          /* A8Y8 */
+    CHECK(texel(0x99, px32, NULL, 0) == 0xFFFF00FFu);          /* unknown: magenta */
     CHECK(surface_color_bpp(0x3) == 2 && surface_color_bpp(0x6) == 4);
     CHECK(surface_color_bpp(0x9) == 1 && surface_color_bpp(0xF) == 0);
     CHECK(surface_alpha_mode(0x1) == 0 && surface_alpha_mode(0x2) == 1);
@@ -208,6 +210,5 @@ void nv2a_pb_interp_enable(int on) { (void)on; abort(); }
 int nv2a_pb_replay(float t) { (void)t; abort(); return 0; }
 int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp, uint32_t *w, uint32_t *h)
 { (void)pitch; (void)bpp; (void)w; (void)h; return 0; }
-void xbox_FramebufferSdlHints(void) {}
 
 #endif

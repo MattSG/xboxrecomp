@@ -40,7 +40,7 @@ static DWORD g_sdl_packet[XBOX_MAX_CONTROLLERS];
 
 static SDL_Gamepad *sdl_pad(DWORD port)
 {
-    static Uint64 next_scan;
+    static Uint64 next_scan[XBOX_MAX_CONTROLLERS];
     SDL_Gamepad *pad = g_sdl_pads[port];
     if (pad && SDL_GamepadConnected(pad))
         return pad;
@@ -48,9 +48,9 @@ static SDL_Gamepad *sdl_pad(DWORD port)
         SDL_CloseGamepad(pad);
         g_sdl_pads[port] = NULL;
     }
-    if (SDL_GetTicks() < next_scan)
+    if (SDL_GetTicks() < next_scan[port])
         return NULL;
-    next_scan = SDL_GetTicks() + 1000;   /* a hot-plug check, not every poll */
+    next_scan[port] = SDL_GetTicks() + 1000; /* hot-plug check, not every poll */
     {
         int count = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&count);

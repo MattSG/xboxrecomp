@@ -29,6 +29,35 @@ void nv2a_d3d_collect_menu_rects(int on) { (void)on; }
 int main(int argc, char **argv)
 {
     XBOX_INPUT_STATE s;
+#ifndef _WIN32
+    if (argc == 2 && !strcmp(argv[1], "two-gamepads")) {
+        SDL_VirtualJoystickDesc desc;
+        SDL_JoystickID ids[2];
+        XINPUT_STATE state;
+        if (!SDL_Init(SDL_INIT_GAMEPAD)) return 30;
+        SDL_INIT_INTERFACE(&desc);
+        desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        desc.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1u;
+        desc.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1u;
+        desc.name = "discovery regression";
+        ids[0] = SDL_AttachVirtualJoystick(&desc);
+        ids[1] = SDL_AttachVirtualJoystick(&desc);
+        SDL_UpdateGamepads();
+        int ok = ids[0] && ids[1] &&
+            host_pad_state(0, &state) == ERROR_SUCCESS &&
+            host_pad_state(1, &state) == ERROR_SUCCESS;
+        for (unsigned i = 0; i < XBOX_MAX_CONTROLLERS; ++i)
+            if (g_sdl_pads[i]) SDL_CloseGamepad(g_sdl_pads[i]);
+        if (ids[0]) SDL_DetachVirtualJoystick(ids[0]);
+        if (ids[1]) SDL_DetachVirtualJoystick(ids[1]);
+        SDL_Quit();
+        if (!ok) return 31;
+        puts("PASS: two gamepads discovered on consecutive port polls");
+        return 0;
+    }
+#endif
     if (argc == 2 && !strcmp(argv[1], "default-padmap")) {
         XINPUT_GAMEPAD g = {0};
         XBOX_GAMEPAD out;

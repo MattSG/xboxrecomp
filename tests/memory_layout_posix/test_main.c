@@ -31,6 +31,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+#include <signal.h>
 #include <sys/wait.h>
 
 
@@ -71,6 +76,20 @@ static int read_byte_in_child(const unsigned char *addr, unsigned char *out)
 
     if (pid == 0) {
         close(fd[0]);
+#ifdef __linux__
+        /* Piped core handlers (including WSL) ignore RLIMIT_CORE. */
+        prctl(PR_SET_DUMPABLE, 0);
+#endif
+        /* Do not run the inherited emulator fault handler in this probe: it
+         * initializes SDL/GPU state after fork. Expected faults should simply
+         * terminate this child, without writing a potentially huge core. */
+        struct sigaction sa = {0};
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+        struct rlimit no_core = {0, 0};
+        setrlimit(RLIMIT_CORE, &no_core);
         unsigned char v = *addr;          /* faults here, or does not */
         ssize_t n = write(fd[1], &v, 1);
         _exit(n == 1 ? 0 : 1);

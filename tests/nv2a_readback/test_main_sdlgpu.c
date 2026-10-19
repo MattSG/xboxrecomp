@@ -152,7 +152,9 @@ static void test_batch(void)
     for (i = 0; i < 8; i++) {
         surfaces[i] = new_surface(i, i & 1 ? 2 : 4, i & 2 ? 32 : 16, i & 4 ? 16 : 8, 16);
         CHECK(surfaces[i]);
+        CHECK(copy_begin()); /* upload/copy still open when a clear changes targets */
         draw_color(surfaces[i], i & 1);
+        CHECK(!s_copy);
     }
     reset_counts(); inspect = 1;
     writeback_surfaces();

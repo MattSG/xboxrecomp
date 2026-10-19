@@ -33,6 +33,9 @@
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #endif
+#ifndef MEM_MAPPED
+#define MEM_MAPPED 0x00040000u
+#endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -205,6 +208,22 @@ BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *
 /* Forward decl; the definition lives further down with the wait helpers. */
 static void deadline_from_ms(DWORD ms, struct timespec *ts);
 
+static void unlock_mutex_cleanup(void *mutex)
+{
+    pthread_mutex_unlock((pthread_mutex_t *)mutex);
+}
+
+static int cond_wait_cancel_safe(pthread_cond_t *cond, pthread_mutex_t *mutex,
+                                 int bounded, const struct timespec *until)
+{
+    volatile int rc;
+    pthread_cleanup_push(unlock_mutex_cleanup, mutex);
+    rc = bounded ? pthread_cond_timedwait(cond, mutex, until)
+                 : pthread_cond_wait(cond, mutex);
+    pthread_cleanup_pop(0);
+    return rc;
+}
+
 static void cv_lazy_init(PCONDITION_VARIABLE cv)
 {
     if (!cv->Ptr) {
@@ -227,13 +246,13 @@ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWOR
     if (!cs->LockSemaphore) InitializeCriticalSection(cs);
     pthread_cond_t  *c = (pthread_cond_t  *)cv->Ptr;
     pthread_mutex_t *m = (pthread_mutex_t *)cs->LockSemaphore;
-    if (ms == INFINITE) {
-        pthread_cond_wait(c, m);
-        return TRUE;
-    }
     struct timespec ts;
-    deadline_from_ms(ms, &ts);
-    int rc = pthread_cond_timedwait(c, m, &ts);
+    int rc;
+    if (ms != INFINITE) deadline_from_ms(ms, &ts);
+    pthread_cleanup_push(unlock_mutex_cleanup, m);
+    rc = ms == INFINITE ? pthread_cond_wait(c, m)
+                        : pthread_cond_timedwait(c, m, &ts);
+    pthread_cleanup_pop(0);
     if (rc == ETIMEDOUT) { SetLastError(WAIT_TIMEOUT); return FALSE; }
     return TRUE;
 }
@@ -394,11 +413,23 @@ typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
 
 #define W32_MAX_APC 16
 
-typedef struct w32_object {
+typedef struct w32_object w32_object;
+typedef enum { W32_APC_USER, W32_APC_TIMER } w32_apc_kind;
+typedef struct {
+    w32_apc_kind kind;
+    PAPCFUNC user_func;
+    ULONG_PTR user_data;
+    w32_object *timer;
+    ULONGLONG timer_generation;
+} w32_apc;
+
+struct w32_object {
     w32_kind        kind;
     LONG            refcount;
     pthread_mutex_t lock;
     pthread_cond_t  cond;
+    pthread_cond_t  waitable_cond;
+    int             waitable_cond_monotonic;
 
     /* event */
     int             signaled;
@@ -414,17 +445,16 @@ typedef struct w32_object {
 
     /* thread */
     pthread_t       thread;
-    int             thread_joinable;
     DWORD           tid;
     int             exited;
+    int             thread_termination_requested;
     DWORD           exit_code;
     int             suspend_count;
     pthread_cond_t  gate;
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
-    PAPCFUNC        apc_func[W32_MAX_APC];
-    ULONG_PTR       apc_data[W32_MAX_APC];
+    w32_apc         apcs[W32_MAX_APC];
     int             apc_count;
 
     /* timer-queue timer */
@@ -437,14 +467,27 @@ typedef struct w32_object {
     /* waitable timer */
     int             waitable_manual_reset;
     struct timespec waitable_due_time;
+    clockid_t       waitable_clock;
     int             waitable_triggered;
     int             waitable_armed;
+    LONG            waitable_period;
+    PTIMERAPCROUTINE waitable_completion;
+    PVOID           waitable_arg;
+    LONGLONG        waitable_apc_due;
+    w32_object     *waitable_apc_owner;
+    ULONGLONG       waitable_generation;
+    int             waitable_apc_queued;
+    int             waitable_apc_due_pending;
+    int             waitable_registered;
+    LONG            waitable_handle_count;
+    w32_object     *waitable_next;
 
     /* file mapping / fd-backed file handle */
     int             fd;
     SIZE_T          map_size;
+    DWORD           map_protect;
     char           *file_path;
-} w32_object;
+};
 
 /* pseudo handles for "current thread"/"current process" */
 #define PSEUDO_CURRENT_PROCESS ((HANDLE)(LONG_PTR)-1)
@@ -454,6 +497,14 @@ typedef struct w32_object {
 static __thread w32_object *t_self_obj = NULL;
 static __thread DWORD       t_tid      = 0;
 static volatile LONG        s_next_tid = 1000;
+static pthread_mutex_t s_waitable_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static w32_object *s_waitable_registry;
+static pthread_key_t s_apc_context_key;
+static pthread_once_t s_apc_context_once = PTHREAD_ONCE_INIT;
+
+static void service_waitable_timers(void);
+static void cancel_thread_timers(w32_object *thread);
+static int timespec_before(const struct timespec *a, const struct timespec *b);
 
 DWORD GetCurrentThreadId(void)
 {
@@ -536,10 +587,20 @@ static w32_object *obj_lookup(HANDLE h)
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
+    if (!o) return NULL;
     o->kind     = kind;
     o->refcount = 1;
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
+#if defined(__linux__)
+    pthread_condattr_t waitable_attr;
+    pthread_condattr_init(&waitable_attr);
+    o->waitable_cond_monotonic = pthread_condattr_setclock(&waitable_attr, CLOCK_MONOTONIC) == 0;
+    pthread_cond_init(&o->waitable_cond, o->waitable_cond_monotonic ? &waitable_attr : NULL);
+    pthread_condattr_destroy(&waitable_attr);
+#else
+    pthread_cond_init(&o->waitable_cond, NULL);
+#endif
     pthread_cond_init(&o->gate, NULL);
     pthread_rwlock_wrlock(&s_live_lock);
     live_insert_locked(o);
@@ -571,8 +632,206 @@ static void obj_release(w32_object *o)
     }
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
+    pthread_cond_destroy(&o->waitable_cond);
     pthread_cond_destroy(&o->gate);
     free(o);
+}
+
+static void apc_context_destroy(void *value)
+{
+    w32_object *o = (w32_object *)value;
+    if (!o) return;
+    cancel_thread_timers(o);
+    obj_release(o);
+}
+
+static void make_apc_context_key(void)
+{
+    pthread_key_create(&s_apc_context_key, apc_context_destroy);
+}
+
+static w32_object *current_apc_object(void)
+{
+    if (t_self_obj) return t_self_obj;
+    pthread_once(&s_apc_context_once, make_apc_context_key);
+    w32_object *o = pthread_getspecific(s_apc_context_key);
+    if (!o) {
+        o = obj_alloc(K_THREAD);
+        if (!o) return NULL;
+        o->tid = GetCurrentThreadId();
+        if (pthread_setspecific(s_apc_context_key, o) != 0) {
+            obj_release(o);
+            return NULL;
+        }
+    }
+    return o;
+}
+
+static void timer_remove_apcs_locked(w32_object *timer, w32_object *owner)
+{
+    if (!owner) return;
+    pthread_mutex_lock(&owner->lock);
+    for (int i = 0; i < owner->apc_count;) {
+        w32_apc *entry = &owner->apcs[i];
+        if (entry->kind == W32_APC_TIMER && entry->timer == timer) {
+            memmove(entry, entry + 1,
+                    (size_t)(owner->apc_count - i - 1) * sizeof(*entry));
+            owner->apc_count--;
+            obj_release(timer); /* queued APC reference; caller still owns one */
+        } else {
+            i++;
+        }
+    }
+    pthread_mutex_unlock(&owner->lock);
+}
+
+static void timer_register_locked(w32_object *timer)
+{
+    if (timer->waitable_registered || !timer->waitable_armed) return;
+    timer->waitable_next = s_waitable_registry;
+    s_waitable_registry = timer;
+    timer->waitable_registered = 1;
+    InterlockedIncrement(&timer->refcount); /* registry reference */
+}
+
+static int timer_unlink_locked(w32_object *timer)
+{
+    w32_object **link = &s_waitable_registry;
+    while (*link && *link != timer) link = &(*link)->waitable_next;
+    if (!*link) return 0;
+    *link = timer->waitable_next;
+    timer->waitable_next = NULL;
+    timer->waitable_registered = 0;
+    return 1;
+}
+
+static int timer_refresh_locked(w32_object *timer)
+{
+    if (!timer->waitable_armed || timer->waitable_triggered) return timer->waitable_triggered;
+    struct timespec now;
+    clock_gettime(timer->waitable_clock, &now);
+    if (timespec_before(&now, &timer->waitable_due_time)) return 0;
+    timer->waitable_triggered = 1;
+    return 1;
+}
+
+/* Both ordinary object waits and waitable-timer waits share timer state. */
+static void timer_notify_locked(w32_object *timer)
+{
+    pthread_cond_broadcast(&timer->cond);
+    pthread_cond_broadcast(&timer->waitable_cond);
+}
+
+static void timer_add_period(struct timespec *due, LONG period, const struct timespec *now)
+{
+    int64_t behind_sec = (int64_t)now->tv_sec - (int64_t)due->tv_sec;
+    int64_t behind_ms = behind_sec * 1000 + (now->tv_nsec - due->tv_nsec) / 1000000;
+    int64_t steps = behind_ms >= 0 ? behind_ms / period + 1 : 1;
+    int64_t advance_ms = steps * period;
+    due->tv_sec += (time_t)(advance_ms / 1000);
+    due->tv_nsec += (long)(advance_ms % 1000) * 1000000L;
+    if (due->tv_nsec >= 1000000000L) { due->tv_sec++; due->tv_nsec -= 1000000000L; }
+}
+
+/* Registry is always acquired before timer/APC locks. Never call while holding an object lock. */
+static void service_waitable_timers(void)
+{
+    pthread_mutex_lock(&s_waitable_registry_lock);
+    w32_object **link = &s_waitable_registry;
+    while (*link) {
+        w32_object *timer = *link;
+        pthread_mutex_lock(&timer->lock);
+        int expired = 0;
+        if (timer->waitable_armed) {
+            struct timespec now;
+            clock_gettime(timer->waitable_clock, &now);
+            expired = !timespec_before(&now, &timer->waitable_due_time);
+        }
+        if (expired) {
+            timer->waitable_triggered = 1;
+            /* A timer has at most one completion APC outstanding. Expiries
+             * while that APC is queued are coalesced, not replayed later. */
+            if (timer->waitable_completion && timer->waitable_apc_owner &&
+                !timer->waitable_apc_queued && !timer->waitable_apc_due_pending) {
+                timer->waitable_apc_due_pending = 1;
+                struct timespec realtime;
+                clock_gettime(CLOCK_REALTIME, &realtime);
+                timer->waitable_apc_due =
+                    ((LONGLONG)realtime.tv_sec + 11644473600LL) * 10000000LL +
+                    realtime.tv_nsec / 100LL;
+            }
+            if (timer->waitable_period > 0) {
+                struct timespec now;
+                clock_gettime(timer->waitable_clock, &now);
+                timer_add_period(&timer->waitable_due_time, timer->waitable_period, &now);
+            } else {
+                timer->waitable_armed = 0;
+            }
+        }
+        if (timer->waitable_apc_due_pending && timer->waitable_completion &&
+            timer->waitable_apc_owner && !timer->waitable_apc_queued) {
+            w32_object *owner = timer->waitable_apc_owner;
+            pthread_mutex_lock(&owner->lock);
+            if (owner->apc_count < W32_MAX_APC) {
+                w32_apc *entry = &owner->apcs[owner->apc_count++];
+                memset(entry, 0, sizeof(*entry));
+                entry->kind = W32_APC_TIMER;
+                entry->timer = timer;
+                entry->timer_generation = timer->waitable_generation;
+                timer->waitable_apc_queued = 1;
+                timer->waitable_apc_due_pending = 0;
+                InterlockedIncrement(&timer->refcount);
+                pthread_cond_broadcast(&owner->cond);
+            }
+            pthread_mutex_unlock(&owner->lock);
+        }
+        timer_notify_locked(timer);
+        if (!timer->waitable_armed && !timer->waitable_apc_queued &&
+            !timer->waitable_apc_due_pending) {
+            *link = timer->waitable_next;
+            timer->waitable_next = NULL;
+            timer->waitable_registered = 0;
+            pthread_mutex_unlock(&timer->lock);
+            obj_release(timer); /* registry reference, still under registry lock */
+        } else {
+            pthread_mutex_unlock(&timer->lock);
+            link = &timer->waitable_next;
+        }
+    }
+    pthread_mutex_unlock(&s_waitable_registry_lock);
+}
+
+static void cancel_thread_timers(w32_object *thread)
+{
+    pthread_mutex_lock(&s_waitable_registry_lock);
+    w32_object **link = &s_waitable_registry;
+    while (*link) {
+        w32_object *timer = *link;
+        pthread_mutex_lock(&timer->lock);
+        if (timer->waitable_apc_owner == thread && timer->waitable_completion) {
+            timer_refresh_locked(timer);
+            timer->waitable_armed = 0;
+            timer->waitable_completion = NULL;
+            timer->waitable_apc_owner = NULL;
+            timer->waitable_apc_queued = 0;
+            timer->waitable_apc_due_pending = 0;
+            timer->waitable_generation++;
+            timer_remove_apcs_locked(timer, thread);
+            timer_notify_locked(timer);
+        }
+        if (!timer->waitable_armed && !timer->waitable_apc_queued &&
+            !timer->waitable_apc_due_pending) {
+            *link = timer->waitable_next;
+            timer->waitable_next = NULL;
+            timer->waitable_registered = 0;
+            pthread_mutex_unlock(&timer->lock);
+            obj_release(timer); /* registry reference, still under registry lock */
+        } else {
+            pthread_mutex_unlock(&timer->lock);
+            link = &timer->waitable_next;
+        }
+    }
+    pthread_mutex_unlock(&s_waitable_registry_lock);
 }
 
 /* ---- fd-backed file handle (for the file-I/O HLE) -------------------- */
@@ -601,11 +860,28 @@ BOOL CloseHandle(HANDLE h)
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
         h == INVALID_HANDLE_VALUE)
         return TRUE;
-    {
-        w32_object *o = obj_lookup(h);
-        if (!o) return FALSE;
-        if (o != &s_process_heap) obj_release(o);
+    w32_object *o = obj_lookup(h);
+    if (!o) return FALSE;
+    if (o->kind == K_WAITABLE_TIMER) {
+        int drop_registry = 0;
+        pthread_mutex_lock(&s_waitable_registry_lock);
+        pthread_mutex_lock(&o->lock);
+        if (--o->waitable_handle_count == 0) {
+            if (!o->waitable_completion) {
+                timer_refresh_locked(o);
+                o->waitable_armed = 0;
+                o->waitable_generation++;
+                o->waitable_apc_queued = 0;
+                o->waitable_apc_due_pending = 0;
+                drop_registry = timer_unlink_locked(o);
+            }
+        }
+        timer_notify_locked(o);
+        pthread_mutex_unlock(&o->lock);
+        pthread_mutex_unlock(&s_waitable_registry_lock);
+        if (drop_registry) obj_release(o);
     }
+    if (o != &s_process_heap) obj_release(o);
     return TRUE;
 }
 
@@ -621,10 +897,17 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
     w32_object *o = obj_lookup(src);
     if (!o) return FALSE;
-    InterlockedIncrement(&o->refcount);
+    if (o->kind == K_WAITABLE_TIMER) {
+        pthread_mutex_lock(&s_waitable_registry_lock);
+        o->waitable_handle_count++;
+        InterlockedIncrement(&o->refcount);
+        pthread_mutex_unlock(&s_waitable_registry_lock);
+    } else {
+        InterlockedIncrement(&o->refcount);
+    }
     *dst = src;
     if (options & DUPLICATE_CLOSE_SOURCE)
-        obj_release(o);
+        CloseHandle(src);
     return TRUE;
 }
 
@@ -637,21 +920,44 @@ static void deadline_from_ms(DWORD ms, struct timespec *ts)
     if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
 }
 
-/* Run any pending user-APCs for the calling thread. Returns count run. */
+/* Run pending user/timer APCs for the calling thread. Returns count run. */
 static int drain_apcs(void)
 {
-    w32_object *o = t_self_obj;
+    w32_object *o = current_apc_object();
     int run = 0;
     if (!o) return 0;
     pthread_mutex_lock(&o->lock);
     while (o->apc_count > 0) {
-        PAPCFUNC  f = o->apc_func[0];
-        ULONG_PTR d = o->apc_data[0];
-        memmove(o->apc_func, o->apc_func + 1, sizeof(PAPCFUNC) * (o->apc_count - 1));
-        memmove(o->apc_data, o->apc_data + 1, sizeof(ULONG_PTR) * (o->apc_count - 1));
+        w32_apc entry = o->apcs[0];
+        memmove(o->apcs, o->apcs + 1, sizeof(w32_apc) * (o->apc_count - 1));
         o->apc_count--;
         pthread_mutex_unlock(&o->lock);
-        f(d);
+        if (entry.kind == W32_APC_USER) {
+            if (entry.user_func) entry.user_func(entry.user_data);
+        } else {
+            w32_object *timer = entry.timer;
+            PTIMERAPCROUTINE callback = NULL;
+            PVOID arg = NULL;
+            DWORD low = 0, high = 0;
+            pthread_mutex_lock(&timer->lock);
+            if (timer->waitable_generation == entry.timer_generation &&
+                timer->waitable_apc_owner == o && timer->waitable_completion &&
+                timer->waitable_apc_queued) {
+                callback = timer->waitable_completion;
+                arg = timer->waitable_arg;
+                low = (DWORD)(ULONGLONG)timer->waitable_apc_due;
+                high = (DWORD)((ULONGLONG)timer->waitable_apc_due >> 32);
+                timer->waitable_apc_queued = 0;
+                if (!timer->waitable_armed && timer->waitable_period == 0) {
+                    timer->waitable_completion = NULL;
+                    timer->waitable_apc_owner = NULL;
+                }
+            }
+            pthread_mutex_unlock(&timer->lock);
+            if (callback) callback(arg, low, high);
+            obj_release(timer); /* queued APC reference */
+            service_waitable_timers();
+        }
         run++;
         pthread_mutex_lock(&o->lock);
     }
@@ -668,91 +974,160 @@ static int timespec_before(const struct timespec *a, const struct timespec *b)
  * signalled until it is set or cancelled again. Caller holds o->lock. */
 static int waitable_due(w32_object *o)
 {
-    struct timespec now;
-    if (o->waitable_triggered) return 1;
-    if (!o->waitable_armed) return 0;
-    clock_gettime(CLOCK_REALTIME, &now);
-    if (timespec_before(&now, &o->waitable_due_time)) return 0;
-    o->waitable_triggered = 1;
-    return 1;
+    return timer_refresh_locked(o);
+}
+
+static int object_ready_locked(w32_object *o)
+{
+    switch (o->kind) {
+    case K_EVENT: return o->signaled;
+    case K_THREAD: return o->exited;
+    case K_SEM: return o->sem_count > 0;
+    case K_MUTEX: return o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId();
+    case K_WAITABLE_TIMER: return waitable_due(o);
+    case K_PROCESS: return 0;
+    default: return 1;
+    }
+}
+
+static void object_consume_locked(w32_object *o)
+{
+    switch (o->kind) {
+    case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+    case K_WAITABLE_TIMER:
+        if (!o->waitable_manual_reset) o->waitable_triggered = 0;
+        break;
+    case K_SEM: o->sem_count--; break;
+    case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
+    default: break;
+    }
 }
 
 /*
  * Wait on a single object. The object lock must NOT be held.
  * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
  */
-static DWORD wait_single(w32_object *o, DWORD ms)
+static DWORD wait_single_impl(w32_object *o, DWORD ms, int consume)
 {
-    struct timespec ts;
+    struct timespec ts = {0, 0};
     int timed = (ms != INFINITE);
-    if (timed) deadline_from_ms(ms, &ts);
-
-    pthread_mutex_lock(&o->lock);
-    DWORD result = WAIT_OBJECT_0;
+    int timer_wait = o->kind == K_WAITABLE_TIMER;
+    clockid_t timeout_clock = timer_wait && o->waitable_cond_monotonic
+                            ? CLOCK_MONOTONIC : CLOCK_REALTIME;
+    if (timed) {
+        clock_gettime(timeout_clock, &ts);
+        ts.tv_sec += ms / 1000;
+        ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    }
 
     for (;;) {
-        int ready = 0;
-        switch (o->kind) {
-        case K_EVENT:  ready = o->signaled; break;
-        case K_THREAD: ready = o->exited;   break;
-        case K_SEM:    ready = (o->sem_count > 0); break;
-        case K_MUTEX:
-            ready = (o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId());
-            break;
-        case K_WAITABLE_TIMER: ready = waitable_due(o); break;
-        case K_PROCESS: ready = 0; break;   /* signalled at exit; never here */
-        default:       ready = 1; break;
+        service_waitable_timers();
+        pthread_mutex_lock(&o->lock);
+        int ready = object_ready_locked(o);
+        if (ready) {
+            if (consume) object_consume_locked(o);
+            pthread_mutex_unlock(&o->lock);
+            service_waitable_timers();
+            return WAIT_OBJECT_0;
         }
-        if (ready) break;
+        struct timespec now;
+        clock_gettime(timeout_clock, &now);
+        if (timed && !timespec_before(&now, &ts)) {
+            pthread_mutex_unlock(&o->lock);
+            service_waitable_timers();
+            return WAIT_TIMEOUT;
+        }
 
-        /* An armed timer has its own deadline. Waiting on the caller's alone
-         * would sleep straight past the due time, so take whichever comes
-         * first and re-test. */
+        /* Timer/APC state is serviced outside object locks, so cap sleeps to
+         * keep the deadline visible without introducing registry lock inversions. */
         struct timespec until = ts;
         int bounded = timed;
-        if (o->kind == K_WAITABLE_TIMER && o->waitable_armed &&
-            (!timed || timespec_before(&o->waitable_due_time, &ts))) {
+        int use_timer_deadline = timer_wait && o->waitable_armed &&
+                                 o->waitable_clock == timeout_clock;
+        if (timer_wait && o->waitable_armed && !use_timer_deadline) {
+            struct timespec poll = now;
+            poll.tv_nsec += 5000000L;
+            if (poll.tv_nsec >= 1000000000L) { poll.tv_sec++; poll.tv_nsec -= 1000000000L; }
+            if (!bounded || timespec_before(&poll, &until)) until = poll;
+            bounded = 1;
+        } else if (use_timer_deadline &&
+                   (!bounded || timespec_before(&o->waitable_due_time, &until))) {
             until = o->waitable_due_time;
             bounded = 1;
         }
-        int rc = bounded ? pthread_cond_timedwait(&o->cond, &o->lock, &until)
-                         : pthread_cond_wait(&o->cond, &o->lock);
-        if (rc == ETIMEDOUT && timed && !timespec_before(&until, &ts)) {
-            result = WAIT_TIMEOUT; break;
-        }
+        int rc = cond_wait_cancel_safe(timer_wait ? &o->waitable_cond : &o->cond,
+                                       &o->lock, bounded, &until);
+        pthread_mutex_unlock(&o->lock);
+        (void)rc;
     }
+}
 
-    if (result == WAIT_OBJECT_0) {
-        switch (o->kind) {
-        case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
-        case K_WAITABLE_TIMER:
-            if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
-            break;
-        case K_SEM:   o->sem_count--; break;
-        case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
-        default: break;
-        }
-    }
-    pthread_mutex_unlock(&o->lock);
-    return result;
+static DWORD wait_single(w32_object *o, DWORD ms)
+{
+    return wait_single_impl(o, ms, 1);
 }
 
 DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
-    if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+    if (!h) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return WAIT_FAILED;
+    }
+    if (h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
     {
         w32_object *o = obj_lookup(h);
         if (!o) return WAIT_FAILED;
+        service_waitable_timers();
         return wait_single(o, ms);
     }
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
 {
-    if (alertable && drain_apcs() > 0)
-        return WAIT_IO_COMPLETION;
-    return WaitForSingleObject(h, ms);
+    if (!alertable) return WaitForSingleObject(h, ms);
+    service_waitable_timers();
+    if (!h) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return WAIT_FAILED;
+    }
+    if (h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+        return drain_apcs() > 0 ? WAIT_IO_COMPLETION : WAIT_OBJECT_0;
+    struct timespec end = {0, 0};
+    int timed = ms != INFINITE;
+    if (timed) deadline_from_ms(ms, &end);
+    w32_object *o = obj_lookup(h);
+    if (!o) return WAIT_FAILED;
+    for (;;) {
+        service_waitable_timers();
+        if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+        if (wait_single_impl(o, 0, 0) == WAIT_OBJECT_0) {
+            service_waitable_timers();
+            if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+            if (wait_single_impl(o, 0, 1) == WAIT_OBJECT_0) return WAIT_OBJECT_0;
+        }
+        DWORD slice = 5;
+        if (timed) {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            if (!timespec_before(&now, &end)) return WAIT_TIMEOUT;
+            int64_t left_ms = ((int64_t)end.tv_sec - now.tv_sec) * 1000 +
+                              (end.tv_nsec - now.tv_nsec + 999999) / 1000000;
+            if (left_ms < slice) slice = (DWORD)left_ms;
+        }
+        DWORD result = wait_single_impl(o, slice, 0);
+        service_waitable_timers();
+        if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+        if (result == WAIT_OBJECT_0) {
+            if (wait_single_impl(o, 0, 1) == WAIT_OBJECT_0) return WAIT_OBJECT_0;
+        }
+        if (timed) {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            if (!timespec_before(&now, &end)) return WAIT_TIMEOUT;
+        }
+    }
 }
 
 /*
@@ -767,23 +1142,108 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, D
 DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                                DWORD ms, BOOL alertable)
 {
-    struct timespec ts;
+    if (!handles || count == 0 || count > MAXIMUM_WAIT_OBJECTS) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
+    for (DWORD i = 0; i < count; i++) {
+        if (!handles[i] ||
+            (handles[i] != PSEUDO_CURRENT_THREAD &&
+             handles[i] != PSEUDO_CURRENT_PROCESS && !obj_lookup(handles[i]))) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return WAIT_FAILED;
+        }
+        for (DWORD j = 0; j < i; j++) {
+            if (handles[i] == handles[j]) {
+                SetLastError(ERROR_INVALID_PARAMETER);
+                return WAIT_FAILED;
+            }
+        }
+    }
+
+    struct timespec ts = {0, 0};
     int timed = (ms != INFINITE);
     if (timed) deadline_from_ms(ms, &ts);
 
+    w32_object *ordered[MAXIMUM_WAIT_OBJECTS];
+    if (waitAll) {
+        for (DWORD i = 0; i < count; i++) {
+            ordered[i] = (w32_object *)handles[i];
+        }
+        /* Insertion sort is bounded by MAXIMUM_WAIT_OBJECTS and gives every
+         * wait-all call the same lock order, including reversed arrays. */
+        for (DWORD i = 1; i < count; i++) {
+            w32_object *item = ordered[i];
+            DWORD j = i;
+            while (j > 0 && (uintptr_t)ordered[j - 1] > (uintptr_t)item) {
+                ordered[j] = ordered[j - 1];
+                j--;
+            }
+            ordered[j] = item;
+        }
+    }
+
     for (;;) {
+        service_waitable_timers();
         if (alertable && drain_apcs() > 0)
             return WAIT_IO_COMPLETION;
 
         if (waitAll) {
-            DWORD got = 0;
-            for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) got++;
-            if (got == count) return WAIT_OBJECT_0;
+            DWORD locked = 0;
+            for (; locked < count; locked++) {
+                if (ordered[locked] == (w32_object *)PSEUDO_CURRENT_PROCESS ||
+                    ordered[locked] == (w32_object *)PSEUDO_CURRENT_THREAD) continue;
+                pthread_mutex_lock(&ordered[locked]->lock);
+            }
+            int ready = 1;
+            for (DWORD i = 0; i < count; i++) {
+                if (handles[i] == PSEUDO_CURRENT_PROCESS || handles[i] == PSEUDO_CURRENT_THREAD) continue;
+                if (!object_ready_locked((w32_object *)handles[i])) { ready = 0; break; }
+            }
+            if (ready && alertable) {
+                for (DWORD i = count; i > 0; i--) {
+                    if (ordered[i - 1] == (w32_object *)PSEUDO_CURRENT_PROCESS ||
+                        ordered[i - 1] == (w32_object *)PSEUDO_CURRENT_THREAD) continue;
+                    pthread_mutex_unlock(&ordered[i - 1]->lock);
+                }
+                service_waitable_timers();
+                if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+                for (locked = 0; locked < count; locked++) {
+                    if (ordered[locked] == (w32_object *)PSEUDO_CURRENT_PROCESS ||
+                        ordered[locked] == (w32_object *)PSEUDO_CURRENT_THREAD) continue;
+                    pthread_mutex_lock(&ordered[locked]->lock);
+                }
+                for (DWORD i = 0; i < count; i++) {
+                    if (handles[i] == PSEUDO_CURRENT_PROCESS || handles[i] == PSEUDO_CURRENT_THREAD) continue;
+                    if (!object_ready_locked((w32_object *)handles[i])) { ready = 0; break; }
+                }
+            }
+            if (ready) {
+                for (DWORD i = 0; i < count; i++) {
+                    if (handles[i] == PSEUDO_CURRENT_PROCESS || handles[i] == PSEUDO_CURRENT_THREAD) continue;
+                    object_consume_locked((w32_object *)handles[i]);
+                }
+            }
+            for (DWORD i = count; i > 0; i--) {
+                if (ordered[i - 1] == (w32_object *)PSEUDO_CURRENT_PROCESS ||
+                    ordered[i - 1] == (w32_object *)PSEUDO_CURRENT_THREAD) continue;
+                pthread_mutex_unlock(&ordered[i - 1]->lock);
+            }
+            if (ready) return WAIT_OBJECT_0;
         } else {
-            for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0)
+            for (DWORD i = 0; i < count; i++) {
+                HANDLE h = handles[i];
+                int ready = h == PSEUDO_CURRENT_PROCESS || h == PSEUDO_CURRENT_THREAD;
+                if (!ready) ready = wait_single_impl((w32_object *)h, 0, 0) == WAIT_OBJECT_0;
+                if (ready) {
+                    service_waitable_timers();
+                    if (alertable && drain_apcs() > 0) return WAIT_IO_COMPLETION;
+                    if (h != PSEUDO_CURRENT_PROCESS && h != PSEUDO_CURRENT_THREAD &&
+                        wait_single_impl((w32_object *)h, 0, 1) != WAIT_OBJECT_0)
+                        continue;
                     return WAIT_OBJECT_0 + i;
+                }
+            }
         }
 
         if (timed) {
@@ -922,28 +1382,44 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+static void thread_finish(void *arg)
+{
+    w32_object *o = (w32_object *)arg;
+    cancel_thread_timers(o);
+    pthread_mutex_lock(&o->lock);
+    if (!o->exited) {
+        o->exited = 1;
+        o->signaled = 1;
+        pthread_cond_broadcast(&o->cond);
+    }
+    pthread_mutex_unlock(&o->lock);
+    t_self_obj = NULL;
+    t_tid = 0;
+    obj_release(o); /* exactly one worker reference, for return or cancellation */
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
+    pthread_cleanup_push(thread_finish, o);
     t_self_obj = o;
     t_tid      = o->tid;
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
+    pthread_cleanup_push(unlock_mutex_cleanup, &o->lock);
     while (o->suspend_count > 0)
         pthread_cond_wait(&o->gate, &o->lock);
+    pthread_cleanup_pop(0);
     pthread_mutex_unlock(&o->lock);
 
     DWORD rc = o->start ? o->start(o->start_param) : 0;
-
     pthread_mutex_lock(&o->lock);
-    o->exit_code = rc;
-    o->exited    = 1;
-    o->signaled  = 1;
-    pthread_cond_broadcast(&o->cond);
+    if (!o->thread_termination_requested && !o->exited)
+        o->exit_code = rc;
     pthread_mutex_unlock(&o->lock);
 
-    obj_release(o);   /* drop the trampoline's reference */
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
@@ -953,6 +1429,10 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 {
     (void)sa;
     w32_object *o = obj_alloc(K_THREAD);
+    if (!o) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     o->start         = start;
     o->start_param   = param;
     o->tid           = (DWORD)InterlockedIncrement(&s_next_tid);
@@ -960,7 +1440,19 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
     o->refcount      = 2;   /* one for caller, one for the trampoline */
 
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
+    if (pthread_attr_init(&attr) != 0) {
+        o->refcount = 1;
+        obj_release(o);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0) {
+        pthread_attr_destroy(&attr);
+        o->refcount = 1;
+        obj_release(o);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     if (stackSize)
         pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize);
 
@@ -972,7 +1464,6 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
         return NULL;
     }
     pthread_attr_destroy(&attr);
-    o->thread_joinable = 1;
 
     if (threadId) *threadId = o->tid;
     return (HANDLE)o;
@@ -983,12 +1474,9 @@ VOID ExitThread(DWORD exitCode)
     w32_object *o = t_self_obj;
     if (o) {
         pthread_mutex_lock(&o->lock);
-        o->exit_code = exitCode;
-        o->exited    = 1;
-        o->signaled  = 1;
-        pthread_cond_broadcast(&o->cond);
+        if (!o->thread_termination_requested && !o->exited)
+            o->exit_code = exitCode;
         pthread_mutex_unlock(&o->lock);
-        obj_release(o);
     }
     pthread_exit(NULL);
 }
@@ -1030,16 +1518,24 @@ DWORD SuspendThread(HANDLE h)
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
+    if (h == PSEUDO_CURRENT_THREAD) {
+        ExitThread(exitCode);
+        return TRUE;
+    }
     w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_THREAD) return FALSE;
-    pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
-    o->exit_code = exitCode;
-    o->exited    = 1;
-    o->signaled  = 1;
-    pthread_cond_broadcast(&o->cond);
+    if (o->exited) {
+        pthread_mutex_unlock(&o->lock);
+        return TRUE;
+    }
+    int rc = pthread_cancel(o->thread);
+    if (rc == 0) {
+        o->exit_code = exitCode;
+        o->thread_termination_requested = 1;
+    }
     pthread_mutex_unlock(&o->lock);
-    return TRUE;
+    return rc == 0;
 }
 
 BOOL SetThreadPriority(HANDLE h, int priority)
@@ -1060,13 +1556,16 @@ VOID YieldProcessor(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_lookup(thread);
-    if (!o || o->kind != K_THREAD) return 0;
+    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? current_apc_object() : obj_lookup(thread);
+    if (!o || o->kind != K_THREAD || !func) return 0;
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
     if (o->apc_count < W32_MAX_APC) {
-        o->apc_func[o->apc_count] = func;
-        o->apc_data[o->apc_count] = data;
+        w32_apc *entry = &o->apcs[o->apc_count];
+        memset(entry, 0, sizeof(*entry));
+        entry->kind = W32_APC_USER;
+        entry->user_func = func;
+        entry->user_data = data;
         o->apc_count++;
         ok = 1;
     }
@@ -1080,19 +1579,34 @@ DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 
 VOID Sleep(DWORD ms)
 {
-    if (ms == 0) { sched_yield(); return; }
+    if (ms == 0) { sched_yield(); service_waitable_timers(); return; }
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
+    service_waitable_timers();
 }
 
 DWORD SleepEx(DWORD ms, BOOL alertable)
 {
-    if (alertable && drain_apcs() > 0)
-        return WAIT_IO_COMPLETION;
-    Sleep(ms);
-    if (alertable && drain_apcs() > 0)
-        return WAIT_IO_COMPLETION;
-    return 0;
+    if (!alertable) { Sleep(ms); return 0; }
+    if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+    struct timespec end;
+    int timed = ms != INFINITE;
+    if (timed) deadline_from_ms(ms, &end);
+    for (;;) {
+        service_waitable_timers();
+        if (drain_apcs() > 0) return WAIT_IO_COMPLETION;
+        int64_t left_ns = 5000000LL;
+        if (timed) {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            if (!timespec_before(&now, &end)) return 0;
+            left_ns = ((int64_t)end.tv_sec - now.tv_sec) * 1000000000LL +
+                      end.tv_nsec - now.tv_nsec;
+            if (left_ns > 5000000LL) left_ns = 5000000LL;
+        }
+        struct timespec delay = { (time_t)(left_ns / 1000000000LL), (long)(left_ns % 1000000000LL) };
+        while (nanosleep(&delay, &delay) == -1 && errno == EINTR) { }
+    }
 }
 
 /* ===================================================================== */
@@ -1206,6 +1720,7 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
     (void)name;
     w32_object *o = obj_alloc(K_WAITABLE_TIMER);
     o->waitable_manual_reset = manualReset;
+    o->waitable_handle_count = 1;
     return (HANDLE)o;
 }
 
@@ -1213,46 +1728,89 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
                       PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
 {
     w32_object *o = obj_lookup(h);
-    (void)completion; (void)arg; (void)resume;
-    if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
-    pthread_mutex_lock(&o->lock);
-    /* Win32 100ns units: negative is relative to now, positive is an absolute
-     * FILETIME. ponytail: period is ignored -- one-shot only, revisit if a
-     * title actually arms a repeating timer. */
-    if (dueTime->QuadPart <= 0) {
-        clock_gettime(CLOCK_REALTIME, &o->waitable_due_time);
-        LONGLONG ns = -dueTime->QuadPart * 100LL;
-        o->waitable_due_time.tv_sec  += (time_t)(ns / 1000000000LL);
-        o->waitable_due_time.tv_nsec += (long)(ns % 1000000000LL);
-        if (o->waitable_due_time.tv_nsec >= 1000000000L) {
-            o->waitable_due_time.tv_sec++;
-            o->waitable_due_time.tv_nsec -= 1000000000L;
-        }
+    if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (period < 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    LONGLONG value = dueTime->QuadPart;
+    clockid_t clock = value < 0 ? CLOCK_MONOTONIC : CLOCK_REALTIME;
+    struct timespec deadline;
+    if (value < 0) {
+        uint64_t ticks = (uint64_t)(-(value + 1)) + 1;
+        uint64_t seconds = ticks / 10000000ULL;
+        uint64_t remainder = ticks % 10000000ULL;
+        clock_gettime(clock, &deadline);
+        deadline.tv_sec += (time_t)seconds;
+        deadline.tv_nsec += (long)(remainder * 100ULL);
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
     } else {
         /* FILETIME epoch is 1601-01-01; Unix is 1970-01-01. */
-        LONGLONG unix100ns = dueTime->QuadPart - 116444736000000000LL;
-        o->waitable_due_time.tv_sec  = (time_t)(unix100ns / 10000000LL);
-        o->waitable_due_time.tv_nsec = (long)((unix100ns % 10000000LL) * 100LL);
+        LONGLONG unix100ns = value - 116444736000000000LL;
+        LONGLONG seconds = unix100ns / 10000000LL;
+        LONGLONG remainder = unix100ns % 10000000LL;
+        if (remainder < 0) { seconds--; remainder += 10000000LL; }
+        deadline.tv_sec = (time_t)seconds;
+        deadline.tv_nsec = (long)(remainder * 100LL);
     }
-    (void)period;
+    w32_object *owner = completion ? current_apc_object() : NULL;
+    if (completion && !owner) {
+        SetLastError(8 /* ERROR_NOT_ENOUGH_MEMORY */);
+        return FALSE;
+    }
+
+    pthread_mutex_lock(&s_waitable_registry_lock);
+    pthread_mutex_lock(&o->lock);
+    timer_refresh_locked(o);
+    timer_remove_apcs_locked(o, o->waitable_apc_owner);
+    o->waitable_apc_queued = 0;
+    o->waitable_apc_due_pending = 0;
+    o->waitable_generation++;
+    o->waitable_clock = clock;
+    o->waitable_due_time = deadline;
+    o->waitable_period = period;
+    o->waitable_completion = completion;
+    o->waitable_arg = arg;
+    o->waitable_apc_due = value;
+    o->waitable_apc_owner = owner;
     o->waitable_armed = 1;
     o->waitable_triggered = 0;
+    timer_register_locked(o);
+    timer_notify_locked(o);
     pthread_mutex_unlock(&o->lock);
-    pthread_cond_broadcast(&o->cond);
+    pthread_mutex_unlock(&s_waitable_registry_lock);
+    if (resume) SetLastError(ERROR_NOT_SUPPORTED);
     return TRUE;
 }
 
 BOOL CancelWaitableTimer(HANDLE h)
 {
     w32_object *o = obj_lookup(h);
-    if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
+    if (!o || o->kind != K_WAITABLE_TIMER) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    pthread_mutex_lock(&s_waitable_registry_lock);
     pthread_mutex_lock(&o->lock);
-    o->waitable_triggered = 0;
+    timer_refresh_locked(o);
     o->waitable_armed = 0;
+    o->waitable_generation++;
+    timer_remove_apcs_locked(o, o->waitable_apc_owner);
+    o->waitable_apc_queued = 0;
+    o->waitable_apc_due_pending = 0;
+    o->waitable_completion = NULL;
+    o->waitable_apc_owner = NULL;
+    int drop_registry = timer_unlink_locked(o);
+    timer_notify_locked(o);
     pthread_mutex_unlock(&o->lock);
+    pthread_mutex_unlock(&s_waitable_registry_lock);
+    if (drop_registry) obj_release(o);
     return TRUE;
 }
-
 /* ===================================================================== */
 /* Heap (thin wrapper over malloc; the single process heap)              */
 /* ===================================================================== */
@@ -1296,6 +1854,7 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
  * is ERROR_INVALID_PARAMETER, as on Win32, and returns -1 rather than a guess. */
 static int prot_from_page(DWORD protect)
 {
+    if (protect & ~0xFFu) return -1;
     switch (protect & 0xFF) {
     case PAGE_NOACCESS:          return PROT_NONE;
     case PAGE_READONLY:          return PROT_READ;
@@ -1355,74 +1914,170 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
 }
 #endif
 
-/* Length registry, defined with the view helpers below. Win32 frees by address
- * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
- * documented to take size 0 -- so the length has to be recoverable here or
- * munmap cannot be called at all. */
-void view_register(void *addr, size_t len);
-size_t view_take(const void *addr);
-static int held_contains(const void *addr, size_t len);
-static int held_release(void *addr, size_t len);
-static void held_add(void *addr, size_t len);
-static void held_drop(const void *addr, size_t len);
+/* The same bounded registry owns both private VirtualAlloc reservations and
+ * mapped views. Per-page metadata is what makes the Win32 query/protect/free
+ * contracts observable without pretending arbitrary host mappings are ours. */
+typedef struct {
+    void *addr;
+    void *allocation_base;
+    size_t len;
+    size_t page_count;
+    DWORD allocation_protect;
+    DWORD type;
+    int private_allocation;
+    uint64_t allocation_id;
+    DWORD *pages; /* MEM_RESERVE/MEM_COMMIT plus current PAGE_* protection */
+} w32_view;
+static w32_view s_views[512];
+static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t s_next_view_allocation_id = 1;
+
+static size_t vm_page_size(void)
+{
+    long value = sysconf(_SC_PAGESIZE);
+    return value > 0 ? (size_t)value : 4096;
+}
+
+static int vm_round_size(SIZE_T size, size_t *rounded)
+{
+    size_t page = vm_page_size();
+    if (!size || size > SIZE_MAX - (page - 1)) return 0;
+    *rounded = (size + page - 1) & ~(page - 1);
+    return 1;
+}
+
+static int vm_reservation_range(void *address, SIZE_T size,
+                               void **base_out, size_t *size_out)
+{
+    const uintptr_t granularity = 64 * 1024;
+    uintptr_t page = (uintptr_t)vm_page_size();
+    uintptr_t start = (uintptr_t)address;
+    if (!size || size > UINTPTR_MAX - start) return 0;
+    uintptr_t lo = address ? start & ~(granularity - 1) : start;
+    uintptr_t end = start + size;
+    if (end > UINTPTR_MAX - (page - 1)) return 0;
+    uintptr_t hi = (end + page - 1) & ~(page - 1);
+    if (hi <= lo || hi - lo > SIZE_MAX) return 0;
+    *base_out = (void *)lo;
+    *size_out = (size_t)(hi - lo);
+    return 1;
+}
+
+static int vm_normalize_range(void *address, SIZE_T size,
+                              void **base_out, size_t *size_out)
+{
+    uintptr_t page = (uintptr_t)vm_page_size();
+    uintptr_t start = (uintptr_t)address;
+    if (!size || size > UINTPTR_MAX - start) return 0;
+    uintptr_t lo = start & ~(page - 1);
+    uintptr_t end = start + size;
+    if (end > UINTPTR_MAX - (page - 1)) return 0;
+    uintptr_t hi = (end + page - 1) & ~(page - 1);
+    if (hi <= lo || hi - lo > SIZE_MAX) return 0;
+    *base_out = (void *)lo;
+    *size_out = (size_t)(hi - lo);
+    return 1;
+}
+
+static int view_register(void *addr, size_t len, DWORD allocation_protect,
+                         DWORD type, DWORD page_state, int private_allocation);
+static int view_find_locked(const void *addr, size_t len, int require_private,
+                            int exact_base, int *index, size_t *first_page,
+                            size_t *page_count);
+static int view_commit(void *address, size_t size, DWORD protect);
+static int view_decommit(void *address, size_t size);
+static int view_protect(void *address, size_t size, DWORD protect,
+                        DWORD *old_protect);
+static int view_release(void *address, SIZE_T size);
 
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    size_t rounded;
+    void *map_address = address;
 
-    if (prot < 0) {
+    if (prot < 0 || !vm_round_size(size, &rounded)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return NULL;
     }
 
-    /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
-     * just adjust protection. */
-    if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address) {
-        if (mprotect(address, size, prot) == 0)
-            return address;
-        /* fall through to a fresh mapping */
+    if ((allocationType != MEM_COMMIT) && (allocationType != MEM_RESERVE) &&
+        (allocationType != (MEM_RESERVE | MEM_COMMIT))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
     }
 
-    /* Inside one of our own reservations the range is ours to replace, the
-     * way Win32 replaces a placeholder; anywhere else a fixed address must
-     * not displace someone else's mapping. */
-    int replace = address && held_contains(address, size);
-    if (replace)
-        flags |= MAP_FIXED;
+    if (allocationType == MEM_COMMIT && address) {
+        if (!view_commit(address, size, protect)) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        return (void *)((uintptr_t)address & ~(uintptr_t)(vm_page_size() - 1));
+    }
+
+    if (address) {
+        if (!vm_reservation_range(address, size, &map_address, &rounded)) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+    } else if (!vm_round_size(size, &rounded)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    size_t mapping_len = rounded;
+    if (!map_address) {
+        if (rounded > SIZE_MAX - 0x10000u) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return NULL;
+        }
+        mapping_len += 0x10000u;
+    }
+
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #if defined(MAP_FIXED_NOREPLACE)
-    else if (address) flags |= MAP_FIXED_NOREPLACE;
+    if (map_address) flags |= MAP_FIXED_NOREPLACE;
 #endif
 
-    /* MEM_RESERVE alone maps no access: a reserved page is neither readable nor
-     * writable until it is committed, and VirtualQuery reports it that way. */
-    int map_prot = (allocationType & MEM_RESERVE) && !(allocationType & MEM_COMMIT)
-                   ? PROT_NONE : (prot ? prot : PROT_READ | PROT_WRITE);
+    int map_prot = allocationType == MEM_RESERVE ? PROT_NONE : prot;
+
     void *p;
 #if defined(__APPLE__)
-    if (address && !replace) {
-        p = mach_map_fixed(address, size, map_prot);
+    if (map_address) {
+        p = mach_map_fixed(map_address, rounded, map_prot);
     } else
 #endif
-    p = mmap(address, size, map_prot, flags, -1, 0);
+    p = mmap(map_address, mapping_len, map_prot, flags, -1, 0);
     if (p == MAP_FAILED) {
+        SetLastError(map_address ? ERROR_INVALID_ADDRESS : ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    if (!map_address) {
+        uintptr_t aligned = ((uintptr_t)p + 0xFFFFu) & ~(uintptr_t)0xFFFFu;
+        size_t prefix = (size_t)(aligned - (uintptr_t)p);
+        size_t suffix = mapping_len - prefix - rounded;
+        if ((prefix && munmap(p, prefix) != 0) ||
+            (suffix && munmap((char *)aligned + rounded, suffix) != 0)) {
+            /* munmap of aligned fragments should not fail for this fresh
+             * anonymous mapping; do not publish a partially trimmed range. */
+            munmap((void *)aligned, rounded);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
+        p = (void *)aligned;
+    }
+    DWORD state = allocationType == MEM_RESERVE ? MEM_RESERVE : MEM_COMMIT;
+    if (!view_register(p, rounded, protect, MEM_PRIVATE, state, 1)) {
+        munmap(p, rounded);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
-    if (replace)
-        held_drop(p, size);                 /* now an allocation of its own */
-    if ((allocationType & MEM_RESERVE) && !(allocationType & MEM_COMMIT))
-        held_add(p, size);                  /* and still a reservation */
-    /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
-     * Win32 caller, and munmap cannot be called without one. */
-    view_register(p, size);
 #if !defined(MAP_FIXED_NOREPLACE) && !defined(__APPLE__)
     /* Older kernels without MAP_FIXED_NOREPLACE: plain MAP_FIXED would silently
      * unmap whatever already lives there, so we pass the address as a hint and
      * treat a different result as "taken". Apple goes through mach_map_fixed
      * above, which reports that properly instead of inferring it. */
-    if (address && p != address) {
-        munmap(p, size);
+    if (map_address && p != map_address) {
+        view_release(p, 0);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
@@ -1432,99 +2087,10 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 
 BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
 {
-    if (freeType & MEM_RELEASE) {
-        /* Win32 MEM_RELEASE passes size 0 and frees the whole allocation, so
-         * the length comes from the registry VirtualAlloc filled in. Returning
-         * TRUE without unmapping -- as this used to -- made every release a
-         * silent no-op: the caller believed the address was free, the next
-         * allocation there failed, and nothing connected the two. */
-        /* Part of one of our reservations: keep holding it (no access, no
-         * memory) so the slice can be mapped over atomically, instead of
-         * opening a hole another thread's mmap can land in first. */
-        if (size && held_release(address, size))
-            return TRUE;
-        size_t len = view_take(address);
-        if (size == 0) size = len;
-        if (size == 0) return FALSE;
-        held_drop(address, size);
-        return munmap(address, size) == 0;
-    }
-    if (freeType & MEM_DECOMMIT)
-        return mprotect(address, size, PROT_NONE) == 0;
-    return TRUE;
-}
-
-/* Host page state, read back from the kernel (/proc/self/maps on Linux,
- * mach_vm_region on Darwin). Win32 protection and commit state derive from it,
- * so there is no parallel record to drift from the page tables. */
-typedef struct {
-    uintptr_t start, end;   /* [start, end) */
-    int       mapped;       /* 0: [addr, start) is a gap */
-    int       perms;        /* PROT_* of the mapping */
-} w32_host_region;
-
-/* The region holding addr, or else the first one after it. Returns 1 when a
- * region was found, 0 when nothing maps at or after addr, -1 when the host
- * state cannot be read. */
-#if defined(__APPLE__)
-static int host_region_at(uintptr_t addr, w32_host_region *r)
-{
-    mach_vm_address_t at = (mach_vm_address_t)addr;
-    mach_vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t object = MACH_PORT_NULL;
-    if (mach_vm_region(mach_task_self(), &at, &size, VM_REGION_BASIC_INFO_64,
-                       (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
-        return 0;
-    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
-    r->start  = (uintptr_t)at;
-    r->end    = (uintptr_t)(at + size);
-    r->mapped = (uintptr_t)at <= addr;
-    r->perms  = ((info.protection & VM_PROT_READ)    ? PROT_READ  : 0) |
-                ((info.protection & VM_PROT_WRITE)   ? PROT_WRITE : 0) |
-                ((info.protection & VM_PROT_EXECUTE) ? PROT_EXEC  : 0);
-    return 1;
-}
-#else
-static int host_region_at(uintptr_t addr, w32_host_region *r)
-{
-    char line[1024];
-    FILE *maps = fopen("/proc/self/maps", "r");
-    int found = 0;
-    if (!maps) return -1;
-    /* Lines are address-ordered. A line longer than the buffer is cut, but the
-     * fields read here come first, and the tail fails the sscanf below. */
-    while (fgets(line, sizeof line, maps)) {
-        unsigned long lo, hi;
-        char perm[5] = "";
-        if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perm) != 3) continue;
-        if ((uintptr_t)hi <= addr) continue;
-        r->start  = (uintptr_t)lo;
-        r->end    = (uintptr_t)hi;
-        r->mapped = (uintptr_t)lo <= addr;
-        r->perms  = (perm[0] == 'r' ? PROT_READ  : 0) |
-                    (perm[1] == 'w' ? PROT_WRITE : 0) |
-                    (perm[2] == 'x' ? PROT_EXEC  : 0);
-        found = 1;
-        break;
-    }
-    fclose(maps);
-    return found;
-}
-#endif
-
-static DWORD protect_from_perms(int perms)
-{
-    switch (perms & (PROT_READ | PROT_WRITE | PROT_EXEC)) {
-    case 0:                              return PAGE_NOACCESS;
-    case PROT_READ:                      return PAGE_READONLY;
-    case PROT_READ | PROT_WRITE:
-    case PROT_WRITE:                     return PAGE_READWRITE;
-    case PROT_EXEC:                      return PAGE_EXECUTE;
-    case PROT_READ | PROT_EXEC:          return PAGE_EXECUTE_READ;
-    default:                             return PAGE_EXECUTE_READWRITE;
-    }
+    if (freeType == MEM_RELEASE) return view_release(address, size);
+    if (freeType == MEM_DECOMMIT) return view_decommit(address, size);
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
 }
 
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
@@ -1535,13 +2101,7 @@ BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldPro
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    w32_host_region r;
-    /* Win32 reports the protection of the first page of the range. */
-    int known = host_region_at((uintptr_t)address, &r) == 1 && r.mapped;
-    if (oldProtect) *oldProtect = known ? protect_from_perms(r.perms) : PAGE_READWRITE;
-    if (mprotect(address, size, prot) == 0) return TRUE;
-    SetLastError(ERROR_INVALID_ADDRESS);
-    return FALSE;
+    return view_protect(address, size, newProtect, oldProtect);
 }
 
 /* ===================================================================== */
@@ -2012,117 +2572,358 @@ int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 /* File mapping (memfd-backed)                                           */
 /* ===================================================================== */
 
-/* Registry of active views: UnmapViewOfFile takes no length, so we must
- * recover the mapping length here for munmap. */
-typedef struct { void *addr; size_t len; } w32_view;
-static w32_view        s_views[512];
-static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
-
-void view_register(void *addr, size_t len)
+/* Register one complete mapping. Failure is explicit: callers unmap it before
+ * publishing a pointer when all 512 ownership slots are occupied. */
+static int view_register(void *addr, size_t len, DWORD allocation_protect,
+                         DWORD type, DWORD page_state, int private_allocation)
 {
+    size_t page_count = len / vm_page_size();
+    if (!page_count || page_count > SIZE_MAX / sizeof(DWORD)) return 0;
+    DWORD *pages = (DWORD *)malloc(page_count * sizeof(*pages));
+    if (!pages) return 0;
+    DWORD value = page_state;
+    if (page_state == MEM_COMMIT) value |= allocation_protect & 0xFF;
+    for (size_t i = 0; i < page_count; i++) pages[i] = value;
+
+    int registered = 0;
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++)
-        if (!s_views[i].addr) { s_views[i].addr = addr; s_views[i].len = len; break; }
+        if (!s_views[i].addr) {
+            s_views[i].addr = addr;
+            s_views[i].allocation_base = addr;
+            s_views[i].len = len;
+            s_views[i].page_count = page_count;
+            s_views[i].allocation_protect = allocation_protect;
+            s_views[i].type = type;
+            s_views[i].private_allocation = private_allocation;
+            s_views[i].allocation_id = s_next_view_allocation_id++;
+            if (!s_views[i].allocation_id)
+                s_views[i].allocation_id = s_next_view_allocation_id++;
+            s_views[i].pages = pages;
+            registered = 1;
+            break;
+        }
     pthread_mutex_unlock(&s_views_lock);
+    if (!registered) free(pages);
+    return registered;
 }
 
-/* Non-destructive counterpart to view_take, and interior-aware: VirtualQuery
- * is asked about addresses *within* a region at least as often as about its
- * base -- a translated guest VA lands in the middle of the 64 MB window.
- * Picks the containing region and reports where it starts. */
-int view_lookup(const void *addr, void **base_out, size_t *len_out)
+/* Find a page-aligned range wholly inside one tracked mapping. */
+static int view_find_locked(const void *addr, size_t len, int require_private,
+                            int exact_base, int *index_out, size_t *first_out,
+                            size_t *count_out)
 {
+    uintptr_t p = (uintptr_t)addr;
+    size_t page = vm_page_size();
+    if ((p % page) || (len % page) || len > UINTPTR_MAX - p) return 0;
+    for (int i = 0; i < 512; i++) {
+        w32_view *v = &s_views[i];
+        if (!v->addr || (require_private && !v->private_allocation)) continue;
+        uintptr_t lo = (uintptr_t)v->addr, hi = lo + v->len;
+        if ((exact_base && p != lo) || p < lo || p >= hi || p + len > hi)
+            continue;
+        size_t first = (p - lo) / page, count = len / page;
+        if (index_out) *index_out = i;
+        if (first_out) *first_out = first;
+        if (count_out) *count_out = count;
+        return 1;
+    }
+    return 0;
+}
+
+static int view_commit(void *address, size_t size, DWORD protect)
+{
+    int prot = prot_from_page(protect), index;
+    size_t first, count;
+    void *base;
+    if (!vm_normalize_range(address, size, &base, &size)) return 0;
+    if (prot < 0) return 0;
+    pthread_mutex_lock(&s_views_lock);
+    int found = view_find_locked(base, size, 1, 0, &index, &first, &count);
+    if (!found) { pthread_mutex_unlock(&s_views_lock); return 0; }
+    w32_view *v = &s_views[index];
+    if (mprotect(base, size, prot) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) v->pages[first + i] = MEM_COMMIT | (protect & 0xFF);
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+}
+
+static int view_decommit(void *address, size_t size)
+{
+#if defined(__APPLE__)
+    /* Darwin's MADV_DONTNEED does not promise that contents are discarded
+     * before a recommit. Do not report Windows zero-on-recommit semantics. */
+    (void)address; (void)size;
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return 0;
+#else
+    size_t rounded;
+    void *base;
+    int index;
+    size_t first, count;
+    if (!address) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    pthread_mutex_lock(&s_views_lock);
+    if (size == 0) {
+        if (!view_find_locked(address, 0, 1, 1, &index, NULL, NULL)) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
+        base = address;
+        rounded = s_views[index].len;
+    } else if (!vm_normalize_range(address, size, &base, &rounded)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (!view_find_locked(base, rounded, 1, 0, &index, &first, &count)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return 0;
+    }
+    if (mprotect(base, rounded, PROT_NONE) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+#if defined(MADV_DONTNEED)
+    if (madvise(base, rounded, MADV_DONTNEED) != 0) {
+        w32_view *v = &s_views[index];
+        for (size_t i = 0; i < count; i++) {
+            DWORD page = v->pages[first + i];
+            if ((page & MEM_COMMIT) == MEM_COMMIT)
+                mprotect((char *)base + i * vm_page_size(), vm_page_size(),
+                         prot_from_page(page & 0xFF));
+        }
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+#else
+    /* Without a discard primitive, decommit cannot promise zero-on-recommit. */
+    w32_view *v = &s_views[index];
+    for (size_t i = 0; i < count; i++) {
+        DWORD page = v->pages[first + i];
+        if ((page & MEM_COMMIT) == MEM_COMMIT)
+            mprotect((char *)base + i * vm_page_size(), vm_page_size(),
+                     prot_from_page(page & 0xFF));
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return 0;
+#endif
+    for (size_t i = 0; i < count; i++) s_views[index].pages[first + i] = MEM_RESERVE;
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+#endif
+}
+
+static int view_protect(void *address, size_t size, DWORD protect, DWORD *old_protect)
+{
+    int prot = prot_from_page(protect), index;
+    size_t rounded, first, count;
+    void *base;
+    if (!old_protect || prot < 0 || !vm_normalize_range(address, size, &base, &rounded)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    pthread_mutex_lock(&s_views_lock);
+    if (!view_find_locked(base, rounded, 0, 0, &index, &first, &count)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return 0;
+    }
+    w32_view *v = &s_views[index];
+    for (size_t i = 0; i < count; i++) {
+        if ((v->pages[first + i] & MEM_COMMIT) != MEM_COMMIT) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
+    }
+    DWORD previous = v->pages[first] & 0xFF;
+    if (mprotect(base, rounded, prot) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) v->pages[first + i] = MEM_COMMIT | (protect & 0xFF);
+    if (old_protect) *old_protect = previous;
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+}
+
+static int view_release(void *address, SIZE_T size)
+{
+    int index;
+    pthread_mutex_lock(&s_views_lock);
+    if (size != 0 || !view_find_locked(address, 0, 1, 1, &index, NULL, NULL)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    w32_view *v = &s_views[index];
+    for (int i = 0; i < 512; i++) {
+        if (i != index && s_views[i].addr && s_views[i].private_allocation &&
+            s_views[i].allocation_id == v->allocation_id) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+    }
+    if (v->allocation_base != address) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (munmap(v->addr, v->len) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+    free(v->pages);
+    memset(v, 0, sizeof(*v));
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+}
+
+/* Read the page record under the registry lock; query pages with matching
+ * state/protection form the Win32 region around the input page. */
+static int view_query(const void *addr, MEMORY_BASIC_INFORMATION *buffer)
+{
+    uintptr_t p = (uintptr_t)addr;
+    size_t page = vm_page_size();
     int found = 0;
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++) {
-        if (!s_views[i].addr)
+        w32_view *v = &s_views[i];
+        uintptr_t lo = (uintptr_t)v->addr;
+        if (!v->addr || p < lo || p - lo >= v->len) continue;
+        size_t at = (p - lo) / page;
+        DWORD value = v->pages[at];
+        size_t begin = at, end = at + 1;
+        while (end < v->page_count && v->pages[end] == value) end++;
+        buffer->BaseAddress = (char *)v->addr + begin * page;
+        buffer->AllocationBase = v->allocation_base;
+        buffer->AllocationProtect = v->allocation_protect;
+        buffer->RegionSize = (end - begin) * page;
+        buffer->State = value & (MEM_COMMIT | MEM_RESERVE);
+        buffer->Protect = buffer->State == MEM_COMMIT ? (value & 0xFF) : 0;
+        buffer->Type = v->type;
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    if (!found) {
+        buffer->BaseAddress = (PVOID)((uintptr_t)addr & ~(uintptr_t)(page - 1));
+        buffer->State = MEM_FREE;
+        buffer->Protect = PAGE_NOACCESS;
+    }
+    return found;
+}
+
+uint64_t w32_reservation_id(LPVOID base)
+{
+    uint64_t id = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        if (s_views[i].addr == base && s_views[i].private_allocation) {
+            id = s_views[i].allocation_id;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return id;
+}
+
+BOOL w32_release_reserved_region(LPVOID address, SIZE_T size)
+{
+    int index, free_slot = -1;
+    size_t first, count;
+    if (!address || !size || ((uintptr_t)address % vm_page_size()) ||
+        (size % vm_page_size())) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    pthread_mutex_lock(&s_views_lock);
+    if (!view_find_locked(address, size, 1, 0, &index, &first, &count)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    }
+    w32_view *v = &s_views[index];
+    for (size_t i = 0; i < count; i++) {
+        if (v->pages[first + i] != MEM_RESERVE) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return FALSE;
+        }
+    }
+    size_t left_count = first;
+    size_t right_count = v->page_count - first - count;
+    DWORD *right_pages = NULL;
+    if (left_count && right_count) {
+        for (int i = 0; i < 512; i++) {
+            if (!s_views[i].addr) { free_slot = i; break; }
+        }
+        if (free_slot < 0 || right_count > SIZE_MAX / sizeof(DWORD) ||
+            !(right_pages = (DWORD *)malloc(right_count * sizeof(DWORD)))) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return FALSE;
+        }
+        memcpy(right_pages, v->pages + first + count,
+               right_count * sizeof(DWORD));
+    }
+    if (munmap(address, size) != 0) {
+        free(right_pages);
+        pthread_mutex_unlock(&s_views_lock);
+        return FALSE;
+    }
+    if (left_count && right_count) {
+        w32_view right = *v;
+        right.addr = (char *)address + size;
+        right.len = right_count * vm_page_size();
+        right.page_count = right_count;
+        right.pages = right_pages;
+        v->len = left_count * vm_page_size();
+        v->page_count = left_count;
+        s_views[free_slot] = right;
+    } else if (left_count) {
+        v->len = left_count * vm_page_size();
+        v->page_count = left_count;
+    } else if (right_count) {
+        memmove(v->pages, v->pages + first + count, right_count * sizeof(DWORD));
+        v->addr = (char *)address + size;
+        v->len = right_count * vm_page_size();
+        v->page_count = right_count;
+    } else {
+        free(v->pages);
+        memset(v, 0, sizeof(*v));
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return TRUE;
+}
+
+BOOL w32_release_reservation(uint64_t allocation_id)
+{
+    if (!allocation_id) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    int ok = TRUE, found = FALSE;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        w32_view *v = &s_views[i];
+        if (!v->addr || !v->private_allocation || v->allocation_id != allocation_id)
             continue;
-        uintptr_t lo = (uintptr_t)s_views[i].addr;
-        uintptr_t hi = lo + s_views[i].len;
-        if ((uintptr_t)addr >= lo && (uintptr_t)addr < hi) {
-            if (base_out) *base_out = s_views[i].addr;
-            if (len_out)  *len_out  = s_views[i].len;
-            found = 1;
-            break;
+        found = TRUE;
+        if (munmap(v->addr, v->len) != 0) {
+            ok = FALSE;
+            continue;
         }
+        free(v->pages);
+        memset(v, 0, sizeof(*v));
     }
     pthread_mutex_unlock(&s_views_lock);
-    return found;
-}
-
-/* Reservations made by VirtualAlloc(MEM_RESERVE) and still held: address
- * ranges this process owns, which a fixed-address map may replace in place.
- * ponytail: a small array under the views lock; the memory layout makes a
- * handful of these. */
-typedef struct { uintptr_t lo, hi; } w32_held;
-static w32_held s_held[64];
-
-static void held_add(void *addr, size_t len)
-{
-    pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 64; i++)
-        if (!s_held[i].hi) { s_held[i].lo = (uintptr_t)addr; s_held[i].hi = (uintptr_t)addr + len; break; }
-    pthread_mutex_unlock(&s_views_lock);
-}
-
-static int held_contains(const void *addr, size_t len)
-{
-    uintptr_t lo = (uintptr_t)addr, hi = lo + len;
-    int found = 0;
-    pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 64 && !found; i++)
-        found = s_held[i].hi && lo >= s_held[i].lo && hi <= s_held[i].hi;
-    pthread_mutex_unlock(&s_views_lock);
-    return found;
-}
-
-/* A partial release inside a held reservation: discard the contents and keep
- * the range held. 1 if handled; 0 if not inside one, or if it is the whole
- * reservation (a real release). */
-static int held_release(void *addr, size_t len)
-{
-    uintptr_t lo = (uintptr_t)addr, hi = lo + len;
-    int partial = 0;
-    pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 64; i++)
-        if (s_held[i].hi && lo >= s_held[i].lo && hi <= s_held[i].hi) {
-            partial = !(lo == s_held[i].lo && hi == s_held[i].hi);
-            break;
-        }
-    pthread_mutex_unlock(&s_views_lock);
-    if (!partial) return 0;
-    return mmap(addr, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
-                -1, 0) != MAP_FAILED;
-}
-
-/* Stop holding [addr, addr+len): it was released or mapped over. A held range
- * that loses a piece from the middle keeps both ends. */
-static void held_drop(const void *addr, size_t len)
-{
-    uintptr_t lo = (uintptr_t)addr, hi = lo + len;
-    pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 64; i++) {
-        w32_held h = s_held[i];
-        if (!h.hi || hi <= h.lo || lo >= h.hi) continue;
-        s_held[i].lo = s_held[i].hi = 0;
-        if (h.lo < lo) { s_held[i].lo = h.lo; s_held[i].hi = lo; }
-        if (hi < h.hi) {
-            if (!s_held[i].hi) { s_held[i].lo = hi; s_held[i].hi = h.hi; }
-            else for (int j = 0; j < 64; j++)
-                if (!s_held[j].hi) { s_held[j].lo = hi; s_held[j].hi = h.hi; break; }
-        }
-    }
-    pthread_mutex_unlock(&s_views_lock);
-}
-
-size_t view_take(const void *addr)
-{
-    size_t len = 0;
-    pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 512; i++)
-        if (s_views[i].addr == addr) { len = s_views[i].len; s_views[i].addr = NULL; break; }
-    pthread_mutex_unlock(&s_views_lock);
-    return len;
+    if (!ok || !found) return FALSE;
+    return TRUE;
 }
 
 /* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
@@ -2146,9 +2947,23 @@ static int anon_map_fd(const char *name)
 HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                           DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
 {
-    (void)file; (void)sa; (void)protect;
-    SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
-    if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    (void)sa;
+    if (file != (HANDLE)(LONG_PTR)-1) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return NULL;
+    }
+    if (protect != PAGE_READONLY && protect != PAGE_READWRITE &&
+        protect != PAGE_WRITECOPY) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    uint64_t requested_size = ((uint64_t)maxSizeHigh << 32) | maxSizeLow;
+    if (requested_size == 0 || requested_size > SIZE_MAX ||
+        requested_size > (uint64_t)INT64_MAX) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    SIZE_T size = (SIZE_T)requested_size;
 
     int fd = anon_map_fd(name);
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
@@ -2159,8 +2974,10 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     }
 
     w32_object *o = obj_alloc(K_FILEMAP);
+    if (!o) { close(fd); SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     o->fd       = fd;
     o->map_size = size;
+    o->map_protect = protect;
     return (HANDLE)o;
 }
 
@@ -2174,13 +2991,42 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
-    w32_object *o = (w32_object *)mapping;
+    w32_object *o = obj_lookup(mapping);
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
-    off_t  off = ((off_t)offHigh << 32) | offLow;
-    SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
-    int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED;
+    uint64_t off_value = ((uint64_t)offHigh << 32) | offLow;
+    if (off_value > (uint64_t)INT64_MAX) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    off_t off = (off_t)off_value;
+    if ((off_value % (64 * 1024)) != 0 ||
+        (baseAddr && ((uintptr_t)baseAddr % (64 * 1024)) != 0)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    if (off < 0 || (SIZE_T)off >= o->map_size || (count && count > o->map_size - (SIZE_T)off)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    SIZE_T requested = count ? count : (o->map_size - (SIZE_T)off);
+    size_t len;
+    if (!vm_round_size(requested, &len)) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    int map_copy = access == FILE_MAP_COPY;
+    if (access != FILE_MAP_READ && access != FILE_MAP_WRITE &&
+        access != FILE_MAP_COPY && access != FILE_MAP_ALL_ACCESS) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    if ((o->map_protect == PAGE_READONLY && access != FILE_MAP_READ) ||
+        (o->map_protect == PAGE_WRITECOPY && access != FILE_MAP_READ && !map_copy)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    int prot   = PROT_READ | ((access == FILE_MAP_READ) ? 0 : PROT_WRITE);
+    DWORD page_protect = access == FILE_MAP_READ ? PAGE_READONLY
+                       : map_copy ? PAGE_WRITECOPY : PAGE_READWRITE;
+    int flags  = map_copy ? MAP_PRIVATE : MAP_SHARED;
 
     /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
      * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
@@ -2188,10 +3034,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
      * reserved, so with a base the OS chose rather than one we picked, that
      * difference is the process quietly destroying its own libraries and heap
      * and dying somewhere unrelated a moment later. */
-    int replace = baseAddr && held_contains(baseAddr, len);
-    if (replace) {
-        flags |= MAP_FIXED;                 /* over our own reservation */
-    } else if (baseAddr) {
+    if (baseAddr) {
 #if defined(MAP_FIXED_NOREPLACE)
         flags |= MAP_FIXED_NOREPLACE;
 #elif defined(__APPLE__)
@@ -2217,9 +3060,11 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
         SetLastError(ERROR_INVALID_ADDRESS);
         return NULL;
     }
-    if (replace)
-        held_drop(p, len);
-    view_register(p, len);
+    if (!view_register(p, len, page_protect, MEM_MAPPED, MEM_COMMIT, 0)) {
+        munmap(p, len);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     return p;
 }
 
@@ -2230,9 +3075,23 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, 
 
 BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
-    size_t len = view_take(baseAddr);
-    if (len == 0) return FALSE;
-    return munmap((void *)baseAddr, len) == 0;
+    pthread_mutex_lock(&s_views_lock);
+    int index;
+    if (!view_find_locked(baseAddr, 0, 0, 1, &index, NULL, NULL) ||
+        s_views[index].private_allocation) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    }
+    w32_view *v = &s_views[index];
+    if (munmap(v->addr, v->len) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return FALSE;
+    }
+    free(v->pages);
+    memset(v, 0, sizeof(*v));
+    pthread_mutex_unlock(&s_views_lock);
+    return TRUE;
 }
 
 /* ===================================================================== */
@@ -2263,59 +3122,13 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
     if (!buffer || length < sizeof(*buffer)) return 0;
     memset(buffer, 0, sizeof(*buffer));
 
-    void  *base = NULL;
-    size_t len  = 0;
-
-    if (!view_lookup(address, &base, &len)) {
+    if (!view_query(address, buffer)) {
         /* Not ours. Report it free rather than inventing a committed page. */
-        buffer->BaseAddress    = (PVOID)address;
         buffer->AllocationBase = NULL;
         buffer->RegionSize     = 0;
-        buffer->State          = MEM_FREE;
-        buffer->Protect        = PAGE_NOACCESS;
         buffer->Type           = 0;
         return sizeof(*buffer);
     }
-
-    /* The state is the host's: a page with no access is a reservation (Win32
-     * MEM_RESERVE, which also covers a decommitted page), anything else is
-     * committed. Without /proc the registry alone says it is committed RW. */
-    uintptr_t addr      = (uintptr_t)address;
-    uintptr_t page_size = (uintptr_t)sysconf(_SC_PAGESIZE);
-    uintptr_t page      = addr & ~(page_size - 1);
-    uintptr_t limit     = (uintptr_t)base + ((len + page_size - 1) & ~(page_size - 1));
-    w32_host_region r, first, next;
-    int rc = host_region_at(addr, &r);
-
-    if (rc == 0 || (rc > 0 && !r.mapped)) {
-        /* Owned by this layer but not mapped on the host: nothing to report. */
-        buffer->BaseAddress    = (PVOID)page;
-        buffer->AllocationBase = NULL;
-        buffer->State          = MEM_FREE;
-        buffer->Protect        = PAGE_NOACCESS;
-        return sizeof(*buffer);
-    }
-    if (rc < 0) {
-        r.start = addr; r.end = limit; r.mapped = 1; r.perms = PROT_READ | PROT_WRITE;
-    }
-
-    /* RegionSize is the run from this page of pages with the same state and
-     * protection, within the allocation. Callers sizing a copy depend on it. */
-    uintptr_t end = r.end < limit ? r.end : limit;
-    while (end < limit && host_region_at(end, &next) == 1 && next.mapped &&
-           next.start == end && next.perms == r.perms)
-        end = next.end < limit ? next.end : limit;
-
-    if (host_region_at((uintptr_t)base, &first) == 1 && first.mapped)
-        buffer->AllocationProtect = protect_from_perms(first.perms);
-    else
-        buffer->AllocationProtect = PAGE_READWRITE;
-    buffer->BaseAddress      = (PVOID)page;
-    buffer->AllocationBase   = base;
-    buffer->RegionSize       = end - page;
-    buffer->State            = r.perms == 0 ? MEM_RESERVE : MEM_COMMIT;
-    buffer->Protect          = protect_from_perms(r.perms);
-    buffer->Type             = MEM_PRIVATE;
     return sizeof(*buffer);
 }
 

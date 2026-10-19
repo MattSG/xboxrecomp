@@ -209,18 +209,18 @@ static void test_pixels(void)
     for (i = 0; i < 112; i++) {
         NvD3DTexture t = request(i);
         int levels = (int)(i % 5) + 1, reduce = (int)((i / 7) % 2);
-        SDL_GPUSampler *now = sampler(&t, levels, reduce);
+        SDL_GPUSampler *now = sampler(&t, levels, reduce, no_pinned_samplers);
         expect_sampler(now, &t, levels, reduce);
         calls = create_calls;
         for (repeat = 0; repeat < 8; repeat++)
-            CHECK(sampler(&t, levels, reduce) == now);
+            CHECK(sampler(&t, levels, reduce, no_pinned_samplers) == now);
         CHECK(create_calls == calls);
         /* Bits this descriptor does not read (filter bit 15, border colour)
          * keep the same sampler: the key is the descriptor, not the raw words. */
         t.filter ^= 0x8000;
-        CHECK(sampler(&t, levels, reduce) == now);
+        CHECK(sampler(&t, levels, reduce, no_pinned_samplers) == now);
         t.border ^= 0xFFFFFFu;
-        CHECK(sampler(&t, levels, reduce) == now);
+        CHECK(sampler(&t, levels, reduce, no_pinned_samplers) == now);
         CHECK(create_calls == calls);
     }
     /* Native GPU taps through the renderer's own draw: point sampling, and
@@ -242,24 +242,24 @@ static void test_pixels(void)
 static void test_eviction(void)
 {
     NvD3DTexture t = request(2), other = request(4);
-    SDL_GPUSampler *old = sampler(&t, 4, 0), *now;
+    SDL_GPUSampler *old = sampler(&t, 4, 0, no_pinned_samplers), *now;
     unsigned i, calls;
     int evicted = 0;
     expect_sampler(old, &t, 4, 0);
     for (i = 0; i < 32768 && !evicted; i++) {
         /* Control bits outside the LOD fields vary the key, not the result. */
         other.control0 = (i << 6) & 0x3FFFFFC0u;
-        CHECK(sampler(&other, 4, 0));
+        CHECK(sampler(&other, 4, 0, no_pinned_samplers));
         evicted = 1;
         for (unsigned j = 0; j < SAMP_SLOTS; j++)
-            if (s_samp[j].smp == old) { evicted = 0; break; }
+            if (s_samp[j].resource == old) { evicted = 0; break; }
     }
     CHECK(evicted && i > SAMP_SLOTS);
     calls = create_calls;
-    now = sampler(&t, 4, 0);
+    now = sampler(&t, 4, 0, no_pinned_samplers);
     CHECK(now && create_calls == calls + 1);
     expect_sampler(now, &t, 4, 0);
-    CHECK(sampler(&t, 4, 0) == now && create_calls == calls + 1);
+    CHECK(sampler(&t, 4, 0, no_pinned_samplers) == now && create_calls == calls + 1);
     printf("PASS: sampler table evicted the oldest key after %u requests; the same request is recreated with the reference descriptor\n", i);
 }
 
@@ -269,12 +269,12 @@ static void test_failure(void)
     SDL_GPUSampler *now;
     unsigned calls = create_calls;
     fail_sampler = 1;
-    CHECK(!sampler(&t, 4, 1));
+    CHECK(!sampler(&t, 4, 1, no_pinned_samplers));
     CHECK(create_calls == calls + 1 && !fail_sampler);
-    now = sampler(&t, 4, 1);
+    now = sampler(&t, 4, 1, no_pinned_samplers);
     CHECK(now && create_calls == calls + 2);
     expect_sampler(now, &t, 4, 1);
-    CHECK(sampler(&t, 4, 1) == now && create_calls == calls + 2);
+    CHECK(sampler(&t, 4, 1, no_pinned_samplers) == now && create_calls == calls + 2);
     printf("PASS: failed sampler creation publishes no cached hit; the same request retries and matches the reference\n");
 }
 
@@ -305,7 +305,7 @@ static void check_bound(const NvD3DTexture *t, int levels, int has_view, int tex
     CHECK(bind_calls == sampler_calls + 1);
     if (has_view) {
         CHECK(bound[0].texture && bound[0].texture != s_dummy_2d);
-        CHECK(bound[0].sampler == sampler(t, levels, 0));
+        CHECK(bound[0].sampler == sampler(t, levels, 0, no_pinned_samplers));
     } else {
         CHECK(bound[0].texture == s_dummy_2d);
         CHECK(bound[0].sampler == s_linear_clamp);

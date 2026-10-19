@@ -21,6 +21,28 @@
 #include <stddef.h>
 #include <stdlib.h>
 
+#ifndef STATUS_BUFFER_TOO_SMALL
+#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
+#endif
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+#endif
+
+static INIT_ONCE s_dir_cs_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK initialize_dir_cs(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    (void)once;
+    (void)context;
+    InitializeCriticalSection((LPCRITICAL_SECTION)parameter);
+    return TRUE;
+}
+
+static void ensure_dir_cs(CRITICAL_SECTION *cs)
+{
+    InitOnceExecuteOnce(&s_dir_cs_once, initialize_dir_cs, cs, NULL);
+}
+
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
@@ -37,6 +59,7 @@ extern NTSTATUS xbox_OpenSymbolicLink(const char* name, HANDLE* out);
 extern const char* xbox_SymbolicLinkHandleTarget(HANDLE h);
 extern int xbox_CloseObjectHandle(HANDLE h);
 extern void xbox_NoteUnsupportedIoctl(const char* what, ULONG code);
+static void xbox_dir_context_close(HANDLE FileHandle);
 
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
@@ -626,8 +649,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     if (xbox_CloseObjectHandle(Handle))
         return STATUS_SUCCESS;  /* object handle: a link or directory, nothing to close */
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
-        xbox_dir_context_drop(Handle);
-        file_diag_close_native(Handle);
+        xbox_dir_context_close(Handle);
         return STATUS_SUCCESS;
     }
     return STATUS_INVALID_HANDLE;
@@ -902,29 +924,33 @@ typedef struct {
     HANDLE file_handle;
     HANDLE find_handle;
     BOOL   first_done;
+    BOOL   initial_query;
+    BOOL   pending;
+    BOOL   exhausted;
+    WCHAR  pattern[MAX_PATH];
     WIN32_FIND_DATAW find_data;
 } DIR_CONTEXT;
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
-static BOOL s_dir_cs_init = FALSE;
 
 static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 {
-    if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
+    ensure_dir_cs(&s_dir_cs);
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
-        if (s_dir_contexts[i].file_handle == FileHandle && s_dir_contexts[i].find_handle != NULL) {
-            LeaveCriticalSection(&s_dir_cs);
+        if (s_dir_contexts[i].file_handle == FileHandle) {
             return &s_dir_contexts[i];
         }
     }
     if (!create) { LeaveCriticalSection(&s_dir_cs); return NULL; }
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
-        if (s_dir_contexts[i].find_handle == NULL) {
+        if (s_dir_contexts[i].file_handle == NULL) {
             s_dir_contexts[i].file_handle = FileHandle;
             s_dir_contexts[i].first_done = FALSE;
-            LeaveCriticalSection(&s_dir_cs);
+            s_dir_contexts[i].initial_query = TRUE;
+            s_dir_contexts[i].pending = FALSE;
+            s_dir_contexts[i].exhausted = FALSE;
             return &s_dir_contexts[i];
         }
     }
@@ -936,10 +962,9 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
  * are reused, and a search abandoned part-way (a title that stops at the first
  * match) otherwise carried on under the next directory opened at the same
  * value: its first answer was the old search's next entry. */
-void xbox_dir_context_drop(HANDLE FileHandle)
+static void xbox_dir_context_close(HANDLE FileHandle)
 {
-    if (!s_dir_cs_init)
-        return;
+    ensure_dir_cs(&s_dir_cs);
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
         if (s_dir_contexts[i].file_handle == FileHandle) {
@@ -949,8 +974,12 @@ void xbox_dir_context_drop(HANDLE FileHandle)
             s_dir_contexts[i].find_handle = NULL;
             s_dir_contexts[i].file_handle = NULL;
             s_dir_contexts[i].first_done = FALSE;
+            s_dir_contexts[i].initial_query = FALSE;
+            s_dir_contexts[i].pending = FALSE;
+            s_dir_contexts[i].exhausted = FALSE;
         }
     }
+    file_diag_close_native(FileHandle);
     LeaveCriticalSection(&s_dir_cs);
 }
 
@@ -972,11 +1001,44 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         return STATUS_INVALID_INFO_CLASS;
     }
 
+    ULONG header_size = (ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName);
+    if (Length < sizeof(XBOX_FILE_DIRECTORY_INFORMATION)) {
+        IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
     ctx = find_or_create_dir_context(FileHandle, TRUE);
-    if (!ctx)
+    if (!ctx) {
+        IoStatusBlock->Status = STATUS_INSUFFICIENT_RESOURCES;
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (ctx->exhausted && !RestartScan) {
+        IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_NO_MORE_FILES;
+    }
 
     if (RestartScan || !ctx->first_done) {
+        if (!ctx->first_done) {
+            if (FileName && FileName->Buffer && FileName->Length > 0) {
+                if (FileName->Length >= MAX_PATH) {
+                    IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
+                    LeaveCriticalSection(&s_dir_cs);
+                    return STATUS_INVALID_PARAMETER;
+                }
+                int pattern_chars = MultiByteToWideChar(CP_ACP, 0, FileName->Buffer,
+                    FileName->Length, ctx->pattern, MAX_PATH - 1);
+                if (pattern_chars <= 0 || pattern_chars >= MAX_PATH) {
+                    IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
+                    LeaveCriticalSection(&s_dir_cs);
+                    return STATUS_INVALID_PARAMETER;
+                }
+                ctx->pattern[pattern_chars] = L'\0';
+            } else {
+                ctx->pattern[0] = L'\0';
+            }
+        }
         if (ctx->find_handle && ctx->find_handle != INVALID_HANDLE_VALUE) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
@@ -987,35 +1049,42 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
                                                    FILE_NAME_NORMALIZED);
         if (path_len == 0 || path_len >= MAX_PATH) {
             IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            LeaveCriticalSection(&s_dir_cs);
             return STATUS_UNSUCCESSFUL;
         }
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
-            WCHAR pattern_wide[MAX_PATH];
-            MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
-                                pattern_wide, MAX_PATH);
-            pattern_wide[FileName->Length] = L'\0';
-            swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, pattern_wide);
+        if (ctx->pattern[0]) {
+            swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, ctx->pattern);
         } else {
             swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
         }
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
+        ctx->first_done = TRUE;
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
             ctx->find_handle = NULL;
+            ctx->first_done = TRUE;
+            ctx->exhausted = TRUE;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+            LeaveCriticalSection(&s_dir_cs);
             return STATUS_NO_MORE_FILES;
         }
         ctx->first_done = TRUE;
-    } else {
+        ctx->initial_query = TRUE;
+        ctx->pending = TRUE;
+        ctx->exhausted = FALSE;
+    } else if (!ctx->pending) {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
-            ctx->file_handle = NULL;
+            ctx->first_done = TRUE;
+            ctx->exhausted = TRUE;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+            LeaveCriticalSection(&s_dir_cs);
             return STATUS_NO_MORE_FILES;
         }
+        ctx->pending = TRUE;
     }
 
     /* FATX enumeration never exposes the host's dot directories. */
@@ -1024,19 +1093,36 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
-            ctx->file_handle = NULL;
+            ctx->first_done = TRUE;
+            ctx->exhausted = TRUE;
+            ctx->pending = FALSE;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+            LeaveCriticalSection(&s_dir_cs);
             return STATUS_NO_MORE_FILES;
         }
+        ctx->pending = TRUE;
     }
 
-    entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
-    memset(entry, 0, Length);
     char filename_ansi[MAX_PATH];
     int name_len = WideCharToMultiByte(CP_ACP, 0, ctx->find_data.cFileName, -1,
                                        filename_ansi, MAX_PATH, NULL, NULL);
-    if (name_len > 0) name_len--;
+    if (name_len <= 0) {
+        IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_UNSUCCESSFUL;
+    }
+    name_len--;
 
+    ULONG available_name = Length - header_size;
+    ULONG copied_name = (ULONG)name_len < available_name ? (ULONG)name_len : available_name;
+    if (copied_name < (ULONG)name_len && !ctx->initial_query) {
+        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Information = 0;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_SUCCESS;
+    }
+    entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
+    memset(entry, 0, header_size);
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;
     entry->CreationTime.LowPart   = ctx->find_data.ftCreationTime.dwLowDateTime;
@@ -1050,13 +1136,19 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->AllocationSize.QuadPart = (entry->EndOfFile.QuadPart + 4095) & ~4095LL;
     entry->FileAttributes = ctx->find_data.dwFileAttributes;
     entry->FileNameLength = name_len;
-    {
-        ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
-        if (name_len > 0 && (header_size + name_len) <= Length)
-            memcpy(entry->FileName, filename_ansi, name_len);
-        IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = header_size + name_len;
+    if (copied_name)
+        memcpy(entry->FileName, filename_ansi, copied_name);
+    IoStatusBlock->Information = header_size + copied_name;
+    if (copied_name < (ULONG)name_len) {
+        ctx->initial_query = FALSE;
+        IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_BUFFER_OVERFLOW;
     }
+    ctx->pending = FALSE;
+    ctx->initial_query = FALSE;
+    IoStatusBlock->Status = STATUS_SUCCESS;
+    LeaveCriticalSection(&s_dir_cs);
     return STATUS_SUCCESS;
 }
 
@@ -1358,8 +1450,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     if (xbox_CloseObjectHandle(Handle))
         return STATUS_SUCCESS;  /* object handle: a link or directory, nothing to close */
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
-        xbox_dir_context_drop(Handle);
-        CloseHandle(Handle);
+        xbox_dir_context_close(Handle);
         return STATUS_SUCCESS;
     }
     return STATUS_INVALID_HANDLE;
@@ -1580,27 +1671,38 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 typedef struct {
     HANDLE handle;
     DIR*   dir;
-    char   pattern[64];
+    char   pattern[MAX_PATH];
+    BOOL   initial_query;
+    BOOL   pending;
+    BOOL   exhausted;
+    BOOL   pattern_set;
+    char   pending_name[MAX_PATH];
+    struct stat pending_stat;
 } DIR_CONTEXT;
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
-static BOOL s_dir_cs_init = FALSE;
 
-/* Closing a directory handle ends its search, as the Win32 backend does. An
- * open DIR* would otherwise hold a context slot, and a recycled handle value
- * would resume the old enumeration. */
-void xbox_dir_context_drop(HANDLE FileHandle)
+static void xbox_dir_context_close(HANDLE FileHandle)
 {
-    if (!s_dir_cs_init) return;
+    ensure_dir_cs(&s_dir_cs);
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
-        if (s_dir_contexts[i].handle == FileHandle && FileHandle) {
-            if (s_dir_contexts[i].dir) closedir(s_dir_contexts[i].dir);
-            s_dir_contexts[i].dir = NULL;
-            s_dir_contexts[i].handle = NULL;
+        DIR_CONTEXT *ctx = &s_dir_contexts[i];
+        if (ctx->handle != FileHandle)
+            continue;
+        if (ctx->dir) {
+            closedir(ctx->dir);
+            ctx->dir = NULL;
         }
+        ctx->handle = NULL;
+        ctx->initial_query = FALSE;
+        ctx->pending = FALSE;
+        ctx->exhausted = FALSE;
+        ctx->pattern_set = FALSE;
+        ctx->pattern[0] = '\0';
     }
+    CloseHandle(FileHandle);
     LeaveCriticalSection(&s_dir_cs);
 }
 
@@ -1619,7 +1721,13 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         return STATUS_INVALID_INFO_CLASS;
     }
 
-    if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
+    ULONG header_size = (ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName);
+    if (Length < sizeof(XBOX_FILE_DIRECTORY_INFORMATION)) {
+        IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
+    ensure_dir_cs(&s_dir_cs);
     EnterCriticalSection(&s_dir_cs);
 
     /* Locate or create the per-handle enumeration context. */
@@ -1629,61 +1737,114 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     if (!ctx) {
         for (int i = 0; i < MAX_DIR_CONTEXTS; i++)
             if (s_dir_contexts[i].handle == NULL) { ctx = &s_dir_contexts[i]; break; }
-        if (!ctx) { LeaveCriticalSection(&s_dir_cs); return STATUS_INSUFFICIENT_RESOURCES; }
+        if (!ctx) {
+            IoStatusBlock->Status = STATUS_INSUFFICIENT_RESOURCES;
+            LeaveCriticalSection(&s_dir_cs);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
         ctx->handle = FileHandle;
         ctx->dir = NULL;
+        ctx->initial_query = TRUE;
+        ctx->pending = FALSE;
+        ctx->exhausted = FALSE;
+        ctx->pattern_set = FALSE;
     }
 
-    if (RestartScan || ctx->dir == NULL) {
+    if (ctx->exhausted && !RestartScan) {
+        IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_NO_MORE_FILES;
+    }
+    if (RestartScan || (!ctx->exhausted && ctx->dir == NULL)) {
+        if (!ctx->pattern_set) {
+            if (FileName && FileName->Buffer && FileName->Length >= sizeof(ctx->pattern)) {
+                IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
+                LeaveCriticalSection(&s_dir_cs);
+                return STATUS_INVALID_PARAMETER;
+            }
+            if (FileName && FileName->Buffer && FileName->Length > 0) {
+                USHORT n = FileName->Length;
+                memcpy(ctx->pattern, FileName->Buffer, n);
+                ctx->pattern[n] = '\0';
+            } else {
+                strcpy(ctx->pattern, "*");
+            }
+            ctx->pattern_set = TRUE;
+        }
         if (ctx->dir) { closedir(ctx->dir); ctx->dir = NULL; }
         const char* dpath = w32_handle_path(FileHandle);
         if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
         ctx->dir = opendir(dpath);
         if (!ctx->dir) {
-            LeaveCriticalSection(&s_dir_cs);
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
-        }
-        if (FileName && FileName->Buffer && FileName->Length > 0) {
-            USHORT n = FileName->Length;
-            if (n >= sizeof(ctx->pattern)) n = sizeof(ctx->pattern) - 1;
-            memcpy(ctx->pattern, FileName->Buffer, n);
-            ctx->pattern[n] = '\0';
-        } else {
-            strcpy(ctx->pattern, "*");
-        }
-    }
-
-    /* Advance to the next entry matching the search pattern. */
-    struct dirent* de;
-    const char* dpath = w32_handle_path(FileHandle);
-    struct stat st;
-    for (;;) {
-        de = readdir(ctx->dir);
-        if (!de) {
-            closedir(ctx->dir);
-            ctx->dir = NULL;
             ctx->handle = NULL;
             LeaveCriticalSection(&s_dir_cs);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
-            continue;
-        if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
-            break;
+        ctx->initial_query = TRUE;
+        ctx->pending = FALSE;
+        ctx->exhausted = FALSE;
     }
 
-    char full[MAX_PATH];
-    snprintf(full, sizeof(full), "%s/%s", dpath ? dpath : ".", de->d_name);
-    if (stat(full, &st) != 0)
-        memset(&st, 0, sizeof(st));
-    LeaveCriticalSection(&s_dir_cs);
+    /* Advance to the next entry matching the search pattern. */
+    if (!ctx->pending) {
+        struct dirent* de;
+        const char* dpath = w32_handle_path(FileHandle);
+        if (!dpath) {
+            LeaveCriticalSection(&s_dir_cs);
+            IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            return STATUS_UNSUCCESSFUL;
+        }
+        errno = 0;
+        for (;;) {
+            de = readdir(ctx->dir);
+            if (!de) {
+                int read_error = errno;
+                closedir(ctx->dir);
+                ctx->dir = NULL;
+                ctx->pending = FALSE;
+                ctx->exhausted = TRUE;
+                LeaveCriticalSection(&s_dir_cs);
+                IoStatusBlock->Status = read_error ? errno_to_status(read_error) : STATUS_NO_MORE_FILES;
+                return IoStatusBlock->Status;
+            }
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                continue;
+            if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
+                break;
+        }
+        size_t name_length = strlen(de->d_name);
+        if (name_length >= sizeof(ctx->pending_name)) {
+            LeaveCriticalSection(&s_dir_cs);
+            IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            return STATUS_UNSUCCESSFUL;
+        }
+        memcpy(ctx->pending_name, de->d_name, name_length + 1);
+        if (fstatat(dirfd(ctx->dir), ctx->pending_name, &ctx->pending_stat, 0) != 0) {
+            NTSTATUS status = errno_to_status(errno);
+            ctx->pending = FALSE;
+            IoStatusBlock->Status = status;
+            LeaveCriticalSection(&s_dir_cs);
+            return status;
+        }
+        ctx->pending = TRUE;
+    }
 
+    size_t name_len = strlen(ctx->pending_name);
+    struct stat st = ctx->pending_stat;
+    char name[MAX_PATH];
+    memcpy(name, ctx->pending_name, name_len + 1);
+
+    ULONG copied_name = (ULONG)name_len < Length - header_size
+        ? (ULONG)name_len : Length - header_size;
+    if (copied_name < name_len && !ctx->initial_query) {
+        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Information = 0;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_SUCCESS;
+    }
     PXBOX_FILE_DIRECTORY_INFORMATION entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
-    memset(entry, 0, Length);
-
-    int name_len = (int)strlen(de->d_name);
+    memset(entry, 0, header_size + copied_name);
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;
     unix_to_filetime(st.st_ctime, 0, &entry->CreationTime);
@@ -1693,13 +1854,21 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->EndOfFile.QuadPart = st.st_size;
     entry->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
     entry->FileAttributes = mode_to_xbox_attrs(st.st_mode);
-    entry->FileNameLength = name_len;
+    entry->FileNameLength = (ULONG)name_len;
 
-    ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
-    if (name_len > 0 && (header_size + (ULONG)name_len) <= Length)
-        memcpy(entry->FileName, de->d_name, name_len);
+    if (copied_name)
+        memcpy(entry->FileName, name, copied_name);
+    IoStatusBlock->Information = header_size + copied_name;
+    if (copied_name < name_len) {
+        ctx->initial_query = FALSE;
+        IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    ctx->pending = FALSE;
+    ctx->initial_query = FALSE;
     IoStatusBlock->Status = STATUS_SUCCESS;
-    IoStatusBlock->Information = header_size + name_len;
+    LeaveCriticalSection(&s_dir_cs);
     return STATUS_SUCCESS;
 }
 

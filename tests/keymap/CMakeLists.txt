@@ -13,3 +13,7 @@ endif()
 enable_testing()
 add_test(NAME keymap COMMAND keymap-test)
 add_test(NAME keymap-default-padmap COMMAND keymap-test default-padmap)
+
+if(NOT WIN32)
+    add_test(NAME keymap-two-gamepads COMMAND keymap-test two-gamepads)
+endif()

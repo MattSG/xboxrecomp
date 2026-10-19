@@ -26,6 +26,7 @@
  */
 
 #include "kernel.h"
+#include "kernel_guest_io.h"
 #include "guest_vmem.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
@@ -75,6 +76,7 @@ extern NTSTATUS xbox_CreateDirectoryHandle(const char* name, HANDLE* out);
 extern int xbox_IsObjectHandle(HANDLE h);
 extern int xbox_CloseObjectHandle(HANDLE h);
 extern void xbox_NoteUnsupportedIoctl(const char* what, ULONG code);
+extern int xbox_IoInitializeIrpGuest(uint32_t guest_va, PVOID irp, USHORT packet_size, CCHAR stack_size);
 
 /* Dispatch table lookup (for function pointer args) */
 typedef void (*recomp_func_t)(void);
@@ -105,6 +107,35 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * layer can catch it, because xbox_NtReadFile receives a host pointer and a
  * count and cannot know where the mapping ends.
  */
+static int bridge_native_span_accessible(uint32_t va, uint32_t bytes,
+                                         int write_access)
+{
+    uintptr_t cursor = (uintptr_t)XBOX_TO_NATIVE(va);
+    uintptr_t end = cursor + bytes;
+    if (end < cursor) return 0;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uintptr_t region_end;
+        DWORD protection;
+        if (!VirtualQuery((void *)cursor, &mbi, sizeof(mbi)) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
+        protection = mbi.Protect & 0xFFu;
+        if (write_access) {
+            if (protection != PAGE_READWRITE && protection != PAGE_WRITECOPY &&
+                protection != PAGE_EXECUTE_READWRITE &&
+                protection != PAGE_EXECUTE_WRITECOPY) return 0;
+        } else if (protection != PAGE_READONLY && protection != PAGE_READWRITE &&
+                   protection != PAGE_WRITECOPY && protection != PAGE_EXECUTE_READ &&
+                   protection != PAGE_EXECUTE_READWRITE &&
+                   protection != PAGE_EXECUTE_WRITECOPY) return 0;
+        region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (region_end <= cursor) return 0;
+        cursor = region_end;
+    }
+    return 1;
+}
+
 static int bridge_va_mapped(uint32_t va, uint32_t bytes, int write_access)
 {
     uint64_t end = (uint64_t)va + bytes;
@@ -113,10 +144,10 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes, int write_access)
     if (va < 0x1000)            /* page zero is deliberately unmapped */
         return 0;
     if (end <= mapped)
-        return 1;
+        return bridge_native_span_accessible(va, bytes, write_access);
     if (va >= XBOX_CONTIG_BASE &&
         end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-        return 1;
+        return bridge_native_span_accessible(va, bytes, write_access);
     {
         uint32_t remaining;
         if (xbox_IoMappingQuery(XBOX_TO_NATIVE(va), NULL, NULL, &remaining) &&
@@ -137,7 +168,7 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes, int write_access)
                     return 0;
                 checked += chunk;
             }
-            return 1;
+            return bridge_native_span_accessible(va, bytes, write_access);
         }
     }
     return 0;
@@ -1850,6 +1881,12 @@ static void bridge_KeWaitForSingleObject(void)
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    /* KeInitializeEvent-backed synchronization events use an auto-reset host
+     * object, but their Xbox dispatcher header remains guest-visible too. */
+    if (g_eax == 0 && h && ke_shadow_lookup_initialized(object) == h &&
+        BRIDGE_MEM8(object) == XBOX_EVENT_SYNCHRONIZATION_OBJECT &&
+        bridge_buf_ok(object + 4, 4, 1, "KeWaitForSingleObject"))
+        BRIDGE_MEM32(object + 4) = 0;
     bridge_async_wait_log(159, object, h, resolution, timeout_ptr, started);
 }
 
@@ -2046,9 +2083,16 @@ static void bridge_NtUserIoApcDispatcher(void)
 {
     uint32_t apc_context = STACK_ARG(0);
     uint32_t iostatus    = STACK_ARG(1);
-    uint32_t status      = iostatus ? BRIDGE_MEM32(iostatus) : 0;
-    uint32_t information = iostatus ? BRIDGE_MEM32(iostatus + 4) : 0;
+    uint32_t status, information;
     recomp_func_t fn;
+
+    if (!iostatus || !bridge_buf_ok(iostatus, 8, 0,
+                                    "NtUserIoApcDispatcher")) {
+        g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    status = BRIDGE_MEM32(iostatus);
+    information = BRIDGE_MEM32(iostatus + 4);
 
     fn = recomp_lookup(apc_context);
     if (!fn) fn = recomp_lookup_manual(apc_context);
@@ -3216,13 +3260,19 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     return path;
 }
 
-/* Write NTSTATUS + Information into Xbox IO_STATUS_BLOCK */
+/* IO_STATUS_BLOCK is a required 8-byte output on the NT file exports below.
+ * Validate it before calling the host/backend operation: discovering a bad
+ * guest output only after a file was created, read, or modified is too late. */
+static int bridge_iostatus_ok(uint32_t ios_va, const char *export_name)
+{
+    return bridge_buf_ok(ios_va, 8, 1, export_name);
+}
+
+/* Write NTSTATUS + Information into a preflighted Xbox IO_STATUS_BLOCK. */
 static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t info)
 {
-    if (ios_va) {
-        BRIDGE_MEM32(ios_va + 0) = (uint32_t)status;
-        BRIDGE_MEM32(ios_va + 4) = info;
-    }
+    BRIDGE_MEM32(ios_va + 0) = (uint32_t)status;
+    BRIDGE_MEM32(ios_va + 4) = info;
 }
 
 /*
@@ -3448,6 +3498,9 @@ static NTSTATUS bridge_create_file_impl(
     /* Some malformed guest names fail before the host backend is called.
      * They have no Win32 reason and must not inherit a previous open's error. */
     if (host_error) *host_error = 0;
+
+    if (!bridge_iostatus_ok(iostatus_va, "NtCreateFile/NtOpenFile/IoCreateFile"))
+        return (NTSTATUS)0xC0000005; /* STATUS_ACCESS_VIOLATION */
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
     if (!name.Buffer) {
@@ -3924,12 +3977,21 @@ static void bridge_NtReadFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(iostatus, "NtReadFile")) {
+        g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (!bridge_buf_ok(buffer_va, length, 1, "NtReadFile")) {
         bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
     }
     if (offset_va) {
+        if (!bridge_buf_ok(offset_va, 8, 0, "NtReadFile offset")) {
+            bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
+            g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+            return;
+        }
         off.LowPart  = BRIDGE_MEM32(offset_va);
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
@@ -4007,12 +4069,21 @@ static void bridge_NtWriteFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(iostatus, "NtWriteFile")) {
+        g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (!bridge_buf_ok(buffer_va, length, 0, "NtWriteFile")) {
         bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
     }
     if (offset_va) {
+        if (!bridge_buf_ok(offset_va, 8, 0, "NtWriteFile offset")) {
+            bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
+            g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+            return;
+        }
         off.LowPart  = BRIDGE_MEM32(offset_va);
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
@@ -4035,6 +4106,10 @@ static void bridge_NtQueryInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(ios_va, "NtQueryInformationFile")) {
+        g_eax = 0xC0000005u;
+        return;
+    }
     if (!bridge_buf_ok(info_va, length, 1, "NtQueryInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
@@ -4057,6 +4132,10 @@ static void bridge_NtSetInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(ios_va, "NtSetInformationFile")) {
+        g_eax = 0xC0000005u;
+        return;
+    }
     if (!bridge_buf_ok(info_va, length, 0, "NtSetInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
@@ -4079,6 +4158,10 @@ static void bridge_NtQueryVolumeInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(ios_va, "NtQueryVolumeInformationFile")) {
+        g_eax = 0xC0000005u;
+        return;
+    }
     if (!bridge_buf_ok(info_va, length, 1, "NtQueryVolumeInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
@@ -4112,6 +4195,10 @@ static void bridge_NtFlushBuffersFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(ios_va, "NtFlushBuffersFile")) {
+        g_eax = 0xC0000005u;
+        return;
+    }
     g_eax = (uint32_t)xbox_NtFlushBuffersFile(handle, &ios);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
@@ -4142,6 +4229,10 @@ static void bridge_NtQueryDirectoryFile(void)
     PXBOX_ANSI_STRING    pfn = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(ios_va, "NtQueryDirectoryFile")) {
+        g_eax = 0xC0000005u;
+        return;
+    }
     if (filename_va) {
         /* Xbox ANSI_STRING: 0=Length(u16), 2=MaximumLength(u16), 4=Buffer(u32) */
         uint32_t fn_buf  = BRIDGE_MEM32(filename_va + 4);
@@ -4298,6 +4389,11 @@ static void bridge_NtDeviceIoControlFile(void)
     uint32_t out_va  = STACK_ARG(8);
     uint32_t out_len = STACK_ARG(9);
 
+    if (!bridge_iostatus_ok(ios_va, "NtDeviceIoControlFile")) {
+        g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+
     /* IOCTLs aimed at the DVD device (see bridge_is_cdrom_device).
      *
      * These are the media check: the title asks the drive to confirm a disc is
@@ -4439,6 +4535,10 @@ static void bridge_NtFsControlFile(void)
 {
     uint32_t fsctl = STACK_ARG(5);
     uint32_t ios_va = STACK_ARG(4);
+    if (!bridge_iostatus_ok(ios_va, "NtFsControlFile")) {
+        g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     xbox_NoteUnsupportedIoctl("NtFsControlFile", fsctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
     g_eax = 0xC00000BBu;
@@ -4679,40 +4779,87 @@ static void bridge_ExFreePool(void)
  * DeviceExtensionSize bytes through the NULL, erasing the fake TIB at guest
  * VA 0. The crash surfaced in SetLastError, thousands of calls later.
  *
- * Layout is the Xbox DEVICE_OBJECT: Flags at 0x14, DeviceExtension at 0x18,
- * DeviceType at 0x1C, StackSize at 0x1D, header 0x38 bytes. Only the fields a
- * title actually reads are filled; the rest is zero, which is what a freshly
- * created device object holds anyway.
+ * The guest DEVICE_OBJECT is 0x48 bytes, ending with its embedded queue,
+ * lock event and StartIoKey. Keep it in fixed-width guest memory; the native
+ * xbox_IoCreateDevice fake is not safe to expose through a guest out-pointer.
  */
-#define XBOX_DEVICE_OBJECT_SIZE 0x38u
-
 static void bridge_IoCreateDevice(void)
 {
     uint32_t extension_size = STACK_ARG(1);
     uint32_t device_type    = STACK_ARG(3);
     uint32_t out_va         = STACK_ARG(5);
-    uint32_t object_va;
+    uint32_t object_va, total_size, alloc_size;
+    uint64_t total64 = (uint64_t)XBOX_DEVICE_OBJECT_SIZE + extension_size;
+    uint32_t name_va = STACK_ARG(2);
+    int device_has_name = 0;
+    int physical_device = device_type == XBOX_DEVICE_TYPE_CD_ROM2 ||
+        device_type == XBOX_DEVICE_TYPE_DISK2 ||
+        device_type == XBOX_DEVICE_TYPE_MEMORY_UNIT ||
+        device_type == XBOX_DEVICE_TYPE_MEDIA_BOARD;
 
-    if (!out_va) {
+    if (!bridge_buf_ok(out_va, 4, 1, "IoCreateDevice")) {
         g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
         return;
     }
+    BRIDGE_MEM32(out_va) = 0;
+    if (name_va) {
+        uint16_t name_length, name_maximum;
+        uint32_t name_buffer;
+        if (!bridge_buf_ok(name_va, 8, 0, "IoCreateDevice DeviceName")) {
+            g_eax = 0xC0000005u;   /* STATUS_ACCESS_VIOLATION */
+            return;
+        }
+        name_length = BRIDGE_MEM16(name_va);
+        name_maximum = BRIDGE_MEM16(name_va + 2);
+        name_buffer = BRIDGE_MEM32(name_va + 4);
+        if (name_length > name_maximum || (name_length && !name_buffer)) {
+            g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
+            return;
+        }
+        if (name_length &&
+            !bridge_buf_ok(name_buffer, name_length, 0, "IoCreateDevice DeviceName.Buffer")) {
+            g_eax = 0xC0000005u;   /* STATUS_ACCESS_VIOLATION */
+            return;
+        }
+        device_has_name = name_length != 0;
+    }
+    if (total64 > UINT16_MAX || total64 > UINT32_MAX - 7u) {
+        g_eax = 0xC000000Du;
+        return;
+    }
+    total_size = (uint32_t)total64;
+    alloc_size = (total_size + 7u) & ~7u;
 
-    object_va = xbox_HeapAlloc(XBOX_DEVICE_OBJECT_SIZE + extension_size, 16);
+    object_va = xbox_HeapAlloc(alloc_size, 16);
     if (!object_va) {
         g_eax = 0xC000009Au;   /* STATUS_INSUFFICIENT_RESOURCES */
         return;
     }
 
     memset(XBOX_TO_NATIVE(object_va), 0,
-           XBOX_DEVICE_OBJECT_SIZE + extension_size);
-    BRIDGE_MEM16(object_va + 0x02) = (uint16_t)XBOX_DEVICE_OBJECT_SIZE;
-    BRIDGE_MEM32(object_va + 0x04) = 1;                 /* ReferenceCount   */
+           alloc_size);
+    BRIDGE_MEM16(object_va + 0x00) = XBOX_IO_TYPE_DEVICE;
+    BRIDGE_MEM16(object_va + 0x02) = (uint16_t)total_size;
     BRIDGE_MEM32(object_va + 0x08) = STACK_ARG(0);      /* DriverObject     */
-    BRIDGE_MEM32(object_va + 0x18) =                    /* DeviceExtension  */
+    BRIDGE_MEM32(object_va + XBOX_DEVICE_EXTENSION_OFFSET) = /* DeviceExtension */
         extension_size ? object_va + XBOX_DEVICE_OBJECT_SIZE : 0;
-    BRIDGE_MEM8(object_va + 0x1C)  = (uint8_t)device_type;
-    BRIDGE_MEM8(object_va + 0x1D)  = 1;                 /* StackSize        */
+    BRIDGE_MEM8(object_va + XBOX_DEVICE_TYPE_OFFSET) = (uint8_t)device_type;
+    BRIDGE_MEM8(object_va + XBOX_DEVICE_STACK_SIZE_OFFSET) = 1;
+    BRIDGE_MEM32(object_va + 0x0c) = physical_device ? 0 : object_va;
+    BRIDGE_MEM32(object_va + XBOX_DEVICE_FLAGS_OFFSET) = XBOX_DEVICE_FLAG_INITIALIZING |
+        ((uint32_t)STACK_ARG(4) ? XBOX_DEVICE_FLAG_EXCLUSIVE : 0u) |
+        (device_has_name ? XBOX_DEVICE_FLAG_HAS_NAME : 0u);
+    BRIDGE_MEM16(object_va + 0x28) = XBOX_DEVICE_QUEUE_OBJECT;
+    BRIDGE_MEM8(object_va + 0x2a) = 0x0c; /* sizeof(KDEVICE_QUEUE) */
+    BRIDGE_MEM32(object_va + 0x28 + 4) = object_va + 0x28 + 4;
+    BRIDGE_MEM32(object_va + 0x28 + 8) = object_va + 0x28 + 4;
+    if (physical_device) {
+        BRIDGE_MEM8(object_va + 0x34) = XBOX_EVENT_SYNCHRONIZATION_OBJECT;
+        BRIDGE_MEM8(object_va + 0x36) = 4; /* sizeof(KEVENT) / sizeof(LONG) */
+        BRIDGE_MEM32(object_va + 0x38) = 1; /* signaled on creation */
+        BRIDGE_MEM32(object_va + 0x3c) = object_va + 0x3c;
+        BRIDGE_MEM32(object_va + 0x40) = object_va + 0x3c;
+    }
 
     BRIDGE_MEM32(out_va) = object_va;
     g_eax = 0;                                          /* STATUS_SUCCESS   */
@@ -5309,23 +5456,244 @@ static void bridge_WRITE_PORT_BUFFER_USHORT(void)
  * arguments live in ecx/edx, never on the stack -- the arg-size entries are 0
  * and reading STACK_ARG would dereference whatever the caller left there.
  */
+/* These two builders return bridge-owned IRPs: completion releases them after
+ * publishing the IOSB and event. Asynchronous builders and IoAllocateIrp stay
+ * caller-owned and still require IoFreeIrp. Ownership is external to guest
+ * fields; guest-thread exit with a pending IRP is not tracked yet. */
+typedef struct bridge_sync_irp_owner {
+    uint32_t irp_va;
+    struct bridge_sync_irp_owner *next;
+} bridge_sync_irp_owner;
+static bridge_sync_irp_owner *g_sync_irp_owners;
+static SRWLOCK g_sync_irp_lock = SRWLOCK_INIT;
+
+static int bridge_sync_irp_register(uint32_t irp_va)
+{
+    bridge_sync_irp_owner *owner = (bridge_sync_irp_owner *)malloc(sizeof(*owner));
+    bridge_sync_irp_owner *cur;
+    if (!owner) return 0;
+    owner->irp_va = irp_va;
+    AcquireSRWLockExclusive(&g_sync_irp_lock);
+    for (cur = g_sync_irp_owners; cur; cur = cur->next) {
+        if (cur->irp_va == irp_va) {
+            ReleaseSRWLockExclusive(&g_sync_irp_lock);
+            free(owner);
+            return 0;
+        }
+    }
+    owner->next = g_sync_irp_owners;
+    g_sync_irp_owners = owner;
+    ReleaseSRWLockExclusive(&g_sync_irp_lock);
+    return 1;
+}
+
+static int bridge_sync_irp_take(uint32_t irp_va)
+{
+    bridge_sync_irp_owner **link, *owner;
+    AcquireSRWLockExclusive(&g_sync_irp_lock);
+    for (link = &g_sync_irp_owners; *link; link = &(*link)->next) {
+        if ((*link)->irp_va == irp_va) {
+            owner = *link;
+            *link = owner->next;
+            ReleaseSRWLockExclusive(&g_sync_irp_lock);
+            free(owner);
+            return 1;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_sync_irp_lock);
+    return 0;
+}
+
+static void bridge_sync_irp_reset(void)
+{
+    bridge_sync_irp_owner *owner;
+    AcquireSRWLockExclusive(&g_sync_irp_lock);
+    owner = g_sync_irp_owners;
+    g_sync_irp_owners = NULL;
+    ReleaseSRWLockExclusive(&g_sync_irp_lock);
+    while (owner) {
+        bridge_sync_irp_owner *next = owner->next;
+        free(owner);
+        owner = next;
+    }
+}
+
 static void bridge_IoBuildDeviceIoControlRequest(void)
 {
-    g_eax = (uint32_t)xbox_IoBuildDeviceIoControlRequest(
-        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
-        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
-        XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
-        (BOOLEAN)STACK_ARG(6), bridge_resolve_handle(STACK_ARG(7)),
-        (PXBOX_IO_STATUS_BLOCK)XBOX_TO_NATIVE(STACK_ARG(8)));
+    uint32_t ioctl = STACK_ARG(0), device_va = STACK_ARG(1);
+    uint32_t input_va = STACK_ARG(2), input_len = STACK_ARG(3);
+    uint32_t output_va = STACK_ARG(4), output_len = STACK_ARG(5);
+    uint32_t internal = STACK_ARG(6), event_va = STACK_ARG(7);
+    uint32_t ios_va = STACK_ARG(8), size, irp_va, slot_va;
+    XBOX_GUEST_DEVICE_OBJECT *device;
+    XBOX_GUEST_IRP *irp;
+    XBOX_GUEST_IO_STACK_LOCATION *slot;
+
+    if (!bridge_buf_ok(device_va, XBOX_DEVICE_OBJECT_SIZE, 0,
+                       "IoBuildDeviceIoControlRequest") ||
+        (ios_va && !bridge_buf_ok(ios_va, 8, 1,
+                                  "IoBuildDeviceIoControlRequest")) ||
+        (event_va && !bridge_buf_ok(event_va, 16, 1,
+                                    "IoBuildDeviceIoControlRequest")) ||
+        (input_len && !bridge_buf_ok(input_va, input_len, 0,
+                                     "IoBuildDeviceIoControlRequest")) ||
+        (output_len && !bridge_buf_ok(output_va, output_len, 1,
+                                      "IoBuildDeviceIoControlRequest"))) {
+        g_eax = 0;
+        return;
+    }
+    device = (XBOX_GUEST_DEVICE_OBJECT *)XBOX_TO_NATIVE(device_va);
+    if (device->type != XBOX_IO_TYPE_DEVICE || device->stack_size <= 0) {
+        g_eax = 0;
+        return;
+    }
+    size = XBOX_IRP_SIZE + (uint32_t)(uint8_t)device->stack_size *
+           XBOX_IO_STACK_LOCATION_SIZE;
+    irp_va = xbox_HeapAlloc(size, 16);
+    if (!irp_va || !xbox_IoInitializeIrpGuest(irp_va, XBOX_TO_NATIVE(irp_va),
+                                              (USHORT)size, device->stack_size)) {
+        if (irp_va) xbox_HeapFree(irp_va);
+        g_eax = 0;
+        return;
+    }
+    irp = (XBOX_GUEST_IRP *)XBOX_TO_NATIVE(irp_va);
+    irp->flags |= XBOX_IRP_FLAG_SYNCHRONOUS_API;
+    irp->user_iosb = ios_va;
+    irp->user_event = event_va;
+    irp->user_buffer = output_va;
+    slot_va = irp->current_stack_location - XBOX_IO_STACK_LOCATION_SIZE;
+    slot = (XBOX_GUEST_IO_STACK_LOCATION *)XBOX_TO_NATIVE(slot_va);
+    slot->major_function = internal ? XBOX_MAJOR_INTERNAL_DEVICE_CONTROL :
+                                      XBOX_MAJOR_DEVICE_CONTROL;
+    slot->parameters[0] = output_len;
+    slot->parameters[1] = input_len;
+    slot->parameters[2] = input_va;
+    slot->parameters[3] = ioctl;
+    if (!bridge_sync_irp_register(irp_va)) {
+        xbox_HeapFree(irp_va);
+        g_eax = 0;
+        return;
+    }
+    g_eax = irp_va;
 }
 
 static void bridge_IoBuildSynchronousFsdRequest(void)
 {
-    g_eax = (uint32_t)(uintptr_t)xbox_IoBuildSynchronousFsdRequest(
-        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
-        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
-        XBOX_TO_NATIVE(STACK_ARG(4)), bridge_resolve_handle(STACK_ARG(5)),
-        (PXBOX_IO_STATUS_BLOCK)XBOX_TO_NATIVE(STACK_ARG(6)));
+    uint32_t major = STACK_ARG(0), device_va = STACK_ARG(1);
+    uint32_t buffer_va = STACK_ARG(2), length = STACK_ARG(3);
+    uint32_t offset_va = STACK_ARG(4), event_va = STACK_ARG(5);
+    uint32_t ios_va = STACK_ARG(6), size, irp_va, slot_va;
+    XBOX_GUEST_DEVICE_OBJECT *device;
+    XBOX_GUEST_IRP *irp;
+    XBOX_GUEST_IO_STACK_LOCATION *slot;
+
+    if ((major != XBOX_MAJOR_READ && major != XBOX_MAJOR_WRITE) ||
+        !bridge_buf_ok(device_va, XBOX_DEVICE_OBJECT_SIZE, 0,
+                       "IoBuildSynchronousFsdRequest") ||
+        (length && !bridge_buf_ok(buffer_va, length,
+                                  major == XBOX_MAJOR_READ,
+                                  "IoBuildSynchronousFsdRequest")) ||
+        (offset_va && !bridge_buf_ok(offset_va, 8, 0,
+                                     "IoBuildSynchronousFsdRequest")) ||
+        (event_va && !bridge_buf_ok(event_va, 16, 1,
+                                    "IoBuildSynchronousFsdRequest")) ||
+        (ios_va && !bridge_buf_ok(ios_va, 8, 1,
+                                  "IoBuildSynchronousFsdRequest"))) {
+        g_eax = 0;
+        return;
+    }
+    device = (XBOX_GUEST_DEVICE_OBJECT *)XBOX_TO_NATIVE(device_va);
+    if (device->type != XBOX_IO_TYPE_DEVICE || device->stack_size <= 0) {
+        g_eax = 0;
+        return;
+    }
+    size = XBOX_IRP_SIZE + (uint32_t)(uint8_t)device->stack_size *
+           XBOX_IO_STACK_LOCATION_SIZE;
+    irp_va = xbox_HeapAlloc(size, 16);
+    if (!irp_va || !xbox_IoInitializeIrpGuest(irp_va, XBOX_TO_NATIVE(irp_va),
+                                              (USHORT)size, device->stack_size)) {
+        if (irp_va) xbox_HeapFree(irp_va);
+        g_eax = 0;
+        return;
+    }
+    irp = (XBOX_GUEST_IRP *)XBOX_TO_NATIVE(irp_va);
+    irp->flags |= XBOX_IRP_FLAG_SYNCHRONOUS_API |
+                  (major == XBOX_MAJOR_READ ? XBOX_IRP_FLAG_READ_OPERATION :
+                                              XBOX_IRP_FLAG_WRITE_OPERATION);
+    irp->user_iosb = ios_va;
+    irp->user_event = event_va;
+    irp->user_buffer = buffer_va;
+    slot_va = irp->current_stack_location - XBOX_IO_STACK_LOCATION_SIZE;
+    slot = (XBOX_GUEST_IO_STACK_LOCATION *)XBOX_TO_NATIVE(slot_va);
+    slot->major_function = (uint8_t)major;
+    slot->parameters[0] = length;
+    slot->parameters[1] = buffer_va;
+    if (offset_va) {
+        const uint32_t *offset = (const uint32_t *)XBOX_TO_NATIVE(offset_va);
+        slot->parameters[2] = offset[0];
+        slot->parameters[3] = offset[1];
+    }
+    if (!bridge_sync_irp_register(irp_va)) {
+        xbox_HeapFree(irp_va);
+        g_eax = 0;
+        return;
+    }
+    g_eax = irp_va;
+}
+
+static void bridge_IoBuildAsynchronousFsdRequest(void)
+{
+    uint32_t major = STACK_ARG(0), device_va = STACK_ARG(1);
+    uint32_t buffer_va = STACK_ARG(2), length = STACK_ARG(3);
+    uint32_t offset_va = STACK_ARG(4), ios_va = STACK_ARG(5);
+    uint32_t size, irp_va, slot_va;
+    XBOX_GUEST_DEVICE_OBJECT *device;
+    XBOX_GUEST_IRP *irp;
+    XBOX_GUEST_IO_STACK_LOCATION *slot;
+
+    if ((major != XBOX_MAJOR_READ && major != XBOX_MAJOR_WRITE) ||
+        !bridge_buf_ok(device_va, XBOX_DEVICE_OBJECT_SIZE, 0,
+                       "IoBuildAsynchronousFsdRequest") ||
+        (length && !bridge_buf_ok(buffer_va, length,
+                                  major == XBOX_MAJOR_READ,
+                                  "IoBuildAsynchronousFsdRequest")) ||
+        (offset_va && !bridge_buf_ok(offset_va, 8, 0,
+                                     "IoBuildAsynchronousFsdRequest")) ||
+        (ios_va && !bridge_buf_ok(ios_va, 8, 1,
+                                  "IoBuildAsynchronousFsdRequest"))) {
+        g_eax = 0;
+        return;
+    }
+    device = (XBOX_GUEST_DEVICE_OBJECT *)XBOX_TO_NATIVE(device_va);
+    if (device->type != XBOX_IO_TYPE_DEVICE || device->stack_size <= 0) {
+        g_eax = 0;
+        return;
+    }
+    size = XBOX_IRP_SIZE + (uint32_t)(uint8_t)device->stack_size *
+           XBOX_IO_STACK_LOCATION_SIZE;
+    irp_va = xbox_HeapAlloc(size, 16);
+    if (!irp_va || !xbox_IoInitializeIrpGuest(irp_va, XBOX_TO_NATIVE(irp_va),
+                                              (USHORT)size, device->stack_size)) {
+        if (irp_va) xbox_HeapFree(irp_va);
+        g_eax = 0;
+        return;
+    }
+    irp = (XBOX_GUEST_IRP *)XBOX_TO_NATIVE(irp_va);
+    irp->flags |= (major == XBOX_MAJOR_READ ? XBOX_IRP_FLAG_READ_OPERATION :
+                                              XBOX_IRP_FLAG_WRITE_OPERATION);
+    irp->user_iosb = ios_va;
+    irp->user_buffer = buffer_va;
+    slot_va = irp->current_stack_location - XBOX_IO_STACK_LOCATION_SIZE;
+    slot = (XBOX_GUEST_IO_STACK_LOCATION *)XBOX_TO_NATIVE(slot_va);
+    slot->major_function = (uint8_t)major;
+    slot->parameters[0] = length;
+    slot->parameters[1] = buffer_va;
+    if (offset_va) {
+        const uint32_t *offset = (const uint32_t *)XBOX_TO_NATIVE(offset_va);
+        slot->parameters[2] = offset[0];
+        slot->parameters[3] = offset[1];
+    }
+    g_eax = irp_va;
 }
 
 static void bridge_IoDeleteSymbolicLink(void)
@@ -5346,15 +5714,149 @@ static void bridge_IoDeleteSymbolicLink(void)
 
 static void bridge_IoInitializeIrp(void)
 {
-    xbox_IoInitializeIrp(XBOX_TO_NATIVE(STACK_ARG(0)),
-        (USHORT)STACK_ARG(1), (CCHAR)STACK_ARG(2));
+    uint32_t va = STACK_ARG(0);
+    uint16_t size = (uint16_t)STACK_ARG(1);
+    int8_t stacks = (int8_t)STACK_ARG(2);
+    uint64_t required = stacks > 0 ? XBOX_IRP_SIZE +
+        (uint32_t)stacks * XBOX_IO_STACK_LOCATION_SIZE : UINT64_MAX;
+    if (required <= UINT16_MAX && size >= required &&
+        bridge_buf_ok(va, size, 1, "IoInitializeIrp"))
+        (void)xbox_IoInitializeIrpGuest(va, XBOX_TO_NATIVE(va), size, stacks);
     g_eax = 0;
+}
+
+/* Guest kernel callbacks run nested on the recompiler's register file. Save
+ * the complete modeled CPU state so a StartIo callback, dispatch callback, or
+ * nested IofCompleteRequest obeys the Xbox call boundary instead of leaking
+ * the callback's volatile registers/FPU state into its caller. */
+typedef struct bridge_guest_call_state {
+    uint32_t eax, ecx, edx, esp, ebx, esi, edi, ebp, seh_ebp, fs_base;
+    uint32_t caller;
+    int df, fp_top, fp_cmp;
+    uint16_t fp_control, fp_cc;
+    double fp_stack[8];
+    RecompMmx mmx[8];
+    RecompXmm xmm[8];
+    fenv_t host_fenv;
+#ifdef BRIDGE_HAS_MXCSR
+    uint32_t mxcsr;
+#endif
+} bridge_guest_call_state;
+
+static void bridge_guest_state_save(bridge_guest_call_state *s)
+{
+    s->eax=g_eax; s->ecx=g_ecx; s->edx=g_edx; s->esp=g_esp;
+    s->ebx=g_ebx; s->esi=g_esi; s->edi=g_edi; s->ebp=g_ebp;
+    s->seh_ebp=g_seh_ebp; s->fs_base=g_fs_base;
+    s->caller=g_xbox_kernel_caller;
+    s->df=g_df; s->fp_top=g_fp_top; s->fp_cmp=g_fp_cmp;
+    s->fp_control=g_fp_control_word; s->fp_cc=g_fp_cc;
+    memcpy(s->fp_stack,g_fp_stack,sizeof(s->fp_stack));
+    s->mmx[0]=g_mm0; s->mmx[1]=g_mm1; s->mmx[2]=g_mm2; s->mmx[3]=g_mm3;
+    s->mmx[4]=g_mm4; s->mmx[5]=g_mm5; s->mmx[6]=g_mm6; s->mmx[7]=g_mm7;
+    s->xmm[0]=g_xmm0; s->xmm[1]=g_xmm1; s->xmm[2]=g_xmm2; s->xmm[3]=g_xmm3;
+    s->xmm[4]=g_xmm4; s->xmm[5]=g_xmm5; s->xmm[6]=g_xmm6; s->xmm[7]=g_xmm7;
+    fegetenv(&s->host_fenv);
+#ifdef BRIDGE_HAS_MXCSR
+    s->mxcsr=_mm_getcsr();
+#endif
+}
+
+static void bridge_guest_state_restore(const bridge_guest_call_state *s,
+                                       uint32_t eax)
+{
+    g_eax=eax; g_ecx=s->ecx; g_edx=s->edx; g_esp=s->esp;
+    g_ebx=s->ebx; g_esi=s->esi; g_edi=s->edi; g_ebp=s->ebp;
+    g_seh_ebp=s->seh_ebp; g_fs_base=s->fs_base;
+    g_xbox_kernel_caller=s->caller;
+    g_df=s->df; g_fp_top=s->fp_top; g_fp_cmp=s->fp_cmp;
+    g_fp_control_word=s->fp_control; g_fp_cc=s->fp_cc;
+    memcpy(g_fp_stack,s->fp_stack,sizeof(s->fp_stack));
+    g_mm0=s->mmx[0]; g_mm1=s->mmx[1]; g_mm2=s->mmx[2]; g_mm3=s->mmx[3];
+    g_mm4=s->mmx[4]; g_mm5=s->mmx[5]; g_mm6=s->mmx[6]; g_mm7=s->mmx[7];
+    g_xmm0=s->xmm[0]; g_xmm1=s->xmm[1]; g_xmm2=s->xmm[2]; g_xmm3=s->xmm[3];
+    g_xmm4=s->xmm[4]; g_xmm5=s->xmm[5]; g_xmm6=s->xmm[6]; g_xmm7=s->xmm[7];
+    fesetenv(&s->host_fenv);
+#ifdef BRIDGE_HAS_MXCSR
+    _mm_setcsr(s->mxcsr);
+#endif
+}
+
+/* Call a guest stdcall routine with `args` in guest memory. Preserve all
+ * modeled state except EAX when the caller needs the function result. */
+static int bridge_call_guest_stdcall(uint32_t fn_va, const uint32_t *args,
+                                     uint32_t argc, int keep_eax,
+                                     uint32_t *result)
+{
+    bridge_guest_call_state state;
+    recomp_func_t fn = recomp_lookup(fn_va);
+    uint32_t i, out;
+    if (!fn) fn = recomp_lookup_manual(fn_va);
+    if (!fn) fn = recomp_lookup_kernel(fn_va);
+    if (!fn || argc > 8 || g_esp < (argc + 1) * 4 ||
+        !bridge_buf_ok(g_esp - (argc + 1) * 4,
+                       (argc + 1) * 4, 1, "guest I/O callback"))
+        return 0;
+    bridge_guest_state_save(&state);
+    for (i = argc; i > 0; --i) {
+        g_esp -= 4;
+        BRIDGE_MEM32(g_esp) = args[i - 1];
+    }
+    g_esp -= 4;
+    BRIDGE_MEM32(g_esp) = 0; /* guest return sentinel */
+    g_df = 0;
+    fn();
+    out = g_eax;
+    bridge_guest_state_restore(&state, keep_eax ? state.eax : out);
+    if (result) *result = out;
+    return 1;
+}
+
+static int bridge_io_get_irp(uint32_t va, XBOX_GUEST_IRP **out)
+{
+    XBOX_GUEST_IRP *irp;
+    if (!bridge_buf_ok(va, XBOX_IRP_SIZE, 1, "I/O IRP")) return 0;
+    irp = (XBOX_GUEST_IRP *)XBOX_TO_NATIVE(va);
+    if (irp->type != XBOX_IO_TYPE_IRP || irp->stack_count <= 0 ||
+        irp->size < XBOX_IRP_SIZE + (uint32_t)(uint8_t)irp->stack_count *
+                    XBOX_IO_STACK_LOCATION_SIZE ||
+        !bridge_buf_ok(va, irp->size, 1, "I/O IRP"))
+        return 0;
+    *out = irp;
+    return 1;
+}
+
+static void bridge_io_complete_request(uint32_t irp_va);
+
+static int bridge_io_get_stack(uint32_t irp_va, XBOX_GUEST_IRP *irp,
+                               XBOX_GUEST_IO_STACK_LOCATION **out)
+{
+    uint32_t first = irp_va + XBOX_IRP_SIZE;
+    uint32_t end = first + (uint32_t)(uint8_t)irp->stack_count *
+                   XBOX_IO_STACK_LOCATION_SIZE;
+    uint32_t va = irp->current_stack_location;
+    if (irp->current_location <= 1 || va < first + XBOX_IO_STACK_LOCATION_SIZE ||
+        va > end || ((va - first) % XBOX_IO_STACK_LOCATION_SIZE) != 0)
+        return 0;
+    va -= XBOX_IO_STACK_LOCATION_SIZE;
+    if (!bridge_buf_ok(va, XBOX_IO_STACK_LOCATION_SIZE, 1, "I/O stack location"))
+        return 0;
+    *out = (XBOX_GUEST_IO_STACK_LOCATION *)XBOX_TO_NATIVE(va);
+    return 1;
 }
 
 static void bridge_IoInvalidDeviceRequest(void)
 {
-    g_eax = (uint32_t)xbox_IoInvalidDeviceRequest(
-        XBOX_TO_NATIVE(STACK_ARG(0)), XBOX_TO_NATIVE(STACK_ARG(1)));
+    uint32_t irp_va = STACK_ARG(1);
+    XBOX_GUEST_IRP *irp;
+    if (!bridge_io_get_irp(irp_va, &irp)) {
+        g_eax = 0xC000000Du; /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    irp->io_status.status = 0xC0000010u; /* STATUS_INVALID_DEVICE_REQUEST */
+    irp->io_status.information = 0;
+    bridge_io_complete_request(irp_va);
+    g_eax = 0xC0000010u;
 }
 
 static void bridge_IoMarkIrpMustComplete(void)
@@ -5371,54 +5873,465 @@ static void bridge_IoSetIoCompletion(void)
         (ULONG_PTR)STACK_ARG(4));
 }
 
+static SRWLOCK g_io_queue_lock = SRWLOCK_INIT;
+
+static uint32_t bridge_io_call_driver(uint32_t device_va, uint32_t irp_va)
+{
+    XBOX_GUEST_DEVICE_OBJECT *device;
+    XBOX_GUEST_IRP *irp;
+    XBOX_GUEST_IO_STACK_LOCATION *stack;
+    XBOX_GUEST_DRIVER_OBJECT *driver;
+    uint32_t dispatch, args[2], result = 0;
+    if (!bridge_buf_ok(device_va, XBOX_DEVICE_OBJECT_SIZE, 0, "IofCallDriver") ||
+        !bridge_io_get_irp(irp_va, &irp))
+        return 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+    device = (XBOX_GUEST_DEVICE_OBJECT *)XBOX_TO_NATIVE(device_va);
+    if (device->type != XBOX_IO_TYPE_DEVICE || !device->driver_object ||
+        !bridge_io_get_stack(irp_va, irp, &stack))
+        return 0xC000000Du; /* STATUS_INVALID_PARAMETER */
+    if (!bridge_buf_ok(device->driver_object, sizeof(*driver), 0,
+                       "IofCallDriver"))
+        return 0xC0000005u;
+    driver = (XBOX_GUEST_DRIVER_OBJECT *)XBOX_TO_NATIVE(device->driver_object);
+    if (stack->major_function >= 14)
+        return 0xC0000010u; /* STATUS_INVALID_DEVICE_REQUEST */
+    dispatch = driver->major_function[stack->major_function];
+    if (!dispatch)
+        return 0xC0000010u;
+    /* Consume the stack location only after all guest inputs are validated. */
+    irp->current_stack_location -= XBOX_IO_STACK_LOCATION_SIZE;
+    irp->current_location--;
+    stack = (XBOX_GUEST_IO_STACK_LOCATION *)XBOX_TO_NATIVE(
+        irp->current_stack_location);
+    args[0] = device_va;
+    args[1] = irp_va;
+    if (!bridge_call_guest_stdcall(dispatch, args, 2, 0, &result))
+        return 0xC0000002u; /* STATUS_NOT_IMPLEMENTED */
+    return result;
+}
+
+static void bridge_io_complete_request(uint32_t irp_va)
+{
+    XBOX_GUEST_IRP *irp;
+    HANDLE event = NULL;
+    uint32_t ios_va, event_va;
+    if (!bridge_io_get_irp(irp_va, &irp)) return;
+    ios_va = irp->user_iosb;
+    event_va = irp->user_event;
+    if (ios_va && bridge_buf_ok(ios_va, 8, 1, "IofCompleteRequest")) {
+        BRIDGE_MEM32(ios_va) = irp->io_status.status;
+        BRIDGE_MEM32(ios_va + 4) = irp->io_status.information;
+    }
+    if (event_va && bridge_buf_ok(event_va, 16, 1, "IofCompleteRequest")) {
+        event = ke_shadow_lookup_initialized(event_va);
+        int type = 0;
+        if (!event) event = ke_guest_event(event_va, &type);
+        if (event) {
+            BRIDGE_MEM32(event_va + 4) = 1;
+        }
+    }
+    /* Publish the final IOSB/event state and retire synchronous ownership
+     * before waking its waiter. Otherwise the waiter can free and reuse this
+     * IRP VA before this thread's post-wake owner lookup, which could then
+     * accidentally free the new IRP. SetEvent must be the final guest-visible
+     * action here; keep only the captured host handle after freeing. */
+    if (bridge_sync_irp_take(irp_va))
+        xbox_HeapFree(irp_va);
+    if (event) SetEvent(event);
+}
+
+static int bridge_io_list_valid(uint32_t link_va)
+{
+    return bridge_buf_ok(link_va, 8, 1, "I/O device queue");
+}
+
+/* Validate the whole circular list before changing any link. Queue entries
+ * occupy the IRP's 16-byte DeviceQueueEntry overlay; malformed guest pointers
+ * or cycles are rejected without partially consuming the queue. */
+static int bridge_io_queue_valid(uint32_t head_va)
+{
+    uint32_t first, prev, cur, steps;
+    if (!bridge_io_list_valid(head_va)) return 0;
+    first = BRIDGE_MEM32(head_va);
+    prev = BRIDGE_MEM32(head_va + 4);
+    if (!bridge_io_list_valid(first) || !bridge_io_list_valid(prev)) return 0;
+    if (first == head_va) return prev == head_va;
+    cur = first;
+    prev = head_va;
+    for (steps = 0; steps < 1024; ++steps) {
+        uint32_t next;
+        XBOX_GUEST_IRP *entry_irp;
+        if (cur < offsetof(XBOX_GUEST_IRP, tail_overlay) ||
+            !bridge_buf_ok(cur, 16, 1, "I/O device queue")) return 0;
+        if (!bridge_io_get_irp(cur - offsetof(XBOX_GUEST_IRP, tail_overlay),
+                               &entry_irp) ||
+            !entry_irp->tail_overlay.device_queue_entry.device_queue_inserted)
+            return 0;
+        if (BRIDGE_MEM32(cur + 4) != prev) return 0;
+        next = BRIDGE_MEM32(cur);
+        if (!bridge_io_list_valid(next) || BRIDGE_MEM32(next + 4) != cur) return 0;
+        if (next == head_va) return 1;
+        prev = cur;
+        cur = next;
+    }
+    return 0;
+}
+
+static void bridge_io_start_io(uint32_t device_va, uint32_t irp_va,
+                               uint32_t driver_va)
+{
+    XBOX_GUEST_DRIVER_OBJECT *driver;
+    uint32_t args[2];
+    if (!bridge_buf_ok(driver_va, sizeof(*driver), 0, "IoStartPacket")) return;
+    driver = (XBOX_GUEST_DRIVER_OBJECT *)XBOX_TO_NATIVE(driver_va);
+    if (!driver->driver_start_io) return;
+    args[0] = device_va; args[1] = irp_va;
+    (void)bridge_call_guest_stdcall(driver->driver_start_io, args, 2, 1, NULL);
+}
+
+static void bridge_io_start_packet(uint32_t device_va, uint32_t irp_va,
+                                   uint32_t key)
+{
+    XBOX_GUEST_DEVICE_OBJECT *device;
+    XBOX_GUEST_IRP *irp;
+    uint32_t head_va, entry_va, first, cur, steps;
+    int start_now = 0;
+    if (!bridge_buf_ok(device_va, XBOX_DEVICE_OBJECT_SIZE, 1, "IoStartPacket") ||
+        !bridge_io_get_irp(irp_va, &irp)) return;
+    device = (XBOX_GUEST_DEVICE_OBJECT *)XBOX_TO_NATIVE(device_va);
+    if (device->type != XBOX_IO_TYPE_DEVICE || !device->driver_object) return;
+    head_va = device_va + offsetof(XBOX_GUEST_DEVICE_OBJECT, device_queue) + 4;
+    entry_va = irp_va + offsetof(XBOX_GUEST_IRP, tail_overlay);
+    if (!bridge_io_list_valid(head_va) ||
+        !bridge_buf_ok(entry_va, 16, 1, "IoStartPacket")) return;
+    AcquireSRWLockExclusive(&g_io_queue_lock);
+    if (!bridge_io_queue_valid(head_va) ||
+        irp->tail_overlay.device_queue_entry.device_queue_inserted ||
+        device->device_queue.busy > 1 || device->current_irp == irp_va ||
+        (!!device->current_irp != !!device->device_queue.busy)) {
+        ReleaseSRWLockExclusive(&g_io_queue_lock);
+        return;
+    }
+    if (!device->current_irp && !device->device_queue.busy) {
+        device->device_queue.busy = 1;
+        device->current_irp = irp_va;
+        device->start_io_key = key;
+        irp->tail_overlay.device_queue_entry.device_queue_sort_key = key;
+        irp->tail_overlay.device_queue_entry.device_queue_inserted = 0;
+        start_now = 1;
+    } else {
+        uint32_t link_va;
+        first = BRIDGE_MEM32(head_va);
+        cur = first;
+        for (steps = 0; cur != head_va && steps < 1024; ++steps) {
+            uint32_t next;
+            if (cur < offsetof(XBOX_GUEST_IRP, tail_overlay) ||
+                !bridge_buf_ok(cur, 16, 1, "IoStartPacket")) break;
+            next = BRIDGE_MEM32(cur);
+            if (BRIDGE_MEM32(cur + 8) > key) break;
+            cur = next;
+        }
+        if (steps == 1024 || (cur != head_va &&
+            !bridge_buf_ok(cur, 16, 1, "IoStartPacket"))) {
+            ReleaseSRWLockExclusive(&g_io_queue_lock);
+            return;
+        }
+        link_va = cur;
+        {
+            uint32_t prev = BRIDGE_MEM32(link_va + 4);
+            if (!bridge_buf_ok(prev, 8, 1, "IoStartPacket")) {
+                ReleaseSRWLockExclusive(&g_io_queue_lock);
+                return;
+            }
+            BRIDGE_MEM32(entry_va) = link_va;
+            BRIDGE_MEM32(entry_va + 4) = prev;
+            BRIDGE_MEM32(prev) = entry_va;
+            BRIDGE_MEM32(link_va + 4) = entry_va;
+            BRIDGE_MEM32(entry_va + 8) = key;
+            BRIDGE_MEM8(entry_va + 12) = 1;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_io_queue_lock);
+    if (start_now) bridge_io_start_io(device_va, irp_va, device->driver_object);
+}
+
+static void bridge_io_start_next_packet(uint32_t device_va, uint32_t key,
+                                        int keyed)
+{
+    XBOX_GUEST_DEVICE_OBJECT *device;
+    uint32_t head_va, link_va, selected = 0, selected_prev = 0;
+    uint32_t cur, steps;
+    if (!bridge_buf_ok(device_va, XBOX_DEVICE_OBJECT_SIZE, 1,
+                       "IoStartNextPacket")) return;
+    device = (XBOX_GUEST_DEVICE_OBJECT *)XBOX_TO_NATIVE(device_va);
+    if (device->type != XBOX_IO_TYPE_DEVICE || !device->driver_object) return;
+    head_va = device_va + offsetof(XBOX_GUEST_DEVICE_OBJECT, device_queue) + 4;
+    if (!bridge_io_list_valid(head_va)) return;
+    AcquireSRWLockExclusive(&g_io_queue_lock);
+    if (!bridge_io_queue_valid(head_va)) {
+        ReleaseSRWLockExclusive(&g_io_queue_lock);
+        return;
+    }
+    cur = BRIDGE_MEM32(head_va);
+    {
+    uint32_t first = cur;
+    for (steps = 0; cur != head_va && steps < 1024; ++steps) {
+        uint32_t next;
+        if (cur < offsetof(XBOX_GUEST_IRP, tail_overlay) ||
+            !bridge_buf_ok(cur, 16, 1, "IoStartNextPacket")) break;
+        next = BRIDGE_MEM32(cur);
+        if (!bridge_io_list_valid(next)) break;
+        if (!keyed || BRIDGE_MEM32(cur + 8) >= key) {
+            selected = cur;
+            selected_prev = BRIDGE_MEM32(cur + 4);
+            break;
+        }
+        cur = next;
+    }
+    if (steps == 1024 || (cur != head_va && !selected && !bridge_io_list_valid(cur))) {
+        ReleaseSRWLockExclusive(&g_io_queue_lock);
+        return;
+    }
+    if (!selected && first != head_va && steps < 1024 && keyed) {
+        /* Key removal falls back to the head when no entry meets the key. */
+        selected = first;
+        if (selected != head_va) selected_prev = BRIDGE_MEM32(selected + 4);
+    }
+    }
+    if (!selected || selected == head_va) {
+        device->current_irp = 0;
+        device->device_queue.busy = 0;
+        ReleaseSRWLockExclusive(&g_io_queue_lock);
+        return;
+    }
+    link_va = selected;
+    {
+        uint32_t next = BRIDGE_MEM32(link_va);
+        if (!bridge_buf_ok(selected_prev, 8, 1, "IoStartNextPacket") ||
+            !bridge_buf_ok(next, 8, 1, "IoStartNextPacket")) {
+            ReleaseSRWLockExclusive(&g_io_queue_lock);
+            return;
+        }
+        BRIDGE_MEM32(selected_prev) = next;
+        BRIDGE_MEM32(next + 4) = selected_prev;
+        BRIDGE_MEM32(link_va) = link_va;
+        BRIDGE_MEM32(link_va + 4) = link_va;
+        BRIDGE_MEM8(link_va + 12) = 0;
+        device->current_irp = link_va - offsetof(XBOX_GUEST_IRP, tail_overlay);
+        device->start_io_key = BRIDGE_MEM32(link_va + 8);
+    }
+    {
+        uint32_t irp_va = device->current_irp;
+        ReleaseSRWLockExclusive(&g_io_queue_lock);
+        bridge_io_start_io(device_va, irp_va, device->driver_object);
+    }
+}
+
 static void bridge_IoStartNextPacket(void)
 {
-    xbox_IoStartNextPacket(XBOX_TO_NATIVE(STACK_ARG(0)),
-        (BOOLEAN)STACK_ARG(1));
+    uint32_t device_va = STACK_ARG(0);
+    /* Xbox IoStartNextPacket takes exactly one argument. */
+    bridge_io_start_next_packet(device_va, 0, 0);
     g_eax = 0;
 }
 
 static void bridge_IoStartNextPacketByKey(void)
 {
-    xbox_IoStartNextPacketByKey(XBOX_TO_NATIVE(STACK_ARG(0)),
-        (BOOLEAN)STACK_ARG(1), STACK_ARG(2));
+    uint32_t device_va = STACK_ARG(0), key = STACK_ARG(1);
+    bridge_io_start_next_packet(device_va, key, 1);
     g_eax = 0;
 }
 
 static void bridge_IoStartPacket(void)
 {
-    xbox_IoStartPacket(XBOX_TO_NATIVE(STACK_ARG(0)),
-        XBOX_TO_NATIVE(STACK_ARG(1)), (PULONG)XBOX_TO_NATIVE(STACK_ARG(2)),
-        XBOX_TO_NATIVE(STACK_ARG(3)));
+    uint32_t device_va = STACK_ARG(0), irp_va = STACK_ARG(1);
+    uint32_t key_va = STACK_ARG(2), key = 0;
+    if (key_va) {
+        if (!bridge_buf_ok(key_va, 4, 0, "IoStartPacket")) {
+            g_eax = 0;
+            return;
+        }
+        key = BRIDGE_MEM32(key_va);
+    }
+    bridge_io_start_packet(device_va, irp_va, key);
     g_eax = 0;
+}
+
+static HANDLE ke_shadow_lookup_initialized(uint32_t guest_va);
+static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
+static void ke_shadow_remove(uint32_t guest_va);
+
+/* Xbox DISPATCHER_HEADER's Size is measured in ULONGs. KEVENT is 16 bytes,
+ * so Size is 4; Inserted is clear and the empty wait list points to itself. */
+static HANDLE bridge_ke_initialize_event_shadow(uint32_t guest_va,
+                                                uint32_t event_type,
+                                                uint32_t initial_state,
+                                                const char *export_name)
+{
+    HANDLE event;
+    XBOX_GUEST_DISPATCHER_HEADER *header;
+    if (event_type > 1 || (guest_va & 3u) ||
+        !bridge_buf_ok(guest_va, 16, 1, export_name))
+        return NULL;
+    event = CreateEventW(NULL, event_type == 0 ? TRUE : FALSE,
+                         initial_state ? TRUE : FALSE, NULL);
+    if (!event) return NULL;
+    ke_shadow_insert(guest_va, event);
+    if (ke_shadow_lookup_initialized(guest_va) != event)
+        return NULL; /* insertion already closed the handle if the table was full */
+    header = (XBOX_GUEST_DISPATCHER_HEADER *)XBOX_TO_NATIVE(guest_va);
+    header->type = (uint8_t)event_type;
+    header->absolute = 0;
+    header->size = sizeof(*header) / sizeof(uint32_t);
+    header->inserted = 0;
+    header->signal_state = initial_state ? 1 : 0;
+    header->wait_list_head[0] = guest_va +
+        offsetof(XBOX_GUEST_DISPATCHER_HEADER, wait_list_head);
+    header->wait_list_head[1] = header->wait_list_head[0];
+    return event;
+}
+
+/* Run a builder through its real guest stack ABI, then restore the caller's
+ * complete modeled register/FPU state. The returned IRP remains guest-owned
+ * and its synchronous-owner entry is consumed by completion or this wrapper's
+ * failure cleanup. */
+static uint32_t bridge_io_call_builder(void (*builder)(void),
+                                      uint32_t *args, uint32_t argc)
+{
+    bridge_guest_call_state state;
+    uint32_t frame_va, i, irp_va;
+    frame_va = xbox_HeapAlloc((argc + 1) * 4, 4);
+    if (!frame_va) return 0;
+    for (i = 0; i < argc; ++i)
+        BRIDGE_MEM32(frame_va + 4 + i * 4) = args[i];
+    bridge_guest_state_save(&state);
+    /* Bridge entrypoints see ESP at argument zero because the synthetic
+     * dispatcher has already consumed the guest return address. */
+    g_esp = frame_va + 4;
+    builder();
+    irp_va = g_eax;
+    bridge_guest_state_restore(&state, state.eax);
+    xbox_HeapFree(frame_va);
+    return irp_va;
+}
+
+/* The wrapper owns temporary guest KEVENT/IOSB memory until either immediate
+ * dispatch returns or a pending request signals the event. Completion writes
+ * both guest structures before signaling and does not touch them afterwards. */
+static uint32_t bridge_io_synchronous_request(uint32_t device_va,
+                                               uint32_t *builder_args,
+                                               uint32_t builder_argc,
+                                               void (*builder)(void),
+                                               uint32_t output_length_va)
+{
+    uint32_t temp_va, event_va, ios_va, irp_va, dispatch_status, status;
+    HANDLE event = NULL;
+    const uint32_t temp_size = 24;
+
+    if (output_length_va) {
+        if (!bridge_buf_ok(output_length_va, 4, 1,
+                           "IoSynchronousDeviceIoControlRequest"))
+            return 0xC0000005u;
+    }
+    if (!bridge_buf_ok(device_va, XBOX_DEVICE_OBJECT_SIZE, 0,
+                       "synchronous I/O request"))
+        return 0xC0000005u;
+    if (builder == bridge_IoBuildDeviceIoControlRequest) {
+        uint32_t input_va = builder_args[2], input_len = builder_args[3];
+        uint32_t output_va = builder_args[4], output_len = builder_args[5];
+        if ((input_len && !bridge_buf_ok(input_va, input_len, 0,
+                                         "IoSynchronousDeviceIoControlRequest")) ||
+            (output_len && !bridge_buf_ok(output_va, output_len, 1,
+                                          "IoSynchronousDeviceIoControlRequest")))
+            return 0xC0000005u;
+    } else {
+        uint32_t major = builder_args[0], buffer_va = builder_args[2];
+        uint32_t length = builder_args[3], offset_va = builder_args[4];
+        if (major != XBOX_MAJOR_READ && major != XBOX_MAJOR_WRITE)
+            return 0xC000000Du;
+        if ((length && !bridge_buf_ok(buffer_va, length,
+                                      major == XBOX_MAJOR_READ,
+                                      "IoSynchronousFsdRequest")) ||
+            (offset_va && !bridge_buf_ok(offset_va, 8, 0,
+                                         "IoSynchronousFsdRequest")))
+            return 0xC0000005u;
+    }
+    temp_va = xbox_HeapAlloc(temp_size, 4);
+    if (!temp_va) return 0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
+    event_va = temp_va;
+    ios_va = temp_va + 16;
+    builder_args[builder_argc - 2] = event_va;
+    builder_args[builder_argc - 1] = ios_va;
+    memset(XBOX_TO_NATIVE(temp_va), 0, temp_size);
+    BRIDGE_MEM32(ios_va + 0) = 0x00000103u; /* pending until completion */
+    /* The original helper constructs a NotificationEvent (Type == 0), not an
+     * auto-reset SynchronizationEvent. */
+    event = bridge_ke_initialize_event_shadow(event_va, 0, 0,
+                                                "synchronous I/O event");
+    if (!event) {
+        xbox_HeapFree(temp_va);
+        return 0xC000009Au;
+    }
+    irp_va = bridge_io_call_builder(builder, builder_args, builder_argc);
+    if (!irp_va) {
+        ke_shadow_remove(event_va);
+        xbox_HeapFree(temp_va);
+        return 0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
+    }
+    dispatch_status = bridge_io_call_driver(device_va, irp_va);
+    if (dispatch_status == 0x00000103u) {
+        DWORD wait_status = WaitForSingleObject(event, INFINITE);
+        if (wait_status != WAIT_OBJECT_0) {
+            if (bridge_sync_irp_take(irp_va)) xbox_HeapFree(irp_va);
+            ke_shadow_remove(event_va);
+            xbox_HeapFree(temp_va);
+            return 0xC0000001u; /* STATUS_UNSUCCESSFUL */
+        }
+        status = BRIDGE_MEM32(ios_va);
+    } else {
+        /* Xbox returns IofCallDriver's result for immediate completion. Only
+         * the pending path above waits and substitutes IOSB.Status. */
+        status = dispatch_status;
+    }
+    /* The original export copies IOSB.Information without filtering by the
+     * returned NTSTATUS, including STATUS_BUFFER_OVERFLOW and errors. */
+    if (output_length_va)
+        BRIDGE_MEM32(output_length_va) = BRIDGE_MEM32(ios_va + 4);
+    /* Immediate drivers are expected to complete before returning. If they
+     * return a non-pending error without completion, reclaim our IRP here. */
+    if (bridge_sync_irp_take(irp_va)) xbox_HeapFree(irp_va);
+    ke_shadow_remove(event_va);
+    xbox_HeapFree(temp_va);
+    return status;
 }
 
 static void bridge_IoSynchronousDeviceIoControlRequest(void)
 {
-    g_eax = (uint32_t)xbox_IoSynchronousDeviceIoControlRequest(
-        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
-        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
-        XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
-        (PULONG)XBOX_TO_NATIVE(STACK_ARG(6)), (BOOLEAN)STACK_ARG(7));
+    uint32_t ioctl = STACK_ARG(0), device = STACK_ARG(1);
+    uint32_t returned_length = STACK_ARG(6), internal = STACK_ARG(7);
+    uint32_t args[9] = { ioctl, device, STACK_ARG(2), STACK_ARG(3),
+        STACK_ARG(4), STACK_ARG(5), internal, 0, 0 };
+    g_eax = bridge_io_synchronous_request(device, args, 9,
+                 bridge_IoBuildDeviceIoControlRequest, returned_length);
 }
 
 static void bridge_IoSynchronousFsdRequest(void)
 {
-    g_eax = (uint32_t)xbox_IoSynchronousFsdRequest(
-        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
-        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
-        XBOX_TO_NATIVE(STACK_ARG(4)));
+    uint32_t args[7], i;
+    for (i = 0; i < 5; ++i) args[i] = STACK_ARG(i);
+    args[5] = 0; args[6] = 0;
+    g_eax = bridge_io_synchronous_request(args[1], args, 7,
+                 bridge_IoBuildSynchronousFsdRequest, 0);
 }
 
 static void bridge_IofCallDriver(void)
 {
-    g_eax = (uint32_t)xbox_IofCallDriver(XBOX_TO_NATIVE(g_ecx),
-                                        XBOX_TO_NATIVE(g_edx));
+    g_eax = bridge_io_call_driver(g_ecx, g_edx);
 }
 
 static void bridge_IofCompleteRequest(void)
 {
-    xbox_IofCompleteRequest(XBOX_TO_NATIVE(g_ecx), (CCHAR)g_edx);
+    bridge_io_complete_request(g_ecx);
     g_eax = 0;
 }
 
@@ -6805,26 +7718,9 @@ static int ke_inline_event_enabled(void)
  * reading any of it; guest bounds alone cannot establish either property. */
 static int ke_guest_event_header(uint32_t guest_va, uint32_t header[4])
 {
-    uintptr_t cursor, end;
-    if (guest_va < 0x10000u || (guest_va & 3u) || !bridge_va_mapped(guest_va, 16, 0)) return 0;
+    if (guest_va < 0x10000u || (guest_va & 3u) || !bridge_va_mapped(guest_va, 16, 1)) return 0;
     if (guest_va >= 0x04000000u && (guest_va < 0x80000000u || guest_va >= 0x84000000u))
         return 0;
-    cursor = (uintptr_t)XBOX_TO_NATIVE(guest_va);
-    end = cursor + 16;
-    if (end < cursor) return 0;
-    while (cursor < end) {
-        MEMORY_BASIC_INFORMATION mbi;
-        uintptr_t region_end;
-        DWORD protection;
-        if (!VirtualQuery((void *)cursor, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
-            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        protection = mbi.Protect & 0xFFu;
-        if (protection != PAGE_READWRITE && protection != PAGE_WRITECOPY &&
-            protection != PAGE_EXECUTE_READWRITE && protection != PAGE_EXECUTE_WRITECOPY) return 0;
-        region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-        if (region_end <= cursor) return 0;
-        cursor = region_end;
-    }
 #ifdef _WIN32
     {
         SIZE_T copied;
@@ -7406,37 +8302,31 @@ static void bridge_InterlockedPushEntrySList(void)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-/* --- IoAllocateIrp (ordinal 59, 2 args = 8 bytes)
- * PIRP IoAllocateIrp(CCHAR StackSize, BOOLEAN ChargeQuota);
+/* --- IoAllocateIrp (ordinal 59, 1 arg = 4 bytes)
+ * PIRP IoAllocateIrp(CCHAR StackSize);
  * Allocates an IRP header plus StackSize IO_STACK_LOCATIONs from the guest
  * heap. Pair with IoFreeIrp (ordinal 72), which frees through the same heap. */
 static void bridge_IoAllocateIrp(void)
 {
-    uint32_t stack_size = STACK_ARG(0);
-    uint32_t charge_quota = STACK_ARG(1);
-    uint32_t total = 0x28 + stack_size * 0x20;  /* header + stack locations */
+    int32_t stack_size = (int8_t)STACK_ARG(0);
+    uint32_t total;
     uint32_t va;
 
-    (void)charge_quota;
+    if (stack_size <= 0 || stack_size > INT8_MAX) {
+        g_eax = 0;
+        return;
+    }
+    total = XBOX_IRP_SIZE + (uint32_t)stack_size * XBOX_IO_STACK_LOCATION_SIZE;
     va = xbox_HeapAlloc(total, 16);
-    if (va)
-        memset((void *)((uintptr_t)va + g_xbox_mem_offset), 0, total);
-    else
+    if (va && !xbox_IoInitializeIrpGuest(va,
+            (void *)((uintptr_t)va + g_xbox_mem_offset), (USHORT)total,
+            (CCHAR)stack_size)) {
+        xbox_HeapFree(va);
+        va = 0;
+    } else if (!va) {
         fprintf(stderr, "  [KERNEL] IoAllocateIrp: %u bytes REFUSED\n", total);
+    }
     g_eax = va;
-}
-
-/* --- IoBuildAsynchronousFsdRequest (ordinal 60, 7 args = 28 bytes) --- */
-static void bridge_IoBuildAsynchronousFsdRequest(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    g_eax = 0;
 }
 
 /* --- IoCheckShareAccess (ordinal 63, 5 args = 20 bytes) --- */
@@ -7453,7 +8343,9 @@ static void bridge_IoCheckShareAccess(void)
 /* --- IoFreeIrp (ordinal 72, 1 arg = 4 bytes) --- */
 static void bridge_IoFreeIrp(void)
 {
-    xbox_HeapFree(STACK_ARG(0));
+    uint32_t irp_va = STACK_ARG(0);
+    (void)bridge_sync_irp_take(irp_va);
+    xbox_HeapFree(irp_va);
     g_eax = 0;
 }
 
@@ -7550,31 +8442,9 @@ static void bridge_KeInitializeEvent(void)
     uint32_t guest_va = STACK_ARG(0);
     uint32_t event_type = STACK_ARG(1); /* 0=Notification(manual-reset), 1=Synchronization(auto-reset) */
     uint32_t initial_state = STACK_ARG(2);
-
-    BOOL manual_reset = (event_type == 0) ? TRUE : FALSE;
-    HANDLE h = CreateEventW(NULL, manual_reset, initial_state ? TRUE : FALSE, NULL);
-    if (!h) {
-        fprintf(stderr, "  [KERNEL] KeInitializeEvent: CreateEventW failed (error %u)\n",
-                GetLastError());
-        g_eax = 0;
-        return;
-    }
-
-    ke_shadow_insert(guest_va, h);
-
-    /* Also zero the guest KEVENT struct (16 bytes) and set SignalState.
-     * KEVENT layout: +0x00 Type(UCHAR), +0x01 Absolute(UCHAR),
-     *                +0x02 Size(UCHAR), +0x03 Inserted(UCHAR)
-     *                +0x04 SignalState(LONG), +0x08 WaitListHead.Flink,
-     *                +0x0C WaitListHead.Blink */
-    BRIDGE_MEM8(guest_va + 0)  = (uint8_t)(event_type ? 1 : 0);
-    BRIDGE_MEM8(guest_va + 1)  = 0;
-    BRIDGE_MEM8(guest_va + 2)  = 16;
-    BRIDGE_MEM8(guest_va + 3)  = 1;
-    BRIDGE_MEM32(guest_va + 4) = initial_state ? 1 : 0; /* SignalState */
-    BRIDGE_MEM32(guest_va + 8) = 0;  /* WaitListHead.Flink (self/empty) */
-    BRIDGE_MEM32(guest_va + 12) = 0; /* WaitListHead.Blink (self/empty) */
-
+    if (!bridge_ke_initialize_event_shadow(guest_va, event_type,
+                                          initial_state, "KeInitializeEvent"))
+        fprintf(stderr, "  [KERNEL] KeInitializeEvent: invalid guest event or host event creation failed\n");
     g_eax = 0;
 }
 
@@ -8988,9 +9858,9 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  73: return 12;  /* IoInitializeIrp (3) */
     case  74: return  8;  /* IoInvalidDeviceRequest (2) */
     case  79: return 20;  /* IoSetIoCompletion (5) */
-    case  81: return  8;  /* IoStartNextPacket (2) */
-    case  82: return 12;  /* IoStartNextPacketByKey (3) */
-    case  83: return 16;  /* IoStartPacket (4) */
+    case  81: return  4;  /* IoStartNextPacket (1) */
+    case  82: return  8;  /* IoStartNextPacketByKey (2) */
+    case  83: return 12;  /* IoStartPacket (3) */
     case  84: return 32;  /* IoSynchronousDeviceIoControlRequest (8) */
     case  85: return 20;  /* IoSynchronousFsdRequest (5) */
     case  86: return  0;  /* IofCallDriver (fastcall: args in ecx/edx) */
@@ -9287,8 +10157,8 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  58: return  0;  /* InterlockedPushEntrySList (fastcall) */
 
     /* Io */
-    case  59: return  8;  /* IoAllocateIrp (2) */
-    case  60: return 28;  /* IoBuildAsynchronousFsdRequest (7) */
+    case  59: return  4;  /* IoAllocateIrp (1) */
+    case  60: return 24;  /* IoBuildAsynchronousFsdRequest (6) */
     case  63: return 20;  /* IoCheckShareAccess (5) */
     case  72: return  4;  /* IoFreeIrp (1) */
     case  75: return 20;  /* IoQueryFileInformation (5) */
@@ -10263,6 +11133,9 @@ void xbox_kernel_bridge_init(void)
     DWORD old_protect;
 
     kernel_log_init();
+    /* A new thunk-table initialization accompanies a new guest-memory
+     * generation; discard host ownership metadata from the prior mapping. */
+    bridge_sync_irp_reset();
     guest_cpu_join();          /* the caller goes on to run the title's entry point */
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);

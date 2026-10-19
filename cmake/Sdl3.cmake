@@ -21,9 +21,11 @@ set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SDL_TESTS OFF CACHE BOOL "" FORCE)
 set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+find_package(Git REQUIRED)
 FetchContent_Declare(SDL3
     URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-3.4.16.tar.gz
-    URL_HASH SHA256=7322236cd12090c3eb40b9728be4d49c76f66ad17d04369584d4ecad5cf77c68)
+    URL_HASH SHA256=7322236cd12090c3eb40b9728be4d49c76f66ad17d04369584d4ecad5cf77c68
+    PATCH_COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace "${CMAKE_CURRENT_LIST_DIR}/sdl3-d3d12-descriptors.patch")
 FetchContent_MakeAvailable(SDL3)
 if(NOT TARGET SDL3::SDL3 AND TARGET SDL3::SDL3-static)
     add_library(SDL3::SDL3 ALIAS SDL3-static)

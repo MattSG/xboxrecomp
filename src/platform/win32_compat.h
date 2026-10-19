@@ -542,6 +542,13 @@ typedef struct _MEMORY_BASIC_INFORMATION {
     DWORD  Type;
 } MEMORY_BASIC_INFORMATION, *PMEMORY_BASIC_INFORMATION;
 SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T length);
+#if !defined(_WIN32)
+/* POSIX memory-layout support: these release only currently reserved portions
+ * of shim-owned VirtualAlloc reservations. They are not Win32 APIs. */
+uint64_t w32_reservation_id(LPVOID base);
+BOOL w32_release_reserved_region(LPVOID address, SIZE_T size);
+BOOL w32_release_reservation(uint64_t allocation_id);
+#endif
 
 typedef struct _MEMORYSTATUSEX {
     DWORD     dwLength;

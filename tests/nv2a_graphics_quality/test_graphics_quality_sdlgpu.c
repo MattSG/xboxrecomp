@@ -304,6 +304,40 @@ static int test_depth(void)
     return 0;
 }
 
+/* Cross the D3D12 2048-sampler heap boundary with a four-sampler draw.
+ * A rollover must preserve every descriptor table and the resulting pixels. */
+static int test_descriptor_rollover(void)
+{
+    NvD3DState st = state_for(8, 8);
+    Surface *s;
+    SDL_GPUTexture *packed, *out;
+    PresentConsts pc = {0};
+    uint32_t pixels[64], reference[64];
+    unsigned i;
+    nv2a_d3d_clear(&st, 0xF0, 0xFFFF0000u, 0, 0, 0, 7, 7);
+    submit(NULL);
+    s = surface_find(phys(st.color_addr));
+    CHECK(s);
+    packed = make_texture(16, 8, 1, 0, FMT_RGBA16, USAGE_TARGET);
+    out = make_texture(8, 8, 1, 0, FMT_BGRA8, USAGE_TARGET);
+    CHECK(packed && out);
+    composite(out, 8, 8, s, &pc, 0);
+    CHECK(nv2a_test_read_level(out, 8, 8, 0, 0, reference));
+    submit(NULL);
+    for (i = 0; i < 2047; i++) {
+        int clear = i == 0;
+        y16_draw(packed, &clear, 16, 8, SH_Y16_PS, s->tex, NULL);
+        flush_batch();
+    }
+    composite(out, 8, 8, s, &pc, 0);
+    CHECK(nv2a_test_read_level(out, 8, 8, 0, 0, pixels));
+    for (i = 0; i < 64; i++) CHECK(pixels[i] == reference[i]);
+    SDL_ReleaseGPUTexture(s_dev, packed);
+    SDL_ReleaseGPUTexture(s_dev, out);
+    puts("PASS: sampler heap rollover preserves all draw tables and exact pixels");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
@@ -318,7 +352,12 @@ int main(int argc, char **argv)
     nv2a_test_default_env("RECOMP_ANISO", "1");
     nv2a_test_default_env("RECOMP_PS_PREWARM", "0");
     nv2a_test_default_env("RECOMP_SHADER_CACHE", "0");
+    if (!strcmp(argv[1], "descriptor_rollover")) {
+        nv2a_test_default_env("RECOMP_D3D_DEBUG", "1");
+        nv2a_test_default_env("SDL_ASSERT", "abort");
+    }
     CHECK(nv2a_test_init());
+    if (!strcmp(argv[1], "descriptor_rollover")) return test_descriptor_rollover();
     if (!strcmp(argv[1], "panorama")) return test_panorama();
     if (!strcmp(argv[1], "gates")) return test_gates();
     if (!strcmp(argv[1], "depth")) return test_depth();

@@ -685,9 +685,6 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     PLARGE_INTEGER ByteOffset);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
-/* Ends a directory search when its handle closes (both file backends). */
-void xbox_dir_context_drop(HANDLE FileHandle);
-
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 
 NTSTATUS __stdcall xbox_NtQueryInformationFile(
@@ -882,13 +879,14 @@ extern PVOID xbox_IoCompletionObjectType;
 extern PVOID xbox_IoFileObjectType;
 
 VOID    __stdcall xbox_IoInitializeIrp(PVOID Irp, USHORT PacketSize, CCHAR StackSize);
-VOID    __stdcall xbox_IoStartNextPacket(PVOID DeviceObject, BOOLEAN Cancelable);
-VOID    __stdcall xbox_IoStartNextPacketByKey(PVOID DeviceObject, BOOLEAN Cancelable, ULONG Key);
-VOID    __stdcall xbox_IoStartPacket(PVOID DeviceObject, PVOID Irp, PULONG Key, PVOID CancelFunction);
+VOID    __stdcall xbox_IoStartNextPacket(PVOID DeviceObject);
+VOID    __stdcall xbox_IoStartNextPacketByKey(PVOID DeviceObject, ULONG Key);
+VOID    __stdcall xbox_IoStartPacket(PVOID DeviceObject, PVOID Irp, PULONG Key);
 NTSTATUS __stdcall xbox_IoSetIoCompletion(PVOID IoCompletion, PVOID KeyContext, PVOID ApcContext, NTSTATUS IoStatus, ULONG_PTR IoStatusInformation);
 VOID    __stdcall xbox_IoMarkIrpMustComplete(PVOID Irp);
 NTSTATUS __stdcall xbox_IoSynchronousDeviceIoControlRequest(ULONG IoControlCode, PVOID DeviceObject, PVOID InputBuffer, ULONG InputBufferLength, PVOID OutputBuffer, ULONG OutputBufferLength, PULONG ReturnedOutputBufferLength, BOOLEAN InternalDeviceIoControl);
-NTSTATUS __stdcall xbox_IoBuildDeviceIoControlRequest(ULONG IoControlCode, PVOID DeviceObject, PVOID InputBuffer, ULONG InputBufferLength, PVOID OutputBuffer, ULONG OutputBufferLength, BOOLEAN InternalDeviceIoControl, HANDLE Event, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
+PVOID   __stdcall xbox_IoBuildDeviceIoControlRequest(ULONG IoControlCode, PVOID DeviceObject, PVOID InputBuffer, ULONG InputBufferLength, PVOID OutputBuffer, ULONG OutputBufferLength, BOOLEAN InternalDeviceIoControl, PVOID Event, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
+PVOID   __stdcall xbox_IoBuildAsynchronousFsdRequest(ULONG MajorFunction, PVOID DeviceObject, PVOID Buffer, ULONG Length, PLARGE_INTEGER StartingOffset, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
 NTSTATUS __stdcall xbox_IoSynchronousFsdRequest(ULONG MajorFunction, PVOID DeviceObject, PVOID Buffer, ULONG Length, PLARGE_INTEGER StartingOffset);
 PVOID   __stdcall xbox_IoBuildSynchronousFsdRequest(ULONG MajorFunction, PVOID DeviceObject, PVOID Buffer, ULONG Length, PLARGE_INTEGER StartingOffset, HANDLE Event, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
 NTSTATUS __stdcall xbox_IoInvalidDeviceRequest(PVOID DeviceObject, PVOID Irp);

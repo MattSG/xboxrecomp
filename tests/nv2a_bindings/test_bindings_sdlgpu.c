@@ -246,7 +246,7 @@ static void check_textured_bindings(const NvD3DTexture *t)
 {
     unsigned n;
     CHECK(bound[0].texture && bound[0].texture != s_dummy_2d);
-    CHECK(bound[0].sampler == sampler(t, 1, 0));
+    CHECK(bound[0].sampler == sampler(t, 1, 0, no_pinned_samplers));
     for (n = 1; n < 4; n++) CHECK(bound[n].texture == s_dummy_2d && bound[n].sampler);
     for (n = 4; n < 8; n++) CHECK(bound[n].texture == s_dummy_cube);
     CHECK(bound[8].texture == s_dummy_2d);
@@ -278,7 +278,7 @@ static void test_ps_bindings(void)
         for (i = 0; i < 2 * SAMP_SLOTS; i++) {
             NvD3DTexture u = t;
             u.control0 = (i << 6) & 0x3FFFFFC0u;
-            CHECK(sampler(&u, 1, 0));
+            CHECK(sampler(&u, 1, 0, no_pinned_samplers));
         }
     }
     textured_triangle(&st, 4);
