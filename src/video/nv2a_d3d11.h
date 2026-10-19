@@ -16,7 +16,6 @@
 #define XBOXRECOMP_NV2A_D3D11_H
 
 #include <stdint.h>
-#include "../../include/nv2a_host_commands.h"
 #include "../kernel/nv2a_combiner.h"
 
 typedef struct {
@@ -156,15 +155,17 @@ void nv2a_d3d_set_flare_depth_test(uint32_t stage_program);
  * scale 1 (the default) leaves depth untouched. */
 void nv2a_d3d_set_depth_view_remap(float scale, float knee);
 
-/* Ordered host fog command: a non-increasing NO_OPERATION packet with eleven
- * parameters: this tag, float W-to-world scale, far clip, start, end, ARGB,
- * flags, sky-fade plane XYZ and inverse width.
- * The executor runs the dedicated D3D11 depth-texture pass at this point,
- * before subsequent UI draws. Stored scene depth must be linear W, even if
- * current state has W writes disabled. SKY_MASK optionally rebuilds destination
- * alpha for later depth-masked composition. SKY_FADE uses the supplied NDC
- * camera-ray world-up plane and inverse transition width to soften that mask.
- * No title fog textures are involved. */
+/* Optional observer for consecutive NV097_NO_OPERATION parameters, called on
+ * the executor thread in stream order. A NULL state ends an interrupted run.
+ * Return nonzero only for consumed extension words. Other NO_OPERATION
+ * commands retain native notification behavior, including with no hook. */
+void nv2a_pb_set_nop_hook(int (*hook)(const NvD3DState *, uint32_t subchannel, uint32_t value));
+
+/* Draw depth-based fog on the executor thread; the caller owns ordering,
+ * distance bands, colours, and the optional world-up fade plane. */
+#define NV_D3D_FOG_SKY_MASK 1u
+#define NV_D3D_FOG_SKY_FILL 2u
+#define NV_D3D_FOG_SKY_FADE 4u
 void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip,
                          float start, float end, uint32_t argb, uint32_t flags, const float sky_fade[4]);
 

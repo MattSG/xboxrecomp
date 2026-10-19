@@ -46,6 +46,15 @@
 #define NV_TLS __thread
 #endif
 
+static int (*s_nop_hook)(const NvD3DState *, uint32_t, uint32_t);
+static int s_nop_pending;
+
+void nv2a_pb_set_nop_hook(int (*hook)(const NvD3DState *, uint32_t, uint32_t))
+{
+    s_nop_hook = hook;
+    s_nop_pending = 0;
+}
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
@@ -3944,24 +3953,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_methods_since_flip++;
         }
     }
-    /* Host postprocessing is ordered with guest draws, never a title-thread
-     * call into the render context or a policy applied to later draw calls. */
-    static uint32_t fog_words[NV2A_HOST_FOG_WORDS-2];
-    static unsigned fog_word;
-    if (subch == 0 && method == 0x100) {
-        if (!fog_word) { if (param == NV2A_HOST_FOG_TAG) fog_word = 1; return; }
-        fog_words[fog_word++ - 1] = param;
-        if (fog_word == NV2A_HOST_FOG_WORDS-1) {
-            NvD3DState st; float values[8];
-            memcpy(values,fog_words,4*sizeof(float));
-            memcpy(values+4,fog_words+6,4*sizeof(float));
+    if (method == 0x100) { /* NV097_NO_OPERATION */
+        if (s_nop_hook) {
+            NvD3DState st;
             d3d_fill_state(&st);
-            nv2a_d3d_distance_fog(&st,values[0],values[1],values[2],values[3],fog_words[4],fog_words[5],values+4);
-            fog_word = 0;
+            int handled = s_nop_hook(&st, subch, param);
+            s_nop_pending = 1;
+            if (handled) return;
         }
-        return;
+    } else if (s_nop_pending) {
+        s_nop_pending = 0;
+        if (s_nop_hook) s_nop_hook(NULL, 0, 0);
     }
-    fog_word = 0; /* An interrupted/malformed extension cannot consume state commands. */
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. Cached: this runs for every method, and an

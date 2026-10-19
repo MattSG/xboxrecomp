@@ -31,8 +31,9 @@ void xbox_Nv2aFrameCounterFlip(void) { test_frame_flips++; }
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
 { (void)physical_offset; (void)size; STUB_HIT("xbox_ContiguousRangeAllocated"); return 0; }
 void xbox_Nv2aSemaphoreRelease(uint32_t dma_context, uint32_t semaphore_offset, uint32_t value)
-{ (void)dma_context; (void)semaphore_offset; (void)value; STUB_HIT("xbox_Nv2aSemaphoreRelease"); }
-void xbox_Nv2aNop(uint32_t param) { (void)param; STUB_HIT("xbox_Nv2aNop"); }
+{ released_dma = dma_context; released_offset = semaphore_offset; (void)value; release_count++; }
+static unsigned native_nops;
+void xbox_Nv2aNop(uint32_t param) { (void)param; native_nops++; }
 void nv2a_vsh_set_load_slot(uint32_t slot) { (void)slot; STUB_HIT("nv2a_vsh_set_load_slot"); }
 void nv2a_vsh_program_word(uint32_t word) { (void)word; STUB_HIT("nv2a_vsh_program_word"); }
 void nv2a_vsh_set_start_slot(uint32_t slot) { (void)slot; STUB_HIT("nv2a_vsh_set_start_slot"); }
@@ -400,6 +401,31 @@ static void test_first_frame_captures_initialized_state(void)
     CHECK_EQ("first snapshot includes executor defaults", mask, 0x01010101u);
 }
 
+static unsigned observed_nops, ended_nops;
+static int test_nop_hook(const NvD3DState *state, uint32_t subchannel, uint32_t value)
+{
+    if (!state) { ended_nops++; return 0; }
+    CHECK_EQ("NOP hook preserves subchannel", subchannel, 0);
+    observed_nops++;
+    return value == 0x12345678;
+}
+
+static void test_nop_extension(void)
+{
+    unsigned before = native_nops;
+    nv2a_pb_set_nop_hook(NULL);
+    nv2a_pb_exec_method(0, NV097_NO_OPERATION, 5);
+    CHECK_EQ("unregistered NOP retains notify", native_nops, before + 1);
+    nv2a_pb_set_nop_hook(test_nop_hook);
+    nv2a_pb_exec_method(0, NV097_NO_OPERATION, 5);
+    nv2a_pb_exec_method(0, NV097_NO_OPERATION, 0x12345678);
+    CHECK_EQ("unrecognized NOP retains notify", native_nops, before + 2);
+    CHECK_EQ("hook sees both NOP words", observed_nops, 2);
+    nv2a_pb_exec_method(0, NV097_SET_SEMAPHORE_OFFSET, 16);
+    CHECK_EQ("interruption ends NOP run", ended_nops, 1);
+    nv2a_pb_set_nop_hook(NULL);
+}
+
 int main(int argc, char **argv)
 {
     const char *which = argc > 1 ? argv[1] : "all";
@@ -414,6 +440,7 @@ int main(int argc, char **argv)
     }
 
     test_state_snapshot();
+    test_nop_extension();
 
     nv2a_pb_exec_method(0, NV097_SET_CONTEXT_DMA_SEMAPHORE, 7);
     nv2a_pb_exec_method(0, NV097_SET_SEMAPHORE_OFFSET, 16);
