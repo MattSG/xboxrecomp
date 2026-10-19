@@ -2588,9 +2588,16 @@ static void bridge_NtUserIoApcDispatcher(void)
 {
     uint32_t apc_context = STACK_ARG(0);
     uint32_t iostatus    = STACK_ARG(1);
-    uint32_t status      = iostatus ? BRIDGE_MEM32(iostatus) : 0;
-    uint32_t information = iostatus ? BRIDGE_MEM32(iostatus + 4) : 0;
+    uint32_t status, information;
     recomp_func_t fn;
+
+    if (!iostatus || !bridge_buf_ok(iostatus, 8, 0,
+                                    "NtUserIoApcDispatcher")) {
+        g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    status = BRIDGE_MEM32(iostatus);
+    information = BRIDGE_MEM32(iostatus + 4);
 
     fn = recomp_lookup(apc_context);
     if (!fn) fn = recomp_lookup_manual(apc_context);
@@ -4287,13 +4294,19 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     return path;
 }
 
-/* Write NTSTATUS + Information into Xbox IO_STATUS_BLOCK */
+/* IO_STATUS_BLOCK is a required 8-byte output on the NT file exports below.
+ * Validate it before calling the host/backend operation: discovering a bad
+ * guest output only after a file was created, read, or modified is too late. */
+static int bridge_iostatus_ok(uint32_t ios_va, const char *export_name)
+{
+    return bridge_buf_ok(ios_va, 8, 1, export_name);
+}
+
+/* Write NTSTATUS + Information into a preflighted Xbox IO_STATUS_BLOCK. */
 static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t info)
 {
-    if (ios_va) {
-        BRIDGE_MEM32(ios_va + 0) = (uint32_t)status;
-        BRIDGE_MEM32(ios_va + 4) = info;
-    }
+    BRIDGE_MEM32(ios_va + 0) = (uint32_t)status;
+    BRIDGE_MEM32(ios_va + 4) = info;
 }
 
 /*
@@ -4547,6 +4560,9 @@ static NTSTATUS bridge_create_file_impl(
     /* Some malformed guest names fail before the host backend is called.
      * They have no Win32 reason and must not inherit a previous open's error. */
     if (host_error) *host_error = 0;
+
+    if (!bridge_iostatus_ok(iostatus_va, "NtCreateFile/NtOpenFile/IoCreateFile"))
+        return (NTSTATUS)0xC0000005; /* STATUS_ACCESS_VIOLATION */
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
     *name_out = name;
@@ -5133,12 +5149,21 @@ static void bridge_NtReadFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(iostatus, "NtReadFile")) {
+        g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (!bridge_buf_ok(buffer_va, length, 1, "NtReadFile")) {
         bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
     }
     if (offset_va) {
+        if (!bridge_buf_ok(offset_va, 8, 0, "NtReadFile offset")) {
+            bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
+            g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+            return;
+        }
         off.LowPart  = BRIDGE_MEM32(offset_va);
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
@@ -5216,12 +5241,21 @@ static void bridge_NtWriteFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(iostatus, "NtWriteFile")) {
+        g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (!bridge_buf_ok(buffer_va, length, 0, "NtWriteFile")) {
         bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
     }
     if (offset_va) {
+        if (!bridge_buf_ok(offset_va, 8, 0, "NtWriteFile offset")) {
+            bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
+            g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+            return;
+        }
         off.LowPart  = BRIDGE_MEM32(offset_va);
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
@@ -5244,6 +5278,10 @@ static void bridge_NtQueryInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(ios_va, "NtQueryInformationFile")) {
+        g_eax = 0xC0000005u;
+        return;
+    }
     if (!bridge_buf_ok(info_va, length, 1, "NtQueryInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
@@ -5266,6 +5304,10 @@ static void bridge_NtSetInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(ios_va, "NtSetInformationFile")) {
+        g_eax = 0xC0000005u;
+        return;
+    }
     if (!bridge_buf_ok(info_va, length, 0, "NtSetInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
@@ -5335,6 +5377,10 @@ static void bridge_NtQueryVolumeInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(ios_va, "NtQueryVolumeInformationFile")) {
+        g_eax = 0xC0000005u;
+        return;
+    }
     if (!bridge_buf_ok(info_va, length, 1, "NtQueryVolumeInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
@@ -5372,6 +5418,10 @@ static void bridge_NtFlushBuffersFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(ios_va, "NtFlushBuffersFile")) {
+        g_eax = 0xC0000005u;
+        return;
+    }
     g_eax = (uint32_t)xbox_NtFlushBuffersFile(handle, &ios);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
@@ -5402,6 +5452,10 @@ static void bridge_NtQueryDirectoryFile(void)
     PXBOX_ANSI_STRING    pfn = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_iostatus_ok(ios_va, "NtQueryDirectoryFile")) {
+        g_eax = 0xC0000005u;
+        return;
+    }
     if (filename_va) {
         /* Xbox ANSI_STRING: 0=Length(u16), 2=MaximumLength(u16), 4=Buffer(u32) */
         uint32_t fn_buf  = BRIDGE_MEM32(filename_va + 4);
@@ -5558,6 +5612,11 @@ static void bridge_NtDeviceIoControlFile(void)
     uint32_t out_va  = STACK_ARG(8);
     uint32_t out_len = STACK_ARG(9);
 
+    if (!bridge_iostatus_ok(ios_va, "NtDeviceIoControlFile")) {
+        g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+
     /* IOCTLs aimed at the DVD device (see bridge_is_cdrom_device).
      *
      * These are the media check: the title asks the drive to confirm a disc is
@@ -5699,6 +5758,10 @@ static void bridge_NtFsControlFile(void)
 {
     uint32_t fsctl = STACK_ARG(5);
     uint32_t ios_va = STACK_ARG(4);
+    if (!bridge_iostatus_ok(ios_va, "NtFsControlFile")) {
+        g_eax = 0xC0000005u; /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     xbox_NoteUnsupportedIoctl("NtFsControlFile", fsctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
     g_eax = 0xC00000BBu;

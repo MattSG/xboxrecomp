@@ -84,6 +84,18 @@ The test embeds data; it does not download dependencies at runtime.
 
 ### 2026-10-19 continuation
 
+- NT file bridges now validate the complete mandatory eight-byte guest IOSB
+  before backend calls or output mutation. Shared create/open handling covers
+  NtCreateFile, NtOpenFile and IoCreateFile; read/write, information queries,
+  directory queries, flush and control requests preflight their IOSBs too.
+  NtReadFile/NtWriteFile validate optional eight-byte offsets before reading
+  either half. NtUserIoApcDispatcher validates its IOSB before reading it.
+  Invalid spans return STATUS_ACCESS_VIOLATION with normal stdcall cleanup.
+  The focused fixture rejects null, read-only and split-page pointers; its
+  previous-source control fails while independent Windows/Linux builds pass.
+  This closes these IOSB/offset accesses, not all guest pointer boundaries:
+  object attributes, output handles and several control payloads remain open.
+
 - Guest I/O builders now allocate initialized packets and populate read/write
   and IOCTL arguments instead of returning null packets with successful IOSBs.
   Dispatch enters guest driver callbacks through modeled x86 call frames;

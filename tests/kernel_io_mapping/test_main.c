@@ -26,6 +26,49 @@ static volatile long map_shutdown_stop, map_shutdown_calls;
 static void *native(uint32_t va) { return (void *)((uintptr_t)va + xbox_GetMemoryOffset()); }
 static uint32_t guest(const void *p) { return (uint32_t)((uintptr_t)p - xbox_GetMemoryOffset()); }
 
+/* The old offset bridge dereferenced a split 64-bit LARGE_INTEGER directly;
+ * keep that regression isolated so its historical host fault is a test failure
+ * rather than taking down the entire mapping suite. */
+static int io_rejects_bad_guest_pointer(guest_fn io_file, uint32_t *stack,
+                                        uint32_t stack_va, uint32_t ios_va,
+                                        uint32_t buffer_va, uint32_t offset_va)
+{
+#ifdef _WIN32
+    __try {
+        memset(stack, 0, 9 * sizeof(*stack));
+        stack[0] = 0x12345678;
+        stack[5] = ios_va;
+        stack[6] = buffer_va;
+        stack[7] = 4;
+        stack[8] = offset_va;
+        g_esp = stack_va;
+        io_file();
+        return g_eax == 0xC0000005u && g_esp == stack_va + 0x24;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+#else
+    pid_t child = fork();
+    int status;
+    if (child < 0) return 0;
+    if (!child) {
+        struct rlimit no_core = {0, 0};
+        setrlimit(RLIMIT_CORE, &no_core);
+        memset(stack, 0, 9 * sizeof(*stack));
+        stack[0] = 0x12345678;
+        stack[5] = ios_va;
+        stack[6] = buffer_va;
+        stack[7] = 4;
+        stack[8] = offset_va;
+        g_esp = stack_va;
+        io_file();
+        _exit(g_eax == 0xC0000005u && g_esp == stack_va + 0x24 ? 0 : 1);
+    }
+    if (waitpid(child, &status, 0) != child) return 0;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
+}
+
 static int write_faults(volatile uint32_t *p)
 {
 #ifdef _WIN32
@@ -254,6 +297,45 @@ int main(int argc, char **argv)
         recomp_lookup_kernel(*(uint32_t *)native(scratch + 16))();
         CHECK(g_eax == 0xC0000005u);
         CHECK(VirtualProtect(native(buffer), 4096, PAGE_READWRITE, &old));
+
+        /* NtReadFile's IOSB is mandatory. Null must fail before the backend
+         * gets to decide the invalid handle's status. */
+        stack[5] = 0;
+        stack[6] = buffer; stack[7] = 4; stack[8] = 0;
+        g_esp = scratch + 0x1000;
+        recomp_lookup_kernel(*(uint32_t *)native(scratch + 16))();
+        CHECK(g_eax == 0xC0000005u && g_esp == scratch + 0x1024);
+        stack[5] = 0;
+        g_esp = scratch + 0x1000;
+        recomp_lookup_kernel(*(uint32_t *)native(scratch + 20))();
+        CHECK(g_eax == 0xC0000005u && g_esp == scratch + 0x1024);
+
+        /* A non-null but read-only IOSB must also fail before backend I/O. */
+        CHECK(VirtualProtect(native(ios), 4096, PAGE_READONLY, &old));
+        CHECK(io_rejects_bad_guest_pointer(
+            recomp_lookup_kernel(*(uint32_t *)native(scratch + 16)), stack,
+            scratch + 0x1000, ios, buffer, 0));
+        CHECK(io_rejects_bad_guest_pointer(
+            recomp_lookup_kernel(*(uint32_t *)native(scratch + 20)), stack,
+            scratch + 0x1000, ios, buffer, 0));
+        CHECK(VirtualProtect(native(ios), 4096, PAGE_READWRITE, &old));
+
+        /* An 8-byte offset crossing into an inaccessible page is rejected
+         * before either half is read and before either file operation reaches
+         * the host. */
+        CHECK(VirtualProtect(native(scratch + 0x4000), 4096,
+                             PAGE_NOACCESS, &old));
+        CHECK(io_rejects_bad_guest_pointer(
+            recomp_lookup_kernel(*(uint32_t *)native(scratch + 16)), stack,
+            scratch + 0x1000, scratch + 0x3FFC, buffer, 0));
+        CHECK(io_rejects_bad_guest_pointer(
+            recomp_lookup_kernel(*(uint32_t *)native(scratch + 16)), stack,
+            scratch + 0x1000, ios, buffer, scratch + 0x3FFC));
+        CHECK(io_rejects_bad_guest_pointer(
+            recomp_lookup_kernel(*(uint32_t *)native(scratch + 20)), stack,
+            scratch + 0x1000, ios, buffer, scratch + 0x3FFC));
+        CHECK(VirtualProtect(native(scratch + 0x4000), 4096,
+                             PAGE_READWRITE, &old));
     }
     stack[0] = 0x12345678; stack[1] = 0x11234; stack[2] = 32; stack[3] = PAGE_READWRITE;
     g_esp = scratch + 0x1000;
