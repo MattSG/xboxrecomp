@@ -172,7 +172,8 @@ static uint32_t texel(uint32_t c, const uint8_t *p, const uint32_t *pal, uint32_
     case 0x29: case 0x16: return argb(255, v >> 8, 0, v & 0xFF);              /* R8B8 */
     case 0x38: case 0x3D: return argb(v & 1 ? 255 : 0, x5(v >> 11), x5(v >> 6), x5(v >> 1));
     case 0x39: case 0x3E: return argb(x4(v), x4(v >> 12), x4(v >> 8), x4(v >> 4));
-    case 0x2C: case 0x2D: case 0x30: case 0x31: case 0x32: case 0x35:
+    case 0x32: case 0x35: return argb(255, 255, v >> 8, v & 0xFF); /* Y16: one, high byte, low byte, one */
+    case 0x2C: case 0x2D: case 0x30: case 0x31:
         return argb(255, v >> 8, v >> 8, v >> 8);
     }
     return 0xFFFF00FFu;
@@ -195,15 +196,21 @@ static void yuv_pair(const uint8_t *g, int uyvy, uint32_t out[2])
 }
 
 /* Where each level/face lives, and the span to hash. */
+static int tex_volume(const NvD3DTexture *t)
+{
+    return !t->cube && ((t->format >> 4) & 15u) == 3u;
+}
+
 typedef struct {
     int kind, bpp, levels, faces;
-    uint32_t level_off[16], level_w[16], level_h[16];
+    uint32_t level_off[16], level_w[16], level_h[16], level_d[16];
     size_t face_stride, total;
 } TexLayout;
 
 static int tex_layout(const NvD3DTexture *t, TexLayout *L)
 {
     uint32_t w = t->width, h = t->height, lv, maxlv = 1, m;
+    uint32_t d = tex_volume(t) ? 1u << (t->format >> 28) : 1u;
     size_t off = 0;
     memset(L, 0, sizeof *L);
     L->bpp = tex_format(t->color, &L->kind);
@@ -211,7 +218,7 @@ static int tex_layout(const NvD3DTexture *t, TexLayout *L)
         texture_refused(t, "unknown_format", 0);
         return 0;
     }
-    if (!w || !h || w > 4096 || h > 4096) {
+    if (!w || !h || w > 4096 || h > 4096 || (tex_volume(t) && (w > 2048 || h > 2048 || d > 2048 || L->kind == K_LIN))) {
         texture_refused(t, "size_out_of_range", 0);
         return 0;
     }
@@ -222,12 +229,14 @@ static int tex_layout(const NvD3DTexture *t, TexLayout *L)
             return 0;
         }
         L->levels = 1;
-        L->level_w[0] = w; L->level_h[0] = h;
+        L->level_w[0] = w; L->level_h[0] = h; L->level_d[0] = 1;
         L->total = L->face_stride = (size_t)t->pitch * h;
         L->faces = 1;
         return 1;
     }
-    for (m = w > h ? w : h; m > 1; m >>= 1) maxlv++;
+    m = w > h ? w : h;
+    if (d > m) m = d;
+    for (; m > 1; m >>= 1) maxlv++;
     L->levels = t->levels ? (int)t->levels : 1;
     /* Not a refusal: the guest's mip count is a field that can exceed the
      * full chain for its base size (log2 + 1). Levels past 1x1 have no texels,
@@ -238,8 +247,9 @@ static int tex_layout(const NvD3DTexture *t, TexLayout *L)
         uint32_t lw = w >> lv ? w >> lv : 1, lh = h >> lv ? h >> lv : 1;
         L->level_off[lv] = (uint32_t)off;
         L->level_w[lv] = lw; L->level_h[lv] = lh;
-        off += L->kind == K_DXT ? (size_t)((lw + 3) / 4) * ((lh + 3) / 4) * L->bpp
-                                : (size_t)lw * lh * L->bpp;
+        L->level_d[lv] = d >> lv ? d >> lv : 1;
+        off += (L->kind == K_DXT ? (size_t)((lw + 3) / 4) * ((lh + 3) / 4) * L->bpp
+                                 : (size_t)lw * lh * L->bpp) * L->level_d[lv];
     }
     L->face_stride = L->faces > 1 ? (off + 127) & ~(size_t)127 : off;
     L->total = L->face_stride * (L->faces - 1) + off;
@@ -281,6 +291,43 @@ static void decode_level(const NvD3DTexture *t, const TexLayout *L, const uint8_
                          int lv, const uint32_t *pal, uint32_t *out)
 {
     uint32_t w = L->level_w[lv], h = L->level_h[lv], x, y;
+    uint32_t d = L->level_d[lv];
+    if (d > 1) {
+        uint32_t z;
+        if (L->kind == K_DXT) {
+            uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, bz, bx, by, dz, pixels[16];
+            size_t block = 0;
+            /* Xbox DXT volumes group four 4x4 slices into each 4x4x4 block.
+             * See xemu hw/xbox/nv2a/pgraph/s3tc.c (MIT), s3tc_decompress_3d. */
+            for (bz = 0; bz < d; bz += 4)
+                for (by = 0; by < bh; ++by)
+                    for (bx = 0; bx < bw; ++bx)
+                        for (dz = 0; dz < 4 && bz + dz < d; ++dz) {
+                            d3d8_dxt_decode_block(src + block++ * L->bpp, t->color, pixels);
+                            for (y = 0; y < 4 && by * 4 + y < h; ++y)
+                                for (x = 0; x < 4 && bx * 4 + x < w; ++x)
+                                    out[((size_t)(bz + dz) * h + by * 4 + y) * w + bx * 4 + x] = pixels[y * 4 + x];
+                        }
+        } else {
+            /* Morton order interleaves only axes which still have a bit. */
+            uint32_t masks[3] = {0}, bit, dstbit = 1, axis, sizes[3] = {w,h,d};
+            for (bit = 1; bit < w || bit < h || bit < d; bit <<= 1)
+                for (axis = 0; axis < 3; ++axis)
+                    if (bit < sizes[axis]) { masks[axis] |= dstbit; dstbit <<= 1; }
+            for (z = 0; z < d; ++z)
+                for (y = 0; y < h; ++y)
+                    for (x = 0; x < w; ++x) {
+                        uint32_t coords[3] = {x,y,z}, offset = 0;
+                        for (axis = 0; axis < 3; ++axis) {
+                            uint32_t value = coords[axis];
+                            for (bit = 1; bit && bit <= masks[axis]; bit <<= 1)
+                                if (masks[axis] & bit) { if (value & 1) offset |= bit; value >>= 1; }
+                        }
+                        out[((size_t)z * h + y) * w + x] = texel(t->color, src + (size_t)offset * L->bpp, pal, t->palette_len);
+                    }
+        }
+        return;
+    }
     if (L->kind == K_DXT) {
         uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, bx, by, px[16];
         if (!(w & 3) && !(h & 3)) {
@@ -366,7 +413,7 @@ static int host_levels(const TexLayout *L, const NvD3DTexture *t)
 {
     int n = 1;
     uint32_t m = t->width > t->height ? t->width : t->height;
-    if (L->levels < 2) return L->levels;
+    if (tex_volume(t) || L->levels < 2) return L->levels;
     while (m > 1) { m >>= 1; n++; }
     return n > L->levels ? n : L->levels;
 }

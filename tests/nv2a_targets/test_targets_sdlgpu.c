@@ -13,7 +13,7 @@ static void test_bind_fragment_samplers(SDL_GPURenderPass *rp, Uint32 first,
                                         const SDL_GPUTextureSamplerBinding *b, Uint32 n);
 #define SDL_BindGPUFragmentSamplers test_bind_fragment_samplers
 
-static SDL_GPUTextureSamplerBinding bound[9];
+static SDL_GPUTextureSamplerBinding bound[13];
 static unsigned bind_calls;
 static int guest_levels;
 
@@ -30,7 +30,7 @@ static SDL_GPUTexture *texture_get(const NvD3DTexture *t)
 static void test_bind_fragment_samplers(SDL_GPURenderPass *rp, Uint32 first,
                                         const SDL_GPUTextureSamplerBinding *b, Uint32 n)
 {
-    if (first == 0 && n == 9) {
+    if (first == 0 && n == 13) {
         memcpy(bound, b, sizeof bound);
         bind_calls++;
     }
@@ -388,8 +388,8 @@ static void test_y16_aliases(void)
     flush_batch();
     CHECK(bound[0].texture == sampled->y16);
     download_wide(sampled->y16, 2 * sampled->iw, sampled->ih, wide);
-    /* The packed R16/G16 of the first two texels: black, then white. */
-    CHECK(((uint16_t *)&wide[0])[0] == 0 && ((uint16_t *)&wide[0])[1] == 0);
+    /* Y16 R is one; G contains each source word's high byte. */
+    CHECK(((uint16_t *)&wide[0])[0] == 0xFFFF && ((uint16_t *)&wide[0])[1] == 0);
     CHECK(((uint16_t *)&wide[1])[0] == 0xFFFF && ((uint16_t *)&wide[1])[1] == 0xFFFF);
     zsample = depth_get(sampled->va, 32, 32);
     CHECK(zsample);

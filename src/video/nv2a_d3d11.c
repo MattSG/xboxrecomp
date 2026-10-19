@@ -1104,6 +1104,7 @@ typedef struct {
     ID3D11RenderTargetView *y16_rtv;
     uint32_t zf, w, h;                      /* zeta format code, guest size last bound with */
     uint32_t gen, y16_gen, seq;             /* as Surface */
+    int depth_mode; /* 0 unknown, 1 Z, 2 W: encoding of the last depth writer */
     uint32_t used_frame;
 } Depth;
 
@@ -1166,8 +1167,8 @@ static void unbind_targets(void)
 
 static void unbind_textures(void)
 {
-    ID3D11ShaderResourceView *none[8] = { 0 };
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, none);
+    ID3D11ShaderResourceView *none[13] = { 0 };
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 13, none);
 }
 
 /* Draw columns [u0, u1) of `srv` into columns [x0, x1) of `rtv` (fractions
@@ -1711,7 +1712,7 @@ typedef struct TexEntry {
     uint64_t hash, pal_hash;
     uint32_t checked_epoch;
     size_t bytes;
-    ID3D11Texture2D *tex;
+    ID3D11Resource *tex;
     ID3D11ShaderResourceView *srv;
     struct TexEntry *next;
 } TexEntry;
@@ -1780,7 +1781,7 @@ static void texture_trace_event(const NvD3DTexture *t, const char *event,
 static void tex_free(TexEntry *e)
 {
     if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
-    if (e->tex) ID3D11Texture2D_Release(e->tex);
+    if (e->tex) ID3D11Resource_Release(e->tex);
     s_tex_bytes -= e->bytes;
     s_tex_count--;
     free(e);
@@ -1820,7 +1821,7 @@ static DXGI_FORMAT texture_host_format(const NvD3DTexture *t, const TexLayout *L
     static int checked[3];
     UINT required = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE;
     int index;
-    if (L->kind != K_DXT || hl != L->levels ||
+    if (tex_volume(t) || L->kind != K_DXT || hl != L->levels ||
         (t->width & 3) || (t->height & 3))
         return DXGI_FORMAT_B8G8R8A8_UNORM;
     index = t->color == 0x0C ? 0 : t->color == 0x0E ? 1 : 2;
@@ -1898,7 +1899,7 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t, int *gu
     host_format = texture_host_format(t, &L, hl);
     native = host_format != DXGI_FORMAT_B8G8R8A8_UNORM;
     if (!native) {
-        px = scratch_pixels((size_t)t->width * t->height);
+        px = scratch_pixels((size_t)t->width * t->height * L.level_d[0]);
         if (!px) {
             texture_trace_event(t, "scratch_allocation_failed", L.total, L.levels, hl,
                                 previous, h, trace_start);
@@ -1914,13 +1915,27 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t, int *gu
         e = (TexEntry *)calloc(1, sizeof *e);
         if (!e) goto upload_failed;
         failure = "texture_creation_failed";
-        e->tex = make_texture(t->width, t->height, (UINT)hl, (UINT)L.faces,
+        if (tex_volume(t)) {
+            D3D11_TEXTURE3D_DESC td = {0};
+            ID3D11Texture3D *volume = NULL;
+            td.Width = t->width; td.Height = t->height; td.Depth = L.level_d[0];
+            td.MipLevels = (UINT)hl; td.Format = host_format;
+            td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            hr = ID3D11Device_CreateTexture3D(s_dev, &td, NULL, &volume);
+            if (FAILED(hr)) { fail("volume texture", hr); goto upload_failed; }
+            e->tex = (ID3D11Resource *)volume;
+        } else {
+            e->tex = (ID3D11Resource *)make_texture(t->width, t->height, (UINT)hl, (UINT)L.faces,
                               host_format, D3D11_BIND_SHADER_RESOURCE,
                               L.faces == 6 ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0);
+        }
         if (!e->tex) goto upload_failed;
         memset(&sd, 0, sizeof sd);
         sd.Format = host_format;
-        if (L.faces == 6) {
+        if (tex_volume(t)) {
+            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+            sd.Texture3D.MipLevels = (UINT)hl;
+        } else if (L.faces == 6) {
             sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
             sd.TextureCube.MipLevels = (UINT)hl;
         } else {
@@ -1940,8 +1955,8 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t, int *gu
             uint32_t w = t->width, ht = t->height;
             int lv;
             for (lv = 0; lv < hl; lv++) {
-                e->bytes += native ? (size_t)((w + 3) / 4) * ((ht + 3) / 4) * L.bpp * L.faces
-                                   : (size_t)w * ht * 4 * L.faces;
+                e->bytes += L.level_d[lv < L.levels ? lv : L.levels - 1] * (native ? (size_t)((w + 3) / 4) * ((ht + 3) / 4) * L.bpp * L.faces
+                                   : (size_t)w * ht * 4 * L.faces);
                 if (w > 1) w /= 2;
                 if (ht > 1) ht /= 2;
             }
@@ -1963,7 +1978,7 @@ static ID3D11ShaderResourceView *texture_get_impl(const NvD3DTexture *t, int *gu
                     ID3D11DeviceContext_UpdateSubresource(
                         s_ctx, (ID3D11Resource *)e->tex,
                         (UINT)lv + (UINT)f * (UINT)hl, NULL,
-                        px, L.level_w[lv] * 4, 0);
+                        px, L.level_w[lv] * 4, L.level_w[lv] * L.level_h[lv] * 4);
                 }
             }
             if (hl <= L.levels) continue;
@@ -2001,7 +2016,7 @@ upload_failed:
     texture_refused(t, failure, L.total);
     if (e) {
         if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
-        if (e->tex) ID3D11Texture2D_Release(e->tex);
+        if (e->tex) ID3D11Resource_Release(e->tex);
         free(e);
     }
     return NULL;
@@ -2606,9 +2621,9 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     Depth *d;
     uint32_t gw, gh, n, zf;
     PSConsts pc;
-    ID3D11ShaderResourceView *srv[8] = { 0 };
+    ID3D11ShaderResourceView *srv[13] = { 0 };
     ID3D11SamplerState *smp[4] = { 0 };
-    int cull = 0, bias = 0, flare_depth = flare_needs_depth(st);
+    int cull = 0, bias = 0, flare_depth = flare_needs_depth(st), wdepth;
     float slope = 0, bf[4];
     s_draw_textured = s_draw_reads_wide = 0;
     s_draw_tex_addr = 0;
@@ -2649,6 +2664,11 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     if (!bind_targets(st, st->depth_test || st->stencil_test || flare_depth, &s, &d, &gw, &gh))
         return 0;
     zf = (st->surface_format >> 4) & 0xF;
+    if (d && st->depth_test && st->depth_mask)
+        d->depth_mode = st->z_perspective ? 2 : 1;
+    /* A flare disables depth itself; forcing a test must retain the scene
+     * buffer's Z/W encoding even if its native draw changed CONTROL0. */
+    wdepth = flare_depth && d && d->depth_mode ? d->depth_mode == 2 : st->z_perspective;
     if (s && write_mask(st, s)) s->gpu_dirty = 1;
 
     /* Textures first: a surface sampled here may need a copy. */
@@ -2670,7 +2690,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         /* A recycled target address can now hold a streamed compressed or
          * paletted image. Those layouts cannot alias a colour render target;
          * decode their guest bytes instead of sampling the cached target. */
-        rt = !t->cube && kind != K_DXT && t->color != 0x0B
+        rt = !tex_volume(t) && !t->cube && kind != K_DXT && t->color != 0x0B
              ? surface_find(phys(t->addr)) : NULL;
         s_draw_textured = 1;
         if (!s_draw_tex_addr) s_draw_tex_addr = t->addr;
@@ -2719,7 +2739,8 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             pc.tex_scale[n][2] = pc.tex_scale[n][3] = 1.0f;
         }
         if (!view) continue;
-        if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
+        if (tex_volume(t)) srv[9 + n] = view;
+        else if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
         smp[n] = sampler_stage(n, t, levels, reduce);
         /* The title opts in its 256x256 DXT5 horizon panorama, magnified
          * across the skyline through destination alpha. Keep ordinary sky,
@@ -2732,7 +2753,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             st->blend_sfactor == s_bspline_sf && st->blend_dfactor == s_bspline_df)
             s_draw_bspline = 1;
         pc.tex_info[n][0] = (t->control0 >> 2) & 1;
-        pc.tex_info[n][1] = t->filter >> 28;
+        pc.tex_info[n][1] = (t->filter >> 28) | (tex_volume(t) ? 256u : 0u);
         /* Point taps of an upscaled linear target average the guest pixel's
          * host block; see tapbox. */
         if (rt && kind == K_LIN && t->color != 0x35 && (rt->iw > rt->w || rt->ih > rt->h) &&
@@ -2779,7 +2800,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     pc.fog_color[1] = ((st->fog_color >> 8) & 0xFF) / 255.0f;
     pc.fog_color[2] = ((st->fog_color >> 16) & 0xFF) / 255.0f;
     pc.fog_color[3] = (st->fog_color >> 24) / 255.0f;
-    if (st->z_perspective && d) {
+    if (wdepth && d) {
         uint32_t zm = zf == 1 ? 0xFFFFu : 0xFFFFFFu;
         if (st->poly_offset_fill) {
             pc.zp0[0] = st->poly_offset_factor;
@@ -2810,7 +2831,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     }
     if (!upload_ps_constants(&pc)) return 0;
 
-    if (st->poly_offset_fill && !(st->z_perspective && d)) {
+    if (st->poly_offset_fill && !(wdepth && d)) {
         /* The slope term multiplies the depth change per pixel. At an
          * internal resolution s times the guest's a pixel spans 1/s as much
          * depth, so the factor scales by s to offset decals as far as the NV2A does; unscaled they fight. */
@@ -2822,11 +2843,11 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         topology == NV_D3D_POINTS ? D3D11_PRIMITIVE_TOPOLOGY_POINTLIST :
         D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     {
-        uint32_t v = (st->flat_shade ? 1u : 0u) | (st->z_perspective && d ? 2u : 0u);
+        uint32_t v = (st->flat_shade ? 1u : 0u) | (wdepth && d ? 2u : 0u);
         ID3D11PixelShader *ps = spec_ps(&pc, v);
         bind_pixel_shader(ps ? ps : s_psv[v]);
     }
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srv);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 13, srv);
     {   /* The horizon panorama reads the frame drawn so far (see bspline0). */
         ID3D11ShaderResourceView *fb = NULL;
         if (s_draw_bspline && s) {
@@ -3190,6 +3211,7 @@ void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,
             mask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
     }
     if (!d) { zclear = sclear = 0; }
+    if (d && zclear) d->depth_mode = st->z_perspective ? 2 : 1;
     if (!mask && !zclear && !sclear) {
         hitch_trace_report("clear_submit", trace_begin);
         return;
