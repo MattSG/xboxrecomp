@@ -630,6 +630,7 @@ static void submit(SDL_GPUFence **fence)
     if (!s_cmd) return;
     if (s_vmap) { SDL_UnmapGPUTransferBuffer(s_dev, s_vtb); s_vmap = NULL; }
     if (s_imap) { SDL_UnmapGPUTransferBuffer(s_dev, s_itb); s_imap = NULL; }
+    RECOMP_PROFILE_BEGIN("SDL GPU submission");
     if (fence) {
         *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(s_cmd);
         /* Submitted, but no fence to wait on: a readback must not map until
@@ -638,6 +639,7 @@ static void submit(SDL_GPUFence **fence)
     } else {
         SDL_SubmitGPUCommandBuffer(s_cmd);
     }
+    RECOMP_PROFILE_END();
     s_cmd = NULL;
     s_cmd_serial++;
     s_vpos = s_ipos = s_upos = 0;
@@ -954,7 +956,9 @@ static SDL_GPUGraphicsPipeline *pipeline(const PipeKey *k)
         }
         ci.target_info.has_depth_stencil_target = k->depth != 0;
         ci.target_info.depth_stencil_format = k->depth ? s_depth_format : SDL_GPU_TEXTUREFORMAT_INVALID;
+        RECOMP_PROFILE_BEGIN("SDL GPU pipeline creation");
         s_pipes[i].pipe = SDL_CreateGPUGraphicsPipeline(s_dev, &ci);
+        RECOMP_PROFILE_END();
         if (!s_pipes[i].pipe) { fail("SDL_CreateGPUGraphicsPipeline"); return NULL; }
         s_pipes[i].key = *k;
         return s_pipes[i].pipe;
@@ -1202,6 +1206,7 @@ typedef struct {
     int y16_clear;
     uint32_t zf, w, h;
     uint32_t gen, y16_gen, seq;
+    int depth_mode; /* 0 unknown, 1 Z, 2 W: encoding of the last depth writer */
     uint32_t used_frame;
 } Depth;
 
@@ -2049,7 +2054,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     SDL_GPUTexture *srv[8] = { 0 };
     void *smp[4] = { 0 };
     SDL_GPUTexture *fb = NULL;
-    int cull = 0, bias = 0, flare_depth = flare_needs_depth(st);
+    int cull = 0, bias = 0, flare_depth = flare_needs_depth(st), wdepth;
     float slope = 0, bf[4];
     PipeKey k;
     SDL_GPUGraphicsPipeline *pipe;
@@ -2088,6 +2093,11 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     if (!bind_targets(st, st->depth_test || st->stencil_test || flare_depth, &s, &d, &gw, &gh))
         return 0;
     zf = (st->surface_format >> 4) & 0xF;
+    if (d && st->depth_test && st->depth_mask)
+        d->depth_mode = st->z_perspective ? 2 : 1;
+    /* A flare disables depth itself; forcing a test must retain the scene
+     * buffer's Z/W encoding even if its native draw changed CONTROL0. */
+    wdepth = flare_depth && d && d->depth_mode ? d->depth_mode == 2 : st->z_perspective;
     if (s && write_mask(st, s)) s->gpu_dirty = 1;
 
     memset(&pc, 0, sizeof pc);
@@ -2207,7 +2217,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     pc.fog_color[1] = ((st->fog_color >> 8) & 0xFF) / 255.0f;
     pc.fog_color[2] = ((st->fog_color >> 16) & 0xFF) / 255.0f;
     pc.fog_color[3] = (st->fog_color >> 24) / 255.0f;
-    if (st->z_perspective && d) {
+    if (wdepth && d) {
         uint32_t zm = zf == 1 ? 0xFFFFu : 0xFFFFFFu;
         if (st->poly_offset_fill) {
             pc.zp0[0] = st->poly_offset_factor;
@@ -2240,13 +2250,13 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         !bind_targets(st, st->depth_test || st->stencil_test || flare_depth, &s, &d, &gw, &gh))
         return 0;
 
-    if (st->poly_offset_fill && !(st->z_perspective && d)) {
+    if (st->poly_offset_fill && !(wdepth && d)) {
         bias = (int)st->poly_offset_units;
         slope = st->poly_offset_factor * s_cur_sy;
     }
     memset(&k, 0, sizeof k);
     {
-        uint32_t v = (st->flat_shade ? 1u : 0u) | (st->z_perspective && d ? 2u : 0u);
+        uint32_t v = (st->flat_shade ? 1u : 0u) | (wdepth && d ? 2u : 0u);
         static const uint8_t ps[4] = { SH_PS_MAIN, SH_PS_MAIN_FLAT, SH_PS_WDEPTH, SH_PS_WDEPTH_FLAT };
         k.vs = SH_UB_VS;
         k.ps = ps[v];
@@ -2737,6 +2747,7 @@ void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,
     if (y1 >= gh) y1 = gh - 1;
     if (x0 > x1 || y0 > y1)
         return;
+    if (d && zclear) d->depth_mode = st->z_perspective ? 2 : 1;
     pipe_key_plain(&k, SH_CLEAR_VS, SH_CLEAR_PS, s ? FMT_BGRA8 : FMT_NONE,
                    SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP);
     k.write_mask = (uint8_t)mask;
@@ -3236,8 +3247,10 @@ static int present_kept_image(FlipPacing *pacing)
     copy_end();
     flush_batch();
     if (!cmd()) return 0;
+    RECOMP_PROFILE_BEGIN("SDL GPU acquire swapchain");
     if (!SDL_WaitAndAcquireGPUSwapchainTexture(s_cmd, s_window, &sc, &sw, &sh))
         fail("SDL_WaitAndAcquireGPUSwapchainTexture");
+    RECOMP_PROFILE_END();
     if (sc) {
         SDL_GPUBlitInfo bi;
         memset(&bi, 0, sizeof bi);
@@ -3501,12 +3514,11 @@ void nv2a_d3d_tick(void)
         return;
     }
     if (SDL_GetAtomicInt(&s_repeat)) {
-        int64_t t0;
-        if (!present_kept_image(NULL))
-            present_surface(s_shown, NULL);
-        t0 = qpc();
-        pace_vblank();
-        frame_csv(qpc() - t0);
+        FlipPacing pacing = { 0, 0 };
+        if (!present_kept_image(&pacing))
+            present_surface(s_shown, &pacing);
+        pace_flip(&pacing);
+        frame_csv(pacing.ticks);
         s_frame++;
         SDL_SetAtomicInt(&s_repeat, 0);
         return;

@@ -246,6 +246,22 @@ int main(int argc, char **argv)
             }
         }
     }
+    /* Flares disable native depth testing and may change Z_PERSPECTIVE.
+     * The forced test must use the scene buffer's encoding, not that toggle. */
+    nv2a_d3d_set_flare_depth_test(0x8421);
+    for (wbuffer = 0; wbuffer < 2; ++wbuffer) {
+        NvD3DState scene = st;
+        float lamp_depth = wbuffer ? 1.0f / (2.71648e-7f * 16777216.0f) : .999532f;
+        scene.z_perspective = wbuffer;
+        st.z_perspective = !wbuffer;
+        clear_color(&st, 0xFFFF0000u);
+        clear_depth(&scene, lamp_depth - .0001f);
+        native_glow(&st);
+        CHECK(pixel(target, (unsigned)(306 * target->sx), (unsigned)(170 * target->sy)) == 0xFFFF0000u);
+        clear_depth(&scene, lamp_depth + .0001f);
+        native_glow(&st);
+        CHECK(pixel(target, (unsigned)(306 * target->sx), (unsigned)(170 * target->sy)) == 0xFFFFFF00u);
+    }
     free(ram);
     puts("PASS: synthetic and native VF/combiner glows fail occluded depth and retain visible lamps; Z/W-buffer and MSAA request/scale");
     return 0;
