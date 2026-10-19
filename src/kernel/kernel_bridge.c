@@ -7157,6 +7157,7 @@ static uint32_t bridge_io_call_driver(uint32_t device_va, uint32_t irp_va)
 static void bridge_io_complete_request(uint32_t irp_va)
 {
     XBOX_GUEST_IRP *irp;
+    HANDLE event = NULL;
     uint32_t ios_va, event_va;
     if (!bridge_io_get_irp(irp_va, &irp)) return;
     ios_va = irp->user_iosb;
@@ -7166,16 +7167,21 @@ static void bridge_io_complete_request(uint32_t irp_va)
         BRIDGE_MEM32(ios_va + 4) = irp->io_status.information;
     }
     if (event_va && bridge_buf_ok(event_va, 16, 1, "IofCompleteRequest")) {
-        HANDLE event = ke_shadow_lookup_initialized(event_va);
+        event = ke_shadow_lookup_initialized(event_va);
         int type = 0;
         if (!event) event = ke_guest_event(event_va, &type);
         if (event) {
             BRIDGE_MEM32(event_va + 4) = 1;
-            SetEvent(event);
         }
     }
+    /* Publish the final IOSB/event state and retire synchronous ownership
+     * before waking its waiter. Otherwise the waiter can free and reuse this
+     * IRP VA before this thread's post-wake owner lookup, which could then
+     * accidentally free the new IRP. SetEvent must be the final guest-visible
+     * action here; keep only the captured host handle after freeing. */
     if (bridge_sync_irp_take(irp_va))
         xbox_HeapFree(irp_va);
+    if (event) SetEvent(event);
 }
 
 static int bridge_io_list_valid(uint32_t link_va)
@@ -7395,17 +7401,171 @@ static void bridge_IoStartPacket(void)
     g_eax = 0;
 }
 
+static HANDLE ke_shadow_lookup_initialized(uint32_t guest_va);
+static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
+static void ke_shadow_remove(uint32_t guest_va);
+
+/* Xbox DISPATCHER_HEADER's Size is measured in ULONGs. KEVENT is 16 bytes,
+ * so Size is 4; Inserted is clear and the empty wait list points to itself. */
+static HANDLE bridge_ke_initialize_event_shadow(uint32_t guest_va,
+                                                uint32_t event_type,
+                                                uint32_t initial_state,
+                                                const char *export_name)
+{
+    HANDLE event;
+    XBOX_GUEST_DISPATCHER_HEADER *header;
+    if (event_type > 1 || (guest_va & 3u) ||
+        !bridge_buf_ok(guest_va, 16, 1, export_name))
+        return NULL;
+    event = CreateEventW(NULL, event_type == 0 ? TRUE : FALSE,
+                         initial_state ? TRUE : FALSE, NULL);
+    if (!event) return NULL;
+    ke_shadow_insert(guest_va, event);
+    if (ke_shadow_lookup_initialized(guest_va) != event)
+        return NULL; /* insertion already closed the handle if the table was full */
+    header = (XBOX_GUEST_DISPATCHER_HEADER *)XBOX_TO_NATIVE(guest_va);
+    header->type = (uint8_t)event_type;
+    header->absolute = 0;
+    header->size = sizeof(*header) / sizeof(uint32_t);
+    header->inserted = 0;
+    header->signal_state = initial_state ? 1 : 0;
+    header->wait_list_head[0] = guest_va +
+        offsetof(XBOX_GUEST_DISPATCHER_HEADER, wait_list_head);
+    header->wait_list_head[1] = header->wait_list_head[0];
+    return event;
+}
+
+/* Run a builder through its real guest stack ABI, then restore the caller's
+ * complete modeled register/FPU state. The returned IRP remains guest-owned
+ * and its synchronous-owner entry is consumed by completion or this wrapper's
+ * failure cleanup. */
+static uint32_t bridge_io_call_builder(void (*builder)(void),
+                                      uint32_t *args, uint32_t argc)
+{
+    bridge_guest_call_state state;
+    uint32_t frame_va, i, irp_va;
+    frame_va = xbox_HeapAlloc((argc + 1) * 4, 4);
+    if (!frame_va) return 0;
+    for (i = 0; i < argc; ++i)
+        BRIDGE_MEM32(frame_va + 4 + i * 4) = args[i];
+    bridge_guest_state_save(&state);
+    /* Bridge entrypoints see ESP at argument zero because the synthetic
+     * dispatcher has already consumed the guest return address. */
+    g_esp = frame_va + 4;
+    builder();
+    irp_va = g_eax;
+    bridge_guest_state_restore(&state, state.eax);
+    xbox_HeapFree(frame_va);
+    return irp_va;
+}
+
+/* The wrapper owns temporary guest KEVENT/IOSB memory until either immediate
+ * dispatch returns or a pending request signals the event. Completion writes
+ * both guest structures before signaling and does not touch them afterwards. */
+static uint32_t bridge_io_synchronous_request(uint32_t device_va,
+                                               uint32_t *builder_args,
+                                               uint32_t builder_argc,
+                                               void (*builder)(void),
+                                               uint32_t output_length_va)
+{
+    uint32_t temp_va, event_va, ios_va, irp_va, dispatch_status, status;
+    HANDLE event = NULL;
+    const uint32_t temp_size = 24;
+
+    if (output_length_va) {
+        if (!bridge_buf_ok(output_length_va, 4, 1,
+                           "IoSynchronousDeviceIoControlRequest"))
+            return 0xC0000005u;
+    }
+    if (!bridge_buf_ok(device_va, XBOX_DEVICE_OBJECT_SIZE, 0,
+                       "synchronous I/O request"))
+        return 0xC0000005u;
+    if (builder == bridge_IoBuildDeviceIoControlRequest) {
+        uint32_t input_va = builder_args[2], input_len = builder_args[3];
+        uint32_t output_va = builder_args[4], output_len = builder_args[5];
+        if ((input_len && !bridge_buf_ok(input_va, input_len, 0,
+                                         "IoSynchronousDeviceIoControlRequest")) ||
+            (output_len && !bridge_buf_ok(output_va, output_len, 1,
+                                          "IoSynchronousDeviceIoControlRequest")))
+            return 0xC0000005u;
+    } else {
+        uint32_t major = builder_args[0], buffer_va = builder_args[2];
+        uint32_t length = builder_args[3], offset_va = builder_args[4];
+        if (major != XBOX_MAJOR_READ && major != XBOX_MAJOR_WRITE)
+            return 0xC000000Du;
+        if ((length && !bridge_buf_ok(buffer_va, length,
+                                      major == XBOX_MAJOR_READ,
+                                      "IoSynchronousFsdRequest")) ||
+            (offset_va && !bridge_buf_ok(offset_va, 8, 0,
+                                         "IoSynchronousFsdRequest")))
+            return 0xC0000005u;
+    }
+    temp_va = xbox_HeapAlloc(temp_size, 4);
+    if (!temp_va) return 0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
+    event_va = temp_va;
+    ios_va = temp_va + 16;
+    builder_args[builder_argc - 2] = event_va;
+    builder_args[builder_argc - 1] = ios_va;
+    memset(XBOX_TO_NATIVE(temp_va), 0, temp_size);
+    BRIDGE_MEM32(ios_va + 0) = 0x00000103u; /* pending until completion */
+    /* The original helper constructs a NotificationEvent (Type == 0), not an
+     * auto-reset SynchronizationEvent. */
+    event = bridge_ke_initialize_event_shadow(event_va, 0, 0,
+                                                "synchronous I/O event");
+    if (!event) {
+        xbox_HeapFree(temp_va);
+        return 0xC000009Au;
+    }
+    irp_va = bridge_io_call_builder(builder, builder_args, builder_argc);
+    if (!irp_va) {
+        ke_shadow_remove(event_va);
+        xbox_HeapFree(temp_va);
+        return 0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
+    }
+    dispatch_status = bridge_io_call_driver(device_va, irp_va);
+    if (dispatch_status == 0x00000103u) {
+        DWORD wait_status = WaitForSingleObject(event, INFINITE);
+        if (wait_status != WAIT_OBJECT_0) {
+            if (bridge_sync_irp_take(irp_va)) xbox_HeapFree(irp_va);
+            ke_shadow_remove(event_va);
+            xbox_HeapFree(temp_va);
+            return 0xC0000001u; /* STATUS_UNSUCCESSFUL */
+        }
+        status = BRIDGE_MEM32(ios_va);
+    } else {
+        /* Xbox returns IofCallDriver's result for immediate completion. Only
+         * the pending path above waits and substitutes IOSB.Status. */
+        status = dispatch_status;
+    }
+    /* The original export copies IOSB.Information without filtering by the
+     * returned NTSTATUS, including STATUS_BUFFER_OVERFLOW and errors. */
+    if (output_length_va)
+        BRIDGE_MEM32(output_length_va) = BRIDGE_MEM32(ios_va + 4);
+    /* Immediate drivers are expected to complete before returning. If they
+     * return a non-pending error without completion, reclaim our IRP here. */
+    if (bridge_sync_irp_take(irp_va)) xbox_HeapFree(irp_va);
+    ke_shadow_remove(event_va);
+    xbox_HeapFree(temp_va);
+    return status;
+}
+
 static void bridge_IoSynchronousDeviceIoControlRequest(void)
 {
-    /* This synchronous helper would need a guest-thread wait/pending contract.
-     * Do not pass Xbox VAs as host pointers or report native-stub success. */
-    g_eax = 0xC0000002u; /* STATUS_NOT_IMPLEMENTED */
+    uint32_t ioctl = STACK_ARG(0), device = STACK_ARG(1);
+    uint32_t returned_length = STACK_ARG(6), internal = STACK_ARG(7);
+    uint32_t args[9] = { ioctl, device, STACK_ARG(2), STACK_ARG(3),
+        STACK_ARG(4), STACK_ARG(5), internal, 0, 0 };
+    g_eax = bridge_io_synchronous_request(device, args, 9,
+                 bridge_IoBuildDeviceIoControlRequest, returned_length);
 }
 
 static void bridge_IoSynchronousFsdRequest(void)
 {
-    /* Synchronous wait semantics are not implemented on the guest path yet. */
-    g_eax = 0xC0000002u; /* STATUS_NOT_IMPLEMENTED */
+    uint32_t args[7], i;
+    for (i = 0; i < 5; ++i) args[i] = STACK_ARG(i);
+    args[5] = 0; args[6] = 0;
+    g_eax = bridge_io_synchronous_request(args[1], args, 7,
+                 bridge_IoBuildSynchronousFsdRequest, 0);
 }
 
 static void bridge_IofCallDriver(void)
@@ -9538,31 +9698,9 @@ static void bridge_KeInitializeEvent(void)
     uint32_t guest_va = STACK_ARG(0);
     uint32_t event_type = STACK_ARG(1); /* 0=Notification(manual-reset), 1=Synchronization(auto-reset) */
     uint32_t initial_state = STACK_ARG(2);
-
-    BOOL manual_reset = (event_type == 0) ? TRUE : FALSE;
-    HANDLE h = CreateEventW(NULL, manual_reset, initial_state ? TRUE : FALSE, NULL);
-    if (!h) {
-        fprintf(stderr, "  [KERNEL] KeInitializeEvent: CreateEventW failed (error %u)\n",
-                GetLastError());
-        g_eax = 0;
-        return;
-    }
-
-    ke_shadow_insert(guest_va, h);
-
-    /* Also zero the guest KEVENT struct (16 bytes) and set SignalState.
-     * KEVENT layout: +0x00 Type(UCHAR), +0x01 Absolute(UCHAR),
-     *                +0x02 Size(UCHAR), +0x03 Inserted(UCHAR)
-     *                +0x04 SignalState(LONG), +0x08 WaitListHead.Flink,
-     *                +0x0C WaitListHead.Blink */
-    BRIDGE_MEM8(guest_va + 0)  = (uint8_t)(event_type ? 1 : 0);
-    BRIDGE_MEM8(guest_va + 1)  = 0;
-    BRIDGE_MEM8(guest_va + 2)  = 16;
-    BRIDGE_MEM8(guest_va + 3)  = 1;
-    BRIDGE_MEM32(guest_va + 4) = initial_state ? 1 : 0; /* SignalState */
-    BRIDGE_MEM32(guest_va + 8) = 0;  /* WaitListHead.Flink (self/empty) */
-    BRIDGE_MEM32(guest_va + 12) = 0; /* WaitListHead.Blink (self/empty) */
-
+    if (!bridge_ke_initialize_event_shadow(guest_va, event_type,
+                                          initial_state, "KeInitializeEvent"))
+        fprintf(stderr, "  [KERNEL] KeInitializeEvent: invalid guest event or host event creation failed\n");
     g_eax = 0;
 }
 

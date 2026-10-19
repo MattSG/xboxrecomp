@@ -153,6 +153,12 @@ XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IRP, current_stack_location) ==
                       XBOX_IRP_CURRENT_STACK_LOCATION_OFFSET, "Xbox IRP current stack offset");
 XBOX_IO_STATIC_ASSERT(sizeof(XBOX_GUEST_IRP) == XBOX_IRP_SIZE, "Xbox IRP size/alignment");
 XBOX_IO_STATIC_ASSERT(sizeof(XBOX_GUEST_DEVICE_QUEUE) == 0x0c, "Xbox device queue size");
+XBOX_IO_STATIC_ASSERT(sizeof(XBOX_GUEST_DISPATCHER_HEADER) == 0x10,
+                      "Xbox dispatcher header size");
+XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_DISPATCHER_HEADER, signal_state) == 4,
+                      "Xbox dispatcher SignalState offset");
+XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_DISPATCHER_HEADER, wait_list_head) == 8,
+                      "Xbox dispatcher wait-list offset");
 XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_DEVICE_OBJECT, device_queue) == 0x28,
                       "Xbox device queue offset");
 XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_DEVICE_OBJECT, device_lock) == 0x34,
