@@ -2814,7 +2814,7 @@ void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far
     SDL_GPUTextureSamplerBinding b;
     Op *o;
     static unsigned logged;
-    if ((flags & NV2A_HOST_FOG_SKY_FADE) && (!sky_fade ||
+    if ((flags & NV_D3D_FOG_SKY_FADE) && (!sky_fade ||
         !isfinite(sky_fade[0]) || !isfinite(sky_fade[1]) || !isfinite(sky_fade[2]) ||
         !isfinite(sky_fade[3]) || sky_fade[3] <= 0)) return;
     if (!isfinite(depth_to_world) || !isfinite(far_clip) || !isfinite(start) || !isfinite(end) ||
@@ -2824,10 +2824,10 @@ void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far
     memset(params, 0, sizeof params);
     params[0] = start; params[1] = 1.f / (end - start);
     params[2] = depth_to_world * (d->zf == 1 ? 65536.f : 16777216.f);
-    params[3] = (flags & NV2A_HOST_FOG_SKY_FILL) ? 1.f : 0.f;
+    params[3] = (flags & NV_D3D_FOG_SKY_FILL) ? 1.f : 0.f;
     params[4] = ((argb_ >> 16) & 255) / 255.f; params[5] = ((argb_ >> 8) & 255) / 255.f;
     params[6] = (argb_ & 255) / 255.f; params[7] = 0;
-    if (flags & NV2A_HOST_FOG_SKY_FADE) {
+    if (flags & NV_D3D_FOG_SKY_FADE) {
         params[8] = 2.f * sky_fade[0] / s->iw;
         params[9] = -2.f * sky_fade[1] / s->ih;
         params[10] = sky_fade[2] - sky_fade[0] + sky_fade[1];
@@ -2851,7 +2851,7 @@ void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far
     s_last_draw_state.vp.max_depth = 1;
     s_last_draw_state.sc.w = (int)s->iw; s_last_draw_state.sc.h = (int)s->ih;
     draw_op(OP_DRAW, 3, 0);
-    if (flags & NV2A_HOST_FOG_SKY_MASK) {
+    if (flags & NV_D3D_FOG_SKY_MASK) {
         /* Optional mask for subsequent destination-alpha composition. */
         params[7] = 1;
         pipe_key_plain(&k, SH_FOG_VS, SH_FOG_PS, FMT_BGRA8, SDL_GPU_PRIMITIVETYPE_TRIANGLELIST);

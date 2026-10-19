@@ -34,7 +34,7 @@ static SDL_GPUBuffer *test_create_buffer(SDL_GPUDevice *dev, const SDL_GPUBuffer
 
 static unsigned vertex_pushes, fragment_pushes, bind_calls;
 static int fail_vertex_map, fail_buffers;
-static SDL_GPUTextureSamplerBinding bound[9];
+static SDL_GPUTextureSamplerBinding bound[13];
 
 #include "../../src/video/nv2a_sdlgpu.c"
 #include "../nv2a_test_host.h"
@@ -53,7 +53,7 @@ static void test_push_fragment(SDL_GPUCommandBuffer *c, Uint32 slot, const void 
 static void test_bind_fragment_samplers(SDL_GPURenderPass *rp, Uint32 first,
                                         const SDL_GPUTextureSamplerBinding *b, Uint32 n)
 {
-    if (first == 0 && n == 9) {
+    if (first == 0 && n == 13) {
         memcpy(bound, b, sizeof bound);
         bind_calls++;
     }
@@ -447,7 +447,7 @@ static uint32_t native_fog_pixel(NvD3DState *st, float depth, float start)
         CHECK((pixels[16 * 64 + 16] >> 24) == alpha);   /* fog preserves destination alpha */
         colour = pixels[16 * 64 + 16] & 0xFFFFFF;
         nv2a_d3d_distance_fog(&post, 1000.f / 16777216.f, 1000, start, 800, 0xFF0000FF,
-                              NV2A_HOST_FOG_SKY_MASK, NULL);
+                              NV_D3D_FOG_SKY_MASK, NULL);
         read_target(pixels);
         CHECK((pixels[16 * 64 + 16] >> 24) == (isfinite(start) ? (depth >= .99999f ? 255u : 0u) : alpha));
         masked_colour = pixels[16 * 64 + 16] & 0xFFFFFF;
@@ -474,7 +474,7 @@ static void test_native_fog(void)
     distant = native_fog_pixel(&st, .8f, 200);
     CHECK((distant >> 16) <= 4 && (distant & 255) >= 251);
     CHECK(native_fog_pixel(&st, 1, 200) == 0xFF0000);     /* default keeps clear/sky colour */
-    nv2a_d3d_distance_fog(&st, 1000.f / 16777216.f, 1000, 200, 800, 0xFF0000FF, NV2A_HOST_FOG_SKY_FILL, NULL);
+    nv2a_d3d_distance_fog(&st, 1000.f / 16777216.f, 1000, 200, 800, 0xFF0000FF, NV_D3D_FOG_SKY_FILL, NULL);
     read_target(pixels);
     CHECK((pixels[16 * 64 + 16] & 0xFFFFFF) == 0x0000FF);  /* no panorama: clear depth becomes untextured air */
     /* The sky mask fades continuously above the camera's world horizon. */
@@ -486,7 +486,7 @@ static void test_native_fog(void)
             NvD3DState panorama;
             nv2a_d3d_clear(&st, 0xF1, 0xFF0000FF, 0xFFFFFF00, 0, 0, 63, 63);
             nv2a_d3d_distance_fog(&st, 1000.f / 16777216.f, 1000, 200, 800, 0xFF0000FF,
-                                  NV2A_HOST_FOG_SKY_MASK | NV2A_HOST_FOG_SKY_FADE, sky_planes[plane]);
+                                  NV_D3D_FOG_SKY_MASK | NV_D3D_FOG_SKY_FADE, sky_planes[plane]);
             read_target(pixels);
             for (y = 0; y < 64; ++y)
                 for (x = 0; x < 64; ++x) {

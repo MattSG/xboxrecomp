@@ -106,7 +106,7 @@ fail:
 
 void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb, uint32_t flags, const float sky_fade[4])
 {
-    if ((flags & NV2A_HOST_FOG_SKY_FADE) && (!sky_fade ||
+    if ((flags & NV_D3D_FOG_SKY_FADE) && (!sky_fade ||
         !isfinite(sky_fade[0]) || !isfinite(sky_fade[1]) || !isfinite(sky_fade[2]) ||
         !isfinite(sky_fade[3]) || sky_fade[3] <= 0)) return;
     Surface *s = NULL; Depth *d = NULL; uint32_t gw, gh;
@@ -115,9 +115,9 @@ void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far
         !st || !bind_targets(st,1,&s,&d,&gw,&gh) ||
         !s || !d || !d->zsrv || s->iw != d->iw || s->ih != d->ih ||
         (!!s->ms != (d->samples > 1)) || !native_fog_init()) return;
-    float params[12] = {start,1.f/(end-start),depth_to_world*(d->zf == 1 ? 65536.f : 16777216.f),(flags & NV2A_HOST_FOG_SKY_FILL) ? 1.f : 0.f,
+    float params[12] = {start,1.f/(end-start),depth_to_world*(d->zf == 1 ? 65536.f : 16777216.f),(flags & NV_D3D_FOG_SKY_FILL) ? 1.f : 0.f,
                       ((argb>>16)&255)/255.f,((argb>>8)&255)/255.f,(argb&255)/255.f,0};
-    if (flags & NV2A_HOST_FOG_SKY_FADE) {
+    if (flags & NV_D3D_FOG_SKY_FADE) {
         params[8] = 2.f*sky_fade[0]/s->iw;
         params[9] = -2.f*sky_fade[1]/s->ih;
         params[10] = sky_fade[2]-sky_fade[0]+sky_fade[1];
@@ -145,7 +145,7 @@ void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far
     ID3D11DeviceContext_Draw(s_ctx,3,0);
     /* Optional mask for subsequent destination-alpha composition. */
     params[7] = 1;
-    if ((flags & NV2A_HOST_FOG_SKY_MASK) && upload_cb(s_native_fog_cb,params,sizeof params)) {
+    if ((flags & NV_D3D_FOG_SKY_MASK) && upload_cb(s_native_fog_cb,params,sizeof params)) {
         ID3D11DeviceContext_OMSetBlendState(s_ctx,s_native_fog_mask,NULL,0xFFFFFFFFu);
         ID3D11DeviceContext_Draw(s_ctx,3,0);
     }
