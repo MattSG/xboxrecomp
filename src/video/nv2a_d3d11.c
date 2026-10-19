@@ -2811,7 +2811,25 @@ static uint8_t *ring_map(ID3D11Buffer *b, UINT *pos, UINT cap, UINT bytes,
     return (uint8_t *)m->pData + *pos;
 }
 
-#include "nv2a_distance_fog.h"
+int nv2a_d3d_host_draw(const NvD3DState *st,
+                       int (*draw)(const NvHostTarget *, void *), void *user)
+{
+    Surface *s = NULL; Depth *d = NULL; uint32_t gw, gh;
+    if (!st || !draw || !nv2a_d3d_init() || !bind_targets(st,1,&s,&d,&gw,&gh) ||
+        !s || !d || !d->zsrv || s->iw != d->iw || s->ih != d->ih ||
+        (!!s->ms != (d->samples > 1))) return 0;
+    NvHostTarget target = {s_dev,s_ctx,s->rtv,d->zsrv,s->iw,s->ih,
+                           d->zf == 1 ? 16u : 24u,d->samples};
+    unbind_textures();
+    unbind_targets();
+    int result = draw(&target,user);
+    /* The client can change native state, including bindings we retain. */
+    ID3D11DeviceContext_ClearState(s_ctx);
+    bind_fixed_resources();
+    unbind_targets();
+    if (result) { s->gpu_dirty = 1; s->ms_dirty = !!s->ms; ++s->gen; }
+    return result;
+}
 
 /* ---------------------------------------------- vertex processing on the GPU
  *
@@ -4330,5 +4348,5 @@ void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
-void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb, uint32_t flags, const float sky_fade[4]) { (void)st; (void)depth_to_world; (void)far_clip; (void)start; (void)end; (void)argb; (void)flags; (void)sky_fade; }
+int nv2a_d3d_host_draw(const NvD3DState *st, int (*draw)(const NvHostTarget *, void *), void *user) { (void)st; (void)draw; (void)user; return 0; }
 #endif

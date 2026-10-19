@@ -64,11 +64,6 @@ int nv2a_d3d_widescreen(void) { STUB_HIT("nv2a_d3d_widescreen"); return 0; }
 int nv2a_d3d_menu_rects_on(void) { STUB_HIT("nv2a_d3d_menu_rects_on"); return 0; }
 void nv2a_d3d_set_menu_tints(const uint32_t *tints) { (void)tints; STUB_HIT("nv2a_d3d_set_menu_tints"); }
 int nv2a_d3d_init(void) { return 1; }
-void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip,
-                           float start, float end, uint32_t argb, uint32_t flags,
-                           const float sky_fade[4])
-{ (void)st; (void)depth_to_world; (void)far_clip; (void)start; (void)end; (void)argb;
-  (void)flags; (void)sky_fade; STUB_HIT("nv2a_d3d_distance_fog"); }
 static uint32_t replay_observed_color;
 void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color, uint32_t zstencil,
                     uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)

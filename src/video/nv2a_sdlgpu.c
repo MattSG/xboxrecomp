@@ -58,8 +58,6 @@
 #include "sdlgpu/y16_vs.spirv.h"
 #include "sdlgpu/y16_ps.spirv.h"
 #include "sdlgpu/y16d_ps.spirv.h"
-#include "sdlgpu/fog_vs.spirv.h"
-#include "sdlgpu/fog_ps.spirv.h"
 #if defined(_WIN32)
 #include "sdlgpu/ub_vs.dxil.h"
 #include "sdlgpu/ps_main.dxil.h"
@@ -73,8 +71,6 @@
 #include "sdlgpu/y16_vs.dxil.h"
 #include "sdlgpu/y16_ps.dxil.h"
 #include "sdlgpu/y16d_ps.dxil.h"
-#include "sdlgpu/fog_vs.dxil.h"
-#include "sdlgpu/fog_ps.dxil.h"
 #define DXIL(name) name##_dxil, sizeof name##_dxil
 #else
 #define DXIL(name) NULL, 0
@@ -280,7 +276,7 @@ static uint32_t phys(uint32_t va)
 
 enum { SH_UB_VS, SH_PS_MAIN, SH_PS_MAIN_FLAT, SH_PS_WDEPTH, SH_PS_WDEPTH_FLAT,
        SH_PRESENT_VS, SH_PRESENT_PS, SH_CLEAR_VS, SH_CLEAR_PS, SH_Y16_VS, SH_Y16_PS,
-       SH_Y16D_PS, SH_FOG_VS, SH_FOG_PS, SH_COUNT };
+       SH_Y16D_PS, SH_COUNT };
 
 typedef struct {
     const unsigned char *spirv; size_t spirv_size;
@@ -304,8 +300,6 @@ static const ShaderSource s_shader_src[SH_COUNT] = {
     [SH_Y16_VS] = { SPIRV(y16_vs), DXIL(y16_vs), "y16_vs", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 0 },
     [SH_Y16_PS] = { SPIRV(y16_ps), DXIL(y16_ps), "y16_ps", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 0 },
     [SH_Y16D_PS] = { SPIRV(y16d_ps), DXIL(y16d_ps), "y16d_ps", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 1 },
-    [SH_FOG_VS] = { SPIRV(fog_vs), DXIL(fog_vs), "fog_vs", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 0 },
-    [SH_FOG_PS] = { SPIRV(fog_ps), DXIL(fog_ps), "fog_ps", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 1 },
 };
 static SDL_GPUShader *s_shader[SH_COUNT];
 
@@ -804,7 +798,7 @@ static SDL_GPUTextureFormat s_depth_format;
 typedef struct {
     uint8_t vs, ps, color, depth, prim, blend_enable, write_mask, cull;
     uint8_t front_ccw, zt, zw, zfunc, st, sfunc, rmask, wmask;
-    uint8_t sfail, szfail, szpass, pad;     /* pad 1: the fog pass's blend */
+    uint8_t sfail, szfail, szpass, pad;
     uint16_t sf, df, eq, pad2;
     int32_t bias;
     float slope;
@@ -953,14 +947,6 @@ static SDL_GPUGraphicsPipeline *pipeline(const PipeKey *k)
             ctd.blend_state.color_blend_op = ctd.blend_state.alpha_blend_op = blend_op(k->eq);
             ctd.blend_state.enable_color_write_mask = true;
             ctd.blend_state.color_write_mask = (SDL_GPUColorComponentFlags)(k->write_mask & 15);
-            if (k->pad == 1) {
-                /* The fog pass: colour over by source alpha, alpha kept. */
-                ctd.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
-                ctd.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
-                ctd.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
-                ctd.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
-                ctd.blend_state.color_blend_op = ctd.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
-            }
             ci.target_info.color_target_descriptions = &ctd;
             ci.target_info.num_color_targets = 1;
         }
@@ -2745,72 +2731,25 @@ void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,
     draw_op(OP_DRAW, 4, 0);
 }
 
-/* --------------------------------------------------------- distance fog */
+/* ---------------------------------------------------- native host drawing */
 
-/* The dedicated host fog pass (nv2a_distance_fog.h on D3D11). */
-void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start,
-                           float end, uint32_t argb_, uint32_t flags, const float sky_fade[4])
+int nv2a_d3d_host_draw(const NvD3DState *st,
+                       int (*draw)(const NvHostTarget *, void *), void *user)
 {
     Surface *s = NULL; Depth *d = NULL; uint32_t gw, gh;
-    float params[12];
-    PipeKey k;
-    SDL_GPUGraphicsPipeline *pipe;
-    SDL_GPUTextureSamplerBinding b;
-    Op *o;
-    static unsigned logged;
-    if ((flags & NV_D3D_FOG_SKY_FADE) && (!sky_fade ||
-        !isfinite(sky_fade[0]) || !isfinite(sky_fade[1]) || !isfinite(sky_fade[2]) ||
-        !isfinite(sky_fade[3]) || sky_fade[3] <= 0)) return;
-    if (!isfinite(depth_to_world) || !isfinite(far_clip) || !isfinite(start) || !isfinite(end) ||
-        depth_to_world <= 0 || far_clip <= 0 || start < 0 || end <= start || end > far_clip ||
-        !st || !nv2a_d3d_init() || !bind_targets(st, 1, &s, &d, &gw, &gh) ||
-        !s || !d || !d->tex || s->iw != d->iw || s->ih != d->ih) return;
-    memset(params, 0, sizeof params);
-    params[0] = start; params[1] = 1.f / (end - start);
-    params[2] = depth_to_world * (d->zf == 1 ? 65536.f : 16777216.f);
-    params[3] = (flags & NV_D3D_FOG_SKY_FILL) ? 1.f : 0.f;
-    params[4] = ((argb_ >> 16) & 255) / 255.f; params[5] = ((argb_ >> 8) & 255) / 255.f;
-    params[6] = (argb_ & 255) / 255.f; params[7] = 0;
-    if (flags & NV_D3D_FOG_SKY_FADE) {
-        params[8] = 2.f * sky_fade[0] / s->iw;
-        params[9] = -2.f * sky_fade[1] / s->ih;
-        params[10] = sky_fade[2] - sky_fade[0] + sky_fade[1];
-        params[11] = sky_fade[3];
-    }
-    if (!isfinite(params[1]) || !isfinite(params[2]) || !isfinite(params[8]) ||
-        !isfinite(params[9]) || !isfinite(params[10])) return;
-    /* The depth buffer is read, so it is not the pass's attachment. */
-    target(s->tex, &s->clear, NULL, NULL);
-    pipe_key_plain(&k, SH_FOG_VS, SH_FOG_PS, FMT_BGRA8, SDL_GPU_PRIMITIVETYPE_TRIANGLELIST);
-    k.blend_enable = 1;
-    k.pad = 1;                       /* fog blend: see pipeline() */
-    if (!(pipe = pipeline(&k))) return;
-    if (!(o = op_add(OP_PIPE))) return;
-    o->pipe = pipe;
-    rec_uniform(1, 0, params, sizeof params);
-    b.texture = d->tex; b.sampler = s_point_clamp;
-    rec_samplers(&b, 1);
-    memset(&s_last_draw_state, 0, sizeof s_last_draw_state);
-    s_last_draw_state.vp.w = (float)s->iw; s_last_draw_state.vp.h = (float)s->ih;
-    s_last_draw_state.vp.max_depth = 1;
-    s_last_draw_state.sc.w = (int)s->iw; s_last_draw_state.sc.h = (int)s->ih;
-    draw_op(OP_DRAW, 3, 0);
-    if (flags & NV_D3D_FOG_SKY_MASK) {
-        /* Optional mask for subsequent destination-alpha composition. */
-        params[7] = 1;
-        pipe_key_plain(&k, SH_FOG_VS, SH_FOG_PS, FMT_BGRA8, SDL_GPU_PRIMITIVETYPE_TRIANGLELIST);
-        k.write_mask = SDL_GPU_COLORCOMPONENT_A;
-        if ((pipe = pipeline(&k)) && (o = op_add(OP_PIPE))) {
-            o->pipe = pipe;
-            rec_uniform(1, 0, params, sizeof params);
-            rec_samplers(&b, 1);
-            draw_op(OP_DRAW, 3, 0);
-        }
-    }
-    s_cur_rt = NULL;
-    s_cur_ds = NULL;
-    s->gpu_dirty = 1; ++s->gen;
-    if (!logged++) fprintf(stderr, "[FOG] native pass %ux%u depth-format=%u (SDL3 GPU)\n", s->iw, s->ih, d->zf);
+    if (!st || !draw || !nv2a_d3d_init() || !bind_targets(st,1,&s,&d,&gw,&gh) ||
+        !s || !d || !d->tex || s->iw != d->iw || s->ih != d->ih) return 0;
+    /* Flush also applies any pending initial target clears. */
+    flush_batch();
+    copy_end();
+    if (!cmd()) return 0;
+    NvHostTarget target = {s_dev,s_cmd,s->tex,d->tex,s->iw,s->ih,
+                           d->zf == 1 ? 16u : 24u,1};
+    int result = draw(&target,user);
+    memset(s_last_uni_len,0,sizeof s_last_uni_len);
+    s_cur_rt = NULL; s_cur_ds = NULL;
+    if (result) { s->gpu_dirty = 1; ++s->gen; }
+    return result;
 }
 
 /* -------------------------------------------------------------- write-back */

@@ -32,9 +32,7 @@ function(xbr_sdlgpu_shaders gen out)
         "clear clear_ps ps"
         "y16 y16_vs vs"
         "y16 y16_ps ps"
-        "y16d y16d_ps ps"
-        "fog fog_vs vs"
-        "fog fog_ps ps")
+        "y16d y16d_ps ps")
     set(_formats spirv)
     if(WIN32)
         list(APPEND _formats dxil)

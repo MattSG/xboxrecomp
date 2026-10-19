@@ -152,13 +152,19 @@ void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks);
  * commands retain native notification behavior, including with no hook. */
 void nv2a_pb_set_nop_hook(int (*hook)(const NvD3DState *, uint32_t subchannel, uint32_t value));
 
-/* Draw depth-based fog on the executor thread; the caller owns ordering,
- * distance bands, colours, and the optional world-up fade plane. */
-#define NV_D3D_FOG_SKY_MASK 1u
-#define NV_D3D_FOG_SKY_FILL 2u
-#define NV_D3D_FOG_SKY_FADE 4u
-void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip,
-                         float start, float end, uint32_t argb, uint32_t flags, const float sky_fade[4]);
+/* Ordered native drawing on the current colour target, reading its depth.
+ * The callback runs on the executor thread after prior draws. Handles are
+ * borrowed until it returns: D3D11 device/context/RTV/depth SRV, or SDL GPU
+ * device/command buffer/colour texture/depth texture. SDL callbacks must end
+ * their passes and must not submit the command buffer. Return nonzero after
+ * writing colour. The renderer restores its bindings and tracks target writes.
+ * NULL callbacks and missing/incompatible colour/depth targets are rejected. */
+typedef struct {
+    void *device, *context, *colour, *depth;
+    uint32_t width, height, depth_bits, samples;
+} NvHostTarget;
+int nv2a_d3d_host_draw(const NvD3DState *state,
+                     int (*draw)(const NvHostTarget *, void *), void *user);
 
 /* NV097_CLEAR_SURFACE: flags as the method's parameter, rect inclusive. */
 void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,
