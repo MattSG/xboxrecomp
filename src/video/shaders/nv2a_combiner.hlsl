@@ -58,13 +58,13 @@ SPEC_DECL
 #endif
 PS_TEX(Texture2D, T2D0, 0); PS_TEX(Texture2D, T2D1, 1); PS_TEX(Texture2D, T2D2, 2); PS_TEX(Texture2D, T2D3, 3);
 PS_TEX(TextureCube, TC0, 4); PS_TEX(TextureCube, TC1, 5); PS_TEX(TextureCube, TC2, 6); PS_TEX(TextureCube, TC3, 7);
-PS_TEX(Texture2D, FBK, 8); static float2 g_pos;
+/* Slot 8 is reserved; volume bindings remain at 9..12. */
 PS_TEX(Texture3D, TV0, 9); PS_TEX(Texture3D, TV1, 10); PS_TEX(Texture3D, TV2, 11); PS_TEX(Texture3D, TV3, 12);
 PS_SAMP(S0, 0); PS_SAMP(S1, 1); PS_SAMP(S2, 2); PS_SAMP(S3, 3);
 /* A cube map samples with its stage's sampler: one slot of its own on SDL3
- * GPU, the 2D one on D3D11. FBK is only loaded; SDL3 GPU pairs it anyway. */
+ * GPU, the 2D one on D3D11. */
 #ifdef SDLGPU
-PS_SAMP(SC0, 4); PS_SAMP(SC1, 5); PS_SAMP(SC2, 6); PS_SAMP(SC3, 7); PS_SAMP(SFBK, 8);
+PS_SAMP(SC0, 4); PS_SAMP(SC1, 5); PS_SAMP(SC2, 6); PS_SAMP(SC3, 7);
 PS_SAMP(SV0, 9); PS_SAMP(SV1, 10); PS_SAMP(SV2, 11); PS_SAMP(SV3, 12);
 #else
 #define SC0 S0
@@ -120,17 +120,7 @@ float4 samp2(uint n, float2 uv) {
   if (((bu & 1u) && (uv.x < 0.0 || uv.x > 1.0)) || ((bu & 2u) && (uv.y < 0.0 || uv.y > 1.0)))
     return tex_border[n];
 #endif
-  if (n == 0 && (ps_flags & 4)) {
-    float4 c = bspline0(uv, 0.0);
-    float f = (float)((ps_flags >> 8) & 255u) / 100.0, dv = ddy(uv.y);
-    if (f > 0.0 && abs(dv) > 1e-7) {
-      float2 fs; FBK.GetDimensions(fs.x, fs.y);
-      float y0 = clamp(g_pos.y - uv.y / dv - 3.0 * fs.y / 900.0, 0.0, fs.y - 1.0);
-      float3 sky = 0;
-      [unroll] for (int k = -4; k <= 4; k++) sky += FBK.Load(int3(clamp(g_pos.x + k * fs.x / 200.0, 0.0, fs.x - 1.0), y0, 0)).rgb;
-      c.rgb = lerp(c.rgb, sky / 9.0, f);
-    }
-    return c; }
+  if (n == 0 && (ps_flags & 4)) return bspline0(uv, 0.0);
   if (n == 0) return T2D0.Sample(S0, uv); if (n == 1) return T2D1.Sample(S1, uv);
   if (n == 2) return T2D2.Sample(S2, uv); return T2D3.Sample(S3, uv);
 }
@@ -171,7 +161,6 @@ float4 sampv(uint n, float3 uv) {
   if (n == 2) return TV2.Sample(SV2, uv); return TV3.Sample(SV3, uv);
 }
 float4 shade(PSIn i, out uint cov) {
-  g_pos = i.pos.xy;
   if (wclip_mode != 0u) {   /* window clip regions the scissor cannot express */
     bool in_any = false;
     [unroll] for (uint w = 0; w < 8; w++)

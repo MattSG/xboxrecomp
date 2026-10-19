@@ -2035,7 +2035,6 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     PSBorder pb;
     SDL_GPUTexture *srv[13] = { 0 };
     void *smp[4] = { 0 };
-    SDL_GPUTexture *fb = NULL;
     int cull = 0, bias = 0, flare_depth = draw_forces_depth(st), wdepth;
     float slope = 0, bf[4];
     PipeKey k;
@@ -2220,8 +2219,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             pc.wclip[w][3] = (float)((v >> 16 & 0xFFF) + 1) * s_aa_y * s_cur_sy;
         }
     }
-    if (s_draw_bspline && s) fb = feedback_copy(s);
-    /* The feedback copy can end the batch too. */
+    /* Texture reads can end the batch. */
     if (!(s_b.open && s_b.color == (s ? s->tex : NULL) && s_b.depth == (d ? d->tex : NULL)) &&
         !bind_targets(st, st->depth_test || st->stencil_test || flare_depth, &s, &d, &gw, &gh))
         return 0;
@@ -2292,7 +2290,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             b[9 + n].texture = srv[9 + n] ? srv[9 + n] : s_dummy_volume;
             b[9 + n].sampler = (SDL_GPUSampler *)smp[n];
         }
-        b[8].texture = fb ? fb : s_dummy_2d;
+        b[8].texture = s_dummy_2d;  /* reserved slot */
         b[8].sampler = s_linear_clamp;
         rec_samplers(b, 13);
     }

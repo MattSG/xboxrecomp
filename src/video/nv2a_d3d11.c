@@ -2766,13 +2766,6 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         bind_pixel_shader(ps ? ps : s_psv[v]);
     }
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 13, srv);
-    {   /* The horizon panorama reads the frame drawn so far (see bspline0). */
-        ID3D11ShaderResourceView *fb = NULL;
-        if (s_draw_bspline && s) {
-            if (s->ms) { surface_resolve(s); fb = s->srv; } else fb = feedback_copy(s);
-        }
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 8, 1, &fb);
-    }
     bind_pixel_samplers(4, smp);
     ID3D11DeviceContext_RSSetState(s_ctx, rs_state(cull == 3 ? 0 : cull,
                                                    st->front_face == 0x901, bias, slope));
