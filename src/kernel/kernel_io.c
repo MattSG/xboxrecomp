@@ -1,12 +1,12 @@
 /*
  * kernel_io.c - I/O Manager Stubs
  *
- * Implements IoCreateDevice, IoDeleteDevice, IRP management, and I/O
- * completion stubs.
+ * Provides native-pointer fallbacks and the shared fixed-width guest IRP
+ * initializer. Guest-address dispatch is implemented by kernel_bridge.c.
  *
- * The Xbox I/O manager is used internally by XDK libraries (DSOUND, D3D,
- * storage drivers). Since we replace those libraries entirely with Win32
- * equivalents, most I/O manager functions are stubs that return success.
+ * The native-pointer exports cannot safely treat Xbox virtual addresses as
+ * host pointers. Guest-address device creation and packet dispatch are routed
+ * through kernel_bridge.c; unsupported native paths return explicit errors.
  */
 
 #include "kernel.h"
@@ -20,8 +20,7 @@
  * Type Object Pointers
  *
  * Exported type objects for device and completion port types.
- * Game code rarely uses these directly - they're mainly for the
- * XDK libraries we're replacing.
+ * These are native type-object placeholders for exports that require them.
  * ============================================================================ */
 
 static ULONG g_device_object_type_data     = 0x44455643; /* 'DEVC' */
@@ -40,14 +39,6 @@ PVOID xbox_IoFileObjectType       = &g_file_object_type_data;
  * the interface without actual device functionality.
  * ============================================================================ */
 
-/* Minimal device object - just enough to not crash if someone reads fields */
-typedef struct _XBOX_FAKE_DEVICE {
-    ULONG Type;
-    ULONG Size;
-    PVOID DeviceExtension;
-    PVOID DriverObject;
-} XBOX_FAKE_DEVICE;
-
 NTSTATUS __stdcall xbox_IoCreateDevice(
     PVOID DriverObject,
     ULONG DeviceExtensionSize,
@@ -56,55 +47,31 @@ NTSTATUS __stdcall xbox_IoCreateDevice(
     BOOLEAN Exclusive,
     PVOID* DeviceObject)
 {
-    XBOX_FAKE_DEVICE* device;
-    ULONG total_size;
-
     (void)DriverObject;
+    (void)DeviceExtensionSize;
+    (void)DeviceName;
     (void)DeviceType;
     (void)Exclusive;
 
-    if (!DeviceObject)
-        return STATUS_INVALID_PARAMETER;
-
-    total_size = sizeof(XBOX_FAKE_DEVICE) + DeviceExtensionSize;
-    device = (XBOX_FAKE_DEVICE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, total_size);
-    if (!device) {
-        *DeviceObject = NULL;
-        return STATUS_NO_MEMORY;
-    }
-
-    device->Type = DeviceType;
-    device->Size = total_size;
-    device->DriverObject = DriverObject;
-    device->DeviceExtension = (DeviceExtensionSize > 0)
-        ? (PVOID)((UCHAR*)device + sizeof(XBOX_FAKE_DEVICE))
-        : NULL;
-
-    *DeviceObject = device;
-
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_IO,
-        "IoCreateDevice: '%.*s' type=%u ext_size=%u → %p",
-        DeviceName ? DeviceName->Length : 0,
-        DeviceName ? DeviceName->Buffer : "<null>",
-        DeviceType, DeviceExtensionSize, device);
-
-    return STATUS_SUCCESS;
+    if (DeviceObject) *DeviceObject = NULL;
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_IO,
+        "IoCreateDevice: native-pointer path unsupported; use guest bridge");
+    return DeviceObject ? STATUS_NOT_IMPLEMENTED : STATUS_INVALID_PARAMETER;
 }
 
 VOID __stdcall xbox_IoDeleteDevice(PVOID DeviceObject)
 {
-    if (DeviceObject) {
-        xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_IO,
-            "IoDeleteDevice: %p", DeviceObject);
-        HeapFree(GetProcessHeap(), 0, DeviceObject);
-    }
+    if (DeviceObject)
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_IO,
+            "IoDeleteDevice: native-pointer path unsupported (%p)", DeviceObject);
 }
 
 /* ============================================================================
  * IRP Management Stubs
  *
  * IRPs (I/O Request Packets) are the core mechanism for driver I/O on Xbox.
- * Since we don't use real drivers, these are all stubs.
+ * Guest IRP layout initialization is shared with the bridge; native-pointer
+ * entrypoints are not a substitute for guest packet dispatch.
  * ============================================================================ */
 
 int xbox_IoInitializeIrpGuest(uint32_t guest_va, PVOID Irp, USHORT PacketSize, CCHAR StackSize)
@@ -137,25 +104,24 @@ VOID __stdcall xbox_IoInitializeIrp(PVOID Irp, USHORT PacketSize, CCHAR StackSiz
     (void)xbox_IoInitializeIrpGuest(guest_va, Irp, PacketSize, StackSize);
 }
 
-VOID __stdcall xbox_IoStartNextPacket(PVOID DeviceObject, BOOLEAN Cancelable)
+VOID __stdcall xbox_IoStartNextPacket(PVOID DeviceObject)
 {
-    (void)DeviceObject;
-    (void)Cancelable;
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_IO,
+        "IoStartNextPacket: native-pointer path unsupported (%p)", DeviceObject);
 }
 
-VOID __stdcall xbox_IoStartNextPacketByKey(PVOID DeviceObject, BOOLEAN Cancelable, ULONG Key)
+VOID __stdcall xbox_IoStartNextPacketByKey(PVOID DeviceObject, ULONG Key)
 {
-    (void)DeviceObject;
-    (void)Cancelable;
-    (void)Key;
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_IO,
+        "IoStartNextPacketByKey: native-pointer path unsupported (%p, %u)",
+        DeviceObject, Key);
 }
 
-VOID __stdcall xbox_IoStartPacket(PVOID DeviceObject, PVOID Irp, PULONG Key, PVOID CancelFunction)
+VOID __stdcall xbox_IoStartPacket(PVOID DeviceObject, PVOID Irp, PULONG Key)
 {
-    (void)DeviceObject;
-    (void)Irp;
-    (void)Key;
-    (void)CancelFunction;
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_IO,
+        "IoStartPacket: native-pointer path unsupported (%p, %p, %p)",
+        DeviceObject, Irp, (void *)Key);
 }
 
 VOID __stdcall xbox_IoMarkIrpMustComplete(PVOID Irp)
@@ -184,14 +150,14 @@ NTSTATUS __stdcall xbox_IoSetIoCompletion(
         "IoSetIoCompletion: completion=%p status=0x%08X (stubbed)",
         IoCompletion, IoStatus);
 
-    return STATUS_SUCCESS;
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 /* ============================================================================
  * Synchronous Device I/O
  *
- * These functions perform synchronous I/O through the driver stack.
- * Stubbed since we replace all Xbox drivers.
+ * These helpers perform synchronous I/O through the driver stack. The guest
+ * bridge does not yet provide the blocking/pending contract for these exports.
  * ============================================================================ */
 
 NTSTATUS __stdcall xbox_IoSynchronousDeviceIoControlRequest(
@@ -215,14 +181,14 @@ NTSTATUS __stdcall xbox_IoSynchronousDeviceIoControlRequest(
     if (ReturnedOutputBufferLength)
         *ReturnedOutputBufferLength = 0;
 
-    xbox_log(XBOX_LOG_TRACE, XBOX_LOG_IO,
-        "IoSynchronousDeviceIoControlRequest: ioctl=0x%08X device=%p (stubbed)",
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_IO,
+        "IoSynchronousDeviceIoControlRequest: ioctl=0x%08X device=%p unsupported native path",
         IoControlCode, DeviceObject);
 
-    return STATUS_SUCCESS;
+    return STATUS_NOT_IMPLEMENTED;
 }
 
-NTSTATUS __stdcall xbox_IoBuildDeviceIoControlRequest(
+PVOID __stdcall xbox_IoBuildDeviceIoControlRequest(
     ULONG IoControlCode,
     PVOID DeviceObject,
     PVOID InputBuffer,
@@ -230,7 +196,7 @@ NTSTATUS __stdcall xbox_IoBuildDeviceIoControlRequest(
     PVOID OutputBuffer,
     ULONG OutputBufferLength,
     BOOLEAN InternalDeviceIoControl,
-    HANDLE Event,
+    PVOID Event,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock)
 {
     (void)IoControlCode;
@@ -243,11 +209,24 @@ NTSTATUS __stdcall xbox_IoBuildDeviceIoControlRequest(
     (void)Event;
 
     if (IoStatusBlock) {
-        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
         IoStatusBlock->Information = 0;
     }
 
-    return STATUS_SUCCESS;
+    return NULL;
+}
+
+PVOID __stdcall xbox_IoBuildAsynchronousFsdRequest(
+    ULONG MajorFunction, PVOID DeviceObject, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER StartingOffset, PXBOX_IO_STATUS_BLOCK IoStatusBlock)
+{
+    (void)MajorFunction; (void)DeviceObject; (void)Buffer; (void)Length;
+    (void)StartingOffset;
+    if (IoStatusBlock) {
+        IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
+        IoStatusBlock->Information = 0;
+    }
+    return NULL;
 }
 
 NTSTATUS __stdcall xbox_IoSynchronousFsdRequest(
@@ -267,7 +246,7 @@ NTSTATUS __stdcall xbox_IoSynchronousFsdRequest(
         "IoSynchronousFsdRequest: major=%u device=%p (stubbed)",
         MajorFunction, DeviceObject);
 
-    return STATUS_SUCCESS;
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 PVOID __stdcall xbox_IoBuildSynchronousFsdRequest(
@@ -276,7 +255,7 @@ PVOID __stdcall xbox_IoBuildSynchronousFsdRequest(
     PVOID Buffer,
     ULONG Length,
     PLARGE_INTEGER StartingOffset,
-    HANDLE Event,
+    PVOID Event,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock)
 {
     (void)DeviceObject;
@@ -294,7 +273,7 @@ PVOID __stdcall xbox_IoBuildSynchronousFsdRequest(
      * the return sees a coherent result.
      */
     if (IoStatusBlock) {
-        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
         IoStatusBlock->Information = 0;
     }
 
@@ -320,13 +299,14 @@ NTSTATUS __fastcall xbox_IofCallDriver(PVOID DeviceObject, PVOID Irp)
     xbox_log(XBOX_LOG_TRACE, XBOX_LOG_IO,
         "IofCallDriver: device=%p irp=%p (stubbed)", DeviceObject, Irp);
 
-    return STATUS_SUCCESS;
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 VOID __fastcall xbox_IofCompleteRequest(PVOID Irp, CCHAR PriorityBoost)
 {
-    (void)Irp;
-    (void)PriorityBoost;
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_IO,
+        "IofCompleteRequest: native-pointer path unsupported (%p, %d)",
+        Irp, (int)PriorityBoost);
 }
 
 NTSTATUS __stdcall xbox_IoInvalidDeviceRequest(PVOID DeviceObject, PVOID Irp)

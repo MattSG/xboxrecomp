@@ -32,6 +32,36 @@ enum {
     XBOX_DEVICE_EXTENSION_BASE_SIZE = XBOX_DEVICE_OBJECT_SIZE
 };
 
+enum {
+    XBOX_IRP_FLAG_SYNCHRONOUS_API = 0x00000004,
+    XBOX_IRP_FLAG_READ_OPERATION = 0x00000010,
+    XBOX_IRP_FLAG_WRITE_OPERATION = 0x00000020,
+    XBOX_SL_PENDING_RETURNED = 0x01,
+    XBOX_MAJOR_READ = 0x02,
+    XBOX_MAJOR_WRITE = 0x03,
+    XBOX_MAJOR_DEVICE_CONTROL = 0x0a,
+    XBOX_MAJOR_INTERNAL_DEVICE_CONTROL = 0x0b
+};
+
+/* Xbox packet layout: a four-byte header followed by the complete 20-byte
+ * parameter payload. The regression test records the title-binary byte
+ * evidence for the observed parameter offsets; a Cxbx record-layout probe
+ * places Parameters at +8 and is not used as the guest-layout authority. */
+typedef struct XBOX_GUEST_IO_STACK_LOCATION {
+    uint8_t major_function;
+    uint8_t minor_function;
+    uint8_t flags;
+    uint8_t control;
+    uint32_t parameters[5];
+} XBOX_GUEST_IO_STACK_LOCATION;
+
+typedef struct XBOX_GUEST_DRIVER_OBJECT {
+    uint32_t driver_start_io;
+    uint32_t driver_delete_device;
+    uint32_t driver_dismount_volume;
+    uint32_t major_function[14];
+} XBOX_GUEST_DRIVER_OBJECT;
+
 typedef struct XBOX_GUEST_IO_STATUS_BLOCK {
     uint32_t status;
     uint32_t information;
@@ -56,7 +86,15 @@ typedef struct XBOX_GUEST_IRP {
     uint32_t user_buffer;             /* 0x30 */
     uint32_t segment_array;           /* 0x34 */
     uint32_t locked_buffer_length;    /* 0x38 */
-    uint32_t driver_context[5];       /* 0x3c; Xbox has five entries */
+    union {
+        struct {
+            uint32_t device_queue_list[2]; /* 0x3c */
+            uint32_t device_queue_sort_key;/* 0x44 */
+            uint8_t device_queue_inserted; /* 0x48 */
+            uint8_t device_queue_pad[3];
+        } device_queue_entry;
+        uint32_t driver_context[5]; /* Xbox has five entries */
+    } tail_overlay;                  /* 0x3c */
     uint32_t thread;                  /* 0x50 */
     uint32_t list_entry[2];           /* 0x54 */
     uint32_t current_stack_location;  /* 0x5c */
@@ -110,7 +148,7 @@ XBOX_IO_STATIC_ASSERT(sizeof(XBOX_GUEST_IO_STATUS_BLOCK) == 8, "Xbox IOSB size")
 XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IRP, io_status) == 0x10, "Xbox IRP IOSB offset");
 XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IRP, overlay) == 0x28, "Xbox IRP overlay alignment");
 XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IRP, user_buffer) == 0x30, "Xbox IRP buffer offset");
-XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IRP, driver_context) == 0x3c, "Xbox IRP tail offset");
+XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IRP, tail_overlay) == 0x3c, "Xbox IRP tail offset");
 XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IRP, current_stack_location) ==
                       XBOX_IRP_CURRENT_STACK_LOCATION_OFFSET, "Xbox IRP current stack offset");
 XBOX_IO_STATIC_ASSERT(sizeof(XBOX_GUEST_IRP) == XBOX_IRP_SIZE, "Xbox IRP size/alignment");
@@ -123,6 +161,22 @@ XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_DEVICE_OBJECT, start_io_key) == 0x44,
                       "Xbox device key offset");
 XBOX_IO_STATIC_ASSERT(sizeof(XBOX_GUEST_DEVICE_OBJECT) == XBOX_DEVICE_OBJECT_SIZE,
                       "Xbox device object size");
+XBOX_IO_STATIC_ASSERT(sizeof(XBOX_GUEST_IO_STACK_LOCATION) == 0x18,
+                      "Xbox stack location size");
+XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IO_STACK_LOCATION, parameters) == 4,
+                      "Xbox stack parameters offset");
+XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IO_STACK_LOCATION, parameters) + 0 * sizeof(uint32_t) == 4,
+                      "Xbox Read/Write Length offset");
+XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IO_STACK_LOCATION, parameters) + 1 * sizeof(uint32_t) == 8,
+                      "Xbox Read/Write Buffer offset");
+XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IO_STACK_LOCATION, parameters) + 2 * sizeof(uint32_t) == 12,
+                      "Xbox Read/Write ByteOffset offset");
+XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IO_STACK_LOCATION, parameters) + 2 * sizeof(uint32_t) == 12,
+                      "Xbox DeviceIoControl input buffer offset");
+XBOX_IO_STATIC_ASSERT(offsetof(XBOX_GUEST_IO_STACK_LOCATION, parameters) + 3 * sizeof(uint32_t) == 16,
+                      "Xbox DeviceIoControl IoControlCode offset");
+XBOX_IO_STATIC_ASSERT(sizeof(XBOX_GUEST_DRIVER_OBJECT) == 0x44,
+                      "Xbox driver object dispatch table size");
 
 #undef XBOX_IO_STATIC_ASSERT
 #endif

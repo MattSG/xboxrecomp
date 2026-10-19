@@ -82,7 +82,36 @@ The test embeds data; it does not download dependencies at runtime.
 
 ## 2026-10-18 execution updates
 
-### 2026-10-19 continuation (uncommitted implementation)
+### 2026-10-19 continuation
+
+- Guest I/O builders now allocate initialized packets and populate read/write
+  and IOCTL arguments instead of returning null packets with successful IOSBs.
+  Dispatch enters guest driver callbacks through modeled x86 call frames;
+  completion publishes the guest's eight-byte IOSB and signals its event.
+  Pending requests retain ownership until completion. Synchronous builder
+  packets are released on completion; explicit free removes their ownership
+  record. Asynchronous builder and allocated packets remain caller-owned.
+  Device queues implement ordered insertion, FIFO/keyed removal and StartIo
+  callbacks. Validation rejects duplicate, malformed and cyclic links before
+  queue mutation. The post-completion/pre-StartNext gap accepts a new packet
+  without dereferencing an already-freed active IRP. Xbox argument counts are
+  corrected for ordinals 60, 81, 82 and 83. Independent MSVC Release and
+  GCC 13.3 Release thunk-dispatch tests pass, including nested completion,
+  event consumption, pending ownership, queue ordering, malformed links and
+  more than 256 simultaneous synchronous builder packets.
+  This is guest packet/dispatch support, not native host-pointer driver I/O.
+  Native unsupported operations return failure rather than fabricated success.
+  Synchronous helper ordinals 84/85, IoMarkIrpMustComplete semantics and
+  abandoned thread-owned request rundown remain open; no full storage-driver
+  acceptance is claimed.
+- Stack payload offsets follow original driver instructions retained in the
+  consuming project's `build/audit-continuation/reference`: read Length `+4`,
+  Buffer `+8`, ByteOffset `+0xc/+0x10`, IOCTL code `+0x10`. The pinned Cxbx
+  declaration compiled for x86 places its union at `+8`, contradicting both
+  its comments and those driver accesses. Its host record is not copied as
+  the guest payload. Raw-byte assertions cover the observed packet fields.
+  Static XBE instructions establish ABI expectations, not live reachability
+  or original-hardware conformance.
 
 - POSIX thread cleanup now has one finalizer for normal return, `ExitThread`
   and deferred cancellation. It runs timer/APC rundown before publishing

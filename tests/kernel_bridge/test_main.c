@@ -28,18 +28,104 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define SCRATCH_SP 0x30000u
+typedef void (*recomp_func_t)(void);
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
+
 /* Provided by the generated title; a regression harness has no title, and a
  * static archive resolves only what gets pulled in. Nothing here calls a
  * guest function. */
-typedef void (*recomp_func_t)(void);
+static uint8_t *g_guest_mem;
+static uint32_t g_complete_entry;
+static uint32_t g_dispatch_mode;
+static uint32_t g_start_order[8];
+static uint32_t g_start_count;
+static uint32_t g_nested_preserved;
+static uint32_t g_start_action;
+static uint32_t g_start_complete_entry;
+static uint32_t g_start_packet_entry;
+static uint32_t g_start_enqueue_irp;
+static uint32_t g_start_enqueue_key_va;
+static uint32_t g_start_completed_and_freed;
+
+#define TEST_DISPATCH_VA 0x45080u
+#define TEST_STARTIO_VA  0x45084u
+
+static void test_dispatch_callback(void)
+{
+    uint32_t *sp = (uint32_t *)(g_guest_mem + g_esp);
+    uint32_t irp_va = sp[2];
+    XBOX_GUEST_IRP *irp = (XBOX_GUEST_IRP *)(g_guest_mem + irp_va);
+    recomp_func_t complete;
+
+    irp->io_status.status = g_dispatch_mode == 1 ? 0x00000103u : 0;
+    irp->io_status.information = 7;
+    g_eax = irp->io_status.status;
+    if (g_dispatch_mode == 0) {
+        uint32_t result = g_eax;
+        g_ecx = irp_va;
+        g_edx = 0;
+        g_esp -= 4; /* kernel thunk dispatch consumes its dummy call return */
+        *(uint32_t *)(g_guest_mem + g_esp) = 0;
+        complete = recomp_lookup_kernel(*(uint32_t *)(g_guest_mem + g_complete_entry));
+        complete();
+        g_nested_preserved = g_eax == 0 && g_esp == SCRATCH_SP - 12;
+        g_eax = result;
+    }
+    g_esp += 12; /* stdcall dispatch routine consumed return + two arguments */
+}
+
+static void test_start_io_callback(void)
+{
+    uint32_t *sp = (uint32_t *)(g_guest_mem + g_esp);
+    uint32_t device_va = sp[1];
+    uint32_t irp_va = sp[2];
+    XBOX_GUEST_IRP *irp = (XBOX_GUEST_IRP *)(g_guest_mem + irp_va);
+    if (g_start_count < sizeof(g_start_order) / sizeof(g_start_order[0]))
+        g_start_order[g_start_count++] = irp->original_file_object;
+    if (g_start_action) {
+        recomp_func_t complete, start_packet;
+        uint32_t saved_esp = g_esp;
+        g_ecx = irp_va; g_edx = 0; g_esp -= 4;
+        *(uint32_t *)(g_guest_mem + g_esp) = 0;
+        complete = recomp_lookup_kernel(*(uint32_t *)(g_guest_mem +
+                                      g_start_complete_entry));
+        complete();
+        g_start_completed_and_freed = xbox_HeapBlockSize(irp_va) == 0;
+
+        g_esp -= 16;
+        *(uint32_t *)(g_guest_mem + g_esp) = 0;
+        *(uint32_t *)(g_guest_mem + g_esp + 4) = device_va;
+        *(uint32_t *)(g_guest_mem + g_esp + 8) = g_start_enqueue_irp;
+        *(uint32_t *)(g_guest_mem + g_esp + 12) = g_start_enqueue_key_va;
+        start_packet = recomp_lookup_kernel(*(uint32_t *)(g_guest_mem +
+                                          g_start_packet_entry));
+        start_packet();
+        g_esp = saved_esp;
+        g_start_action = 0;
+    }
+    /* Simulate a callback clobbering volatile and callee-saved CPU state. */
+    g_eax = 0xE0E0E0E0u; g_ecx = 0xC1C1C1C1u; g_edx = 0xD2D2D2D2u;
+    g_ebx = 0xB3B3B3B3u; g_esi = 0x51515151u; g_edi = 0xD1D1D1D1u;
+    g_esp += 12;
+}
+
 recomp_func_t recomp_lookup(uint32_t xbox_va);
-recomp_func_t recomp_lookup(uint32_t xbox_va) { (void)xbox_va; return NULL; }
+recomp_func_t recomp_lookup(uint32_t xbox_va)
+{
+    if (xbox_va == TEST_DISPATCH_VA) return test_dispatch_callback;
+    if (xbox_va == TEST_STARTIO_VA) return test_start_io_callback;
+    return NULL;
+}
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NULL; }
 
 /* The seam, plus the guest CPU state the dispatcher reads and writes. */
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
+extern RECOMP_TLS uint32_t g_ecx, g_edx, g_ebx, g_esi, g_edi;
 extern ptrdiff_t g_xbox_mem_offset;
 
 static int failures;
@@ -67,8 +153,7 @@ static void check(int ok, const char *what, const char *detail)
 }
 
 /* Guest-side helpers for the checks after ordinal 173. */
-#define SCRATCH_SP 0x30000u
-#define THUNK_SLOTS 12
+#define THUNK_SLOTS 23
 
 /* Calls the bridge in the thunk entry at entry_va with nargs stdcall arguments
  * and returns EAX. The lookup happens here, on every call: recomp_lookup_kernel
@@ -86,6 +171,16 @@ static uint32_t call_slot(uint8_t *mem, uint32_t entry_va, uint32_t nargs,
         sp[1 + i] = args[i];
     g_esp = SCRATCH_SP;
     g_eax = 0xDEADBEEFu;
+    fn();
+    return g_eax;
+}
+
+static uint32_t call_fast_slot(uint8_t *mem, uint32_t entry_va,
+                               uint32_t ecx, uint32_t edx)
+{
+    recomp_func_t fn = recomp_lookup_kernel(*(uint32_t *)(mem + entry_va));
+    g_ecx = ecx; g_edx = edx; g_esp = SCRATCH_SP - 4; g_eax = 0xDEADBEEFu;
+    *(uint32_t *)(mem + g_esp) = 0xBEEF0001u;
     fn();
     return g_eax;
 }
@@ -131,6 +226,7 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
 
     const uint32_t THUNK_VA = 0x10000, STACK_VA = 0x20000;
+    uint32_t device_for_io = 0;
 
     uint8_t *xbe = (uint8_t *)calloc(1, 0x1000);
     uint32_t xbe_word;
@@ -147,6 +243,7 @@ int main(void)
           "minimal XBE fixture initializes guest memory and heap", NULL);
     free(xbe);
     uint8_t *mem = (uint8_t *)xbox_GetMemoryBase();
+    g_guest_mem = mem;
     check(mem != NULL, "mapped guest memory available", NULL);
     if (!mem) {
         printf("\n%d failure(s); the rest needs guest memory.\n", failures);
@@ -157,7 +254,8 @@ int main(void)
      * ordinal 173; the rest are the symbolic link, handle and event calls
      * checked at the end. */
     static const uint32_t ordinals[THUNK_SLOTS] = {
-        173, 67, 203, 215, 187, 225, 61, 62, 59, 65, 72, 73
+        173, 67, 203, 215, 187, 225, 61, 62, 59, 65, 72, 73,
+        60, 83, 81, 82, 86, 87, 74, 108, 84, 85, 159
     };
     for (uint32_t i = 0; i < THUNK_SLOTS; i++)
         *(uint32_t *)(mem + THUNK_VA + 4 * i) = 0x80000000u | ordinals[i];
@@ -270,6 +368,7 @@ int main(void)
         uint32_t a[6] = { 0x44000, 12, 0, 7, 0, out_va };
         uint32_t status = call_slot(mem, create, 6, a);
         uint32_t device_va = *(uint32_t *)(mem + out_va);
+        device_for_io = device_va;
         XBOX_GUEST_DEVICE_OBJECT *device = (XBOX_GUEST_DEVICE_OBJECT *)(mem + device_va);
         check(status == 0 && g_esp == SCRATCH_SP + 28 && device_va != 0,
               "IoCreateDevice allocates through ordinal 65 with six args", NULL);
@@ -334,55 +433,383 @@ int main(void)
               "IoCreateDevice rejects out-of-range guest output pointer", NULL);
     }
 
-    /* IOSBs are 8-byte guest structures. The host bridge must marshal them;
-     * passing the guest pointer as a native IO_STATUS_BLOCK writes Information
-     * at host offset +8 and corrupts the adjacent guest canary. The zero
-     * builder return below is existing unsupported-builder behavior, not
-     * successful IRP creation; these checks cover only marshaling and stack ABI. */
+    /* The builders create real fixed-width guest packets. Raw offsets below
+     * are independently grounded in MM3's driver code (default.xbe SHA-256
+     * 2b04b66c43e7f37bbcebbfb5b72ccb96a2aa99cc2c60c53eb7d3530bcc2a3d79):
+     * 0x35B2B3 reads stack+0x0c and 0x35B2B6 reads +0x04; 0x35B2D3 reads
+     * +0x10; 0x35B2F4 tests Flags+2 and 0x35B2FA reads Buffer+8. At 0x35B1DE
+     * it reads IoControlCode+0x10. This static disassembly establishes the
+     * title's expected byte offsets, not runtime reachability or hardware
+     * conformance. These tests verify guest packet ABI and dispatch only; the
+     * separate native kernel_io entrypoints remain unsupported and no test
+     * here claims a real backing-device transfer. */
     {
         const uint32_t build_ioctl = THUNK_VA + 6 * 4;
         const uint32_t build_fsd = THUNK_VA + 7 * 4;
-        const uint32_t ios_va = 0x40800;
-        const uint32_t canary = 0xA55A3CC3u;
-        uint32_t a[9] = { 0 };
-        uint32_t status;
+        const uint32_t ios_va = 0x40800, event_va = 0x40900;
+        const uint32_t buffer_va = 0x40A00, offset_va = 0x40B00;
+        uint32_t a[9] = { 0 }, irp_va;
+        XBOX_GUEST_IRP *irp;
+        XBOX_GUEST_IO_STACK_LOCATION *slot;
+        uint32_t init_event[3] = { event_va, 1, 0 };
+        uint32_t init_event_thunk = THUNK_VA + 19 * 4;
 
-        a[8] = ios_va;
-        *(uint32_t *)(mem + ios_va) = 0xFFFFFFFFu;
-        *(uint32_t *)(mem + ios_va + 4) = 0xFFFFFFFFu;
-        *(uint32_t *)(mem + ios_va + 8) = canary;
-        status = call_slot(mem, build_ioctl, 9, a);
-        check(status == 0 && g_esp == SCRATCH_SP + 40,
-              "IoBuildDeviceIoControlRequest dispatches with 9 stdcall args", NULL);
-        check(*(uint32_t *)(mem + ios_va) == 0 &&
-              *(uint32_t *)(mem + ios_va + 4) == 0,
-              "IoBuildDeviceIoControlRequest writes guest IOSB status and information", NULL);
-        check(*(uint32_t *)(mem + ios_va + 8) == canary,
-              "IoBuildDeviceIoControlRequest preserves the adjacent guest canary", NULL);
-
-        a[8] = 0;
-        status = call_slot(mem, build_ioctl, 9, a);
-        check(status == 0 && g_esp == SCRATCH_SP + 40,
-              "IoBuildDeviceIoControlRequest accepts a null IOSB", NULL);
+        check(device_for_io != 0, "I/O builders have a real guest device", NULL);
+        call_slot(mem, init_event_thunk, 3, init_event);
+        *(uint32_t *)(mem + offset_va) = 0x11223344u;
+        *(uint32_t *)(mem + offset_va + 4) = 0x55667788u;
+        a[0] = 0x222000u; a[1] = device_for_io;
+        a[2] = buffer_va; a[3] = 4; a[4] = buffer_va + 0x10; a[5] = 8;
+        a[6] = 0; a[7] = event_va; a[8] = ios_va;
+        irp_va = call_slot(mem, build_ioctl, 9, a);
+        irp = (XBOX_GUEST_IRP *)(mem + irp_va);
+        slot = (XBOX_GUEST_IO_STACK_LOCATION *)(mem + irp->current_stack_location -
+                                                 XBOX_IO_STACK_LOCATION_SIZE);
+        check(irp_va && g_esp == SCRATCH_SP + 40 &&
+              irp->type == XBOX_IO_TYPE_IRP && irp->user_iosb == ios_va &&
+              irp->user_event == event_va && irp->user_buffer == buffer_va + 0x10,
+              "IoBuildDeviceIoControlRequest creates synchronous guest IRP", NULL);
+        check(slot->major_function == XBOX_MAJOR_DEVICE_CONTROL &&
+              slot->parameters[0] == 8 && slot->parameters[1] == 4 &&
+              slot->parameters[2] == buffer_va &&
+              slot->parameters[3] == 0x222000u,
+              "DeviceIoControl stack parameters use verified Xbox offsets", NULL);
+        uint32_t slot_va = irp->current_stack_location - XBOX_IO_STACK_LOCATION_SIZE;
+        check(*(uint32_t *)(mem + slot_va + 4) == 8 &&
+              *(uint32_t *)(mem + slot_va + 8) == 4 &&
+              *(uint32_t *)(mem + slot_va + 12) == buffer_va &&
+              *(uint32_t *)(mem + slot_va + 16) == 0x222000u,
+              "DeviceIoControl raw stack bytes match observed Xbox driver offsets", NULL);
 
         memset(a, 0, sizeof a);
-        a[6] = ios_va;
+        a[0] = XBOX_MAJOR_READ; a[1] = device_for_io; a[2] = buffer_va;
+        a[3] = 16; a[4] = offset_va; a[5] = event_va; a[6] = ios_va;
+        irp_va = call_slot(mem, build_fsd, 7, a);
+        irp = (XBOX_GUEST_IRP *)(mem + irp_va);
+        slot = (XBOX_GUEST_IO_STACK_LOCATION *)(mem + irp->current_stack_location -
+                                                 XBOX_IO_STACK_LOCATION_SIZE);
+        check(irp_va && g_esp == SCRATCH_SP + 32 &&
+              (irp->flags & (XBOX_IRP_FLAG_SYNCHRONOUS_API |
+                             XBOX_IRP_FLAG_READ_OPERATION)) ==
+                (XBOX_IRP_FLAG_SYNCHRONOUS_API | XBOX_IRP_FLAG_READ_OPERATION),
+              "IoBuildSynchronousFsdRequest builds read IRP", NULL);
+        check(slot->major_function == XBOX_MAJOR_READ &&
+              slot->parameters[0] == 16 &&
+              slot->parameters[1] == buffer_va &&
+              slot->parameters[2] == 0x11223344u &&
+              slot->parameters[3] == 0x55667788u,
+              "Read stack Length and LARGE_INTEGER offsets match Xbox layout", NULL);
+        slot_va = irp->current_stack_location - XBOX_IO_STACK_LOCATION_SIZE;
+        check(*(uint32_t *)(mem + slot_va + 4) == 16 &&
+              *(uint32_t *)(mem + slot_va + 8) == buffer_va &&
+              *(uint32_t *)(mem + slot_va + 12) == 0x11223344u &&
+              *(uint32_t *)(mem + slot_va + 16) == 0x55667788u,
+              "Read raw stack bytes match observed Xbox driver offsets", NULL);
+    }
+
+    /* Async builder IRPs are caller-owned, and packet queue insertion keeps
+     * keyed FIFO ordering while invoking StartIo outside the queue lock. */
+    {
+        const uint32_t build_async = THUNK_VA + 12 * 4;
+        const uint32_t start_packet = THUNK_VA + 13 * 4;
+        const uint32_t start_next = THUNK_VA + 14 * 4;
+        const uint32_t start_next_by_key = THUNK_VA + 15 * 4;
+        const uint32_t alloc = THUNK_VA + 8 * 4;
+        const uint32_t free_irp = THUNK_VA + 10 * 4;
+        const uint32_t driver_va = 0x45040;
+        const uint32_t key_va = 0x40C00;
+        uint32_t a6[6] = { XBOX_MAJOR_WRITE, 0, 0x40A00, 12, 0x40B00, 0x40800 };
+        uint32_t irp_va, free_arg[1];
+        uint32_t alloc_arg[1] = { 1 }, pkt[3];
+        XBOX_GUEST_IRP *async_irp;
+        XBOX_GUEST_DEVICE_OBJECT *device =
+            (XBOX_GUEST_DEVICE_OBJECT *)(mem + device_for_io);
+        XBOX_GUEST_DRIVER_OBJECT *driver =
+            (XBOX_GUEST_DRIVER_OBJECT *)(mem + driver_va);
+
+        a6[1] = device_for_io;
+        irp_va = call_slot(mem, build_async, 6, a6);
+        async_irp = (XBOX_GUEST_IRP *)(mem + irp_va);
+        XBOX_GUEST_IO_STACK_LOCATION *async_slot =
+            (XBOX_GUEST_IO_STACK_LOCATION *)(mem + async_irp->current_stack_location -
+                                              XBOX_IO_STACK_LOCATION_SIZE);
+        check(irp_va && g_esp == SCRATCH_SP + 28 &&
+              !(async_irp->flags & XBOX_IRP_FLAG_SYNCHRONOUS_API) &&
+              async_slot->major_function == XBOX_MAJOR_WRITE &&
+              async_slot->parameters[0] == 12 &&
+              async_slot->parameters[1] == 0x40A00,
+              "IoBuildAsynchronousFsdRequest builds caller-owned write packet", NULL);
+        free_arg[0] = irp_va;
+        (void)call_slot(mem, free_irp, 1, free_arg);
+
+        memset(driver, 0, sizeof(*driver));
+        driver->driver_start_io = TEST_STARTIO_VA;
+        device->driver_object = driver_va;
+        uint32_t queue_irps[3];
+        for (uint32_t i = 0; i < 3; ++i) {
+            queue_irps[i] = call_slot(mem, alloc, 1, alloc_arg);
+            ((XBOX_GUEST_IRP *)(mem + queue_irps[i]))->original_file_object =
+                (i + 1) * 100;
+        }
+        g_start_count = 0;
+        *(uint32_t *)(mem + key_va) = 30;
+        pkt[0] = device_for_io; pkt[1] = queue_irps[0]; pkt[2] = key_va;
+        call_slot(mem, start_packet, 3, pkt);
+        *(uint32_t *)(mem + key_va) = 10;
+        pkt[1] = queue_irps[1]; call_slot(mem, start_packet, 3, pkt);
+        *(uint32_t *)(mem + key_va) = 20;
+        pkt[1] = queue_irps[2]; call_slot(mem, start_packet, 3, pkt);
+        check(g_start_count == 1 && g_start_order[0] == 100 &&
+              device->current_irp == queue_irps[0] && device->device_queue.busy == 1 &&
+              g_esp == SCRATCH_SP + 16,
+              "IoStartPacket starts active IRP and queues two keyed packets", NULL);
+        /* Duplicate insertion of an already queued IRP must be a no-op. */
+        call_slot(mem, start_packet, 3, pkt);
+        uint32_t by_key[2] = { device_for_io, 15 };
+        call_slot(mem, start_next_by_key, 2, by_key);
+        check(g_start_count == 2 && g_start_order[1] == 300 &&
+              device->current_irp == queue_irps[2] &&
+              !((XBOX_GUEST_IRP *)(mem + queue_irps[2]))->tail_overlay.device_queue_entry.device_queue_inserted &&
+              g_esp == SCRATCH_SP + 12,
+              "IoStartNextPacketByKey selects first queued key at or above request", NULL);
+        uint32_t by_device[1] = { device_for_io };
+        call_slot(mem, start_next, 1, by_device);
+        check(g_start_count == 3 && g_start_order[2] == 200 &&
+              device->current_irp == queue_irps[1] && g_esp == SCRATCH_SP + 8,
+              "IoStartNextPacket dequeues next keyed IRP with one-arg cleanup", NULL);
+        call_slot(mem, start_next, 1, by_device);
+        check(!device->current_irp && !device->device_queue.busy &&
+              *(uint32_t *)(mem + device_for_io + 0x2c) == device_for_io + 0x2c &&
+              g_esp == SCRATCH_SP + 8,
+              "IoStartNextPacket empties queue and clears busy state", NULL);
+        {
+            uint32_t head_va = device_for_io + 0x2c;
+            uint32_t entry_va = queue_irps[0] + offsetof(XBOX_GUEST_IRP, tail_overlay);
+            uint32_t saved_head[2] = { *(uint32_t *)(mem + head_va),
+                                        *(uint32_t *)(mem + head_va + 4) };
+            *(uint32_t *)(mem + head_va) = 0xFFFFFFF0u;
+            *(uint32_t *)(mem + head_va + 4) = head_va;
+            call_slot(mem, start_next, 1, by_device);
+            check(*(uint32_t *)(mem + head_va) == 0xFFFFFFF0u &&
+                  *(uint32_t *)(mem + head_va + 4) == head_va &&
+                  !device->current_irp && !device->device_queue.busy,
+                  "IoStartNextPacket rejects unmapped queue link without mutation", NULL);
+
+            *(uint32_t *)(mem + head_va) = entry_va;
+            *(uint32_t *)(mem + head_va + 4) = entry_va;
+            *(uint32_t *)(mem + entry_va) = entry_va;
+            *(uint32_t *)(mem + entry_va + 4) = head_va;
+            *(uint8_t *)(mem + entry_va + 12) = 1;
+            call_slot(mem, start_next, 1, by_device);
+            check(*(uint32_t *)(mem + head_va) == entry_va &&
+                  *(uint32_t *)(mem + head_va + 4) == entry_va &&
+                  *(uint32_t *)(mem + entry_va) == entry_va &&
+                  *(uint32_t *)(mem + entry_va + 4) == head_va &&
+                  *(uint8_t *)(mem + entry_va + 12) == 1 &&
+                  !device->current_irp && !device->device_queue.busy,
+                  "IoStartNextPacket rejects cyclic queue without mutation", NULL);
+
+            *(uint32_t *)(mem + head_va) = saved_head[0];
+            *(uint32_t *)(mem + head_va + 4) = saved_head[1];
+            *(uint32_t *)(mem + entry_va) = entry_va;
+            *(uint32_t *)(mem + entry_va + 4) = entry_va;
+            *(uint8_t *)(mem + entry_va + 12) = 0;
+        }
+        for (uint32_t i = 0; i < 3; ++i) {
+            free_arg[0] = queue_irps[i];
+            (void)call_slot(mem, free_irp, 1, free_arg);
+        }
+    }
+
+    /* The synchronous convenience exports need a guest-thread wait contract
+     * that this bridge does not provide. They fail explicitly without
+     * translating/dereferencing guest pointers as host addresses. */
+    {
+        const uint32_t sync_ioctl = THUNK_VA + 20 * 4;
+        const uint32_t sync_fsd = THUNK_VA + 21 * 4;
+        uint32_t ioctl_args[8] = {
+            0x222000u, device_for_io, 0x40A00, 4, 0x40A10, 8, 0x40C20, 0
+        };
+        uint32_t fsd_args[5] = { XBOX_MAJOR_READ, device_for_io, 0x40A00,
+                                 4, 0x40B00 };
+        *(uint32_t *)(mem + 0x40C20) = 0xA55AA55Au;
+        check(call_slot(mem, sync_ioctl, 8, ioctl_args) == 0xC0000002u &&
+              *(uint32_t *)(mem + 0x40C20) == 0xA55AA55Au &&
+              g_esp == SCRATCH_SP + 36,
+              "IoSynchronousDeviceIoControlRequest fails explicitly with 8-arg cleanup", NULL);
+        check(call_slot(mem, sync_fsd, 5, fsd_args) == 0xC0000002u &&
+              g_esp == SCRATCH_SP + 24,
+              "IoSynchronousFsdRequest fails explicitly with 5-arg cleanup", NULL);
+    }
+
+    /* Synchronous builder ownership metadata must grow with live requests,
+     * unregister on explicit IoFreeIrp, and allow the heap VA to be reused. */
+    {
+        enum { LIVE_SYNC_IRPS = 260 };
+        const uint32_t build_fsd = THUNK_VA + 7 * 4;
+        const uint32_t free_irp = THUNK_VA + 10 * 4;
+        uint32_t irps[LIVE_SYNC_IRPS];
+        uint32_t args[7] = { XBOX_MAJOR_READ, device_for_io, 0x40A00, 4,
+                             0x40B00, 0, 0 };
+        uint32_t free_arg[1];
+        int all_built = 1, all_freed = 1;
+        for (uint32_t i = 0; i < LIVE_SYNC_IRPS; ++i) {
+            irps[i] = call_slot(mem, build_fsd, 7, args);
+            if (!irps[i]) all_built = 0;
+        }
+        for (uint32_t i = 0; i < LIVE_SYNC_IRPS; ++i) {
+            free_arg[0] = irps[i];
+            if (!irps[i] || call_slot(mem, free_irp, 1, free_arg) != 0 ||
+                xbox_HeapBlockSize(irps[i]) != 0)
+                all_freed = 0;
+        }
+        check(all_built && all_freed,
+              "synchronous IRP ownership handles 260 live allocations and frees", NULL);
+
+        uint32_t first = call_slot(mem, build_fsd, 7, args);
+        free_arg[0] = first;
+        (void)call_slot(mem, free_irp, 1, free_arg);
+        uint32_t reused = call_slot(mem, build_fsd, 7, args);
+        check(first && reused == first && xbox_HeapBlockSize(reused) != 0,
+              "IoFreeIrp unregisters ownership before guest VA reuse", NULL);
+        free_arg[0] = reused;
+        (void)call_slot(mem, free_irp, 1, free_arg);
+    }
+
+    /* Real driver order can complete/free the active synchronous IRP, queue a
+     * new packet while DeviceObject still names that just-completed IRP, then
+     * call IoStartNextPacket. The queue path must not dereference the stale
+     * CurrentIrp during this documented transition window. */
+    {
+        const uint32_t build_fsd = THUNK_VA + 7 * 4;
+        const uint32_t alloc = THUNK_VA + 8 * 4;
+        const uint32_t start_packet = THUNK_VA + 13 * 4;
+        const uint32_t start_next = THUNK_VA + 14 * 4;
+        const uint32_t free_irp = THUNK_VA + 10 * 4;
+        uint32_t sync_args[7] = { XBOX_MAJOR_READ, device_for_io, 0x40A00,
+                                  4, 0x40B00, 0, 0 };
+        uint32_t alloc_args[1] = { 1 }, packet_args[3];
+        uint32_t next_irp = call_slot(mem, alloc, 1, alloc_args);
+        uint32_t active_irp = call_slot(mem, build_fsd, 7, sync_args);
+        uint32_t empty_queue[1] = { device_for_io };
+        XBOX_GUEST_DEVICE_OBJECT *device =
+            (XBOX_GUEST_DEVICE_OBJECT *)(mem + device_for_io);
+        ((XBOX_GUEST_IRP *)(mem + next_irp))->original_file_object = 902;
+        ((XBOX_GUEST_IRP *)(mem + active_irp))->original_file_object = 901;
+        g_start_count = 0;
+        g_start_action = 1;
+        g_start_complete_entry = THUNK_VA + 17 * 4;
+        g_start_packet_entry = start_packet;
+        g_start_enqueue_irp = next_irp;
+        g_start_enqueue_key_va = 0;
+        g_start_completed_and_freed = 0;
+        packet_args[0] = device_for_io;
+        packet_args[1] = active_irp;
+        packet_args[2] = 0;
+        call_slot(mem, start_packet, 3, packet_args);
+        check(g_start_completed_and_freed && g_start_count == 1 &&
+              device->current_irp == active_irp && device->device_queue.busy == 1 &&
+              ((XBOX_GUEST_IRP *)(mem + next_irp))->tail_overlay.device_queue_entry.device_queue_inserted,
+              "StartPacket queues behind just-completed active IRP", NULL);
+        call_slot(mem, start_next, 1, empty_queue);
+        check(g_start_count == 2 && g_start_order[1] == 902 &&
+              device->current_irp == next_irp && device->device_queue.busy == 1 &&
+              !((XBOX_GUEST_IRP *)(mem + next_irp))->tail_overlay.device_queue_entry.device_queue_inserted,
+              "StartNextPacket starts queued request after completion transition", NULL);
+        call_slot(mem, start_next, 1, empty_queue);
+        uint32_t free_args[1] = { next_irp };
+        (void)call_slot(mem, free_irp, 1, free_args);
+    }
+
+    /* IofCallDriver enters the driver table through a guest x86 stdcall frame;
+     * completion writes the caller's guest IOSB and signals its guest event. */
+    {
+        const uint32_t build_fsd = THUNK_VA + 7 * 4;
+        const uint32_t call_driver = THUNK_VA + 16 * 4;
+        const uint32_t complete = THUNK_VA + 17 * 4;
+        const uint32_t alloc = THUNK_VA + 8 * 4;
+        const uint32_t driver_va = 0x45040, event_va = 0x40900;
+        const uint32_t ios_va = 0x40800, buffer_va = 0x40A00;
+        uint32_t a[7] = { XBOX_MAJOR_READ, 0, buffer_va, 4, 0, event_va, ios_va };
+        uint32_t irp_va, invalid_dispatch_va;
+        XBOX_GUEST_DRIVER_OBJECT *driver = (XBOX_GUEST_DRIVER_OBJECT *)(mem + driver_va);
+        XBOX_GUEST_IRP *irp;
+
+        memset(driver, 0, sizeof(*driver));
+        driver->major_function[XBOX_MAJOR_READ] = TEST_DISPATCH_VA;
+        ((XBOX_GUEST_DEVICE_OBJECT *)(mem + device_for_io))->driver_object = driver_va;
+        a[1] = device_for_io;
+        g_complete_entry = complete;
         *(uint32_t *)(mem + ios_va) = 0xFFFFFFFFu;
         *(uint32_t *)(mem + ios_va + 4) = 0xFFFFFFFFu;
-        *(uint32_t *)(mem + ios_va + 8) = canary;
-        status = call_slot(mem, build_fsd, 7, a);
-        check(status == 0 && g_esp == SCRATCH_SP + 32,
-              "IoBuildSynchronousFsdRequest dispatches with 7 stdcall args", NULL);
+        *(uint32_t *)(mem + event_va + 4) = 0;
+        g_dispatch_mode = 0;
+        irp_va = call_slot(mem, build_fsd, 7, a);
+        g_ebx = 0xBEBEBEBEu; g_esi = 0x51515151u; g_edi = 0xD1D1D1D1u;
+        uint32_t dispatch_status = call_fast_slot(mem, call_driver, device_for_io, irp_va);
+        char dispatch_detail[160];
+        snprintf(dispatch_detail, sizeof dispatch_detail,
+                 "status=%08x esp=%08x ebx=%08x esi=%08x edi=%08x nested=%u",
+                 dispatch_status, g_esp, g_ebx, g_esi, g_edi, g_nested_preserved);
+        check(dispatch_status == 0 &&
+              g_esp == SCRATCH_SP && g_ebx == 0xBEBEBEBEu &&
+              g_esi == 0x51515151u && g_edi == 0xD1D1D1D1u,
+              "IofCallDriver dispatches guest callback and restores caller state", dispatch_detail);
         check(*(uint32_t *)(mem + ios_va) == 0 &&
-              *(uint32_t *)(mem + ios_va + 4) == 0,
-              "IoBuildSynchronousFsdRequest writes guest IOSB status and information", NULL);
-        check(*(uint32_t *)(mem + ios_va + 8) == canary,
-              "IoBuildSynchronousFsdRequest preserves the adjacent guest canary", NULL);
+              *(uint32_t *)(mem + ios_va + 4) == 7 &&
+              *(int32_t *)(mem + event_va + 4) == 1 && g_nested_preserved,
+              "nested IofCompleteRequest writes IOSB and signals event", NULL);
+        uint32_t wait_args[5] = { event_va, 0, 0, 0, 0 };
+        check(call_slot(mem, THUNK_VA + 22 * 4, 5, wait_args) == 0 &&
+              *(int32_t *)(mem + event_va + 4) == 0,
+              "KeWaitForSingleObject consumes completed synchronization event", NULL);
 
-        a[6] = 0;
-        status = call_slot(mem, build_fsd, 7, a);
-        check(status == 0 && g_esp == SCRATCH_SP + 32,
-              "IoBuildSynchronousFsdRequest accepts a null IOSB", NULL);
+        *(uint32_t *)(mem + ios_va) = 0xFFFFFFFFu;
+        *(uint32_t *)(mem + ios_va + 4) = 0xFFFFFFFFu;
+        *(int32_t *)(mem + event_va + 4) = 0;
+        g_dispatch_mode = 1;
+        irp_va = call_slot(mem, build_fsd, 7, a);
+        check(call_fast_slot(mem, call_driver, device_for_io, irp_va) == 0x103u &&
+              *(uint32_t *)(mem + ios_va) == 0xFFFFFFFFu &&
+              *(uint32_t *)(mem + ios_va + 4) == 0xFFFFFFFFu &&
+              *(int32_t *)(mem + event_va + 4) == 0,
+              "pending dispatch retains IRP without premature completion", NULL);
+        irp = (XBOX_GUEST_IRP *)(mem + irp_va);
+        irp->io_status.status = 0;
+        irp->io_status.information = 11;
+        check(call_fast_slot(mem, complete, irp_va, 0) == 0 &&
+              *(uint32_t *)(mem + ios_va) == 0 &&
+              *(uint32_t *)(mem + ios_va + 4) == 11 &&
+              *(int32_t *)(mem + event_va + 4) == 1,
+              "later completion publishes retained pending IRP result", NULL);
+        check(call_slot(mem, THUNK_VA + 22 * 4, 5, wait_args) == 0 &&
+              *(int32_t *)(mem + event_va + 4) == 0,
+              "KeWaitForSingleObject consumes pending completion event", NULL);
+        check(xbox_HeapBlockSize(irp_va) == 0,
+              "synchronous builder IRP is released after completion", NULL);
+
+        /* A major-function entry may point directly to an imported kernel
+         * thunk such as IoInvalidDeviceRequest, not only generated code. */
+        invalid_dispatch_va = *(uint32_t *)(mem + THUNK_VA + 18 * 4);
+        driver->major_function[XBOX_MAJOR_READ] = invalid_dispatch_va;
+        uint32_t stack_args[1] = { 1 };
+        irp_va = call_slot(mem, alloc, 1, stack_args);
+        irp = (XBOX_GUEST_IRP *)(mem + irp_va);
+        irp->user_iosb = ios_va;
+        irp->user_event = event_va;
+        ((XBOX_GUEST_IO_STACK_LOCATION *)(mem + irp->current_stack_location -
+          XBOX_IO_STACK_LOCATION_SIZE))->major_function = XBOX_MAJOR_READ;
+        *(int32_t *)(mem + event_va + 4) = 0;
+        *(uint32_t *)(mem + ios_va + 4) = 0xFFFFFFFFu;
+        check(call_fast_slot(mem, call_driver, device_for_io, irp_va) == 0xC0000010u &&
+              irp->io_status.status == 0xC0000010u && irp->io_status.information == 0 &&
+              *(uint32_t *)(mem + ios_va) == 0xC0000010u &&
+              *(uint32_t *)(mem + ios_va + 4) == 0 &&
+              *(int32_t *)(mem + event_va + 4) == 1,
+              "IoInvalidDeviceRequest thunk rejects and completes guest IRP", NULL);
+        uint32_t free_args[1] = { irp_va };
+        free_args[0] = irp_va;
+        (void)call_slot(mem, THUNK_VA + 10 * 4, 1, free_args);
     }
 
     /* Symbolic links. A name the title registered opens to that target, an
