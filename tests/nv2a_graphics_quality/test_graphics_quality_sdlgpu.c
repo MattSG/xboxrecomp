@@ -318,8 +318,8 @@ static int test_descriptor_rollover(void)
     submit(NULL);
     s = surface_find(phys(st.color_addr));
     CHECK(s);
-    packed = make_texture(16, 8, 1, 0, FMT_RGBA16, USAGE_TARGET);
-    out = make_texture(8, 8, 1, 0, FMT_BGRA8, USAGE_TARGET);
+    packed = make_texture(16, 8, 1, 0, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM, USAGE_TARGET);
+    out = make_texture(8, 8, 1, 0, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, USAGE_TARGET);
     CHECK(packed && out);
     composite(out, 8, 8, s, &pc, 0);
     CHECK(nv2a_test_read_level(out, 8, 8, 0, 0, reference));
@@ -331,7 +331,10 @@ static int test_descriptor_rollover(void)
     }
     composite(out, 8, 8, s, &pc, 0);
     CHECK(nv2a_test_read_level(out, 8, 8, 0, 0, pixels));
-    for (i = 0; i < 64; i++) CHECK(pixels[i] == reference[i]);
+    for (i = 0; i < 64; i++) {
+        CHECK(reference[i] == 0xFFFF0000u);
+        CHECK(pixels[i] == reference[i]);
+    }
     SDL_ReleaseGPUTexture(s_dev, packed);
     SDL_ReleaseGPUTexture(s_dev, out);
     puts("PASS: sampler heap rollover preserves all draw tables and exact pixels");
