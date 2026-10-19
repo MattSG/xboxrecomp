@@ -1880,46 +1880,17 @@ static uint32_t write_mask(const NvD3DState *st, Surface *s)
 
 static int s_draw_textured, s_draw_reads_wide;
 static uint32_t s_draw_tex_addr;
-static uint32_t s_flare_stage_program;
 static int s_draw_bspline;
-static uint32_t s_bspline_sf, s_bspline_df;
 
 extern const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4];
 extern const float (*nv2a_vsh_constants(uint32_t *version))[4];
 
-void nv2a_d3d_set_flare_depth_test(uint32_t stage_program)
+static int draw_forces_depth(const NvD3DState *st)
 {
-    s_flare_stage_program = stage_program;
-}
-
-/* See flare_needs_depth in nv2a_d3d11.c. */
-static int flare_needs_depth(const NvD3DState *st)
-{
-    static int noted;
-    Surface *mask;
-    uint32_t address, reject = 0;
-    unsigned n;
-    if (!s_flare_stage_program || !st->rc_seen || st->rc.stage_program != s_flare_stage_program)
-        return 0;
-    address = phys(st->tex[0].addr);
-    if (!address || phys(st->tex[3].addr) == address) return 0;
-    mask = surface_find(address);
-    if (st->depth_test || st->depth_mask || !st->zeta_addr) reject |= 1u;
-    if (!st->blend_enable || st->blend_dfactor != 1u || st->blend_equation != 0x8006u)
-        reject |= 2u;
-    if (!mask || mask->w != st->clip_w || mask->h != st->clip_h) reject |= 4u;
-    for (n = 0; n < 3; ++n) {
-        const NvD3DTexture *t = &st->tex[n];
-        if (phys(t->addr) != address || t->cube || t->color != 0x12u ||
-            ((t->filter >> 24) & 15u) != 2u)
-            reject |= 8u;
-    }
-    if (reject) return 0;
-    if (!noted) {
-        fprintf(stderr, "[SDLGPU] lamp visibility sprites use scene depth\n");
-        noted = 1;
-    }
-    return 1;
+    Surface *source;
+    if (!s_overlay.force_depth_test) return 0;
+    source = surface_find(phys(st->tex[0].addr));
+    return s_overlay.force_depth_test(st, source ? source->w : 0, source ? source->h : 0);
 }
 
 /* The levels of a swizzled render target found as one chain (see
@@ -2077,7 +2048,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     SDL_GPUTexture *srv[13] = { 0 };
     void *smp[4] = { 0 };
     SDL_GPUTexture *fb = NULL;
-    int cull = 0, bias = 0, flare_depth = flare_needs_depth(st), wdepth;
+    int cull = 0, bias = 0, flare_depth = draw_forces_depth(st), wdepth;
     float slope = 0, bf[4];
     PipeKey k;
     SDL_GPUGraphicsPipeline *pipe;
@@ -2187,12 +2158,8 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         if (tex_volume(t)) srv[9 + n] = view;
         else if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
         smp[n] = sampler(t, levels, reduce, smp);
-        if (n == 0 && !rt && !t->cube && kind == K_DXT && t->color == 0x0F &&
-            t->width == 256 && t->height == 256 && levels > 4 &&
-            (((t->filter >> 16) & 0xFF) == 2 || ((t->filter >> 16) & 0xFF) == 4 ||
-             ((t->filter >> 16) & 0xFF) == 6) && ((t->filter >> 24) & 0xF) != 1 &&
-            s_bspline_sf && !st->depth_test && st->blend_enable &&
-            st->blend_sfactor == s_bspline_sf && st->blend_dfactor == s_bspline_df)
+        if (n == 0 && !t->cube && !tex_volume(t) && s_overlay.cubic_filter_0 &&
+            s_overlay.cubic_filter_0(st, rt != NULL, (uint32_t)levels))
             s_draw_bspline = 1;
         pc.tex_info[n][0] = (t->control0 >> 2) & 1;
         pc.tex_info[n][1] = (t->filter >> 28) | (tex_volume(t) ? 256u : 0u);
@@ -2402,11 +2369,6 @@ int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4])
     return n;
 }
 
-void nv2a_d3d_set_bspline_blend(uint32_t sfactor, uint32_t dfactor)
-{
-    s_bspline_sf = sfactor;
-    s_bspline_df = dfactor;
-}
 
 static void note_menu_rects(const float (*pos)[4], const uint32_t *idx, uint32_t ni, uint32_t lo)
 {

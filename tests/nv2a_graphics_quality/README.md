@@ -7,9 +7,9 @@ It compiles the actual HLSL; no renderer or GPU results are simulated.
   independent 16-texel cardinal cubic reference. It verifies ordinary stage-zero
   and stage-one sampling against bilinear reference pixels. Alpha stays within
   the authored range. Float texture fixtures isolate filtering from BC decoding.
-- `gates`: inspects the constant buffer produced by real pipeline setup, checking
-  title opt-in and exact panorama selection while ordinary, cube, nonzero-stage,
-  short-mip, point-filtered, blend and depth-tested draws retain their sampling.
+- `gates`: inspects actual pipeline setup with and without the optional sampling
+  hook, checking metadata delivery and opt-in/opt-out. Authored asset selection
+  belongs to the port and is tested there.
 - `depth`: checks every packed high-word depth texel from the actual depth view
   at scales 1/2/4/8, both single-sample and 4x MSAA, against independently indexed
   depth values. Covers the left boundary clamp and all color/alpha channels.
@@ -17,14 +17,12 @@ It compiles the actual HLSL; no renderer or GPU results are simulated.
   stream output. Checks full-screen bounds, integer menu vertices, fractional
   boundaries, perspective geometry, and offscreen pixel-zero snapping.
 
-From the game repository with its portable toolchain loaded:
+From the toolkit root with CMake and a C compiler available:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process Bypass -Force
-. ./scripts/enter-env.ps1
-cmake -S tools/xboxrecomp/tests/nv2a_graphics_quality -B conformance_tmp/graphics-quality-test -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build conformance_tmp/graphics-quality-test
-ctest --test-dir conformance_tmp/graphics-quality-test --output-on-failure
+cmake -S tests/nv2a_graphics_quality -B build/graphics-quality -DCMAKE_BUILD_TYPE=Release
+cmake --build build/graphics-quality --config Release
+ctest --test-dir build/graphics-quality -C Release --output-on-failure
 ```
 
 The cubic comparison allows 0.004 per float channel for hardware bilinear weight
