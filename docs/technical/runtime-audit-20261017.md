@@ -84,6 +84,25 @@ The test embeds data; it does not download dependencies at runtime.
 
 ### 2026-10-19 continuation
 
+- Synchronous guest helper ordinals 84/85 now build, dispatch and wait for
+  actual completion. Original kernel 4627 disassembly resolves their policy:
+  immediate requests return the driver dispatch status; pending requests wait
+  and return IOSB.Status. Ordinal 84 copies IOSB.Information even for errors
+  and STATUS_BUFFER_OVERFLOW. Their temporary event is a NotificationEvent.
+  Export 84 returns with 32 bytes of arguments; export 85 with 20 bytes.
+  The original allocation-failure path copies an uninitialized Information
+  word; this runtime leaves returned length unchanged on pre-dispatch failure
+  instead of fabricating that undefined value. This is not full driver fidelity.
+  KEVENT initialization now shares a checked 16-byte header writer (Size=4,
+  Inserted=0, self-linked wait list). Completion retires synchronous IRP
+  ownership before signaling, preventing a waiter/reused-address cleanup race.
+  Independent MSVC and GCC13 bridge tests pass, including pending completion,
+  immediate status/IOSB disagreement, warning lengths, raw event headers and
+  32 immediate-reuse handoffs. Primary instruction bytes are retained in the
+  ignored `build/audit-continuation/xemu-io-policy/` evidence directory of this
+  repository. The probe used private HDD/EEPROM/config copies and stopped only
+  its owned xemu process. No guest helper reachability in gameplay is claimed.
+
 - NT file bridges now validate the complete mandatory eight-byte guest IOSB
   before backend calls or output mutation. Shared create/open handling covers
   NtCreateFile, NtOpenFile and IoCreateFile; read/write, information queries,
@@ -113,7 +132,7 @@ The test embeds data; it does not download dependencies at runtime.
   more than 256 simultaneous synchronous builder packets.
   This is guest packet/dispatch support, not native host-pointer driver I/O.
   Native unsupported operations return failure rather than fabricated success.
-  Synchronous helper ordinals 84/85, IoMarkIrpMustComplete semantics and
+  IoMarkIrpMustComplete semantics and
   abandoned thread-owned request rundown remain open; no full storage-driver
   acceptance is claimed.
 - Stack payload offsets follow original driver instructions retained in the

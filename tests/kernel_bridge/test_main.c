@@ -49,6 +49,14 @@ static uint32_t g_start_packet_entry;
 static uint32_t g_start_enqueue_irp;
 static uint32_t g_start_enqueue_key_va;
 static uint32_t g_start_completed_and_freed;
+static uint32_t g_sync_pending_irp;
+static uint32_t g_sync_complete_entry;
+static HANDLE g_sync_dispatch_entered;
+static int g_sync_event_header_expected;
+static int g_sync_event_header_ok = 1;
+static uint32_t g_sync_event_header_checks;
+static uint32_t call_fast_slot(uint8_t *mem, uint32_t entry_va,
+                               uint32_t ecx, uint32_t edx);
 
 #define TEST_DISPATCH_VA 0x45080u
 #define TEST_STARTIO_VA  0x45084u
@@ -60,10 +68,32 @@ static void test_dispatch_callback(void)
     XBOX_GUEST_IRP *irp = (XBOX_GUEST_IRP *)(g_guest_mem + irp_va);
     recomp_func_t complete;
 
-    irp->io_status.status = g_dispatch_mode == 1 ? 0x00000103u : 0;
-    irp->io_status.information = 7;
-    g_eax = irp->io_status.status;
-    if (g_dispatch_mode == 0) {
+    if (g_sync_event_header_expected) {
+        uint32_t event_va = irp->user_event;
+        XBOX_GUEST_DISPATCHER_HEADER *header = event_va ?
+            (XBOX_GUEST_DISPATCHER_HEADER *)(g_guest_mem + event_va) : NULL;
+        if (!header || header->type != 0 || header->absolute != 0 ||
+            header->size != 4 || header->inserted != 0 ||
+            header->signal_state != 0 ||
+            header->wait_list_head[0] != event_va + 8 ||
+            header->wait_list_head[1] != event_va + 8)
+            g_sync_event_header_ok = 0;
+        ++g_sync_event_header_checks;
+    }
+
+    irp->io_status.status = g_dispatch_mode == 1 ? 0x00000103u :
+                            g_dispatch_mode == 2 ? 0xC0000001u :
+                            g_dispatch_mode == 3 ? 0x80000005u : 0;
+    irp->io_status.information = g_dispatch_mode == 2 ? 9 :
+                                  g_dispatch_mode == 3 ? 13 : 7;
+    /* Mode 2 returns success with an IOSB error; mode 3 returns the warning
+     * STATUS_BUFFER_OVERFLOW. Xbox ordinal 84 returns the dispatch status on
+     * immediate completion but copies IOSB.Information for either status. */
+    g_eax = g_dispatch_mode == 2 ? 0 : irp->io_status.status;
+    if (g_dispatch_mode == 1 && g_sync_dispatch_entered) {
+        g_sync_pending_irp = irp_va;
+        SetEvent(g_sync_dispatch_entered);
+    } else if (g_dispatch_mode != 1) {
         uint32_t result = g_eax;
         g_ecx = irp_va;
         g_edx = 0;
@@ -75,6 +105,20 @@ static void test_dispatch_callback(void)
         g_eax = result;
     }
     g_esp += 12; /* stdcall dispatch routine consumed return + two arguments */
+}
+
+static DWORD WINAPI complete_pending_sync_irp(LPVOID parameter)
+{
+    (void)parameter;
+    if (WaitForSingleObject(g_sync_dispatch_entered, 2000) != WAIT_OBJECT_0)
+        return 1;
+    Sleep(10); /* let dispatch return STATUS_PENDING before completion */
+    XBOX_GUEST_IRP *irp = (XBOX_GUEST_IRP *)(g_guest_mem + g_sync_pending_irp);
+    irp->io_status.status = 0;
+    irp->io_status.information = 13;
+    (void)call_fast_slot(g_guest_mem, g_sync_complete_entry,
+                         g_sync_pending_irp, 0);
+    return 0;
 }
 
 static void test_start_io_callback(void)
@@ -456,6 +500,19 @@ int main(void)
 
         check(device_for_io != 0, "I/O builders have a real guest device", NULL);
         call_slot(mem, init_event_thunk, 3, init_event);
+        XBOX_GUEST_DISPATCHER_HEADER *initialized_event =
+            (XBOX_GUEST_DISPATCHER_HEADER *)(mem + event_va);
+        check(initialized_event->type == 1 && initialized_event->absolute == 0 &&
+              initialized_event->size == 4 && initialized_event->inserted == 0 &&
+              initialized_event->signal_state == 0 &&
+              initialized_event->wait_list_head[0] == event_va + 8 &&
+              initialized_event->wait_list_head[1] == event_va + 8,
+              "KeInitializeEvent writes Xbox dispatcher-header bytes", NULL);
+        uint32_t boundary_event[3] = { 0x03FFFFF8u, 1, 0 };
+        memset(mem + boundary_event[0], 0xCC, 8);
+        call_slot(mem, init_event_thunk, 3, boundary_event);
+        check(all_value(mem + boundary_event[0], 8, 0xCC),
+              "KeInitializeEvent validates full 16-byte guest header before write", NULL);
         *(uint32_t *)(mem + offset_va) = 0x11223344u;
         *(uint32_t *)(mem + offset_va + 4) = 0x55667788u;
         a[0] = 0x222000u; a[1] = device_for_io;
@@ -621,25 +678,126 @@ int main(void)
         }
     }
 
-    /* The synchronous convenience exports need a guest-thread wait contract
-     * that this bridge does not provide. They fail explicitly without
-     * translating/dereferencing guest pointers as host addresses. */
+    /* Synchronous convenience exports use the same guest builders and driver
+     * dispatch path, then wait on a shadowed guest notification event when
+     * the driver returns STATUS_PENDING. The wait itself has no runtime
+     * timeout; the CTest process has a finite guard against a broken test. */
     {
         const uint32_t sync_ioctl = THUNK_VA + 20 * 4;
         const uint32_t sync_fsd = THUNK_VA + 21 * 4;
-        uint32_t ioctl_args[8] = {
-            0x222000u, device_for_io, 0x40A00, 4, 0x40A10, 8, 0x40C20, 0
-        };
+        const uint32_t driver_va = 0x45040;
+        uint32_t ioctl_args[8] = { 0x222000u, device_for_io, 0x40A00, 4,
+            0x40A10, 8, 0x40C20, 0 };
         uint32_t fsd_args[5] = { XBOX_MAJOR_READ, device_for_io, 0x40A00,
                                  4, 0x40B00 };
+        XBOX_GUEST_DRIVER_OBJECT *driver =
+            (XBOX_GUEST_DRIVER_OBJECT *)(mem + driver_va);
+        driver->major_function[XBOX_MAJOR_DEVICE_CONTROL] = TEST_DISPATCH_VA;
+        driver->major_function[XBOX_MAJOR_READ] = TEST_DISPATCH_VA;
+        g_complete_entry = THUNK_VA + 17 * 4;
         *(uint32_t *)(mem + 0x40C20) = 0xA55AA55Au;
-        check(call_slot(mem, sync_ioctl, 8, ioctl_args) == 0xC0000002u &&
-              *(uint32_t *)(mem + 0x40C20) == 0xA55AA55Au &&
+        *(uint32_t *)(mem + 0x40C24) = 0xC0FFEE11u;
+        g_dispatch_mode = 0;
+        g_sync_event_header_expected = 1;
+        uint32_t temp_probe = xbox_HeapAlloc(24, 4);
+        xbox_HeapFree(temp_probe);
+        uint32_t status = call_slot(mem, sync_ioctl, 8, ioctl_args);
+        check(status == 0 && *(uint32_t *)(mem + 0x40C20) == 7 &&
+              *(uint32_t *)(mem + 0x40C24) == 0xC0FFEE11u &&
+              g_esp == SCRATCH_SP + 36 && xbox_HeapBlockSize(temp_probe) == 0,
+              "IoSynchronousDeviceIoControlRequest dispatches and returns IOSB length", NULL);
+        check(g_sync_event_header_checks == 1 && g_sync_event_header_ok,
+              "synchronous builder callback observes valid guest KEVENT header", NULL);
+
+        temp_probe = xbox_HeapAlloc(24, 4);
+        xbox_HeapFree(temp_probe);
+        g_sync_dispatch_entered = CreateEventA(NULL, FALSE, FALSE, NULL);
+        g_sync_complete_entry = THUNK_VA + 17 * 4;
+        g_sync_event_header_expected = 1;
+        HANDLE worker = CreateThread(NULL, 0, complete_pending_sync_irp,
+                                     NULL, 0, NULL);
+        g_dispatch_mode = 1;
+        status = call_slot(mem, sync_fsd, 5, fsd_args);
+        DWORD worker_status = worker ? WaitForSingleObject(worker, 2000) : WAIT_FAILED;
+        char pending_detail[160];
+        snprintf(pending_detail, sizeof pending_detail,
+                 "status=%08x worker=%08x esp=%08x irp=%08x size=%u",
+                 status, worker_status, g_esp, g_sync_pending_irp,
+                 xbox_HeapBlockSize(g_sync_pending_irp));
+        check(status == 0 && worker_status == WAIT_OBJECT_0 &&
+              g_esp == SCRATCH_SP + 24 &&
+              xbox_HeapBlockSize(g_sync_pending_irp) == 0 &&
+              xbox_HeapBlockSize(temp_probe) == 0,
+              "IoSynchronousFsdRequest waits for later completion and frees IRP",
+              pending_detail);
+        check(g_sync_event_header_checks == 2 && g_sync_event_header_ok,
+              "pending builder callback observes valid guest KEVENT header", NULL);
+        if (worker) CloseHandle(worker);
+        if (g_sync_dispatch_entered) CloseHandle(g_sync_dispatch_entered);
+        g_sync_dispatch_entered = NULL;
+        g_sync_event_header_expected = 0;
+
+        /* A signaled waiter immediately builds another bridge-owned IRP before
+         * joining the worker. Completion must retire its prior owner before
+         * signaling, or its tail can take and free this recycled owner. */
+        {
+            const uint32_t build_sync_fsd = THUNK_VA + 7 * 4;
+            const uint32_t free_irp = THUNK_VA + 10 * 4;
+            uint32_t owner_args[7] = { XBOX_MAJOR_READ, device_for_io,
+                0x40A00, 4, 0x40B00, 0, 0 };
+            int reuse_ok = 1;
+            for (uint32_t i = 0; i < 32; ++i) {
+                g_sync_dispatch_entered = CreateEventA(NULL, FALSE, FALSE, NULL);
+                g_sync_pending_irp = 0;
+                HANDLE racing_worker = g_sync_dispatch_entered
+                    ? CreateThread(NULL, 0, complete_pending_sync_irp,
+                                   NULL, 0, NULL) : NULL;
+                uint32_t raced_irp = 0;
+                DWORD racing_status = WAIT_FAILED;
+                if (racing_worker) {
+                    g_dispatch_mode = 1;
+                    status = call_slot(mem, sync_fsd, 5, fsd_args);
+                    raced_irp = call_slot(mem, build_sync_fsd, 7, owner_args);
+                    racing_status = WaitForSingleObject(racing_worker, 2000);
+                }
+                if (!racing_worker || status != 0 || !raced_irp ||
+                    racing_status != WAIT_OBJECT_0 ||
+                    xbox_HeapBlockSize(raced_irp) == 0) {
+                    reuse_ok = 0;
+                }
+                if (raced_irp && xbox_HeapBlockSize(raced_irp)) {
+                    uint32_t free_args[1] = { raced_irp };
+                    (void)call_slot(mem, free_irp, 1, free_args);
+                }
+                if (racing_worker) CloseHandle(racing_worker);
+                if (g_sync_dispatch_entered) CloseHandle(g_sync_dispatch_entered);
+                g_sync_dispatch_entered = NULL;
+            }
+            g_dispatch_mode = 0;
+            check(reuse_ok,
+                  "pending completion cannot free a newly registered IRP owner",
+                  "32 completion/waiter handoffs with immediate IRP reuse");
+        }
+
+        g_dispatch_mode = 2;
+        status = call_slot(mem, sync_ioctl, 8, ioctl_args);
+        check(status == 0 &&
+              *(uint32_t *)(mem + 0x40C20) == 9 &&
+              *(uint32_t *)(mem + 0x40C24) == 0xC0FFEE11u,
+              "synchronous control request returns immediate dispatch status and copies error Information", NULL);
+
+        *(uint32_t *)(mem + 0x40C20) = 0xA55AA55Au;
+        g_dispatch_mode = 3;
+        status = call_slot(mem, sync_ioctl, 8, ioctl_args);
+        check(status == 0x80000005u &&
+              *(uint32_t *)(mem + 0x40C20) == 13,
+              "synchronous control request copies Information for STATUS_BUFFER_OVERFLOW", NULL);
+
+        ioctl_args[6] = UINT32_MAX;
+        g_dispatch_mode = 0;
+        check(call_slot(mem, sync_ioctl, 8, ioctl_args) == 0xC0000005u &&
               g_esp == SCRATCH_SP + 36,
-              "IoSynchronousDeviceIoControlRequest fails explicitly with 8-arg cleanup", NULL);
-        check(call_slot(mem, sync_fsd, 5, fsd_args) == 0xC0000002u &&
-              g_esp == SCRATCH_SP + 24,
-              "IoSynchronousFsdRequest fails explicitly with 5-arg cleanup", NULL);
+              "synchronous control request validates returned-length span", NULL);
     }
 
     /* Synchronous builder ownership metadata must grow with live requests,
