@@ -102,9 +102,6 @@ int nv2a_d3d_menu_rects_on(void);
 /* The last shown frame's quads (up to max), and where it landed in the
  * window: x0, y0, w, h as fractions of the client area. */
 int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4]);
-/* Sample stage 0 with a cubic B-spline in depth-test-off draws blended with
- * this source/destination factor pair (a title's magnified sky); 0, 0: off. */
-void nv2a_d3d_set_bspline_blend(uint32_t sfactor, uint32_t dfactor);
 /* Each vertex's final colour (by index - lo) for the next draw, or NULL. */
 void nv2a_d3d_set_menu_tints(const uint32_t *tints);
 
@@ -141,12 +138,14 @@ typedef struct {
      * target. Do not change guest RAM or write outside the copied attribute. */
     void (*sanitize_vertex_upload)(uint8_t *copy, const NvD3DAttrib *attrib,
                                    unsigned attribute, uint32_t lo, uint32_t count);
+    /* Optional draw policy. Zero leaves guest sampling/depth unchanged.
+     * source_width/height describe stage zero's cached render target (zero
+     * if absent). A forced depth test never writes depth and uses the scene's
+     * stored Z/W encoding. Cubic filtering is available for 2D stage zero. */
+    int (*force_depth_test)(const NvD3DState *state, uint32_t source_width, uint32_t source_height);
+    int (*cubic_filter_0)(const NvD3DState *state, int source_is_target, uint32_t levels);
 } NvOverlayHooks;
 void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks);
-/* Opt in lamp visibility sprites to scene depth, without depth writes:
- * `stage_program` is the flare shader's combiner stage program (its texture
- * modes), 0 to turn it off. */
-void nv2a_d3d_set_flare_depth_test(uint32_t stage_program);
 /* A title that multiplies its far plane by `scale` (w-buffered, so depth is
  * w / far) still indexes its authored depth lookups (fog ramps) with the
  * original fractions. Depth read back as a texture is reported in those:

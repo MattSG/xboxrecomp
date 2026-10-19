@@ -2372,75 +2372,17 @@ static uint32_t write_mask(const NvD3DState *st, Surface *s)
  * stored widened (its image already spans the wide screen). */
 static int s_draw_textured, s_draw_reads_wide;
 static uint32_t s_draw_tex_addr;
-static uint32_t s_flare_stage_program;
 static int s_draw_bspline;
-static uint32_t s_bspline_sf, s_bspline_df;
 
 extern const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4];
 extern const float (*nv2a_vsh_constants(uint32_t *version))[4];
 
-void nv2a_d3d_set_flare_depth_test(uint32_t stage_program)
+static int draw_forces_depth(const NvD3DState *st)
 {
-    s_flare_stage_program = stage_program;
-}
-
-static int flare_needs_depth(const NvD3DState *st)
-{
-    static int noted;
-    static unsigned traced;
-    Surface *mask;
-    uint32_t address, reject = 0;
-    unsigned n;
-    /* tex_used describes only the fixed-function fallback in the pushbuffer
-     * executor. Register-combiner draws select sampled stages in stage_program,
-     * which the title names (nv2a_d3d_set_flare_depth_test). */
-    if (!s_flare_stage_program || !st->rc_seen || st->rc.stage_program != s_flare_stage_program)
-        return 0;
-    address = phys(st->tex[0].addr);
-    if (!address || phys(st->tex[3].addr) == address) return 0;
-    mask = surface_find(address);
-    if (st->depth_test || st->depth_mask || !st->zeta_addr) reject |= 1u;
-    if (!st->blend_enable || st->blend_dfactor != 1u || st->blend_equation != 0x8006u)
-        reject |= 2u;
-    if (!mask || mask->w != st->clip_w || mask->h != st->clip_h) reject |= 4u;
-    /* The flare shader: t0..t2 sample the screen visibility mask;
-     * t3 samples the lamp texture. Four framebuffer taps are bloom, and
-     * one/two textures can be HUD or road light passes: none qualify. */
-    for (n = 0; n < 3; ++n) {
-        const NvD3DTexture *t = &st->tex[n];
-        if (phys(t->addr) != address || t->cube || t->color != 0x12u ||
-            ((t->filter >> 24) & 15u) != 2u)
-            reject |= 8u;
-    }
-    if (traced < 4 && getenv("RECOMP_FLARE_TRACE") &&
-        phys(st->tex[1].addr) == address && phys(st->tex[2].addr) == address) {
-        fprintf(stderr, "[D3D11] lamp pass reject=%X clip=%ux%u mask=%ux%u depth=%u write=%u zeta=%08X wbuffer=%u tex_used=%X filter=%08X/%08X/%08X\n",
-                reject, st->clip_w, st->clip_h, mask ? mask->w : 0, mask ? mask->h : 0,
-                st->depth_test, st->depth_mask, st->zeta_addr, st->z_perspective,
-                st->tex_used, st->tex[0].filter, st->tex[1].filter, st->tex[2].filter);
-        if (!traced) {
-            uint32_t start = 0, version = 0, cver = 0, k;
-            const uint32_t (*prog)[4] = nv2a_vsh_program(&start, &version);
-            const float (*consts)[4] = nv2a_vsh_constants(&cver);
-            if (prog && consts) {
-                for (k = start; k < start + 16 && k < 136u; ++k) {
-                    fprintf(stderr, "[D3D11] lamp vp %u %08X %08X %08X %08X\n",
-                            k - start, prog[k][0], prog[k][1], prog[k][2], prog[k][3]);
-                    if (prog[k][3] & 1u) break;
-                }
-                for (k = 0; k < 2; ++k)
-                    fprintf(stderr, "[D3D11] lamp c%u %.9g %.9g %.9g %.9g\n", k,
-                            consts[k][0], consts[k][1], consts[k][2], consts[k][3]);
-            }
-        }
-        ++traced;
-    }
-    if (reject) return 0;
-    if (!noted) {
-        fprintf(stderr, "[D3D11] lamp visibility sprites use scene depth\n");
-        noted = 1;
-    }
-    return 1;
+    Surface *source;
+    if (!s_overlay.force_depth_test) return 0;
+    source = surface_find(phys(st->tex[0].addr));
+    return s_overlay.force_depth_test(st, source ? source->w : 0, source ? source->h : 0);
 }
 
 /* A guest pass that reduces a render target (glare, luminance
@@ -2623,7 +2565,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     PSConsts pc;
     ID3D11ShaderResourceView *srv[13] = { 0 };
     ID3D11SamplerState *smp[4] = { 0 };
-    int cull = 0, bias = 0, flare_depth = flare_needs_depth(st), wdepth;
+    int cull = 0, bias = 0, flare_depth = draw_forces_depth(st), wdepth;
     float slope = 0, bf[4];
     s_draw_textured = s_draw_reads_wide = 0;
     s_draw_tex_addr = 0;
@@ -2742,15 +2684,8 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         if (tex_volume(t)) srv[9 + n] = view;
         else if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
         smp[n] = sampler_stage(n, t, levels, reduce);
-        /* The title opts in its 256x256 DXT5 horizon panorama, magnified
-         * across the skyline through destination alpha. Keep ordinary sky,
-         * clouds, UI, cubemaps and render-target copies on their samplers. */
-        if (n == 0 && !rt && !t->cube && kind == K_DXT && t->color == 0x0F &&
-            t->width == 256 && t->height == 256 && levels > 4 &&
-            (((t->filter >> 16) & 0xFF) == 2 || ((t->filter >> 16) & 0xFF) == 4 ||
-             ((t->filter >> 16) & 0xFF) == 6) && ((t->filter >> 24) & 0xF) != 1 &&
-            s_bspline_sf && !st->depth_test && st->blend_enable &&
-            st->blend_sfactor == s_bspline_sf && st->blend_dfactor == s_bspline_df)
+        if (n == 0 && !t->cube && !tex_volume(t) && s_overlay.cubic_filter_0 &&
+            s_overlay.cubic_filter_0(st, rt != NULL, (uint32_t)levels))
             s_draw_bspline = 1;
         pc.tex_info[n][0] = (t->control0 >> 2) & 1;
         pc.tex_info[n][1] = (t->filter >> 28) | (tex_volume(t) ? 256u : 0u);
@@ -2961,11 +2896,6 @@ int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4])
     return n;
 }
 
-void nv2a_d3d_set_bspline_blend(uint32_t sfactor, uint32_t dfactor)
-{
-    s_bspline_sf = sfactor;
-    s_bspline_df = dfactor;
-}
 
 /* One rect per triangle: either half of an axis-aligned quad spans the
  * whole quad, so batched quads come apart without knowing how they pair. */
@@ -4387,13 +4317,11 @@ int nv2a_d3d_menu_rects_on(void) { return 0; }
 void nv2a_d3d_set_menu_tints(const uint32_t *tints) { (void)tints; }
 int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4])
 { (void)out; (void)max; present[0] = present[1] = present[2] = present[3] = 0; return 0; }
-void nv2a_d3d_set_bspline_blend(uint32_t sfactor, uint32_t dfactor) { (void)sfactor; (void)dfactor; }
 void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks) { (void)hooks; }
 void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
-void nv2a_d3d_set_flare_depth_test(uint32_t stage_program) { (void)stage_program; }
 void nv2a_d3d_set_depth_view_remap(float scale, float knee) { (void)scale; (void)knee; }
 void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb, uint32_t flags, const float sky_fade[4]) { (void)st; (void)depth_to_world; (void)far_clip; (void)start; (void)end; (void)argb; (void)flags; (void)sky_fade; }
 #endif

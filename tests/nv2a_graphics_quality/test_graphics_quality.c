@@ -197,6 +197,21 @@ static NvD3DState state_for(unsigned width, unsigned height)
     st.color_mask = 0x01010101; return st;
 }
 
+static int test_cubic_enabled, test_cubic_is_target;
+static uint32_t test_cubic_levels;
+static int test_cubic_policy(const NvD3DState *st, int is_target, uint32_t levels)
+{
+    test_cubic_is_target = is_target; test_cubic_levels = levels;
+    return test_cubic_enabled && st->blend_enable;
+}
+static void test_cubic_enable(int enabled)
+{
+    NvOverlayHooks hooks = {0};
+    test_cubic_enabled = enabled;
+    hooks.cubic_filter_0 = test_cubic_policy;
+    nv2a_d3d_set_overlay_hooks(&hooks);
+}
+
 static void assert_panorama_gate(NvD3DState *st, int expected)
 {
     Surface *target; uint32_t w,h,z; PSConsts pc;
@@ -207,41 +222,25 @@ static void assert_panorama_gate(NvD3DState *st, int expected)
 
 static void test_gates(void)
 {
-    NvD3DState base = state_for(64,64), st;
-    unsigned i;
+    NvD3DState base = state_for(64,64), changed;
     base.tex_used = 1; base.blend_enable = 1;
-    base.blend_sfactor = 0x304; base.blend_dfactor = 0x305;
     base.tex[0].addr = 0x100000; base.tex[0].color = 0x0F;
     base.tex[0].format = 0x09000F00; base.tex[0].levels = 9;
     base.tex[0].width = base.tex[0].height = 256;
     base.tex[0].filter = (6u << 16) | (2u << 24);
     base.tex[0].control0 = 8u * 256u << 6; base.tex[0].address = 0x030101;
     memset(ram + 0x100000,0x55,0x90000);
-    nv2a_d3d_set_bspline_blend(0,0); assert_panorama_gate(&base,0);
-    nv2a_d3d_set_bspline_blend(0x304,0x305); assert_panorama_gate(&base,1);
-    for (i = 0; i < 10; ++i) {
-        st = base;
-        switch(i) {
-        case 0: st.depth_test = 1; st.zeta_addr = 0x20000; st.zeta_pitch = 64*4; break;
-        case 1: st.blend_enable = 0; break;
-        case 2: st.blend_sfactor = 0x302; break;
-        case 3: st.blend_dfactor = 0x303; break;
-        case 4: st.tex[0].width = 128; st.tex[0].format++; break;
-        case 5: st.tex[0].height = 128; st.tex[0].format++; break;
-        case 6: st.tex[0].color = 0x0C; st.tex[0].format++; break;
-        case 7: st.tex[0].levels = 4; st.tex[0].format++; break;
-        case 8: st.tex[0].filter = (5u << 16) | (2u << 24); break;
-        case 9: st.tex[0].filter = (6u << 16) | (1u << 24); break;
-        }
-        assert_panorama_gate(&st,0);
-    }
-    st = base; st.tex[0].cube = 1; st.tex[0].format++;
-    assert_panorama_gate(&st,0);
-    st = base; st.rc_seen = 1; st.rc.stage_program = 1u << 5;
-    st.tex[1] = st.tex[0]; memset(&st.tex[0],0,sizeof st.tex[0]);
-    assert_panorama_gate(&st,0);
-    nv2a_d3d_set_bspline_blend(0,0); assert_panorama_gate(&base,0);
-    puts("PASS: actual pixel constants select only title-enabled stage-zero 256x256 linearly-filtered DXT5 no-depth panorama; twelve ordinary/cube/stage/mip/blend/filter cases remain unchanged");
+    nv2a_d3d_set_overlay_hooks(NULL); assert_panorama_gate(&base,0);
+    test_cubic_enable(1); assert_panorama_gate(&base,1);
+    CHECK(test_cubic_levels == 9 && !test_cubic_is_target);
+    changed = base; changed.blend_enable = 0;
+    assert_panorama_gate(&changed,0);
+    changed = base; changed.tex[0].cube = 1; changed.tex[0].format++;
+    assert_panorama_gate(&changed,0);
+    changed = base; changed.tex[0].format = (base.tex[0].format & ~0xF0u) | 0x30u;
+    assert_panorama_gate(&changed,0);
+    test_cubic_enable(0); assert_panorama_gate(&base,0);
+    puts("PASS: sampling policy hook receives texture metadata and controls only opted-in draws");
 }
 
 static void test_depth(void)
