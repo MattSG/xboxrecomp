@@ -201,6 +201,22 @@ BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *
 /* Forward decl; the definition lives further down with the wait helpers. */
 static void deadline_from_ms(DWORD ms, struct timespec *ts);
 
+static void unlock_mutex_cleanup(void *mutex)
+{
+    pthread_mutex_unlock((pthread_mutex_t *)mutex);
+}
+
+static int cond_wait_cancel_safe(pthread_cond_t *cond, pthread_mutex_t *mutex,
+                                 int bounded, const struct timespec *until)
+{
+    volatile int rc;
+    pthread_cleanup_push(unlock_mutex_cleanup, mutex);
+    rc = bounded ? pthread_cond_timedwait(cond, mutex, until)
+                 : pthread_cond_wait(cond, mutex);
+    pthread_cleanup_pop(0);
+    return rc;
+}
+
 static void cv_lazy_init(PCONDITION_VARIABLE cv)
 {
     if (!cv->Ptr) {
@@ -223,13 +239,13 @@ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWOR
     if (!cs->LockSemaphore) InitializeCriticalSection(cs);
     pthread_cond_t  *c = (pthread_cond_t  *)cv->Ptr;
     pthread_mutex_t *m = (pthread_mutex_t *)cs->LockSemaphore;
-    if (ms == INFINITE) {
-        pthread_cond_wait(c, m);
-        return TRUE;
-    }
     struct timespec ts;
-    deadline_from_ms(ms, &ts);
-    int rc = pthread_cond_timedwait(c, m, &ts);
+    int rc;
+    if (ms != INFINITE) deadline_from_ms(ms, &ts);
+    pthread_cleanup_push(unlock_mutex_cleanup, m);
+    rc = ms == INFINITE ? pthread_cond_wait(c, m)
+                        : pthread_cond_timedwait(c, m, &ts);
+    pthread_cleanup_pop(0);
     if (rc == ETIMEDOUT) { SetLastError(WAIT_TIMEOUT); return FALSE; }
     return TRUE;
 }
@@ -287,9 +303,9 @@ struct w32_object {
 
     /* thread */
     pthread_t       thread;
-    int             thread_joinable;
     DWORD           tid;
     int             exited;
+    int             thread_termination_requested;
     DWORD           exit_code;
     int             suspend_count;
     pthread_cond_t  gate;
@@ -812,10 +828,8 @@ static DWORD wait_single_impl(w32_object *o, DWORD ms, int consume)
             until = o->waitable_due_time;
             bounded = 1;
         }
-        int rc = bounded ? pthread_cond_timedwait(timer_wait ? &o->waitable_cond : &o->cond,
-                                                  &o->lock, &until)
-                         : pthread_cond_wait(timer_wait ? &o->waitable_cond : &o->cond,
-                                             &o->lock);
+        int rc = cond_wait_cancel_safe(timer_wait ? &o->waitable_cond : &o->cond,
+                                       &o->lock, bounded, &until);
         pthread_mutex_unlock(&o->lock);
         (void)rc;
     }
@@ -1125,30 +1139,44 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+static void thread_finish(void *arg)
+{
+    w32_object *o = (w32_object *)arg;
+    cancel_thread_timers(o);
+    pthread_mutex_lock(&o->lock);
+    if (!o->exited) {
+        o->exited = 1;
+        o->signaled = 1;
+        pthread_cond_broadcast(&o->cond);
+    }
+    pthread_mutex_unlock(&o->lock);
+    t_self_obj = NULL;
+    t_tid = 0;
+    obj_release(o); /* exactly one worker reference, for return or cancellation */
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
+    pthread_cleanup_push(thread_finish, o);
     t_self_obj = o;
     t_tid      = o->tid;
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
+    pthread_cleanup_push(unlock_mutex_cleanup, &o->lock);
     while (o->suspend_count > 0)
         pthread_cond_wait(&o->gate, &o->lock);
+    pthread_cleanup_pop(0);
     pthread_mutex_unlock(&o->lock);
 
     DWORD rc = o->start ? o->start(o->start_param) : 0;
-
-    cancel_thread_timers(o);
     pthread_mutex_lock(&o->lock);
-    o->exit_code = rc;
-    o->exited    = 1;
-    o->signaled  = 1;
-    pthread_cond_broadcast(&o->cond);
+    if (!o->thread_termination_requested && !o->exited)
+        o->exit_code = rc;
     pthread_mutex_unlock(&o->lock);
 
-    t_self_obj = NULL;
-    obj_release(o);   /* drop the trampoline's reference */
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
@@ -1158,6 +1186,10 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 {
     (void)sa;
     w32_object *o = obj_alloc(K_THREAD);
+    if (!o) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     o->start         = start;
     o->start_param   = param;
     o->tid           = (DWORD)InterlockedIncrement(&s_next_tid);
@@ -1165,7 +1197,19 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
     o->refcount      = 2;   /* one for caller, one for the trampoline */
 
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
+    if (pthread_attr_init(&attr) != 0) {
+        o->refcount = 1;
+        obj_release(o);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0) {
+        pthread_attr_destroy(&attr);
+        o->refcount = 1;
+        obj_release(o);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     if (stackSize)
         pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize);
 
@@ -1177,7 +1221,6 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
         return NULL;
     }
     pthread_attr_destroy(&attr);
-    o->thread_joinable = 1;
 
     if (threadId) *threadId = o->tid;
     return (HANDLE)o;
@@ -1187,15 +1230,10 @@ VOID ExitThread(DWORD exitCode)
 {
     w32_object *o = t_self_obj;
     if (o) {
-        cancel_thread_timers(o);
         pthread_mutex_lock(&o->lock);
-        o->exit_code = exitCode;
-        o->exited    = 1;
-        o->signaled  = 1;
-        pthread_cond_broadcast(&o->cond);
+        if (!o->thread_termination_requested && !o->exited)
+            o->exit_code = exitCode;
         pthread_mutex_unlock(&o->lock);
-        t_self_obj = NULL;
-        obj_release(o);
     }
     pthread_exit(NULL);
 }
@@ -1237,16 +1275,24 @@ DWORD SuspendThread(HANDLE h)
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
+    if (h == PSEUDO_CURRENT_THREAD) {
+        ExitThread(exitCode);
+        return TRUE;
+    }
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_THREAD) return FALSE;
-    pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
-    o->exit_code = exitCode;
-    o->exited    = 1;
-    o->signaled  = 1;
-    pthread_cond_broadcast(&o->cond);
+    if (o->exited) {
+        pthread_mutex_unlock(&o->lock);
+        return TRUE;
+    }
+    int rc = pthread_cancel(o->thread);
+    if (rc == 0) {
+        o->exit_code = exitCode;
+        o->thread_termination_requested = 1;
+    }
     pthread_mutex_unlock(&o->lock);
-    return TRUE;
+    return rc == 0;
 }
 
 BOOL SetThreadPriority(HANDLE h, int priority)

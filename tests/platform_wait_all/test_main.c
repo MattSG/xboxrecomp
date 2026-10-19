@@ -17,6 +17,39 @@ typedef struct timer_wait_args {
     pthread_mutex_t lock;
     pthread_cond_t cond;
 } timer_wait_args;
+typedef struct condition_wait_args {
+    CRITICAL_SECTION cs;
+    CONDITION_VARIABLE cv;
+    pthread_cond_t cv_storage;
+    HANDLE ready;
+    HANDLE returned;
+    HANDLE allow_leave;
+    int notified;
+    int wait_result;
+} condition_wait_args;
+
+static DWORD condition_waiter(LPVOID arg)
+{
+    condition_wait_args *a = (condition_wait_args *)arg;
+    EnterCriticalSection(&a->cs);
+    SetEvent(a->ready);
+    while (!a->notified)
+        a->wait_result = SleepConditionVariableCS(&a->cv, &a->cs, 2000);
+    SetEvent(a->returned);
+    WaitForSingleObject(a->allow_leave, INFINITE);
+    LeaveCriticalSection(&a->cs);
+    return 0;
+}
+
+static DWORD condition_cancel_waiter(LPVOID arg)
+{
+    condition_wait_args *a = (condition_wait_args *)arg;
+    EnterCriticalSection(&a->cs);
+    SetEvent(a->ready);
+    SleepConditionVariableCS(&a->cv, &a->cs, INFINITE);
+    LeaveCriticalSection(&a->cs);
+    return 0;
+}
 
 static void *wait_reversed(void *arg)
 {
@@ -308,10 +341,217 @@ static void test_negative_timer_period(void)
     CloseHandle(timer);
 }
 
+typedef struct thread_lifecycle_args {
+    HANDLE timer;
+    HANDLE ready;
+    DWORD wait_result;
+    BOOL timer_set;
+} thread_lifecycle_args;
+
+static volatile LONG lifecycle_worker_ran;
+
+static DWORD return_thread_code(LPVOID arg)
+{
+    return (DWORD)(ULONG_PTR)arg;
+}
+
+static DWORD exit_thread_code(LPVOID arg)
+{
+    ExitThread((DWORD)(ULONG_PTR)arg);
+    return 0;
+}
+
+static DWORD wait_for_timer_until_cancel(LPVOID arg)
+{
+    thread_lifecycle_args *a = (thread_lifecycle_args *)arg;
+    SetEvent(a->ready);
+    a->wait_result = WaitForSingleObject(a->timer, INFINITE);
+    return 0x11111111u;
+}
+
+static DWORD alertable_timer_owner(LPVOID arg)
+{
+    thread_lifecycle_args *a = (thread_lifecycle_args *)arg;
+    LARGE_INTEGER due = { .QuadPart = -300000000LL };
+    a->timer_set = SetWaitableTimer(a->timer, &due, 0, timer_apc, NULL, FALSE);
+    SetEvent(a->ready);
+    if (a->timer_set) a->wait_result = SleepEx(INFINITE, TRUE);
+    return 0x22222222u;
+}
+
+static DWORD queued_apc_owner(LPVOID arg)
+{
+    thread_lifecycle_args *a = (thread_lifecycle_args *)arg;
+    LARGE_INTEGER due = { .QuadPart = -10000 };
+    a->timer_set = SetWaitableTimer(a->timer, &due, 0, timer_apc, NULL, FALSE);
+    SetEvent(a->ready);
+    Sleep(5000); /* nonalertable: let another thread queue its timer APC */
+    return 0x33333333u;
+}
+
+static DWORD suspended_worker(LPVOID arg)
+{
+    (void)arg;
+    InterlockedIncrement(&lifecycle_worker_ran);
+    return 0x44444444u;
+}
+
+static DWORD cancelable_sleep_worker(LPVOID arg)
+{
+    (void)arg;
+    Sleep(INFINITE);
+    return 0x55555555u;
+}
+
+static void check_thread_exit(HANDLE thread, DWORD expected)
+{
+    DWORD code = 0;
+    CHECK(WaitForSingleObject(thread, 2000) == WAIT_OBJECT_0);
+    CHECK(GetExitCodeThread(thread, &code));
+    CHECK(code == expected);
+}
+
+static void test_thread_lifecycle(void)
+{
+    HANDLE thread = CreateThread(NULL, 0, return_thread_code,
+                                 (LPVOID)(ULONG_PTR)0x12345678u, 0, NULL);
+    CHECK(thread != NULL);
+    check_thread_exit(thread, 0x12345678u);
+    CHECK(CloseHandle(thread));
+
+    thread = CreateThread(NULL, 0, exit_thread_code,
+                          (LPVOID)(ULONG_PTR)0x87654321u, 0, NULL);
+    CHECK(thread != NULL);
+    check_thread_exit(thread, 0x87654321u);
+    CHECK(CloseHandle(thread));
+
+    /* SleepConditionVariableCS returns with the critical section held. */
+    condition_wait_args condition = { 0 };
+    InitializeCriticalSection(&condition.cs);
+    condition.cv.Ptr = &condition.cv_storage;
+    CHECK(pthread_cond_init(&condition.cv_storage, NULL) == 0);
+    condition.ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+    condition.returned = CreateEventA(NULL, TRUE, FALSE, NULL);
+    condition.allow_leave = CreateEventA(NULL, TRUE, FALSE, NULL);
+    thread = CreateThread(NULL, 0, condition_waiter, &condition, 0, NULL);
+    CHECK(thread && condition.ready && condition.returned && condition.allow_leave);
+    CHECK(WaitForSingleObject(condition.ready, 1000) == WAIT_OBJECT_0);
+    EnterCriticalSection(&condition.cs);
+    condition.notified = 1;
+    WakeConditionVariable(&condition.cv);
+    LeaveCriticalSection(&condition.cs);
+    CHECK(WaitForSingleObject(condition.returned, 1000) == WAIT_OBJECT_0);
+    CHECK(condition.wait_result);
+    CHECK(!TryEnterCriticalSection(&condition.cs));
+    SetEvent(condition.allow_leave);
+    check_thread_exit(thread, 0);
+    CHECK(TryEnterCriticalSection(&condition.cs));
+    LeaveCriticalSection(&condition.cs);
+    CHECK(CloseHandle(thread));
+    CHECK(CloseHandle(condition.ready));
+    CHECK(CloseHandle(condition.returned));
+    CHECK(CloseHandle(condition.allow_leave));
+    CHECK(pthread_cond_destroy(&condition.cv_storage) == 0);
+    DeleteCriticalSection(&condition.cs);
+
+    /* Cancellation releases the condition wait's reacquired critical section. */
+    condition_wait_args canceled_condition = { 0 };
+    InitializeCriticalSection(&canceled_condition.cs);
+    canceled_condition.cv.Ptr = &canceled_condition.cv_storage;
+    CHECK(pthread_cond_init(&canceled_condition.cv_storage, NULL) == 0);
+    canceled_condition.ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+    thread = CreateThread(NULL, 0, condition_cancel_waiter,
+                          &canceled_condition, 0, NULL);
+    CHECK(thread && canceled_condition.ready);
+    CHECK(WaitForSingleObject(canceled_condition.ready, 1000) == WAIT_OBJECT_0);
+    CHECK(TerminateThread(thread, 0xA0A0A0A0u));
+    check_thread_exit(thread, 0xA0A0A0A0u);
+    EnterCriticalSection(&canceled_condition.cs);
+    LeaveCriticalSection(&canceled_condition.cs);
+    CHECK(CloseHandle(thread));
+    CHECK(CloseHandle(canceled_condition.ready));
+    CHECK(pthread_cond_destroy(&canceled_condition.cv_storage) == 0);
+    DeleteCriticalSection(&canceled_condition.cs);
+
+    /* Cancellation at a timer condition wait must release the reacquired lock. */
+    thread_lifecycle_args a = {0};
+    a.timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+    a.ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+    LARGE_INTEGER due = { .QuadPart = -300000000LL };
+    CHECK(a.timer && a.ready && SetWaitableTimer(a.timer, &due, 0, NULL, NULL, FALSE));
+    thread = CreateThread(NULL, 0, wait_for_timer_until_cancel, &a, 0, NULL);
+    CHECK(thread && WaitForSingleObject(a.ready, 1000) == WAIT_OBJECT_0);
+    CHECK(TerminateThread(thread, 0xA1A1A1A1u));
+    check_thread_exit(thread, 0xA1A1A1A1u);
+    CHECK(CancelWaitableTimer(a.timer));
+    CHECK(CloseHandle(thread));
+    CHECK(CloseHandle(a.ready));
+    CHECK(CloseHandle(a.timer));
+
+    /* Alertable timer owners are disarmed and their completion APC is removed. */
+    memset(&a, 0, sizeof(a));
+    a.timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+    a.ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+    LONG before = timer_apc_calls;
+    thread = CreateThread(NULL, 0, alertable_timer_owner, &a, 0, NULL);
+    CHECK(thread && a.timer && a.ready &&
+          WaitForSingleObject(a.ready, 1000) == WAIT_OBJECT_0);
+    CHECK(a.timer_set);
+    CHECK(TerminateThread(thread, 0xA2A2A2A2u));
+    check_thread_exit(thread, 0xA2A2A2A2u);
+    CHECK(timer_apc_calls == before);
+    CHECK(WaitForSingleObject(a.timer, 0) == WAIT_TIMEOUT);
+    CHECK(CloseHandle(thread));
+    CHECK(CloseHandle(a.ready));
+    CHECK(CloseHandle(a.timer));
+
+    /* A queued timer APC is dropped on owner cancellation; duplicate handle
+     * keeps the thread object alive after the original closes immediately. */
+    memset(&a, 0, sizeof(a));
+    a.timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+    a.ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+    before = timer_apc_calls;
+    thread = CreateThread(NULL, 0, queued_apc_owner, &a, 0, NULL);
+    CHECK(thread && a.timer && a.ready &&
+          WaitForSingleObject(a.ready, 1000) == WAIT_OBJECT_0);
+    CHECK(a.timer_set);
+    Sleep(20); /* services the expired APC while its owner remains nonalertable */
+    HANDLE duplicate = NULL;
+    CHECK(DuplicateHandle(GetCurrentProcess(), thread, GetCurrentProcess(),
+                          &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS));
+    CHECK(TerminateThread(thread, 0xA3A3A3A3u));
+    CHECK(CloseHandle(thread));
+    check_thread_exit(duplicate, 0xA3A3A3A3u);
+    CHECK(timer_apc_calls == before);
+    CHECK(WaitForSingleObject(a.timer, 0) == WAIT_OBJECT_0);
+    CHECK(CloseHandle(duplicate));
+    CHECK(CloseHandle(a.ready));
+    CHECK(CloseHandle(a.timer));
+
+    /* Cancellation while suspended runs the same finalizer without starting. */
+    InterlockedExchange(&lifecycle_worker_ran, 0);
+    thread = CreateThread(NULL, 0, suspended_worker, NULL, CREATE_SUSPENDED, NULL);
+    CHECK(thread && TerminateThread(thread, 0xA4A4A4A4u));
+    check_thread_exit(thread, 0xA4A4A4A4u);
+    CHECK(lifecycle_worker_ran == 0);
+    CHECK(CloseHandle(thread));
+
+    /* Repeated cancel/close exercises worker-vs-handle reference teardown. */
+    for (int i = 0; i < 24; i++) {
+        thread = CreateThread(NULL, 0, cancelable_sleep_worker, NULL, 0, NULL);
+        CHECK(thread != NULL);
+        CHECK(TerminateThread(thread, (DWORD)i));
+        check_thread_exit(thread, (DWORD)i);
+        CHECK(CloseHandle(thread));
+    }
+    puts("PASS thread return, ExitThread, cancellation, timer/APC rundown, and refs");
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "timer") == 0) {
         test_waitable_timers();
+        test_thread_lifecycle();
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "timer-invalid") == 0) {

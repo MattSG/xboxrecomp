@@ -82,6 +82,38 @@ The test embeds data; it does not download dependencies at runtime.
 
 ## 2026-10-18 execution updates
 
+### 2026-10-19 continuation (uncommitted implementation)
+
+- POSIX thread cleanup now has one finalizer for normal return, `ExitThread`
+  and deferred cancellation. It runs timer/APC rundown before publishing
+  terminal state and releases the worker reference exactly once. Cancellation
+  cleanup unlocks mutexes reacquired by condition waits; normal
+  `SleepConditionVariableCS` returns with its critical section held. Native
+  pthreads start detached. Focused tests cover exit codes, timer/APC owners,
+  suspended cancellation, duplicate handles, immediate close and condition
+  wait lock ownership. Warning-clean and UBSan gates pass 3/3; an independent
+  GCC 13.3 ASan+UBSan build passes 3/3 on the final source. GCC 11 ASan still
+  fails during cancellation unwind with an internal sanitizer CHECK; a
+  standalone nested-cleanup reproduction passes, so the cause remains open.
+  This is deferred cancellation: CPU-bound guest code cannot be stopped
+  promptly until it reaches a cancellation point. It is not full Win32
+  `TerminateThread` conformance.
+- A native Windows/POSIX probe confirms that POSIX `VirtualQuery` ignores
+  page protection and reservation state. A read-only page is reported
+  read/write, and reserve-only storage is reported committed. The probe
+  passes on Windows and fails on POSIX. Canonical guest-buffer checks also
+  currently accept low RAM and contiguous ranges without page-rights checks.
+  These are open defects; I/O alias protection tests do not establish the
+  correctness of canonical mappings.
+- The consuming game's owned saved-Cruise pause/resume scenario passed.
+  Independently inspected captures show the pause menu and resumed driving;
+  pre/post three-second motion samples measured 26.80 and 44.01 units.
+  No in-pause movement measurement was obtained. Evidence is under
+  `build/audit-continuation/pause-cruise-resume/run-mwbm2quv` in the consuming
+  project; this does not validate subsequent runtime edits.
+
+### Earlier validated slices
+
 - IRP allocation and initialization now use fixed-width guest layouts checked
   by compiling pinned nxdk `14d5ee97e73347c973f1f57b68b79ec08c9e77f2`
   headers for `i386-pc-win32`: IRP `0x68`, current stack pointer `0x5c`,
