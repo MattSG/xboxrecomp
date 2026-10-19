@@ -303,10 +303,10 @@ typedef struct {
 #define SPIRV(name) name##_spirv, sizeof name##_spirv
 static const ShaderSource s_shader_src[SH_COUNT] = {
     [SH_UB_VS] = { SPIRV(ub_vs), DXIL(ub_vs), "ub_vs", SDL_GPU_SHADERSTAGE_VERTEX, 0, 1, 4 },
-    [SH_PS_MAIN] = { SPIRV(ps_main), DXIL(ps_main), "ps_main", SDL_GPU_SHADERSTAGE_FRAGMENT, 9, 0, 3 },
-    [SH_PS_MAIN_FLAT] = { SPIRV(ps_main_flat), DXIL(ps_main_flat), "ps_main", SDL_GPU_SHADERSTAGE_FRAGMENT, 9, 0, 3 },
-    [SH_PS_WDEPTH] = { SPIRV(ps_wdepth), DXIL(ps_wdepth), "ps_wdepth", SDL_GPU_SHADERSTAGE_FRAGMENT, 9, 0, 3 },
-    [SH_PS_WDEPTH_FLAT] = { SPIRV(ps_wdepth_flat), DXIL(ps_wdepth_flat), "ps_wdepth", SDL_GPU_SHADERSTAGE_FRAGMENT, 9, 0, 3 },
+    [SH_PS_MAIN] = { SPIRV(ps_main), DXIL(ps_main), "ps_main", SDL_GPU_SHADERSTAGE_FRAGMENT, 13, 0, 3 },
+    [SH_PS_MAIN_FLAT] = { SPIRV(ps_main_flat), DXIL(ps_main_flat), "ps_main", SDL_GPU_SHADERSTAGE_FRAGMENT, 13, 0, 3 },
+    [SH_PS_WDEPTH] = { SPIRV(ps_wdepth), DXIL(ps_wdepth), "ps_wdepth", SDL_GPU_SHADERSTAGE_FRAGMENT, 13, 0, 3 },
+    [SH_PS_WDEPTH_FLAT] = { SPIRV(ps_wdepth_flat), DXIL(ps_wdepth_flat), "ps_wdepth", SDL_GPU_SHADERSTAGE_FRAGMENT, 13, 0, 3 },
     [SH_PRESENT_VS] = { SPIRV(present_vs), DXIL(present_vs), "present_vs", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 1 },
     [SH_PRESENT_PS] = { SPIRV(present_ps), DXIL(present_ps), "present_ps", SDL_GPU_SHADERSTAGE_FRAGMENT, 4, 0, 1 },
     [SH_CLEAR_VS] = { SPIRV(clear_vs), DXIL(clear_vs), "clear_vs", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 1 },
@@ -673,8 +673,8 @@ static void outside_copy(void)
 }
 
 /* Upload pixels to one level/layer of a texture. */
-static int upload_texture(SDL_GPUTexture *t, uint32_t level, uint32_t layer,
-                          uint32_t w, uint32_t h, const void *data, uint32_t bytes)
+static int upload_texture_extent(SDL_GPUTexture *t, uint32_t level, uint32_t layer,
+                          uint32_t w, uint32_t h, uint32_t depth, const void *data, uint32_t bytes)
 {
     SDL_GPUTransferBuffer *tb = s_utb;
     uint32_t offset;
@@ -713,10 +713,16 @@ static int upload_texture(SDL_GPUTexture *t, uint32_t level, uint32_t layer,
     dst.layer = layer;
     dst.w = w;
     dst.h = h;
-    dst.d = 1;
+    dst.d = depth;
     SDL_UploadToGPUTexture(s_copy, &src, &dst, false);
     if (temp) SDL_ReleaseGPUTransferBuffer(s_dev, tb);   /* released once the GPU is done */
     return 1;
+}
+
+static int upload_texture(SDL_GPUTexture *t, uint32_t level, uint32_t layer,
+                          uint32_t w, uint32_t h, const void *data, uint32_t bytes)
+{
+    return upload_texture_extent(t, level, layer, w, h, 1, data, bytes);
 }
 
 static void copy_texture(SDL_GPUTexture *dst, uint32_t dst_level, SDL_GPUTexture *src,
@@ -750,6 +756,17 @@ static SDL_GPUTexture *make_texture(uint32_t w, uint32_t h, uint32_t levels, int
     t = SDL_CreateGPUTexture(s_dev, &ci);
     if (!t) fail("SDL_CreateGPUTexture");
     return t;
+}
+
+static SDL_GPUTexture *make_volume(uint32_t w, uint32_t h, uint32_t d, uint32_t levels)
+{
+    SDL_GPUTextureCreateInfo ci = {0};
+    ci.type = SDL_GPU_TEXTURETYPE_3D;
+    ci.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+    ci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    ci.width = w; ci.height = h; ci.layer_count_or_depth = d;
+    ci.num_levels = levels; ci.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    return SDL_CreateGPUTexture(s_dev, &ci);
 }
 
 /* Textures released while a batch may still name them wait for its end. */
@@ -982,7 +999,7 @@ typedef Nv2aSamplerSlot SampSlot;
 #define SAMP_SLOTS 1024
 static SampSlot s_samp[SAMP_SLOTS];
 static SDL_GPUSampler *s_linear_clamp, *s_point_clamp;
-static SDL_GPUTexture *s_dummy_2d, *s_dummy_cube;
+static SDL_GPUTexture *s_dummy_2d, *s_dummy_cube, *s_dummy_volume;
 
 static SDL_GPUSamplerAddressMode addr_mode(uint32_t m)
 {
@@ -1135,8 +1152,10 @@ int nv2a_d3d_init(void)
         int f;
         s_dummy_2d = make_texture(1, 1, 1, 0, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, SDL_GPU_TEXTUREUSAGE_SAMPLER);
         s_dummy_cube = make_texture(1, 1, 1, 1, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, SDL_GPU_TEXTUREUSAGE_SAMPLER);
-        if (!s_dummy_2d || !s_dummy_cube || !s_linear_clamp || !s_point_clamp) return 0;
+        s_dummy_volume = make_volume(1, 1, 1, 1);
+        if (!s_dummy_volume || !s_dummy_2d || !s_dummy_cube || !s_linear_clamp || !s_point_clamp) return 0;
         upload_texture(s_dummy_2d, 0, 0, 1, 1, black, 4);
+        upload_texture(s_dummy_volume, 0, 0, 1, 1, black, 4);
         for (f = 0; f < 6; f++) upload_texture(s_dummy_cube, 0, (uint32_t)f, 1, 1, black + f, 4);
         copy_end();
     }
@@ -1670,7 +1689,7 @@ static SDL_GPUTextureFormat texture_host_format(const NvD3DTexture *t, const Tex
         SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM };
     static int support[2][3], checked[2][3];
     int index, cube = t->cube ? 1 : 0;
-    if (L->kind != K_DXT || hl != L->levels || (t->width & 3) || (t->height & 3))
+    if (tex_volume(t) || L->kind != K_DXT || hl != L->levels || (t->width & 3) || (t->height & 3))
         return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
     index = t->color == 0x0C ? 0 : t->color == 0x0E ? 1 : 2;
     if (!checked[cube][index]) {
@@ -1726,7 +1745,7 @@ static SDL_GPUTexture *texture_get_impl(const NvD3DTexture *t, int *guest_levels
     host_format = texture_host_format(t, &L, hl);
     native = host_format != SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
     if (!native) {
-        px = scratch_pixels((size_t)t->width * t->height);
+        px = scratch_pixels((size_t)t->width * t->height * L.level_d[0]);
         if (!px) {
             if (e) e->used = s_frame;
             return e ? e->tex : NULL;
@@ -1736,7 +1755,8 @@ static SDL_GPUTexture *texture_get_impl(const NvD3DTexture *t, int *guest_levels
     if (!e) {
         e = (TexEntry *)calloc(1, sizeof *e);
         if (!e) return NULL;
-        e->tex = make_texture(t->width, t->height, (uint32_t)hl, L.faces == 6, host_format,
+        e->tex = tex_volume(t) ? make_volume(t->width, t->height, L.level_d[0], (uint32_t)hl)
+                              : make_texture(t->width, t->height, (uint32_t)hl, L.faces == 6, host_format,
                               SDL_GPU_TEXTUREUSAGE_SAMPLER);
         if (!e->tex) { free(e); return NULL; }
         e->phys = p; e->format = t->format; e->pitch = t->pitch;
@@ -1746,8 +1766,8 @@ static SDL_GPUTexture *texture_get_impl(const NvD3DTexture *t, int *guest_levels
             uint32_t w = t->width, ht = t->height;
             int lv;
             for (lv = 0; lv < hl; lv++) {
-                e->bytes += native ? (size_t)((w + 3) / 4) * ((ht + 3) / 4) * L.bpp * L.faces
-                                   : (size_t)w * ht * 4 * L.faces;
+                e->bytes += L.level_d[lv < L.levels ? lv : L.levels - 1] * (native ? (size_t)((w + 3) / 4) * ((ht + 3) / 4) * L.bpp * L.faces
+                                   : (size_t)w * ht * 4 * L.faces);
                 if (w > 1) w /= 2;
                 if (ht > 1) ht /= 2;
             }
@@ -1764,8 +1784,8 @@ static SDL_GPUTexture *texture_get_impl(const NvD3DTexture *t, int *guest_levels
                     upload_texture(e->tex, (uint32_t)lv, (uint32_t)f, L.level_w[lv], L.level_h[lv], src, bytes);
                 } else {
                     decode_level(t, &L, src, lv, pal, px);
-                    upload_texture(e->tex, (uint32_t)lv, (uint32_t)f, L.level_w[lv], L.level_h[lv],
-                                   px, L.level_w[lv] * L.level_h[lv] * 4);
+                    upload_texture_extent(e->tex, (uint32_t)lv, (uint32_t)f, L.level_w[lv], L.level_h[lv], L.level_d[lv],
+                                   px, L.level_w[lv] * L.level_h[lv] * L.level_d[lv] * 4);
                 }
             }
             if (hl <= L.levels) continue;
@@ -2054,7 +2074,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     uint32_t gw, gh, n, zf;
     PSConsts pc;
     PSBorder pb;
-    SDL_GPUTexture *srv[8] = { 0 };
+    SDL_GPUTexture *srv[13] = { 0 };
     void *smp[4] = { 0 };
     SDL_GPUTexture *fb = NULL;
     int cull = 0, bias = 0, flare_depth = flare_needs_depth(st), wdepth;
@@ -2119,7 +2139,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         if (!mode_needs_texture(mode) || !t->addr || !t->width || !t->height)
             continue;
         tex_format(t->color, &kind);
-        rt = !t->cube && kind != K_DXT && t->color != 0x0B ? surface_find(phys(t->addr)) : NULL;
+        rt = !tex_volume(t) && !t->cube && kind != K_DXT && t->color != 0x0B ? surface_find(phys(t->addr)) : NULL;
         s_draw_textured = 1;
         if (!s_draw_tex_addr) s_draw_tex_addr = t->addr;
         if (rt && rt->sx > rt->sy * 1.001f) s_draw_reads_wide = 1;
@@ -2164,7 +2184,8 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             pc.tex_scale[n][2] = pc.tex_scale[n][3] = 1.0f;
         }
         if (!view) continue;
-        if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
+        if (tex_volume(t)) srv[9 + n] = view;
+        else if (t->cube && !rt) srv[4 + n] = view; else srv[n] = view;
         smp[n] = sampler(t, levels, reduce, smp);
         if (n == 0 && !rt && !t->cube && kind == K_DXT && t->color == 0x0F &&
             t->width == 256 && t->height == 256 && levels > 4 &&
@@ -2174,7 +2195,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             st->blend_sfactor == s_bspline_sf && st->blend_dfactor == s_bspline_df)
             s_draw_bspline = 1;
         pc.tex_info[n][0] = (t->control0 >> 2) & 1;
-        pc.tex_info[n][1] = t->filter >> 28;
+        pc.tex_info[n][1] = (t->filter >> 28) | (tex_volume(t) ? 256u : 0u);
         if (rt && kind == K_LIN && t->color != 0x35 && (rt->iw > rt->w || rt->ih > rt->h) &&
             ((t->filter >> 24) & 0xF) == 1 && !(((t->filter >> 16) & 0xFF) == 2 ||
             ((t->filter >> 16) & 0xFF) == 4 || ((t->filter >> 16) & 0xFF) == 6))
@@ -2184,7 +2205,8 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         pc.bump_lum[n][1] = t->bump_offset;
         /* Border addressing, done in the shader here (PSB). */
         pb.tex_border_uv[n] = ((t->address & 0xF) == 4 ? 1u : 0u) |
-                              (((t->address >> 8) & 0xF) == 4 ? 2u : 0u);
+                              (((t->address >> 8) & 0xF) == 4 ? 2u : 0u) |
+                              (((t->address >> 16) & 0xF) == 4 ? 4u : 0u);
         unpack4(t->border, pb.tex_border[n]);
     }
     for (n = 0; n < 4; n++)
@@ -2310,16 +2332,18 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
     rec_uniform(1, 1, &pc, sizeof pc);
     rec_uniform(1, 2, &pb, sizeof pb);
     {
-        SDL_GPUTextureSamplerBinding b[9];
+        SDL_GPUTextureSamplerBinding b[13];
         for (n = 0; n < 4; n++) {
             b[n].texture = srv[n] ? srv[n] : s_dummy_2d;
             b[n].sampler = (SDL_GPUSampler *)smp[n];
             b[4 + n].texture = srv[4 + n] ? srv[4 + n] : s_dummy_cube;
             b[4 + n].sampler = (SDL_GPUSampler *)smp[n];
+            b[9 + n].texture = srv[9 + n] ? srv[9 + n] : s_dummy_volume;
+            b[9 + n].sampler = (SDL_GPUSampler *)smp[n];
         }
         b[8].texture = fb ? fb : s_dummy_2d;
         b[8].sampler = s_linear_clamp;
-        rec_samplers(b, 9);
+        rec_samplers(b, 13);
     }
     s_last_draw_state.vp.w = (float)(s ? s->iw : d->iw);
     s_last_draw_state.vp.h = (float)(s ? s->ih : d->ih);

@@ -294,8 +294,10 @@ static int test_depth(void)
                 if (column < 0) column = 0;
                 expected = (unsigned)floor(depth[column] * 16777215.0 + .5) >> 8;
                 pixel = pixels + (y * 32 + x) * 4;
-                CHECK(abs((int)pixel[0] - (int)expected) <= 1);
-                CHECK(pixel[0] == pixel[1] && pixel[1] == pixel[2] && pixel[3] == 65535);
+                unsigned actual = ((pixel[1] / 257u) << 8) | (pixel[2] / 257u);
+                CHECK(abs((int)actual - (int)expected) <= 1);
+                CHECK(pixel[0] == 65535 && pixel[3] == 65535);
+                CHECK(pixel[1] % 257u == 0 && pixel[2] % 257u == 0);
             }
             free(texels);
         }
@@ -341,6 +343,9 @@ static int test_descriptor_rollover(void)
     return 0;
 }
 
+#define volume_pixel nv2a_test_target_pixel
+#include "volume_fixture.h"
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
@@ -360,6 +365,8 @@ int main(int argc, char **argv)
         nv2a_test_default_env("SDL_ASSERT", "abort");
     }
     CHECK(nv2a_test_init());
+    if (!strcmp(argv[1], "y16")) { test_y16(); return 0; }
+    if (!strcmp(argv[1], "volume")) { test_volume(); return 0; }
     if (!strcmp(argv[1], "descriptor_rollover")) return test_descriptor_rollover();
     if (!strcmp(argv[1], "panorama")) return test_panorama();
     if (!strcmp(argv[1], "gates")) return test_gates();

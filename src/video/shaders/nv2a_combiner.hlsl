@@ -26,7 +26,7 @@ cbuffer PSC : CBUF(1) {
   uint fin0; uint fin1; uint rc_control; uint stage_prog;
   uint alpha_func; uint alpha_ref; uint ps_flags; uint clip_plane;
   uint other_input; uint dot_map; uint pad0; uint pad1;
-  uint4 tex_info[4];      /* x: bit0 alphakill, y: signed mask (filter>>28) */
+  uint4 tex_info[4];      /* x: bit0 alphakill, y: signed mask (filter>>28) | bit8 volume */
   float4 tex_scale[4];    /* xy multiply the coordinate (1/size for linear) */
   float4 fog_color;
   float4 bump_mat[4]; float4 bump_lum[4];
@@ -36,7 +36,7 @@ cbuffer PSC : CBUF(1) {
 #ifdef SDLGPU
 /* Border addressing, which SDL3 GPU samplers lack (CLAMP_TO_BORDER): those
  * axes clamp to the edge and a coordinate outside [0, 1] takes the border
- * colour here. tex_border_uv: by stage, bit 0 u, bit 1 v. */
+ * colour here. tex_border_uv: by stage, bits 0/1/2 select u/v/w. */
 cbuffer PSB : CBUF(2) { float4 tex_border[4]; uint4 tex_border_uv; };
 #endif
 #ifdef SPEC
@@ -59,16 +59,22 @@ SPEC_DECL
 PS_TEX(Texture2D, T2D0, 0); PS_TEX(Texture2D, T2D1, 1); PS_TEX(Texture2D, T2D2, 2); PS_TEX(Texture2D, T2D3, 3);
 PS_TEX(TextureCube, TC0, 4); PS_TEX(TextureCube, TC1, 5); PS_TEX(TextureCube, TC2, 6); PS_TEX(TextureCube, TC3, 7);
 PS_TEX(Texture2D, FBK, 8); static float2 g_pos;
+PS_TEX(Texture3D, TV0, 9); PS_TEX(Texture3D, TV1, 10); PS_TEX(Texture3D, TV2, 11); PS_TEX(Texture3D, TV3, 12);
 PS_SAMP(S0, 0); PS_SAMP(S1, 1); PS_SAMP(S2, 2); PS_SAMP(S3, 3);
 /* A cube map samples with its stage's sampler: one slot of its own on SDL3
  * GPU, the 2D one on D3D11. FBK is only loaded; SDL3 GPU pairs it anyway. */
 #ifdef SDLGPU
 PS_SAMP(SC0, 4); PS_SAMP(SC1, 5); PS_SAMP(SC2, 6); PS_SAMP(SC3, 7); PS_SAMP(SFBK, 8);
+PS_SAMP(SV0, 9); PS_SAMP(SV1, 10); PS_SAMP(SV2, 11); PS_SAMP(SV3, 12);
 #else
 #define SC0 S0
 #define SC1 S1
 #define SC2 S2
 #define SC3 S3
+#define SV0 S0
+#define SV1 S1
+#define SV2 S2
+#define SV3 S3
 #endif
 uint U8(uint4 a[2], uint s) { return a[s >> 2][s & 3]; }
 float map_in(float x, uint b) {
@@ -155,6 +161,15 @@ float4 sampc(uint n, float3 d) {
   if (n == 0) return TC0.Sample(SC0, d); if (n == 1) return TC1.Sample(SC1, d);
   if (n == 2) return TC2.Sample(SC2, d); return TC3.Sample(SC3, d);
 }
+float4 sampv(uint n, float3 uv) {
+#ifdef SDLGPU
+  uint bu = tex_border_uv[n];
+  if (((bu & 1u) && (uv.x < 0.0 || uv.x > 1.0)) || ((bu & 2u) && (uv.y < 0.0 || uv.y > 1.0)) ||
+      ((bu & 4u) && (uv.z < 0.0 || uv.z > 1.0))) return tex_border[n];
+#endif
+  if (n == 0) return TV0.Sample(SV0, uv); if (n == 1) return TV1.Sample(SV1, uv);
+  if (n == 2) return TV2.Sample(SV2, uv); return TV3.Sample(SV3, uv);
+}
 float4 shade(PSIn i, out uint cov) {
   g_pos = i.pos.xy;
   if (wclip_mode != 0u) {   /* window clip regions the scissor cannot express */
@@ -171,7 +186,8 @@ float4 shade(PSIn i, out uint cov) {
     uint dm = n ? (dot_map >> ((n - 1) * 4)) & 7 : 0;
     float4 c = tc[n]; float4 t = float4(0, 0, 0, 1);
     float q = c.w != 0.0 ? c.w : 1.0;
-    if (mode == 1 || mode == 2) {
+    if ((mode == 1 || mode == 2) && (tex_info[n].y & 256u)) t = sampv(n, c.xyz / q);
+    else if (mode == 1 || mode == 2) {
       float2 g = c.xy / q, d = abs(ddx(g)) + abs(ddy(g));
       if (tex_info[n].z != 0u && max(d.x, d.y) < 1e-4) t = tapbox(n, g, tex_scale[n].xy);
       else t = samp2(n, g * tex_scale[n].xy);
@@ -202,7 +218,7 @@ float4 shade(PSIn i, out uint cov) {
         float3 E = mode == 12 ? float3(tc[1].w, tc[2].w, tc[3].w) : float3(0, 0, 1);
         N = 2.0 * N * dot(N, E) / max(dot(N, N), 1e-20) - E;
       }
-      if (mode == 13) t = samp2(n, N.xy * tex_scale[n].xy); else t = sampc(n, N);
+      if (mode == 13) t = (tex_info[n].y & 256u) ? sampv(n, N) : samp2(n, N.xy * tex_scale[n].xy); else t = sampc(n, N);
     } else if (mode == 15) t = samp2(n, T[inp].ar);
     else if (mode == 16) t = samp2(n, T[inp].gb);
     if (mode != 0 && mode != 4 && mode != 5 && mode != 10 && mode != 17) {

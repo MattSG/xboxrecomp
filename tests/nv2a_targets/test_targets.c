@@ -375,7 +375,7 @@ int main(int argc, char **argv)
         puts("PASS: compressed/paletted uploads at old target addresses bind their decoded pixels");
 
         /* Y16 is an intentional reinterpretation: one32-bit colour/depth
-         * pixel supplies two16-bit luminance texels. Preserve it, including
+         * pixel supplies two byte-pair texels. Preserve it, including
          * depth taking precedence when both targets share an address. */
         sampled = surface_get(0x50000, 128, 8, 32, 32, 0);
         CHECK(sampled);
@@ -394,8 +394,8 @@ int main(int argc, char **argv)
         ID3D11DeviceContext_PSGetShaderResources(s_ctx, 0, 1, &view);
         CHECK(view && view == sampled->y16_srv);
         /* The readback helper returns R16/G16 packed for these views.
-         * RedARGB has low16=0, high16=FFFF, yielding black then white. */
-        CHECK(read_pixel_at(view, 0, 0) == 0);
+         * Red ARGB has low16=0, high16=FFFF; R is always one and G is the high byte. */
+        CHECK(read_pixel_at(view, 0, 0) == 0x0000FFFFu);
         CHECK(read_pixel_at(view, 1, 0) == 0xFFFFFFFFu);
         ID3D11ShaderResourceView_Release(view);
         {

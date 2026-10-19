@@ -235,6 +235,26 @@ int main(int argc, char **argv)
             }
         }
     }
+    /* A flare can switch CONTROL0 after the scene wrote depth. */
+    nv2a_d3d_set_flare_depth_test(0x8421);
+    for (wbuffer = 0; wbuffer < 2; ++wbuffer) {
+        NvD3DState scene = st;
+        float lamp_depth = wbuffer ? 1.0f / (2.71648e-7f * 16777216.0f) : .999532f;
+        scene.z_perspective = wbuffer;
+        scene.depth_test = scene.depth_mask = 1;
+        CHECK(setup_pipeline(&scene, NV_D3D_TRIANGLES, &target, &gw, &gh, &zmax));
+        depth = s_cur_ds;
+        CHECK(depth);
+        st.z_perspective = !wbuffer;
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, target->rtv, red);
+        target->gen++; target->ms_dirty = 1;
+        ID3D11DeviceContext_ClearDepthStencilView(s_ctx, depth->dsv, D3D11_CLEAR_DEPTH, lamp_depth - .0001f, 0);
+        native_glow(&st);
+        CHECK(pixel(target, (unsigned)(306 * target->sx), (unsigned)(170 * target->sy)) == 0xFFFF0000u);
+        ID3D11DeviceContext_ClearDepthStencilView(s_ctx, depth->dsv, D3D11_CLEAR_DEPTH, lamp_depth + .0001f, 0);
+        native_glow(&st);
+        CHECK(pixel(target, (unsigned)(306 * target->sx), (unsigned)(170 * target->sy)) == 0xFFFFFF00u);
+    }
     puts("PASS: synthetic and native VF/combiner glows fail occluded depth and retain visible lamps; Z/W-buffer and MSAA/scale");
     return 0;
 }

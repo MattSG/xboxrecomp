@@ -32,6 +32,6 @@ float4 y16d_ps(float4 p : SV_Position) : SV_Target {
   float s = ccol.x, k = ccol.y;
   d = saturate(d);
   if (s > 1.0 && d < 1.0) { float x = d * s; d = x <= k ? x : k + (1.0 - k) * (1.0 - exp((k - x) / (1.0 - k))); }
-  float y = (float)((uint)round(saturate(d) * 16777215.0) >> 8) / 65535.0;
-  return float4(y, y, y, 1);
+  uint word = (uint)round(saturate(d) * 16777215.0) >> 8;
+  return float4(1, (word >> 8) / 255.0, (word & 255u) / 255.0, 1);
 }

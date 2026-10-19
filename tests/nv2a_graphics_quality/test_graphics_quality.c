@@ -294,8 +294,10 @@ static void test_depth(void)
                 if (column < 0) column = 0;
                 expected = (unsigned)floor(depth[column] * 16777215.0 + .5) >> 8;
                 pixel = (const uint16_t *)((const uint8_t *)mapped.pData + y * mapped.RowPitch) + x*4;
-                CHECK(abs((int)pixel[0] - (int)expected) <= 1);
-                CHECK(pixel[0] == pixel[1] && pixel[1] == pixel[2] && pixel[3] == 65535);
+                unsigned actual = ((pixel[1] / 257u) << 8) | (pixel[2] / 257u);
+                CHECK(abs((int)actual - (int)expected) <= 1);
+                CHECK(pixel[0] == 65535 && pixel[3] == 65535);
+                CHECK(pixel[1] % 257u == 0 && pixel[2] % 257u == 0);
             }
             ID3D11DeviceContext_Unmap(s_ctx,(ID3D11Resource *)staging,0);
             ID3D11Texture2D_Release(staging);
@@ -365,13 +367,32 @@ static void test_placement(void)
     puts("PASS: production vertex output places display full-screen edges exactly at bounds, retains integer menu coordinates, translates perspective geometry, and preserves offscreen pixel-zero snap");
 }
 
+static uint32_t volume_pixel(uint32_t addr, unsigned x, unsigned y)
+{
+    Surface *s = surface_find(phys(addr));
+    ID3D11Texture2D *staging = NULL; D3D11_TEXTURE2D_DESC td;
+    D3D11_MAPPED_SUBRESOURCE m; uint32_t value;
+    CHECK(s); unbind_targets(); unbind_textures();
+    ID3D11Texture2D_GetDesc(s->tex,&td);
+    td.Usage=D3D11_USAGE_STAGING;td.BindFlags=td.MiscFlags=0;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev,&td,NULL,&staging)));
+    ID3D11DeviceContext_CopyResource(s_ctx,(ID3D11Resource *)staging,(ID3D11Resource *)s->tex);
+    CHECK(SUCCEEDED(ID3D11DeviceContext_Map(s_ctx,(ID3D11Resource *)staging,0,D3D11_MAP_READ,0,&m)));
+    memcpy(&value,(const uint8_t *)m.pData+y*m.RowPitch+x*4,4);
+    ID3D11DeviceContext_Unmap(s_ctx,(ID3D11Resource *)staging,0);ID3D11Texture2D_Release(staging);
+    return value;
+}
+#include "volume_fixture.h"
+
 int main(int argc, char **argv)
 {
     _putenv_s("RECOMP_RENDER_SCALE","1"); _putenv_s("RECOMP_MSAA","1");
     _putenv_s("RECOMP_ASPECT","4:3"); _putenv_s("RECOMP_PS_SPEC","0");
     _putenv_s("RECOMP_PS_PREWARM","0"); _putenv_s("RECOMP_SHADER_CACHE","0");
     CHECK(argc == 2 && nv2a_d3d_init());
-    if (!strcmp(argv[1],"panorama")) test_panorama();
+    if (!strcmp(argv[1],"y16")) test_y16();
+    else if (!strcmp(argv[1],"volume")) test_volume();
+    else if (!strcmp(argv[1],"panorama")) test_panorama();
     else if (!strcmp(argv[1],"gates")) test_gates();
     else if (!strcmp(argv[1],"depth")) test_depth();
     else if (!strcmp(argv[1],"placement")) test_placement();

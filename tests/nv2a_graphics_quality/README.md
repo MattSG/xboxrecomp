@@ -31,3 +31,14 @@ The cubic comparison allows 0.004 per float channel for hardware bilinear weight
 precision. Packed depth permits one 16-bit unit for depth-store rounding. These
 checks establish sampled pixels and alignment, not whole-game visual appearance
 or frame-rate improvements.
+
+The `volume` case exercises PROJECT3D and DOT_STR_3D through each production
+renderer and shared combiner shader. It checks every slice of a compressed
+volume on the GPU, W border addressing, BC3 alpha decoding, rectangular 3D
+Morton order and mip offsets. These fixtures establish texture translation;
+they do not establish complete in-game headlight or streetlight rendering.
+
+The `y16` case checks the NV2A Y16 byte-lane mapping `(1, high, low, 1)` in
+CPU texture decoding and GPU colour-target reinterpretation. The `depth` case
+checks the same byte lanes on packed depth views. This follows the hardware
+results linked by [xemu's Y16 correction](https://github.com/xemu-project/xemu/commit/ac72edfc2bc033cd1659123c44dc64f250332a60).
