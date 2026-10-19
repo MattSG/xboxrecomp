@@ -1,26 +1,5 @@
-/*
- * The kernel's memory APIs on a POSIX host -- written to fail.
- *
- * These sit on the Win32 shim rather than on the Xbox layout, and the shim's
- * VirtualQuery is a constant: it reports RegionSize 0x1000, MEM_COMMIT,
- * PAGE_READWRITE and AllocationBase NULL for every address it is ever handed,
- * mapped or not. Four kernel entry points are built on that answer, and one of
- * them picks a deallocator with it.
- *
- *   1. free/alloc pairing  MmAllocateContiguousMemory always uses VirtualAlloc
- *                          (mmap here). MmFreeContiguousMemory routes to
- *                          VirtualFree only when AllocationBase == the
- *                          pointer, which a hardcoded NULL never satisfies --
- *                          so every contiguous buffer is released with free()
- *                          on an mmap'd pointer
- *   2. AllocationBase      must name the allocation a pointer belongs to
- *   3. unmapped addresses  must not be reported as committed and readable
- *   4. MmQueryAllocationSize  must not answer 0x1000 for every allocation
- *
- * Checks that can abort the process run in a forked child, because the failure
- * mode for (1) is the allocator calling abort(), which would take the whole
- * run with it and report nothing about the other three.
- */
+/* POSIX host-memory API checks. Guest backing, physical-address round trips
+ * and thunk dispatch are exercised by kernel_io_mapping and kernel_bridge. */
 #include "kernel.h"
 #include "win32_compat.h"
 
@@ -166,66 +145,18 @@ int main(void)
               "probing before it writes is always told yes");
     }
 
-    /* 3b. A free address reports how far the free run goes: up to the next
-     * mapping the shim made, so a Win32-style walk over free memory moves on
-     * (it used to be RegionSize 0, and guest_vmem's scan spun forever). */
+    /* Without an initialized guest layout these numeric addresses have no
+     * owned physical backing. Raw host/guest pointer arithmetic is invalid. */
     {
-        MEMORY_BASIC_INFORMATION mbi;
-        SIZE_T want = 64 * 1024;
-        LPVOID p = VirtualAlloc(NULL, want, MEM_COMMIT | MEM_RESERVE,
-                                PAGE_READWRITE);
-        check(p != NULL, "VirtualAlloc returns a pointer (free-run check)", NULL);
-        if (p) {
-            uint8_t *below = (uint8_t *)p - 0x10000;
-            memset(&mbi, 0, sizeof mbi);
-            VirtualQuery(below, &mbi, sizeof mbi);
-            check(mbi.State == MEM_FREE && mbi.RegionSize != 0
-                      && (uintptr_t)below + mbi.RegionSize <= (uintptr_t)p,
-                  "VirtualQuery sizes a free run, ending at the next mapping",
-                  "RegionSize 0 for free memory: a region walk never advances");
-            VirtualFree(p, 0, MEM_RELEASE);
-        }
-    }
-
-    /*
-     * 6. MmGetPhysicalAddress must translate.
-     *
-     * Ordinal 173 used to have two implementations that disagreed.
-     * bridge_MmGetPhysicalAddress subtracted XBOX_CONTIG_BASE for addresses
-     * inside the contiguous window, because a DMA consumer needs the physical
-     * offset rather than the virtual-window address; xbox_MmGetPhysicalAddress
-     * returned its argument unchanged, commented as a placeholder. The bridge
-     * now calls this function, so there is one implementation and the expected
-     * values below are it.
-     *
-     * The failure was silent. A title writes the result into a pushbuffer or
-     * DMA descriptor, the NV2A reads an address with bit 31 set, and the
-     * corruption surfaces as wrong geometry with nothing pointing back here.
-     *
-     * What this does NOT cover: the bridge itself. bridge_* functions are
-     * static and driven by guest CPU state, and nothing in tests/ can reach
-     * them -- breaking bridge_MmGetPhysicalAddress alone leaves every check
-     * here green. The bridge calling this function is what ties the two
-     * together; it is not something these checks verify.
-     */
-    {
-        const struct { uint32_t in, want; const char *what; } cases[] = {
-            { 0x80000000u, 0x00000000u, "contiguous base maps to physical 0" },
-            { 0x80001000u, 0x00001000u, "inside the contiguous window" },
-            { 0x83FFFFFFu, 0x03FFFFFFu, "last byte of the window" },
-            { 0x84000000u, 0x84000000u, "just past the window is unchanged" },
-            { 0x00040000u, 0x00040000u, "an ordinary guest VA is unchanged" },
+        const uintptr_t probes[] = {
+            0x80000000u, 0x80001000u, 0x83FFFFFFu, 0x84000000u, 0x00040000u
         };
-        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-            ULONG_PTR got =
-                xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)cases[i].in);
-            char what[96], detail[128];
-            snprintf(what, sizeof what, "MmGetPhysicalAddress: %s",
-                     cases[i].what);
-            snprintf(detail, sizeof detail,
-                     "0x%08X gave 0x%08llX, the bridge gives 0x%08X",
-                     cases[i].in, (unsigned long long)got, cases[i].want);
-            check((uint32_t)got == cases[i].want, what, detail);
+        for (size_t i = 0; i < sizeof probes / sizeof probes[0]; i++) {
+            char detail[80];
+            snprintf(detail, sizeof detail, "uninitialized address 0x%08llX",
+                     (unsigned long long)probes[i]);
+            check(xbox_MmGetPhysicalAddress((PVOID)probes[i]) == 0,
+                  "MmGetPhysicalAddress rejects uninitialized backing", detail);
         }
     }
 

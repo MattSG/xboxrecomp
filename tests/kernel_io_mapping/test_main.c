@@ -206,14 +206,55 @@ int main(int argc, char **argv)
     }
 
     /* Both public dispatch paths use the same physical mapping owner. */
-    scratch = xbox_HeapAlloc(0x4000, 4096);
+    scratch = xbox_HeapAlloc(0x6000, 4096);
     CHECK(scratch != 0);
     *(uint32_t *)native(scratch) = 0x800000b1u; /* ordinal177 */
     *(uint32_t *)native(scratch + 4) = 0x800000b7u; /* ordinal183 */
     *(uint32_t *)native(scratch + 8) = 0x800000adu; /* ordinal173 */
     *(uint32_t *)native(scratch + 12) = 0x8000006bu; /* ordinal107 */
-    xbox_kernel_set_thunk_address(scratch, 4); xbox_kernel_bridge_init();
+    *(uint32_t *)native(scratch + 16) = 0x800000dbu; /* ordinal219 */
+    *(uint32_t *)native(scratch + 20) = 0x800000ecu; /* ordinal236 */
+    xbox_kernel_set_thunk_address(scratch, 6); xbox_kernel_bridge_init();
     stack = native(scratch + 0x1000);
+    {
+        DWORD old;
+        uint32_t buffer = scratch + 0x5000;
+        uint32_t ios = scratch + 0x2000;
+        *(uint32_t *)native(buffer) = 0xCAFEBABEu;
+        CHECK(VirtualProtect(native(buffer), 4096, PAGE_READONLY, &old));
+        memset(stack, 0, 9 * sizeof(*stack));
+        stack[0] = 0x12345678;
+        stack[5] = ios; stack[6] = buffer; stack[7] = 4;
+        g_esp = scratch + 0x1000;
+        recomp_lookup_kernel(*(uint32_t *)native(scratch + 16))();
+        CHECK(g_eax == 0xC0000005u && g_esp == scratch + 0x1024);
+        CHECK(*(uint32_t *)native(buffer) == 0xCAFEBABEu);
+
+        /* A read-only source is legal for NtWriteFile; its invalid file handle
+         * may fail, but the buffer check must not reject readable memory. */
+        g_esp = scratch + 0x1000;
+        recomp_lookup_kernel(*(uint32_t *)native(scratch + 20))();
+        CHECK(g_eax != 0xC0000005u);
+
+        stack[6] = buffer - 4; stack[7] = 8;
+        g_esp = scratch + 0x1000;
+        recomp_lookup_kernel(*(uint32_t *)native(scratch + 16))();
+        CHECK(g_eax == 0xC0000005u);
+        CHECK(VirtualProtect(native(buffer), 4096, PAGE_NOACCESS, &old));
+        stack[6] = buffer; stack[7] = 4;
+        g_esp = scratch + 0x1000;
+        recomp_lookup_kernel(*(uint32_t *)native(scratch + 20))();
+        CHECK(g_eax == 0xC0000005u);
+        CHECK(VirtualProtect(native(buffer), 4096, PAGE_READWRITE, &old));
+
+        buffer = 0x80050000u;
+        CHECK(VirtualProtect(native(buffer), 4096, PAGE_READONLY, &old));
+        stack[6] = buffer;
+        g_esp = scratch + 0x1000;
+        recomp_lookup_kernel(*(uint32_t *)native(scratch + 16))();
+        CHECK(g_eax == 0xC0000005u);
+        CHECK(VirtualProtect(native(buffer), 4096, PAGE_READWRITE, &old));
+    }
     stack[0] = 0x12345678; stack[1] = 0x11234; stack[2] = 32; stack[3] = PAGE_READWRITE;
     g_esp = scratch + 0x1000;
     recomp_lookup_kernel(*(uint32_t *)native(scratch))(); va = g_eax;

@@ -29,6 +29,9 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#ifndef MEM_MAPPED
+#define MEM_MAPPED 0x00040000u
+#endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -343,6 +346,7 @@ struct w32_object {
     /* file mapping / fd-backed file handle */
     int             fd;
     SIZE_T          map_size;
+    DWORD           map_protect;
     char           *file_path;
 };
 
@@ -1610,6 +1614,7 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
  * is ERROR_INVALID_PARAMETER, as on Win32, and returns -1 rather than a guess. */
 static int prot_from_page(DWORD protect)
 {
+    if (protect & ~0xFFu) return -1;
     switch (protect & 0xFF) {
     case PAGE_NOACCESS:          return PROT_NONE;
     case PAGE_READONLY:          return PROT_READ;
@@ -1669,56 +1674,170 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
 }
 #endif
 
-/* Length registry, defined with the view helpers below. Win32 frees by address
- * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
- * documented to take size 0 -- so the length has to be recoverable here or
- * munmap cannot be called at all. */
-void view_register(void *addr, size_t len);
-size_t view_take(const void *addr);
+/* The same bounded registry owns both private VirtualAlloc reservations and
+ * mapped views. Per-page metadata is what makes the Win32 query/protect/free
+ * contracts observable without pretending arbitrary host mappings are ours. */
+typedef struct {
+    void *addr;
+    void *allocation_base;
+    size_t len;
+    size_t page_count;
+    DWORD allocation_protect;
+    DWORD type;
+    int private_allocation;
+    uint64_t allocation_id;
+    DWORD *pages; /* MEM_RESERVE/MEM_COMMIT plus current PAGE_* protection */
+} w32_view;
+static w32_view s_views[512];
+static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t s_next_view_allocation_id = 1;
+
+static size_t vm_page_size(void)
+{
+    long value = sysconf(_SC_PAGESIZE);
+    return value > 0 ? (size_t)value : 4096;
+}
+
+static int vm_round_size(SIZE_T size, size_t *rounded)
+{
+    size_t page = vm_page_size();
+    if (!size || size > SIZE_MAX - (page - 1)) return 0;
+    *rounded = (size + page - 1) & ~(page - 1);
+    return 1;
+}
+
+static int vm_reservation_range(void *address, SIZE_T size,
+                               void **base_out, size_t *size_out)
+{
+    const uintptr_t granularity = 64 * 1024;
+    uintptr_t page = (uintptr_t)vm_page_size();
+    uintptr_t start = (uintptr_t)address;
+    if (!size || size > UINTPTR_MAX - start) return 0;
+    uintptr_t lo = address ? start & ~(granularity - 1) : start;
+    uintptr_t end = start + size;
+    if (end > UINTPTR_MAX - (page - 1)) return 0;
+    uintptr_t hi = (end + page - 1) & ~(page - 1);
+    if (hi <= lo || hi - lo > SIZE_MAX) return 0;
+    *base_out = (void *)lo;
+    *size_out = (size_t)(hi - lo);
+    return 1;
+}
+
+static int vm_normalize_range(void *address, SIZE_T size,
+                              void **base_out, size_t *size_out)
+{
+    uintptr_t page = (uintptr_t)vm_page_size();
+    uintptr_t start = (uintptr_t)address;
+    if (!size || size > UINTPTR_MAX - start) return 0;
+    uintptr_t lo = start & ~(page - 1);
+    uintptr_t end = start + size;
+    if (end > UINTPTR_MAX - (page - 1)) return 0;
+    uintptr_t hi = (end + page - 1) & ~(page - 1);
+    if (hi <= lo || hi - lo > SIZE_MAX) return 0;
+    *base_out = (void *)lo;
+    *size_out = (size_t)(hi - lo);
+    return 1;
+}
+
+static int view_register(void *addr, size_t len, DWORD allocation_protect,
+                         DWORD type, DWORD page_state, int private_allocation);
+static int view_find_locked(const void *addr, size_t len, int require_private,
+                            int exact_base, int *index, size_t *first_page,
+                            size_t *page_count);
+static int view_commit(void *address, size_t size, DWORD protect);
+static int view_decommit(void *address, size_t size);
+static int view_protect(void *address, size_t size, DWORD protect,
+                        DWORD *old_protect);
+static int view_release(void *address, SIZE_T size);
 
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    size_t rounded;
+    void *map_address = address;
 
-    if (prot < 0) {
+    if (prot < 0 || !vm_round_size(size, &rounded)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return NULL;
     }
 
-    /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
-     * just adjust protection. */
-    if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address) {
-        if (mprotect(address, size, prot) == 0)
-            return address;
-        /* fall through to a fresh mapping */
+    if ((allocationType != MEM_COMMIT) && (allocationType != MEM_RESERVE) &&
+        (allocationType != (MEM_RESERVE | MEM_COMMIT))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
     }
 
+    if (allocationType == MEM_COMMIT && address) {
+        if (!view_commit(address, size, protect)) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        return (void *)((uintptr_t)address & ~(uintptr_t)(vm_page_size() - 1));
+    }
+
+    if (address) {
+        if (!vm_reservation_range(address, size, &map_address, &rounded)) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+    } else if (!vm_round_size(size, &rounded)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    size_t mapping_len = rounded;
+    if (!map_address) {
+        if (rounded > SIZE_MAX - 0x10000u) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return NULL;
+        }
+        mapping_len += 0x10000u;
+    }
+
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #if defined(MAP_FIXED_NOREPLACE)
-    if (address) flags |= MAP_FIXED_NOREPLACE;
+    if (map_address) flags |= MAP_FIXED_NOREPLACE;
 #endif
+
+    int map_prot = allocationType == MEM_RESERVE ? PROT_NONE : prot;
 
     void *p;
 #if defined(__APPLE__)
-    if (address) {
-        p = mach_map_fixed(address, size, prot);
+    if (map_address) {
+        p = mach_map_fixed(map_address, rounded, map_prot);
     } else
 #endif
-    p = mmap(address, size, prot, flags, -1, 0);
+    p = mmap(map_address, mapping_len, map_prot, flags, -1, 0);
     if (p == MAP_FAILED) {
+        SetLastError(map_address ? ERROR_INVALID_ADDRESS : ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    if (!map_address) {
+        uintptr_t aligned = ((uintptr_t)p + 0xFFFFu) & ~(uintptr_t)0xFFFFu;
+        size_t prefix = (size_t)(aligned - (uintptr_t)p);
+        size_t suffix = mapping_len - prefix - rounded;
+        if ((prefix && munmap(p, prefix) != 0) ||
+            (suffix && munmap((char *)aligned + rounded, suffix) != 0)) {
+            /* munmap of aligned fragments should not fail for this fresh
+             * anonymous mapping; do not publish a partially trimmed range. */
+            munmap((void *)aligned, rounded);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
+        p = (void *)aligned;
+    }
+    DWORD state = allocationType == MEM_RESERVE ? MEM_RESERVE : MEM_COMMIT;
+    if (!view_register(p, rounded, protect, MEM_PRIVATE, state, 1)) {
+        munmap(p, rounded);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
-    /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
-     * Win32 caller, and munmap cannot be called without one. */
-    view_register(p, size);
 #if !defined(MAP_FIXED_NOREPLACE) && !defined(__APPLE__)
     /* Older kernels without MAP_FIXED_NOREPLACE: plain MAP_FIXED would silently
      * unmap whatever already lives there, so we pass the address as a hint and
      * treat a different result as "taken". Apple goes through mach_map_fixed
      * above, which reports that properly instead of inferring it. */
-    if (address && p != address) {
-        munmap(p, size);
+    if (map_address && p != map_address) {
+        view_release(p, 0);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
@@ -1728,20 +1847,10 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 
 BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
 {
-    if (freeType & MEM_RELEASE) {
-        /* Win32 MEM_RELEASE passes size 0 and frees the whole allocation, so
-         * the length comes from the registry VirtualAlloc filled in. Returning
-         * TRUE without unmapping -- as this used to -- made every release a
-         * silent no-op: the caller believed the address was free, the next
-         * allocation there failed, and nothing connected the two. */
-        size_t len = view_take(address);
-        if (size == 0) size = len;
-        if (size == 0) return FALSE;
-        return munmap(address, size) == 0;
-    }
-    if (freeType & MEM_DECOMMIT)
-        return mprotect(address, size, PROT_NONE) == 0;
-    return TRUE;
+    if (freeType == MEM_RELEASE) return view_release(address, size);
+    if (freeType == MEM_DECOMMIT) return view_decommit(address, size);
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
 }
 
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
@@ -1752,8 +1861,7 @@ BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldPro
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if (oldProtect) *oldProtect = PAGE_READWRITE;
-    return mprotect(address, size, prot) == 0;
+    return view_protect(address, size, newProtect, oldProtect);
 }
 
 /* ===================================================================== */
@@ -2106,52 +2214,358 @@ int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 /* File mapping (memfd-backed)                                           */
 /* ===================================================================== */
 
-/* Registry of active views: UnmapViewOfFile takes no length, so we must
- * recover the mapping length here for munmap. */
-typedef struct { void *addr; size_t len; } w32_view;
-static w32_view        s_views[512];
-static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
-
-void view_register(void *addr, size_t len)
+/* Register one complete mapping. Failure is explicit: callers unmap it before
+ * publishing a pointer when all 512 ownership slots are occupied. */
+static int view_register(void *addr, size_t len, DWORD allocation_protect,
+                         DWORD type, DWORD page_state, int private_allocation)
 {
+    size_t page_count = len / vm_page_size();
+    if (!page_count || page_count > SIZE_MAX / sizeof(DWORD)) return 0;
+    DWORD *pages = (DWORD *)malloc(page_count * sizeof(*pages));
+    if (!pages) return 0;
+    DWORD value = page_state;
+    if (page_state == MEM_COMMIT) value |= allocation_protect & 0xFF;
+    for (size_t i = 0; i < page_count; i++) pages[i] = value;
+
+    int registered = 0;
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++)
-        if (!s_views[i].addr) { s_views[i].addr = addr; s_views[i].len = len; break; }
+        if (!s_views[i].addr) {
+            s_views[i].addr = addr;
+            s_views[i].allocation_base = addr;
+            s_views[i].len = len;
+            s_views[i].page_count = page_count;
+            s_views[i].allocation_protect = allocation_protect;
+            s_views[i].type = type;
+            s_views[i].private_allocation = private_allocation;
+            s_views[i].allocation_id = s_next_view_allocation_id++;
+            if (!s_views[i].allocation_id)
+                s_views[i].allocation_id = s_next_view_allocation_id++;
+            s_views[i].pages = pages;
+            registered = 1;
+            break;
+        }
     pthread_mutex_unlock(&s_views_lock);
+    if (!registered) free(pages);
+    return registered;
 }
 
-/* Non-destructive counterpart to view_take, and interior-aware: VirtualQuery
- * is asked about addresses *within* a region at least as often as about its
- * base -- a translated guest VA lands in the middle of the 64 MB window.
- * Picks the containing region and reports where it starts. */
-int view_lookup(const void *addr, void **base_out, size_t *len_out)
+/* Find a page-aligned range wholly inside one tracked mapping. */
+static int view_find_locked(const void *addr, size_t len, int require_private,
+                            int exact_base, int *index_out, size_t *first_out,
+                            size_t *count_out)
 {
+    uintptr_t p = (uintptr_t)addr;
+    size_t page = vm_page_size();
+    if ((p % page) || (len % page) || len > UINTPTR_MAX - p) return 0;
+    for (int i = 0; i < 512; i++) {
+        w32_view *v = &s_views[i];
+        if (!v->addr || (require_private && !v->private_allocation)) continue;
+        uintptr_t lo = (uintptr_t)v->addr, hi = lo + v->len;
+        if ((exact_base && p != lo) || p < lo || p >= hi || p + len > hi)
+            continue;
+        size_t first = (p - lo) / page, count = len / page;
+        if (index_out) *index_out = i;
+        if (first_out) *first_out = first;
+        if (count_out) *count_out = count;
+        return 1;
+    }
+    return 0;
+}
+
+static int view_commit(void *address, size_t size, DWORD protect)
+{
+    int prot = prot_from_page(protect), index;
+    size_t first, count;
+    void *base;
+    if (!vm_normalize_range(address, size, &base, &size)) return 0;
+    if (prot < 0) return 0;
+    pthread_mutex_lock(&s_views_lock);
+    int found = view_find_locked(base, size, 1, 0, &index, &first, &count);
+    if (!found) { pthread_mutex_unlock(&s_views_lock); return 0; }
+    w32_view *v = &s_views[index];
+    if (mprotect(base, size, prot) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) v->pages[first + i] = MEM_COMMIT | (protect & 0xFF);
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+}
+
+static int view_decommit(void *address, size_t size)
+{
+#if defined(__APPLE__)
+    /* Darwin's MADV_DONTNEED does not promise that contents are discarded
+     * before a recommit. Do not report Windows zero-on-recommit semantics. */
+    (void)address; (void)size;
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return 0;
+#else
+    size_t rounded;
+    void *base;
+    int index;
+    size_t first, count;
+    if (!address) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    pthread_mutex_lock(&s_views_lock);
+    if (size == 0) {
+        if (!view_find_locked(address, 0, 1, 1, &index, NULL, NULL)) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
+        base = address;
+        rounded = s_views[index].len;
+    } else if (!vm_normalize_range(address, size, &base, &rounded)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (!view_find_locked(base, rounded, 1, 0, &index, &first, &count)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return 0;
+    }
+    if (mprotect(base, rounded, PROT_NONE) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+#if defined(MADV_DONTNEED)
+    if (madvise(base, rounded, MADV_DONTNEED) != 0) {
+        w32_view *v = &s_views[index];
+        for (size_t i = 0; i < count; i++) {
+            DWORD page = v->pages[first + i];
+            if ((page & MEM_COMMIT) == MEM_COMMIT)
+                mprotect((char *)base + i * vm_page_size(), vm_page_size(),
+                         prot_from_page(page & 0xFF));
+        }
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+#else
+    /* Without a discard primitive, decommit cannot promise zero-on-recommit. */
+    w32_view *v = &s_views[index];
+    for (size_t i = 0; i < count; i++) {
+        DWORD page = v->pages[first + i];
+        if ((page & MEM_COMMIT) == MEM_COMMIT)
+            mprotect((char *)base + i * vm_page_size(), vm_page_size(),
+                     prot_from_page(page & 0xFF));
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return 0;
+#endif
+    for (size_t i = 0; i < count; i++) s_views[index].pages[first + i] = MEM_RESERVE;
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+#endif
+}
+
+static int view_protect(void *address, size_t size, DWORD protect, DWORD *old_protect)
+{
+    int prot = prot_from_page(protect), index;
+    size_t rounded, first, count;
+    void *base;
+    if (!old_protect || prot < 0 || !vm_normalize_range(address, size, &base, &rounded)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    pthread_mutex_lock(&s_views_lock);
+    if (!view_find_locked(base, rounded, 0, 0, &index, &first, &count)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return 0;
+    }
+    w32_view *v = &s_views[index];
+    for (size_t i = 0; i < count; i++) {
+        if ((v->pages[first + i] & MEM_COMMIT) != MEM_COMMIT) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
+    }
+    DWORD previous = v->pages[first] & 0xFF;
+    if (mprotect(base, rounded, prot) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) v->pages[first + i] = MEM_COMMIT | (protect & 0xFF);
+    if (old_protect) *old_protect = previous;
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+}
+
+static int view_release(void *address, SIZE_T size)
+{
+    int index;
+    pthread_mutex_lock(&s_views_lock);
+    if (size != 0 || !view_find_locked(address, 0, 1, 1, &index, NULL, NULL)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    w32_view *v = &s_views[index];
+    for (int i = 0; i < 512; i++) {
+        if (i != index && s_views[i].addr && s_views[i].private_allocation &&
+            s_views[i].allocation_id == v->allocation_id) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+    }
+    if (v->allocation_base != address) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (munmap(v->addr, v->len) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+    free(v->pages);
+    memset(v, 0, sizeof(*v));
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+}
+
+/* Read the page record under the registry lock; query pages with matching
+ * state/protection form the Win32 region around the input page. */
+static int view_query(const void *addr, MEMORY_BASIC_INFORMATION *buffer)
+{
+    uintptr_t p = (uintptr_t)addr;
+    size_t page = vm_page_size();
     int found = 0;
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++) {
-        if (!s_views[i].addr)
-            continue;
-        uintptr_t lo = (uintptr_t)s_views[i].addr;
-        uintptr_t hi = lo + s_views[i].len;
-        if ((uintptr_t)addr >= lo && (uintptr_t)addr < hi) {
-            if (base_out) *base_out = s_views[i].addr;
-            if (len_out)  *len_out  = s_views[i].len;
-            found = 1;
+        w32_view *v = &s_views[i];
+        uintptr_t lo = (uintptr_t)v->addr;
+        if (!v->addr || p < lo || p - lo >= v->len) continue;
+        size_t at = (p - lo) / page;
+        DWORD value = v->pages[at];
+        size_t begin = at, end = at + 1;
+        while (end < v->page_count && v->pages[end] == value) end++;
+        buffer->BaseAddress = (char *)v->addr + begin * page;
+        buffer->AllocationBase = v->allocation_base;
+        buffer->AllocationProtect = v->allocation_protect;
+        buffer->RegionSize = (end - begin) * page;
+        buffer->State = value & (MEM_COMMIT | MEM_RESERVE);
+        buffer->Protect = buffer->State == MEM_COMMIT ? (value & 0xFF) : 0;
+        buffer->Type = v->type;
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    if (!found) {
+        buffer->BaseAddress = (PVOID)((uintptr_t)addr & ~(uintptr_t)(page - 1));
+        buffer->State = MEM_FREE;
+        buffer->Protect = PAGE_NOACCESS;
+    }
+    return found;
+}
+
+uint64_t w32_reservation_id(LPVOID base)
+{
+    uint64_t id = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        if (s_views[i].addr == base && s_views[i].private_allocation) {
+            id = s_views[i].allocation_id;
             break;
         }
     }
     pthread_mutex_unlock(&s_views_lock);
-    return found;
+    return id;
 }
 
-size_t view_take(const void *addr)
+BOOL w32_release_reserved_region(LPVOID address, SIZE_T size)
 {
-    size_t len = 0;
+    int index, free_slot = -1;
+    size_t first, count;
+    if (!address || !size || ((uintptr_t)address % vm_page_size()) ||
+        (size % vm_page_size())) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 512; i++)
-        if (s_views[i].addr == addr) { len = s_views[i].len; s_views[i].addr = NULL; break; }
+    if (!view_find_locked(address, size, 1, 0, &index, &first, &count)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    }
+    w32_view *v = &s_views[index];
+    for (size_t i = 0; i < count; i++) {
+        if (v->pages[first + i] != MEM_RESERVE) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return FALSE;
+        }
+    }
+    size_t left_count = first;
+    size_t right_count = v->page_count - first - count;
+    DWORD *right_pages = NULL;
+    if (left_count && right_count) {
+        for (int i = 0; i < 512; i++) {
+            if (!s_views[i].addr) { free_slot = i; break; }
+        }
+        if (free_slot < 0 || right_count > SIZE_MAX / sizeof(DWORD) ||
+            !(right_pages = (DWORD *)malloc(right_count * sizeof(DWORD)))) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return FALSE;
+        }
+        memcpy(right_pages, v->pages + first + count,
+               right_count * sizeof(DWORD));
+    }
+    if (munmap(address, size) != 0) {
+        free(right_pages);
+        pthread_mutex_unlock(&s_views_lock);
+        return FALSE;
+    }
+    if (left_count && right_count) {
+        w32_view right = *v;
+        right.addr = (char *)address + size;
+        right.len = right_count * vm_page_size();
+        right.page_count = right_count;
+        right.pages = right_pages;
+        v->len = left_count * vm_page_size();
+        v->page_count = left_count;
+        s_views[free_slot] = right;
+    } else if (left_count) {
+        v->len = left_count * vm_page_size();
+        v->page_count = left_count;
+    } else if (right_count) {
+        memmove(v->pages, v->pages + first + count, right_count * sizeof(DWORD));
+        v->addr = (char *)address + size;
+        v->len = right_count * vm_page_size();
+        v->page_count = right_count;
+    } else {
+        free(v->pages);
+        memset(v, 0, sizeof(*v));
+    }
     pthread_mutex_unlock(&s_views_lock);
-    return len;
+    return TRUE;
+}
+
+BOOL w32_release_reservation(uint64_t allocation_id)
+{
+    if (!allocation_id) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    int ok = TRUE, found = FALSE;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        w32_view *v = &s_views[i];
+        if (!v->addr || !v->private_allocation || v->allocation_id != allocation_id)
+            continue;
+        found = TRUE;
+        if (munmap(v->addr, v->len) != 0) {
+            ok = FALSE;
+            continue;
+        }
+        free(v->pages);
+        memset(v, 0, sizeof(*v));
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    if (!ok || !found) return FALSE;
+    return TRUE;
 }
 
 /* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
@@ -2175,9 +2589,23 @@ static int anon_map_fd(const char *name)
 HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                           DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
 {
-    (void)file; (void)sa; (void)protect;
-    SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
-    if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    (void)sa;
+    if (file != (HANDLE)(LONG_PTR)-1) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return NULL;
+    }
+    if (protect != PAGE_READONLY && protect != PAGE_READWRITE &&
+        protect != PAGE_WRITECOPY) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    uint64_t requested_size = ((uint64_t)maxSizeHigh << 32) | maxSizeLow;
+    if (requested_size == 0 || requested_size > SIZE_MAX ||
+        requested_size > (uint64_t)INT64_MAX) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    SIZE_T size = (SIZE_T)requested_size;
 
     int fd = anon_map_fd(name);
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
@@ -2188,8 +2616,10 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     }
 
     w32_object *o = obj_alloc(K_FILEMAP);
+    if (!o) { close(fd); SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     o->fd       = fd;
     o->map_size = size;
+    o->map_protect = protect;
     return (HANDLE)o;
 }
 
@@ -2206,10 +2636,39 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     w32_object *o = (w32_object *)mapping;
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
-    off_t  off = ((off_t)offHigh << 32) | offLow;
-    SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
-    int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED;
+    uint64_t off_value = ((uint64_t)offHigh << 32) | offLow;
+    if (off_value > (uint64_t)INT64_MAX) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    off_t off = (off_t)off_value;
+    if ((off_value % (64 * 1024)) != 0 ||
+        (baseAddr && ((uintptr_t)baseAddr % (64 * 1024)) != 0)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    if (off < 0 || (SIZE_T)off >= o->map_size || (count && count > o->map_size - (SIZE_T)off)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    SIZE_T requested = count ? count : (o->map_size - (SIZE_T)off);
+    size_t len;
+    if (!vm_round_size(requested, &len)) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    int map_copy = access == FILE_MAP_COPY;
+    if (access != FILE_MAP_READ && access != FILE_MAP_WRITE &&
+        access != FILE_MAP_COPY && access != FILE_MAP_ALL_ACCESS) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    if ((o->map_protect == PAGE_READONLY && access != FILE_MAP_READ) ||
+        (o->map_protect == PAGE_WRITECOPY && access != FILE_MAP_READ && !map_copy)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    int prot   = PROT_READ | ((access == FILE_MAP_READ) ? 0 : PROT_WRITE);
+    DWORD page_protect = access == FILE_MAP_READ ? PAGE_READONLY
+                       : map_copy ? PAGE_WRITECOPY : PAGE_READWRITE;
+    int flags  = map_copy ? MAP_PRIVATE : MAP_SHARED;
 
     /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
      * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
@@ -2243,7 +2702,11 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
         SetLastError(ERROR_INVALID_ADDRESS);
         return NULL;
     }
-    view_register(p, len);
+    if (!view_register(p, len, page_protect, MEM_MAPPED, MEM_COMMIT, 0)) {
+        munmap(p, len);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     return p;
 }
 
@@ -2254,9 +2717,23 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, 
 
 BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
-    size_t len = view_take(baseAddr);
-    if (len == 0) return FALSE;
-    return munmap((void *)baseAddr, len) == 0;
+    pthread_mutex_lock(&s_views_lock);
+    int index;
+    if (!view_find_locked(baseAddr, 0, 0, 1, &index, NULL, NULL) ||
+        s_views[index].private_allocation) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    }
+    w32_view *v = &s_views[index];
+    if (munmap(v->addr, v->len) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return FALSE;
+    }
+    free(v->pages);
+    memset(v, 0, sizeof(*v));
+    pthread_mutex_unlock(&s_views_lock);
+    return TRUE;
 }
 
 /* ===================================================================== */
@@ -2287,29 +2764,13 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
     if (!buffer || length < sizeof(*buffer)) return 0;
     memset(buffer, 0, sizeof(*buffer));
 
-    void  *base = NULL;
-    size_t len  = 0;
-
-    if (!view_lookup(address, &base, &len)) {
+    if (!view_query(address, buffer)) {
         /* Not ours. Report it free rather than inventing a committed page. */
-        buffer->BaseAddress    = (PVOID)address;
         buffer->AllocationBase = NULL;
         buffer->RegionSize     = 0;
-        buffer->State          = MEM_FREE;
-        buffer->Protect        = PAGE_NOACCESS;
         buffer->Type           = 0;
         return sizeof(*buffer);
     }
-
-    buffer->BaseAddress      = (PVOID)address;
-    buffer->AllocationBase   = base;
-    buffer->AllocationProtect = PAGE_READWRITE;
-    /* From the queried address to the end of the region, which is what Win32
-     * reports and what callers sizing a copy out of it depend on. */
-    buffer->RegionSize       = len - (size_t)((uintptr_t)address - (uintptr_t)base);
-    buffer->State            = MEM_COMMIT;
-    buffer->Protect          = PAGE_READWRITE;
-    buffer->Type             = MEM_PRIVATE;
     return sizeof(*buffer);
 }
 
