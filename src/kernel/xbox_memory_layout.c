@@ -81,6 +81,9 @@ static void *g_gap_reserved[XBOX_NUM_MIRRORS] = {0};
  * there would read host memory instead of faulting. */
 static void *g_span_base = NULL;
 static size_t g_span_size = 0;
+#ifndef _WIN32
+static uint64_t g_span_reservation_id = 0;
+#endif
 static void *g_tiled_view = NULL;
 #ifdef _WIN32
 #ifndef MEM_REPLACE_PLACEHOLDER
@@ -2637,14 +2640,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             g_span_size = (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
-            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
-            g_memory_base = MapViewOfFileEx(g_mapping_handle,
-                                            FILE_MAP_ALL_ACCESS, 0, 0,
-                                            g_memory_size, g_span_base);
+            g_span_reservation_id = w32_reservation_id(g_span_base);
+            if (g_span_reservation_id &&
+                w32_release_reserved_region(g_span_base, g_memory_size)) {
+                g_memory_base = MapViewOfFileEx(g_mapping_handle,
+                                                FILE_MAP_ALL_ACCESS, 0, 0,
+                                                g_memory_size, g_span_base);
+            } else {
+                fprintf(stderr, "  RAM base reservation carve failed\n");
+            }
             if (!g_memory_base) {
-                VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+                w32_release_reservation(g_span_reservation_id);
                 g_span_base = NULL;
                 g_span_size = 0;
+                g_span_reservation_id = 0;
             }
         }
 #endif
@@ -3122,9 +3131,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
+        BOOL contig_slot_ready = TRUE;
 #ifndef _WIN32
-        if (g_span_base)
-            VirtualFree((void *)contig_native, XBOX_CONTIG_SIZE, MEM_RELEASE);
+        if (g_span_base &&
+            !w32_release_reserved_region((void *)contig_native, XBOX_CONTIG_SIZE)) {
+            fprintf(stderr, "  contiguous reservation carve failed\n");
+            contig_slot_ready = FALSE;
+        }
 #endif
         g_contig_mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
@@ -3137,7 +3150,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else
 #endif
         {
-        g_contig_memory = g_contig_mapping
+        g_contig_memory = g_contig_mapping && contig_slot_ready
             ? MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS,
                               0, 0, XBOX_CONTIG_SIZE, (LPVOID)contig_native)
             : NULL;
@@ -3446,9 +3459,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 #ifndef _WIN32
     if (g_span_base && getenv("RECOMP_EXT_VMA")) {
         uint64_t top = (uint64_t)g_memory_size * (1u + XBOX_NUM_MIRRORS);
-        if (top < GUEST_VMEM_TOP)
-            VirtualFree((void *)((uintptr_t)g_memory_base + top),
-                        GUEST_VMEM_TOP - top, MEM_RELEASE);
+        if (top < GUEST_VMEM_TOP &&
+            !w32_release_reserved_region((void *)((uintptr_t)g_memory_base + top),
+                                         GUEST_VMEM_TOP - top))
+            fprintf(stderr, "  EXT_VMA carve is outside an owned reserved span\n");
     }
 #endif
     guest_vmem_init(g_memory_offset, g_memory_size,
@@ -3613,10 +3627,11 @@ void xbox_MemoryLayoutShutdown(void)
 #ifdef _WIN32
         if (g_contig_is_view && g_placeholder_span)
             s_unmap_view_of_file2(GetCurrentProcess(), g_contig_memory, MEM_PRESERVE_PLACEHOLDER);
-        else if (g_contig_is_view)
-            UnmapViewOfFile(g_contig_memory);
         else
 #endif
+        if (g_contig_is_view)
+            UnmapViewOfFile(g_contig_memory);
+        else
             VirtualFree(g_contig_memory, 0, MEM_RELEASE);
         g_contig_memory = NULL;
     }
@@ -3649,11 +3664,18 @@ void xbox_MemoryLayoutShutdown(void)
                 fprintf(stderr, "  Placeholder coalesce failed (error %lu)\n", GetLastError());
             if (!VirtualFree(g_span_base, 0, MEM_RELEASE))
                 fprintf(stderr, "  Placeholder release failed (error %lu)\n", GetLastError());
-        } else
+        } else {
+            VirtualFree(g_span_base, 0, MEM_RELEASE);
+        }
+#else
+        if (!w32_release_reservation(g_span_reservation_id))
+            fprintf(stderr, "  POSIX reservation fragment cleanup failed\n");
 #endif
-        VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
         g_span_base = NULL;
         g_span_size = 0;
+#ifndef _WIN32
+        g_span_reservation_id = 0;
+#endif
 #ifdef _WIN32
         g_placeholder_span = 0;
 #endif

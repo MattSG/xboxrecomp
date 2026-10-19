@@ -132,8 +132,25 @@ The test embeds data; it does not download dependencies at runtime.
   read/write, and reserve-only storage is reported committed. The probe
   passes on Windows and fails on POSIX. Canonical guest-buffer checks also
   currently accept low RAM and contiguous ranges without page-rights checks.
-  These are open defects; I/O alias protection tests do not establish the
-  correctness of canonical mappings.
+  The subsequent memory repair tracks per-page reservation, commitment and
+  protection, returns actual old protections and query extents, and makes
+  Linux decommit discard data before zero-filled recommit. Release validates
+  exact ownership before unmapping; failed registration rolls a mapping back.
+  Mapped read/write/copy access and protection are checked. The POSIX-only
+  reservation-carve helper retains stable ownership IDs across fragments;
+  layout shutdown releases those fragments without touching mappings created
+  in carved holes. The contiguous view uses its matching unmap operation.
+  Canonical bridge buffers now share a complete host-page rights walk with
+  guest event validation, as well as the existing guest range/alias checks.
+  Independent GCC 13 ASan+UBSan platform-memory tests pass; kernel-memory and
+  Linux/Windows mapping tests pass. Linking the prior bridge against the same
+  mapping fixture fails four canonical rights assertions. The same native
+  query probe now passes on both hosts. Existing POSIX layout integration also
+  passes. A stale physical-address fixture was corrected only after a clean
+  baseline reproduced its four failures; initialized physical backing remains
+  covered by the mapping integration test. macOS decommit explicitly reports
+  unsupported; it does not claim Linux discard semantics. The registry remains
+  bounded at 512 mappings, with explicit allocation failure at capacity.
 - The consuming game's owned saved-Cruise pause/resume scenario passed.
   Independently inspected captures show the pause menu and resumed driving;
   pre/post three-second motion samples measured 26.80 and 44.01 units.

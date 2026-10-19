@@ -107,6 +107,35 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * layer can catch it, because xbox_NtReadFile receives a host pointer and a
  * count and cannot know where the mapping ends.
  */
+static int bridge_native_span_accessible(uint32_t va, uint32_t bytes,
+                                         int write_access)
+{
+    uintptr_t cursor = (uintptr_t)XBOX_TO_NATIVE(va);
+    uintptr_t end = cursor + bytes;
+    if (end < cursor) return 0;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uintptr_t region_end;
+        DWORD protection;
+        if (!VirtualQuery((void *)cursor, &mbi, sizeof(mbi)) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
+        protection = mbi.Protect & 0xFFu;
+        if (write_access) {
+            if (protection != PAGE_READWRITE && protection != PAGE_WRITECOPY &&
+                protection != PAGE_EXECUTE_READWRITE &&
+                protection != PAGE_EXECUTE_WRITECOPY) return 0;
+        } else if (protection != PAGE_READONLY && protection != PAGE_READWRITE &&
+                   protection != PAGE_WRITECOPY && protection != PAGE_EXECUTE_READ &&
+                   protection != PAGE_EXECUTE_READWRITE &&
+                   protection != PAGE_EXECUTE_WRITECOPY) return 0;
+        region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (region_end <= cursor) return 0;
+        cursor = region_end;
+    }
+    return 1;
+}
+
 static int bridge_va_mapped(uint32_t va, uint32_t bytes, int write_access)
 {
     uint64_t end = (uint64_t)va + bytes;
@@ -115,10 +144,10 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes, int write_access)
     if (va < 0x1000)            /* page zero is deliberately unmapped */
         return 0;
     if (end <= mapped)
-        return 1;
+        return bridge_native_span_accessible(va, bytes, write_access);
     if (va >= XBOX_CONTIG_BASE &&
         end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-        return 1;
+        return bridge_native_span_accessible(va, bytes, write_access);
     {
         uint32_t remaining;
         if (xbox_IoMappingQuery(XBOX_TO_NATIVE(va), NULL, NULL, &remaining) &&
@@ -139,7 +168,7 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes, int write_access)
                     return 0;
                 checked += chunk;
             }
-            return 1;
+            return bridge_native_span_accessible(va, bytes, write_access);
         }
     }
     return 0;
@@ -7471,26 +7500,9 @@ static int ke_inline_event_enabled(void)
  * reading any of it; guest bounds alone cannot establish either property. */
 static int ke_guest_event_header(uint32_t guest_va, uint32_t header[4])
 {
-    uintptr_t cursor, end;
-    if (guest_va < 0x10000u || (guest_va & 3u) || !bridge_va_mapped(guest_va, 16, 0)) return 0;
+    if (guest_va < 0x10000u || (guest_va & 3u) || !bridge_va_mapped(guest_va, 16, 1)) return 0;
     if (guest_va >= 0x04000000u && (guest_va < 0x80000000u || guest_va >= 0x84000000u))
         return 0;
-    cursor = (uintptr_t)XBOX_TO_NATIVE(guest_va);
-    end = cursor + 16;
-    if (end < cursor) return 0;
-    while (cursor < end) {
-        MEMORY_BASIC_INFORMATION mbi;
-        uintptr_t region_end;
-        DWORD protection;
-        if (!VirtualQuery((void *)cursor, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
-            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
-        protection = mbi.Protect & 0xFFu;
-        if (protection != PAGE_READWRITE && protection != PAGE_WRITECOPY &&
-            protection != PAGE_EXECUTE_READWRITE && protection != PAGE_EXECUTE_WRITECOPY) return 0;
-        region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-        if (region_end <= cursor) return 0;
-        cursor = region_end;
-    }
 #ifdef _WIN32
     {
         SIZE_T copied;
