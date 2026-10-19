@@ -146,14 +146,6 @@ typedef struct {
     int (*cubic_filter_0)(const NvD3DState *state, int source_is_target, uint32_t levels);
 } NvOverlayHooks;
 void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks);
-/* A title that multiplies its far plane by `scale` (w-buffered, so depth is
- * w / far) still indexes its authored depth lookups (fog ramps) with the
- * original fractions. Depth read back as a texture is reported in those:
- * unchanged in world distance up to `knee` of the original far plane, then
- * stretched so the rest of the authored ramp ends at the new far plane.
- * scale 1 (the default) leaves depth untouched. */
-void nv2a_d3d_set_depth_view_remap(float scale, float knee);
-
 /* Optional observer for consecutive NV097_NO_OPERATION parameters, called on
  * the executor thread in stream order. A NULL state ends an interrupted run.
  * Return nonzero only for consumed extension words. Other NO_OPERATION
