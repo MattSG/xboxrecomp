@@ -295,17 +295,6 @@ void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks)
     if (hooks) s_overlay = *hooks;
 }
 
-/* nv2a_d3d_set_depth_view_remap: x = scale, y = knee (see y16d_ps). */
-static float s_zview_remap[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
-static int s_depth_hazed;               /* depth read as Y16 this frame */
-
-void nv2a_d3d_set_depth_view_remap(float scale, float knee)
-{
-    if (!(scale >= 1.0f) || !(knee > 0.0f && knee <= 1.0f)) { scale = 1.0f; knee = 1.0f; }
-    s_zview_remap[1] = knee;
-    s_zview_remap[0] = scale;            /* views rebuild on the next depth bind */
-}
-
 /* The aspect the image is rendered at, never narrower than the title's
  * 4:3: RECOMP_ASPECT (e.g. 16:9, 21:9, 1.6, 4:3), else the game window's
  * client area, following it as the window is resized (see display_config).
@@ -2516,7 +2505,6 @@ static ID3D11ShaderResourceView *surface_y16(Surface *s)
 static ID3D11ShaderResourceView *depth_y16(Depth *d)
 {
     if (!d->zsrv) return NULL;
-    s_depth_hazed = 1;
     if (!d->y16) {
         d->y16 = make_texture(2 * d->iw, d->ih, 1, 1, DXGI_FORMAT_R16G16B16A16_UNORM,
                               D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0);
@@ -2543,7 +2531,6 @@ static ID3D11ShaderResourceView *depth_y16(Depth *d)
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, src);
         {
             float cc[8] = { 0 };
-            memcpy(cc, s_zview_remap, sizeof s_zview_remap);
             cc[2] = d->w ? 0.25f * (float)d->iw / (float)d->w : 0.0f;
             upload_cb(s_cb_clear, cc, sizeof cc);
             ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_clear);
@@ -2745,10 +2732,6 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         pc.zp0[3] = s_cur_sy;
         pc.zp1[0] = 1.0f / ((float)zm + 1.0f);
         pc.zp1[1] = (float)zm;
-        if (s_depth_hazed && st->depth_test && st->depth_mask && s_zview_remap[0] > 1.0f) {
-            pc.zp1[2] = s_zview_remap[0];
-            pc.zp1[3] = s_zview_remap[1];
-        }
     }
     if (!wclip_scissored(st)) {
         /* Regions apply per pixel: inclusive keeps a pixel inside any
@@ -4172,7 +4155,6 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
         ReleaseSRWLockExclusive(&s_mr_lock);
         s_mr_frame_n = 0;
     }
-    s_depth_hazed = 0;
     s = surface_find(phys(surface_addr));
     if (!s && pitch)
         s = scan_surface(surface_addr, pitch);
@@ -4355,6 +4337,5 @@ void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
-void nv2a_d3d_set_depth_view_remap(float scale, float knee) { (void)scale; (void)knee; }
 void nv2a_d3d_distance_fog(const NvD3DState *st, float depth_to_world, float far_clip, float start, float end, uint32_t argb, uint32_t flags, const float sky_fade[4]) { (void)st; (void)depth_to_world; (void)far_clip; (void)start; (void)end; (void)argb; (void)flags; (void)sky_fade; }
 #endif

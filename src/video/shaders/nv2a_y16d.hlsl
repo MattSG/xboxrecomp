@@ -7,12 +7,7 @@
  * A high-word tap sits a quarter guest pixel to the right of the shaded
  * pixel. Shift the depth read left by ccol.z host pixels so a building's
  * edge does not accidentally use sky depth and acquire a bright haze rim.
- * Host depth is z / 0xFFFFFF (see map[2]). ccol = nv2a_d3d_set_depth_view_remap
- * (scale s, knee k): x = d*s is depth in units of the original far plane;
- * below k it is x, above it the band k..1 fills exponentially with the
- * original slope at k (63% at the old far plane, 99.6% at twice it), so
- * geometry the title never meant to show fades into the sky colour instead
- * of standing crisp in a stretched band. d = 1 (sky) stays 1. */
+ * Host depth is z / 0xFFFFFF (see map[2]). */
 #ifdef Y16_MS
 Texture2DMS<float> Y16Z : register(t0);
 #else
@@ -29,9 +24,6 @@ float4 y16d_ps(float4 p : SV_Position) : SV_Target {
 #else
   float d = Y16Z.Load(int3(zx, q.y, 0));
 #endif
-  float s = ccol.x, k = ccol.y;
-  d = saturate(d);
-  if (s > 1.0 && d < 1.0) { float x = d * s; d = x <= k ? x : k + (1.0 - k) * (1.0 - exp((k - x) / (1.0 - k))); }
   uint word = (uint)round(saturate(d) * 16777215.0) >> 8;
   return float4(1, (word >> 8) / 255.0, (word & 255u) / 255.0, 1);
 }

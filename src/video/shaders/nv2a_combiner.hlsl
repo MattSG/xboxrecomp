@@ -322,31 +322,11 @@ float4 ps_main(PSIn i, out uint cov : SV_Coverage) : SV_Target { return shade(i,
  * foliage do not fight. Polygon offset is applied here as xemu does: the
  * rasteriser's depth bias never reaches a shader-written depth. zp0 = offset
  * factor, units, host pixels per guest pixel x/y; zp1 = 1/(zmax+1), zmax,
- * view remap scale (0 = off), knee. Draws after the title has read the
- * depth buffer for its haze pass (foliage, in one title) miss that haze; with the
- * far plane extended they lose MSAA coverage by the fraction y16d_ps hazes
- * their depth, so the hazed scene shows through. The sample count is spread
- * over each 2x2 block of host pixels with a Bayer order (floor((c + i/4))
- * over i = 0..3 sums to floor(4c)), so at the default 2x supersample every
- * window pixel gets the exact fraction: a screen-noise dither left a visible
- * pattern on distant trees that shimmered white as they moved.
- * instead of them standing crisp in front of it. The sky dome, at the far
- * plane, is left alone. */
+ * reserved, reserved. */
 void ps_wdepth(PSIn i, out float4 c : SV_Target, out float dep : SV_Depth, out uint cov : SV_Coverage) {
   c = shade(i, cov);
   float z = i.fog.y;
   z += zp0.y + zp0.x * max(abs(ddx(z)) * zp0.z, abs(ddy(z)) * zp0.w);
   z = clamp(z, 0.0, zp1.y);
-  if (zp1.z > 0.0) {
-    float x = z * zp1.x * zp1.z, k = zp1.w;
-    if (x > k && x < 0.98 * zp1.z) {
-      float b = 1.0 - exp((k - x) / (1.0 - k));
-      uint2 q = uint2(i.pos.xy) & 1u;
-      float r = (float)(q.x * 2u + (q.x ^ q.y)) * 0.25;
-      uint ns = RT_SAMPLES, kk = (uint)floor((1.0 - b) * ns + r);
-      if (kk == 0) discard;
-      if (ns > 1 && kk < ns) cov &= (1u << kk) - 1u;
-    }
-  }
   dep = asfloat(asuint(floor(z) * zp1.x) + 1u);
 }

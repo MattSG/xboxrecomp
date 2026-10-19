@@ -222,16 +222,6 @@ void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks)
     if (hooks) s_overlay = *hooks;
 }
 
-static float s_zview_remap[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
-static int s_depth_hazed;
-
-void nv2a_d3d_set_depth_view_remap(float scale, float knee)
-{
-    if (!(scale >= 1.0f) || !(knee > 0.0f && knee <= 1.0f)) { scale = 1.0f; knee = 1.0f; }
-    s_zview_remap[1] = knee;
-    s_zview_remap[0] = scale;
-}
-
 static volatile float s_aspect;
 
 /* The window's size in pixels; 0 if there is no window or it is minimised. */
@@ -1992,7 +1982,6 @@ static SDL_GPUTexture *surface_y16(Surface *s)
 
 static SDL_GPUTexture *depth_y16(Depth *d)
 {
-    s_depth_hazed = 1;
     if (!d->y16) {
         d->y16 = make_texture(2 * d->iw, d->ih, 1, 0, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM, USAGE_TARGET);
         if (!d->y16) return NULL;
@@ -2001,7 +1990,6 @@ static SDL_GPUTexture *depth_y16(Depth *d)
     }
     if (d->y16_gen != d->gen) {
         float cc[8] = { 0 };
-        memcpy(cc, s_zview_remap, sizeof s_zview_remap);
         cc[2] = d->w ? 0.25f * (float)d->iw / (float)d->w : 0.0f;
         y16_draw(d->y16, &d->y16_clear, 2 * d->iw, d->ih, SH_Y16D_PS, d->tex, cc);
         d->y16_gen = d->gen;
@@ -2219,10 +2207,6 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         pc.zp0[3] = s_cur_sy;
         pc.zp1[0] = 1.0f / ((float)zm + 1.0f);
         pc.zp1[1] = (float)zm;
-        if (s_depth_hazed && st->depth_test && st->depth_mask && s_zview_remap[0] > 1.0f) {
-            pc.zp1[2] = s_zview_remap[0];
-            pc.zp1[3] = s_zview_remap[1];
-        }
     }
     if (!wclip_scissored(st)) {
         int w;
@@ -3429,7 +3413,6 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
         SDL_UnlockSpinlock(&s_mr_lock);
         s_mr_frame_n = 0;
     }
-    s_depth_hazed = 0;
     s = surface_find(phys(surface_addr));
     if (!s && pitch)
         s = scan_surface(surface_addr, pitch);
