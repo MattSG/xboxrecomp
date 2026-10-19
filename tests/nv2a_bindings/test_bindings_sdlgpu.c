@@ -417,108 +417,42 @@ static void test_resize(void)
     puts("PASS: a settled window resize releases surfaces and the next draw renders the exact colour");
 }
 
-/* The dedicated host fog pass: colour and alpha from the scene's depth, with
- * the sky mask and fade. The same expectations as the D3D11 test. */
-static uint32_t native_fog_pixel(NvD3DState *st, float depth, float start)
-{
-    float rhw = 1.f / (depth * 16777216.f);
-    float positions[3][4] = { { 8, 8, 0, 0 }, { 56, 8, 0, 0 }, { 8, 56, 0, 0 } };
-    NvD3DAttrib attr[16] = {0};
-    float def[16][4] = { { 0 } };
-    uint32_t idx[3] = { 0, 1, 2 }, pixels[64 * 64], alpha, colour, masked_colour;
-    unsigned i;
-    for (i = 0; i < 3; ++i) {
-        positions[i][3] = rhw;
-        positions[i][2] = (1000.f / 990.f - 10.f / (990.f * depth)) * 16777215.f;
-    }
-    attr[0] = (NvD3DAttrib){ 1, 2, 4, 16, (const uint8_t *)positions };
-    def[3][0] = 1; def[3][3] = .5f;
-    nv2a_d3d_clear(st, 0xF1, 0x80FF0000, 0xFFFFFF00, 0, 0, 63, 63);
-    nv2a_d3d_draw_ub(st, NV_D3D_TRIANGLES, attr, def, 0, idx, 3, 0, 2, NULL);
-    read_target(pixels);
-    alpha = pixels[16 * 64 + 16] >> 24;
-    /* At the postprocess marker, UI/glare setup may already have disabled
-     * W-buffer writes. The stored scene depth still contains linear W. */
-    {
-        NvD3DState post = *st;
-        post.z_perspective = 0; post.depth_mask = 0;
-        nv2a_d3d_distance_fog(&post, 1000.f / 16777216.f, 1000, start, 800, 0xFF0000FF, 0, NULL);
-        read_target(pixels);
-        CHECK((pixels[16 * 64 + 16] >> 24) == alpha);   /* fog preserves destination alpha */
-        colour = pixels[16 * 64 + 16] & 0xFFFFFF;
-        nv2a_d3d_distance_fog(&post, 1000.f / 16777216.f, 1000, start, 800, 0xFF0000FF,
-                              NV_D3D_FOG_SKY_MASK, NULL);
-        read_target(pixels);
-        CHECK((pixels[16 * 64 + 16] >> 24) == (isfinite(start) ? (depth >= .99999f ? 255u : 0u) : alpha));
-        masked_colour = pixels[16 * 64 + 16] & 0xFFFFFF;
-        /* The next panorama draw must affect sky alone, never nearby geometry. */
-        post.depth_test = 0; post.blend_enable = 1;
-        post.blend_sfactor = 0x304; post.blend_dfactor = 0x305;
-        triangle(&post, 1, 0);
-        read_target(pixels);
-        if (isfinite(start))
-            CHECK((pixels[16 * 64 + 16] & 0xFFFFFF) == (depth >= .99999f ? 0x00FF00 : masked_colour));
-    }
-    return colour;
-}
-
-static void test_native_fog(void)
-{
-    NvD3DState st = draw_state();
-    uint32_t pixels[64 * 64], middle, distant;
-    unsigned plane;
-    st.z_perspective = 1; st.depth_mask = 1;
-    CHECK(native_fog_pixel(&st, .1f, 200) == 0xFF0000);
-    middle = native_fog_pixel(&st, .5f, 200);
-    CHECK(abs((int)(middle >> 16) - 81) <= 2 && abs((int)(middle & 255) - 174) <= 2);
-    distant = native_fog_pixel(&st, .8f, 200);
-    CHECK((distant >> 16) <= 4 && (distant & 255) >= 251);
-    CHECK(native_fog_pixel(&st, 1, 200) == 0xFF0000);     /* default keeps clear/sky colour */
-    nv2a_d3d_distance_fog(&st, 1000.f / 16777216.f, 1000, 200, 800, 0xFF0000FF, NV_D3D_FOG_SKY_FILL, NULL);
-    read_target(pixels);
-    CHECK((pixels[16 * 64 + 16] & 0xFFFFFF) == 0x0000FF);  /* no panorama: clear depth becomes untextured air */
-    /* The sky mask fades continuously above the camera's world horizon. */
-    {
-        const float sky_planes[2][4] = { { 0, 1, 0, 1 }, { .6f, .8f, -.1f, 1 } };
-        for (plane = 0; plane < 2; ++plane) {
-            unsigned x, y;
-            int sky_alpha;
-            NvD3DState panorama;
-            nv2a_d3d_clear(&st, 0xF1, 0xFF0000FF, 0xFFFFFF00, 0, 0, 63, 63);
-            nv2a_d3d_distance_fog(&st, 1000.f / 16777216.f, 1000, 200, 800, 0xFF0000FF,
-                                  NV_D3D_FOG_SKY_MASK | NV_D3D_FOG_SKY_FADE, sky_planes[plane]);
-            read_target(pixels);
-            for (y = 0; y < 64; ++y)
-                for (x = 0; x < 64; ++x) {
-                    float h = sky_planes[plane][0] * (2.f * (x + .5f) / 64 - 1) +
-                              sky_planes[plane][1] * (1.f - 2.f * (y + .5f) / 64) + sky_planes[plane][2];
-                    float fade = fminf(1, fmaxf(0, h));
-                    int expected = (int)roundf(255 * fade * fade * (3 - 2 * fade));
-                    CHECK(abs((int)(pixels[y * 64 + x] >> 24) - expected) <= 1);
-                }
-            sky_alpha = pixels[16 * 64 + 16] >> 24;
-            panorama = st;
-            panorama.depth_test = panorama.depth_mask = 0;
-            panorama.blend_enable = 1; panorama.blend_sfactor = 0x304; panorama.blend_dfactor = 0x305;
-            triangle(&panorama, 1, 0);
-            read_target(pixels);
-            CHECK(abs((int)((pixels[16 * 64 + 16] >> 8) & 255) - sky_alpha) <= 1);
-            CHECK(abs((int)(pixels[16 * 64 + 16] & 255) - (255 - sky_alpha)) <= 1);
-        }
-    }
-    CHECK(native_fog_pixel(&st, .8f, NAN) == 0xFF0000);
-    native_fog_pixel(&st, .8f, 200);
-    st.depth_test = 0; st.depth_mask = 0;
-    triangle(&st, 1, 0);
-    read_target(pixels);
-    CHECK((pixels[16 * 64 + 16] & 0xFFFFFF) == 0x00FF00);  /* UI RGB after the pass stays unchanged */
-    puts("PASS: dedicated fog pass reads depth, preserves near/sky/alpha, optionally rebuilds skyline alpha, fades mid/far, rejects invalid ranges, and restores subsequent UI rendering");
-}
-
 static void test_common(void)
 {
     nv2a_common_checks();
     puts("PASS: shared layout, texel and draw helpers (nv2a_render_common.h)");
+}
+
+static unsigned host_draw_calls;
+static int host_clear(const NvHostTarget *target,void *user)
+{
+    CHECK(target->device == s_dev && target->context == s_cmd);
+    CHECK(target->width == 64 && target->height == 64 && target->depth_bits == 24);
+    CHECK(target->samples == 1 && target->colour && target->depth);
+    ++host_draw_calls;
+    if (!user) return 0;
+    SDL_GPUColorTargetInfo colour = {0};
+    colour.texture = target->colour; colour.clear_color.g = colour.clear_color.a = 1;
+    colour.load_op = SDL_GPU_LOADOP_CLEAR; colour.store_op = SDL_GPU_STOREOP_STORE;
+    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(target->context,&colour,1,NULL);
+    CHECK(pass); SDL_EndGPURenderPass(pass); return 1;
+}
+static void test_host_draw(void)
+{
+    NvD3DState st = draw_state(), missing;
+    uint32_t pixels[64*64];
+    triangle(&st,0,0);
+    CHECK(nv2a_d3d_host_draw(&st,host_clear,&st));
+    read_target(pixels); CHECK((pixels[16*64+16]&0xFFFFFF) == 0x00FF00);
+    CHECK(!nv2a_d3d_host_draw(&st,host_clear,NULL));
+    read_target(pixels); CHECK((pixels[16*64+16]&0xFFFFFF) == 0x00FF00);
+    CHECK(!nv2a_d3d_host_draw(NULL,host_clear,&st));
+    CHECK(!nv2a_d3d_host_draw(&st,NULL,&st));
+    missing = st; missing.zeta_addr = 0;
+    CHECK(!nv2a_d3d_host_draw(&missing,host_clear,&st)); CHECK(host_draw_calls == 2);
+    triangle(&st,0,0); read_target(pixels);
+    CHECK((pixels[16*64+16]&0xFFFFFF) == 0xFF0000);
+    puts("PASS: native target callback ordering, metadata, rejection and subsequent guest rendering");
 }
 
 int main(int argc, char **argv)
@@ -541,12 +475,12 @@ int main(int argc, char **argv)
     }
     CHECK(nv2a_d3d_init());
     if (!strcmp(argv[1], "pixels")) test_pixels();
+    else if (!strcmp(argv[1], "host_draw")) test_host_draw();
     else if (!strcmp(argv[1], "failures")) test_failures();
     else if (!strcmp(argv[1], "ps_bindings")) test_ps_bindings();
     else if (!strcmp(argv[1], "ps_reset")) test_ps_reset();
     else if (!strcmp(argv[1], "overlay_upload")) test_overlay_upload();
     else if (!strcmp(argv[1], "resize")) test_resize();
-    else if (!strcmp(argv[1], "native_fog")) test_native_fog();
     else CHECK(0);
     return 0;
 }
