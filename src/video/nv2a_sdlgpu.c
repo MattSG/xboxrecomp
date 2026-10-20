@@ -2136,10 +2136,14 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
             s_draw_bspline = 1;
         pc.tex_info[n][0] = (t->control0 >> 2) & 1;
         pc.tex_info[n][1] = (t->filter >> 28) | (tex_volume(t) ? 256u : 0u);
-        if (rt && kind == K_LIN && t->color != 0x35 && (rt->iw > rt->w || rt->ih > rt->h) &&
-            ((t->filter >> 24) & 0xF) == 1 && !(((t->filter >> 16) & 0xFF) == 2 ||
-            ((t->filter >> 16) & 0xFF) == 4 || ((t->filter >> 16) & 0xFF) == 6))
-            pc.tex_info[n][2] = 1;
+        if (rt && kind == K_LIN && t->color != 0x35 && (rt->iw > rt->w || rt->ih > rt->h)) {
+            unsigned mag = (t->filter >> 24) & 15u;
+            unsigned min = (t->filter >> 16) & 255u;
+            if (mag == 1 && min != 2 && min != 4 && min != 6) pc.tex_info[n][2] = 1;
+            /* Constant linear clamp taps need the same guest-sized footprint. */
+            if (mag == 2 && (t->address & 0xF) == 3 && ((t->address >> 8) & 0xF) == 3)
+                pc.tex_info[n][2] = 2;
+        }
         memcpy(pc.bump_mat[n], t->bump_mat, sizeof pc.bump_mat[n]);
         pc.bump_lum[n][0] = t->bump_scale;
         pc.bump_lum[n][1] = t->bump_offset;
