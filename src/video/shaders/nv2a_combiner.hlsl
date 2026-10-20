@@ -139,13 +139,24 @@ float4 tapbox(uint n, float2 g, float2 inv) {
   uint w, h;
   if (n == 0) T2D0.GetDimensions(w, h); else if (n == 1) T2D1.GetDimensions(w, h);
   else if (n == 2) T2D2.GetDimensions(w, h); else T2D3.GetDimensions(w, h);
-  float2 dim = float2(w, h), sc = dim * inv, gi = floor(g);
-  int2 a = clamp(int2(floor(gi * sc + 0.5)), 0, int2(dim) - 1);
-  int2 b = clamp(int2(floor((gi + 1.0) * sc + 0.5)), a + 1, int2(dim));
+  float2 dim = float2(w, h), sc = dim * inv, gi = clamp(floor(g), 0.0, 1.0 / inv - 1.0);
+  float2 low = gi * sc, high = (gi + 1.0) * sc;
+  int2 a = clamp(int2(floor(low)), 0, int2(dim) - 1);
+  int2 b = clamp(int2(ceil(high)), a + 1, int2(dim));
   float4 acc = 0; float cnt = 0;
-  [loop] for (int y = a.y; y < b.y && y < a.y + 8; y++)
-    [loop] for (int x = a.x; x < b.x && x < a.x + 8; x++) { acc += ldn(n, int2(x, y)); cnt += 1; }
+  [loop] for (int y = a.y; y < b.y; y++)
+    [loop] for (int x = a.x; x < b.x; x++) {
+      float2 cover = max(0.0, min(float2(x,y) + 1.0, high) - max(float2(x,y), low));
+      float area = cover.x * cover.y;
+      acc += ldn(n, int2(x, y)) * area; cnt += area;
+    }
   return acc / max(cnt, 1.0);
+}
+/* Bilinear filtering operates on resolved guest pixels, not host subpixels. */
+float4 taplinear(uint n, float2 g, float2 inv) {
+  float2 p = floor(g - 0.5), f = frac(g - 0.5);
+  return lerp(lerp(tapbox(n, p, inv), tapbox(n, p + float2(1,0), inv), f.x),
+              lerp(tapbox(n, p + float2(0,1), inv), tapbox(n, p + 1, inv), f.x), f.y);
 }
 float4 sampc(uint n, float3 d) {
   if (n == 0) return TC0.Sample(SC0, d); if (n == 1) return TC1.Sample(SC1, d);
@@ -178,7 +189,8 @@ float4 shade(PSIn i, out uint cov) {
     if ((mode == 1 || mode == 2) && (tex_info[n].y & 256u)) t = sampv(n, c.xyz / q);
     else if (mode == 1 || mode == 2) {
       float2 g = c.xy / q, d = abs(ddx(g)) + abs(ddy(g));
-      if (tex_info[n].z != 0u && max(d.x, d.y) < 1e-4) t = tapbox(n, g, tex_scale[n].xy);
+      if (tex_info[n].z != 0u && max(d.x, d.y) < 1e-4)
+        t = tex_info[n].z == 2u ? taplinear(n, g, tex_scale[n].xy) : tapbox(n, g, tex_scale[n].xy);
       else t = samp2(n, g * tex_scale[n].xy);
     }
     else if (mode == 3) t = sampc(n, c.xyz);

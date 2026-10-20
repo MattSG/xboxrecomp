@@ -345,6 +345,64 @@ static int test_descriptor_rollover(void)
 #define volume_pixel nv2a_test_target_pixel
 #include "volume_fixture.h"
 
+/* A constant linear tap must sample a guest pixel, rather than one
+ * subpixel of an upscaled visibility mask. Shift the same one-third
+ * coverage across its three host columns: the sample must remain 85. */
+static int test_constant_tap(void)
+{
+    NvD3DState st = state_for(8, 8);
+    Surface *source;
+    uint32_t pixels[24 * 24], indices[] = {0,1,2,2,1,3};
+    float pos[4][4] = {{0,0,0,1},{8,0,0,1},{0,8,0,1},{8,8,0,1}};
+    float defaults[16][4] = {{0}};
+    NvD3DAttrib attributes[16] = {{0}};
+    unsigned phase, x, y;
+    s_scale = 3;
+    source = surface_get(0x20000, 8*4, 8, 8, 8, 0);
+    CHECK(source && source->iw == 24 && source->ih == 24);
+    defaults[3][0] = defaults[3][1] = defaults[3][2] = defaults[3][3] = 1;
+    defaults[9][0] = defaults[9][1] = 1.5f; defaults[9][3] = 1;
+    attributes[0].enabled = 1; attributes[0].type = 2; attributes[0].size = 4;
+    attributes[0].stride = sizeof pos[0]; attributes[0].data = (const uint8_t *)pos;
+    st.tex_used = 1;
+    st.tex[0].addr = source->va; st.tex[0].color = 0x12;
+    st.tex[0].width = st.tex[0].height = 8; st.tex[0].pitch = 8*4;
+    st.tex[0].levels = 1; st.tex[0].filter = 0x02062000;
+    st.tex[0].address = 0x030303;
+    for (phase = 0; phase < 3; ++phase) {
+        flush_batch();
+        for (y=0; y<24; ++y) for (x=0; x<24; ++x)
+            pixels[y*24+x] = 0xFF000000u | (((x+phase)%3 == 1) ? 0xFF0000u : 0);
+        CHECK(upload_texture(source->tex,0,0,24,24,pixels,sizeof pixels));
+        source->clear = 0; source->gen++;
+        nv2a_d3d_draw_ub(&st,NV_D3D_TRIANGLES,attributes,defaults,0,indices,6,0,3,NULL);
+        x = (nv2a_test_target_pixel(st.color_addr,3,3) >> 16) & 255;
+        fprintf(stderr,"constant tap phase %u: %u\n",phase,x);
+        CHECK(abs((int)x-85) <= 1);
+    }
+    /* Noninteger scaling: a guest pixel covers 8/3 host columns. Two
+     * white columns therefore cover 3/4 of it, independent of rounding. */
+    {
+        NvD3DTexture texture = st.tex[0];
+        s_scale = 8.f/3.f;
+        source = surface_get(0x30000,9*4,8,9,9,0);
+        CHECK(source && source->iw == 24 && source->ih == 24);
+        for (y=0; y<24; ++y) for (x=0; x<24; ++x)
+            pixels[y*24+x] = 0xFF000000u | (x<2 ? 0xFF0000u : 0);
+        CHECK(upload_texture(source->tex,0,0,24,24,pixels,sizeof pixels));
+        source->clear=0; source->gen++;
+        st=state_for(9,9); st.color_addr=0x40000; st.tex_used=1; st.tex[0]=texture;
+        st.tex[0].addr=source->va; st.tex[0].width=st.tex[0].height=9; st.tex[0].pitch=9*4;
+        defaults[9][0]=defaults[9][1]=.5f;
+        nv2a_d3d_draw_ub(&st,NV_D3D_TRIANGLES,attributes,defaults,0,indices,6,0,3,NULL);
+        x=(nv2a_test_target_pixel(st.color_addr,3,3)>>16)&255;
+        fprintf(stderr,"fractional constant tap: %u\n",x);
+        CHECK(abs((int)x-191)<=1);
+    }
+    puts("PASS: constant linear render-target taps retain guest coverage across subpixel phases");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
@@ -364,6 +422,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "volume")) { test_volume(); return 0; }
     if (!strcmp(argv[1], "descriptor_rollover")) return test_descriptor_rollover();
     if (!strcmp(argv[1], "panorama")) return test_panorama();
+    if (!strcmp(argv[1], "constant_tap")) return test_constant_tap();
     if (!strcmp(argv[1], "gates")) return test_gates();
     if (!strcmp(argv[1], "depth")) return test_depth();
     CHECK(0);

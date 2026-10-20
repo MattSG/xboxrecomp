@@ -7,7 +7,7 @@ include(../../cmake/Nv2aSdlgpu.cmake)
 add_executable(nv2a_graphics_quality_sdlgpu test_graphics_quality_sdlgpu.c)
 target_include_directories(nv2a_graphics_quality_sdlgpu PRIVATE ../../src ../../src/video)
 xbr_nv2a_sdlgpu_target(nv2a_graphics_quality_sdlgpu)
-foreach(case panorama gates depth descriptor_rollover volume y16)
+foreach(case panorama gates depth descriptor_rollover volume y16 constant_tap)
     add_test(NAME nv2a_graphics_quality_sdlgpu_${case} COMMAND nv2a_graphics_quality_sdlgpu ${case})
 endforeach()
 
