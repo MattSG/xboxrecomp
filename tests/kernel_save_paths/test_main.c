@@ -33,9 +33,9 @@ const char *xbox_LookupSymbolicLink(const char *link)
 {
     if (!mounted) return NULL;
     if (strcmp(link, "\\??\\U:") == 0)
-        return "\\Device\\Harddisk0\\Partition1\\UDATA\\4d53002a";
+        return "\\Device\\Harddisk0\\Partition1\\UDATA\\01234567";
     if (strcmp(link, "\\??\\T:") == 0)
-        return "\\Device\\Harddisk0\\Partition1\\TDATA\\4d53002a";
+        return "\\Device\\Harddisk0\\Partition1\\TDATA\\01234567";
     return NULL;
 }
 
@@ -119,35 +119,35 @@ int main(void)
 #endif
     xbox_path_init(game, save);
 
-    check_path("\\Device\\Harddisk0\\Partition1\\UDATA\\4d53002a\\profile", save,
-               "UDATA\\4d53002a\\profile");
-    check_path("\\device\\harddisk0\\partition1\\tdata\\4d53002a\\$C", save,
-               "TDATA\\4d53002a\\$C");
+    check_path("\\Device\\Harddisk0\\Partition1\\UDATA\\01234567\\profile", save,
+               "UDATA\\01234567\\profile");
+    check_path("\\device\\harddisk0\\partition1\\tdata\\01234567\\$C", save,
+               "TDATA\\01234567\\$C");
     check_path("\\Device\\Harddisk0\\Partition1\\UDATA", save, "UDATA");
     check_path("\\Device\\Harddisk0\\Partition1\\TDATA\\", save, "TDATA");
     check_path("\\Device\\Harddisk0\\Partition1\\UDATA_backup\\profile", game,
                "UDATA_backup\\profile");
     check_path("\\Device\\Harddisk0\\Partition1\\TDATA2\\asset", game, "TDATA2\\asset");
-    check_path("\\Device\\Harddisk0\\Partition1\\Data\\Shared\\Cars\\VRace\\body.cmp", game,
-               "Data\\Shared\\Cars\\VRace\\body.cmp");
-    check_path("D:\\Data\\Data_hd.zip", game, "Data\\Data_hd.zip");
+    check_path("\\Device\\Harddisk0\\Partition1\\Assets\\Objects\\Example\\mesh.bin", game,
+               "Assets\\Objects\\Example\\mesh.bin");
+    check_path("D:\\Assets\\catalog.dat", game, "Assets\\catalog.dat");
     check_path("U:\\profile", save, "UserData\\profile");
     mounted = 1;
-    check_path("U:\\194916D15BE4\\profile", save, "UDATA\\4d53002a\\194916D15BE4\\profile");
-    check_path("\\??\\T:\\$u\\contentmeta.xbx", save, "TDATA\\4d53002a\\$u\\contentmeta.xbx");
+    check_path("U:\\ABCDEF012345\\profile", save, "UDATA\\01234567\\ABCDEF012345\\profile");
+    check_path("\\??\\T:\\$u\\contentmeta.xbx", save, "TDATA\\01234567\\$u\\contentmeta.xbx");
 
     /* Translation does not manufacture a missing save slot or metadata. */
-    xbox_translate_path("U:\\96734455B22F\\SaveMeta.xbx", translated, MAX_PATH);
+    xbox_translate_path("U:\\FEDCBA543210\\SaveMeta.xbx", translated, MAX_PATH);
     host_narrow(translated, path, sizeof path);
     if (xt_path_exists(path)) failures++;
-    xt_join(path, MAX_PATH, save, "UDATA" XT_SEP "4d53002a" XT_SEP "96734455B22F");
+    xt_join(path, MAX_PATH, save, "UDATA" XT_SEP "01234567" XT_SEP "FEDCBA543210");
     if (xt_path_exists(path)) failures++;
 
     /* A write using the mounted drive cannot change the legacy profile. */
     xt_join(path, MAX_PATH, game, "UDATA"); xt_make_dir(path);
     xt_join(original, MAX_PATH, game, "UDATA" XT_SEP "profile");
     if (!xt_write_file(original, "legacy", 6)) return 11;
-    xt_join(path, MAX_PATH, save, "UDATA" XT_SEP "4d53002a"); xt_make_dir(path);
+    xt_join(path, MAX_PATH, save, "UDATA" XT_SEP "01234567"); xt_make_dir(path);
     xbox_translate_path("U:\\profile", translated, MAX_PATH);
     host_narrow(translated, isolated, sizeof isolated);
     if (!xt_write_file(isolated, "test", 4)) return 12;
@@ -156,13 +156,13 @@ int main(void)
 
     /* NULL and empty save roots retain the existing game_dir save layout. */
     xbox_path_init(game, NULL);
-    check_path("U:\\profile", game, "UDATA\\4d53002a\\profile");
-    check_path("T:\\$C", game, "TDATA\\4d53002a\\$C");
+    check_path("U:\\profile", game, "UDATA\\01234567\\profile");
+    check_path("T:\\$C", game, "TDATA\\01234567\\$C");
     xbox_path_init(game, "");
     check_path("\\Device\\Harddisk0\\Partition1\\UDATA\\profile", game, "UDATA\\profile");
 
     xt_delete_file(isolated);
-    xt_join(path, MAX_PATH, save, "UDATA" XT_SEP "4d53002a"); xt_remove_dir(path);
+    xt_join(path, MAX_PATH, save, "UDATA" XT_SEP "01234567"); xt_remove_dir(path);
     xt_delete_file(original);
     xt_join(path, MAX_PATH, game, "UDATA"); xt_remove_dir(path);
     clean_save_root(save);
