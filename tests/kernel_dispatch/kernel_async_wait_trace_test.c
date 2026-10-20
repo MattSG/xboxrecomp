@@ -23,7 +23,7 @@ static void invoke(unsigned ordinal, uint32_t object, uint32_t expected, DWORD e
     g_fp_control_word = 0x37F; g_fp_cc = 0x4100;
     for (unsigned i = 0; i < 8; ++i) g_fp_stack[i] = i * 1.25 - 3.0;
     memset(stack, 0, 0x200);
-    stack[0] = 0x0035C7F1; stack[1] = object;
+    stack[0] = 0x10010; stack[1] = object;
     stack[ordinal == 159 ? 5 : ordinal == 233 ? 3 : 4] = 0x28000;
     memcpy(before, stack, sizeof before);
     SetLastError(0x1234);
@@ -37,7 +37,7 @@ static void invoke(unsigned ordinal, uint32_t object, uint32_t expected, DWORD e
     }
     CHECK(g_eax == expected && GetLastError() == expected_error);
     CHECK(g_esp == 0x20004 + (ordinal == 159 ? 20 : ordinal == 233 ? 12 : 16));
-    CHECK(g_xbox_kernel_caller == 0x0035C7F1);
+    CHECK(g_xbox_kernel_caller == 0x10010);
     CHECK(g_ecx == 0x11223344 && g_edx == 0x22334455);
     CHECK(g_ebx == 0x33445566 && g_esi == 0x30000 && g_edi == 0x44556677);
     CHECK(g_ebp == 0x55667788 && g_seh_ebp == 0x66778899 && g_df == 1);
@@ -77,19 +77,17 @@ int main(int argc, char **argv) {
     CHECK(signaled && unsignaled);
     on_token = bridge_handle_token(signaled); off_token = bridge_handle_token(unsignaled);
     CHECK(on_token && off_token);
-    BRIDGE_MEM32(0x30000) = 0x1020;
-    BRIDGE_MEM32(0x30004) = 0x103;
-    BRIDGE_MEM32(0x30008) = 0x0035C33A;
-    BRIDGE_MEM32(0x3000C) = 0x22000;
+    for (unsigned i = 0; i < 12; ++i) BRIDGE_MEM32(0x30000 + 4*i) = 0x11220000u+i;
     BRIDGE_MEM32(0x22000) = 0x00040000; /* title-built notification KEVENT */
     BRIDGE_MEM32(0x22004) = 1;
     fflush(stderr); captured = tmpfile(); saved = _dup(_fileno(stderr));
     CHECK(captured && saved >= 0 && _dup2(_fileno(captured), _fileno(stderr)) == 0);
-    /* These diagnostic pointers are reserved but have no committed backing. */
-    g_esp = 0x50000; g_eax = 0; SetLastError(0x9988);
+    /* Stack/ESI have no committed backing; EBX points at readable sentinels. */
+    g_esp = 0x50000; g_eax = 0; g_esi = 0x50000; g_ebx = 0x30000; SetLastError(0x9988);
     g_xbox_kernel_caller = 0;
     bridge_async_wait_log(159, 0x50000, NULL, "probe", 0, 0);
     CHECK(GetLastError() == 0x9988 && g_esp == 0x50000 && g_eax == 0);
+    CHECK(g_esi == 0x50000 && g_ebx == 0x30000);
     {
         int type;
         HANDLE guest_event = ke_guest_event(0x22000, &type);
@@ -123,11 +121,13 @@ int main(int argc, char **argv) {
     /* Polling uses its own budget; later failures still produce 64 records. */
     CHECK(occurrences(output, "[ASYNC_WAIT]") == (tracing ? 3 * (32 + 64) : 0));
     if (tracing) {
-        CHECK(strstr(output, "caller=0035C7F1"));
-        CHECK(strstr(output, "request_callback=0035C33A request_context=00022000"));
+        CHECK(strstr(output, "caller=00010010"));
+        CHECK(strstr(output, "esi=00030000 esi_read=1 esi_words=11220000,11220001,11220002,11220003"));
         CHECK(strstr(output, "status=00000102"));
         CHECK(strstr(output, "requested=00050000") && strstr(output, "header_read=0"));
-        CHECK(strstr(output, "request_read=1 request_status=00000103"));
+        CHECK(strstr(output, "esi=00050000 esi_read=0"));
+        CHECK(strstr(output, "ebx=00030000 ebx_read=1 ebx_words=11220000,11220001,11220002,11220003"));
+        CHECK(strstr(output, "ebx=33445566 ebx_read=0"));
         CHECK(strstr(output, "stack_read=0"));
         CHECK(strstr(output, "kind=unknown_object"));
         if (inline_events) CHECK(strstr(output, "kind=inline_kevent"));

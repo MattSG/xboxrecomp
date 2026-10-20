@@ -162,6 +162,9 @@ x87, stack and host LastError preservation; guarded reads from uncommitted
 memory; separate ordinary/failure budgets per wait kind; explicit
 trace-disable precedence; and unchanged default behavior for title-built
 KEVENTs. The inline case explicitly enables that existing option for the test.
+The log snapshots 12 raw dwords at each of ESI and EBX with guarded reads;
+`esi_read`/`ebx_read` report readability. It does not select or decode a title
+request packet from its return PC.
 
 The inline-event caller cases exercise the public startup-only
 `xbox_kernel_set_inline_event_callers` API with synthetic setter and
