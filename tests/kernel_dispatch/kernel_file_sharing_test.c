@@ -118,7 +118,7 @@ done:
     return ok;
 }
 
-int main(void)
+int main(int argc,char **argv)
 {
     char dir[MAX_PATH] = {0}, path[MAX_PATH] = {0};
     HANDLE exclusive = INVALID_HANDLE_VALUE, root = INVALID_HANDLE_VALUE, opened = NULL;
@@ -132,6 +132,18 @@ int main(void)
     uint32_t *sp;
     MissingOpen missing = {0};
     HANDLE worker = NULL;
+    int diagnostics = argc > 1 && !strcmp(argv[1],"diagnostics"), saved_stderr = -1;
+    FILE *captured = NULL;
+    if (diagnostics) {
+        _putenv_s("RECOMP_FILE_DIAGNOSTICS","1");
+        captured = tmpfile(); saved_stderr = _dup(_fileno(stderr));
+        if (!captured || saved_stderr < 0 || _dup2(_fileno(captured),_fileno(stderr))) {
+            if (captured) fclose(captured);
+            if (saved_stderr >= 0) _close(saved_stderr);
+            return 2;
+        }
+    }
+
 
     /* Narrow paths: the host helpers create the unique directory on either
      * platform, and CreateFileA is the same share-mode call as CreateFileW. */
@@ -260,5 +272,15 @@ done:
     if (memory) VirtualFree(memory, 0, MEM_RELEASE);
     if (*path) xt_delete_file(path);
     if (directory_created) xt_remove_dir(dir);
+    if (diagnostics) {
+        char output[65536] = {0};
+        fflush(stderr); _dup2(saved_stderr,_fileno(stderr)); _close(saved_stderr);
+        rewind(captured); fread(output,1,sizeof output-1,captured); fclose(captured);
+        if (!strstr(output,"[FILE_DIAG] sharing failure") ||
+            !strstr(output,"sharing.bin") || !strstr(output,"guest_same_file handle=")) {
+            fprintf(stderr,"FAIL: generic sharing diagnostics omitted synthetic file/owner evidence\n");
+            result = 1;
+        }
+    }
     return result;
 }

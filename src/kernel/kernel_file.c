@@ -110,7 +110,7 @@ static volatile LONG s_file_hitch_ready;
 static int s_file_hitch_enabled;
 static LARGE_INTEGER s_file_hitch_frequency;
 
-/* Opt-in evidence for a failed cache overwrite. The ledger does not change
+/* Opt-in evidence for failed shared-file opens. The ledger does not change
  * the effective access or sharing policy: it records opens, never retries or
  * closes an owner's handle. It is diagnostic only, not handle ownership. */
 typedef struct XboxFileDiagOpen {
@@ -157,20 +157,6 @@ static int file_diag_path(const WCHAR *path, WCHAR normalized[MAX_PATH])
     return length && length < MAX_PATH;
 }
 
-static int file_diag_archive(const WCHAR *path)
-{
-    const WCHAR *leaf = wcsrchr(path, L'\\');
-    return leaf && !_wcsicmp(leaf + 1, L"Data_hd.zip");
-}
-
-static int file_diag_cached_archive(const WCHAR *path)
-{
-    static const WCHAR suffix[] = L"\\Cache\\Data\\Data_hd.zip";
-    size_t length = wcslen(path), suffix_length = sizeof suffix / sizeof *suffix - 1;
-    return length >= suffix_length &&
-        !_wcsicmp(path + length - suffix_length, suffix);
-}
-
 static void file_diag_open(HANDLE handle, const WCHAR *path, ULONG access,
                            ULONG share, ULONG disposition, ULONG options)
 {
@@ -178,11 +164,10 @@ static void file_diag_open(HANDLE handle, const WCHAR *path, ULONG access,
     WCHAR normalized[MAX_PATH];
     DWORD error = GetLastError();
     file_diag_init();
-    if (!s_file_diag_enabled || !file_diag_path(path, normalized) ||
-        !file_diag_archive(normalized)) goto done;
+    if (!s_file_diag_enabled || !file_diag_path(path, normalized)) goto done;
     entry = malloc(sizeof *entry);
     if (!entry) {
-        fprintf(stderr, "[FILE_DIAG] archive open could not be recorded handle=%p\n", handle);
+        fprintf(stderr, "[FILE_DIAG] file open could not be recorded handle=%p\n", handle);
         goto done;
     }
     entry->handle = handle;
@@ -307,7 +292,7 @@ static void file_diag_failure(const WCHAR *path, DWORD error)
     unsigned owners = 0;
     file_diag_init();
     if (!s_file_diag_enabled || error != ERROR_SHARING_VIOLATION ||
-        !file_diag_path(path, normalized) || !file_diag_cached_archive(normalized))
+        !file_diag_path(path, normalized))
         goto done;
     fprintf(stderr, "[FILE_DIAG] sharing failure pid=%lu thread=%lu path=%ls\n",
             (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(), normalized);
