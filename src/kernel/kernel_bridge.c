@@ -2259,10 +2259,12 @@ static void bridge_async_wait_log(unsigned ordinal, uint32_t requested,
                                   uint32_t timeout, uint64_t started)
 {
     static volatile LONG ordinary[3], failures[3], sequence;
-    uint32_t stack[8] = {0}, header[4] = {0}, request_words[12] = {0};
-    uint32_t request = 0;
+    uint32_t stack[8] = {0}, header[4] = {0}, registers[2][12] = {{0}};
+    const uint32_t pointers[2] = {g_esi,g_ebx};
+    const char *names[2] = {"esi","ebx"};
+    unsigned registers_read[2];
     uint32_t stack_base = g_esp >= 4 ? g_esp - 4 : 0;
-    unsigned stack_read, header_read, request_read = 0;
+    unsigned stack_read, header_read;
     unsigned bucket = ordinal == 159 ? 0 : ordinal == 233 ? 1 : 2;
     unsigned sample;
     const char *inline_flag;
@@ -2278,14 +2280,9 @@ static void bridge_async_wait_log(unsigned ordinal, uint32_t requested,
     /* The dispatcher has already consumed the return address. */
     stack_read = bridge_async_wait_read(stack_base, stack, sizeof stack);
     header_read = bridge_async_wait_read(requested, header, sizeof header);
-    /* XPP's auto-submit wait retains the request in ESI. Its explicit
-     * wait/cancel helper retains it in EBX, whether the request is on the
-     * stack or in a device object (so event-minus-size is not reliable). */
-    if (g_xbox_kernel_caller == 0x0035C7F1u) request = g_esi;
-    else if (g_xbox_kernel_caller == 0x0035D553u ||
-             g_xbox_kernel_caller == 0x0035D56Cu) request = g_ebx;
-    if (request)
-        request_read = bridge_async_wait_read(request, request_words, sizeof request_words);
+    /* Raw register snapshots carry no title-specific packet interpretation. */
+    for (unsigned i = 0; i < 2; ++i)
+        registers_read[i] = bridge_async_wait_read(pointers[i],registers[i],sizeof registers[i]);
     inline_flag = getenv("RECOMP_TITLE_KEVENTS");
     fprintf(stderr, "[ASYNC_WAIT] sample=%u tick_ms=%llu ordinal=%u caller=%08X"
             " esp=%08X stack_base=%08X requested=%08X resolved=%p kind=%s timeout=%08X"
@@ -2298,11 +2295,12 @@ static void bridge_async_wait_log(unsigned ordinal, uint32_t requested,
             header[0], header[1], header[2], header[3], stack_read);
     for (unsigned i = 0; i < 8; ++i)
         fprintf(stderr, "%s%08X", i ? "," : "", stack[i]);
-    fprintf(stderr, " request=%08X request_read=%u request_status=%08X"
-            " request_callback=%08X request_context=%08X request_words=",
-            request, request_read, request_words[1], request_words[2], request_words[3]);
-    for (unsigned i = 0; i < 12; ++i)
-        fprintf(stderr, "%s%08X", i ? "," : "", request_words[i]);
+    for (unsigned reg = 0; reg < 2; ++reg) {
+        fprintf(stderr," %s=%08X %s_read=%u %s_words=",names[reg],pointers[reg],
+                names[reg],registers_read[reg],names[reg]);
+        for (unsigned i = 0; i < 12; ++i)
+            fprintf(stderr,"%s%08X",i ? "," : "",registers[reg][i]);
+    }
     fprintf(stderr, "\n");
     fflush(stderr);
     SetLastError(last_error);
