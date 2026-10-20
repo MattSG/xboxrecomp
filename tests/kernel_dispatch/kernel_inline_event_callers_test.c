@@ -1,4 +1,4 @@
-/* Real event bridges with MM3 XPP's pending-request/wait/cancel contract.
+/* Real event bridges with synthetic caller PCs and request sentinels.
  * No game assets or guest event opt-in are needed. */
 #include "../../src/kernel/kernel_bridge.c"
 #include "../kernel_test_host.h"
@@ -7,11 +7,11 @@
 #define EVENT_VA 0x22000u
 #define REQUEST_VA 0x30000u
 #define TIMEOUT_VA 0x26000u
-#define SETTER_PC 0x0035C348u
-#define WAIT_PC 0x0035D553u
-#define CANCEL_WAIT_PC 0x0035D56Cu
-#define AUTO_WAIT_PC 0x0035C7F1u
-#define UNRELATED_PC 0x00343D57u
+#define SETTER_PC 0x10010u
+#define WAIT_PC 0x10020u
+#define CANCEL_WAIT_PC 0x10030u
+#define AUTO_WAIT_PC 0x10040u
+#define UNRELATED_PC 0x10050u
 #define USB_PENDING 0x40000000u
 
 recomp_func_t recomp_lookup(uint32_t address) { (void)address; abort(); }
@@ -56,9 +56,9 @@ static uint32_t wait_event(uint32_t object, uint32_t caller, uint32_t timeout)
 
 static void prepare_event(uint32_t object, unsigned type, unsigned signaled)
 {
-    /* Only Type and Size identify the event; other header bytes are arbitrary
-     * in the real XPP stack-built headers (00048601 / 01040E00). */
-    BRIDGE_MEM32(object) = 0x01040E00u | type;
+    /* Only Type and Size identify the event; use deliberately arbitrary
+     * values for the other header bytes. */
+    BRIDGE_MEM32(object) = 0xA5047E00u | type;
     BRIDGE_MEM32(object + 4) = signaled;
     BRIDGE_MEM32(object + 8) = object + 8;
     BRIDGE_MEM32(object + 12) = object + 8;
@@ -67,9 +67,9 @@ static void prepare_event(uint32_t object, unsigned type, unsigned signaled)
 static void prepare_request(uint32_t request, uint32_t event)
 {
     memset(memory + request, 0, 48);
-    BRIDGE_MEM32(request) = 0x00004030u;
+    BRIDGE_MEM32(request) = 0xA1B20030u;
     BRIDGE_MEM32(request + 4) = USB_PENDING;
-    BRIDGE_MEM32(request + 8) = 0x0035C33Au;
+    BRIDGE_MEM32(request + 8) = 0x10100u;
     BRIDGE_MEM32(request + 12) = event;
     BRIDGE_MEM32(request + 16) = 0x11223344u;
 }
@@ -87,8 +87,8 @@ static DWORD WINAPI complete_request(void *argument)
     test_stack = c->stack;
     CHECK(WaitForSingleObject(c->start, 2000) == WAIT_OBJECT_0);
     if (c->delay) Sleep(c->delay);
-    if (BRIDGE_MEM32(c->request) != 0x4030u ||
-        BRIDGE_MEM32(c->request + 8) != 0x0035C33Au ||
+    if (BRIDGE_MEM32(c->request) != 0xA1B20030u ||
+        BRIDGE_MEM32(c->request + 8) != 0x10100u ||
         BRIDGE_MEM32(c->request + 12) != c->event ||
         BRIDGE_MEM32(c->request + 16) != 0x11223344u) {
         InterlockedExchange(&c->damaged, 1);
@@ -155,7 +155,7 @@ static void check_late(void)
     CHECK(wait_event(EVENT_VA, WAIT_PC, 0) == STATUS_SUCCESS);
     /* A successful wait cannot release the pending stack request early. */
     CHECK(BRIDGE_MEM32(REQUEST_VA + 4) == 0);
-    CHECK(BRIDGE_MEM32(REQUEST_VA + 8) == 0x0035C33Au);
+    CHECK(BRIDGE_MEM32(REQUEST_VA + 8) == 0x10100u);
     finish_completion(&completion, worker);
     CHECK(completion.completed && !completion.damaged);
 }
@@ -166,8 +166,8 @@ static void check_cancel(void)
     prepare_request(REQUEST_VA, EVENT_VA);
     COMPLETION completion;
     HANDLE worker = start_completion(&completion, REQUEST_VA, EVENT_VA, 0, 0);
-    /* XPP 35D526 uses a 50ms relative wait. Only timeout branches to request
-     * cancellation, followed by the infinite wait at 35D56C. */
+    /* A timeout branches to request cancellation, followed by an infinite
+     * wait for the completion worker to retire the outstanding request. */
     CHECK(wait_event(EVENT_VA, WAIT_PC, TIMEOUT_VA) == STATUS_TIMEOUT);
     CHECK(BRIDGE_MEM32(REQUEST_VA + 4) == USB_PENDING);
     CHECK(BRIDGE_MEM32(EVENT_VA + 4) == 0);
@@ -189,9 +189,9 @@ static void check_negative(void)
     uint32_t status = wait_event(EVENT_VA, WAIT_PC, TIMEOUT_VA);
     CHECK(status & 0x80000000u); CHECK(status != STATUS_TIMEOUT);
     CHECK(GetLastError() == ERROR_INVALID_HANDLE);
-    /* Retail XPP regards this non-timeout result as completion. Reusing its
-     * request storage now reproduces the invalid callback seen in the log. */
-    BRIDGE_MEM32(REQUEST_VA + 8) = 0x040172F0u;
+    /* Mistaking a non-timeout error for completion releases the request too
+     * soon. Reusing its storage must be visible to the completion worker. */
+    BRIDGE_MEM32(REQUEST_VA + 8) = 0xDEAD0040u;
     SetEvent(completion.start);
     finish_completion(&completion, worker);
     CHECK(completion.damaged && !completion.completed);
@@ -214,7 +214,7 @@ static void check_scope(void)
     CHECK(set_event(EVENT_VA, UNRELATED_PC) == 0);
     CHECK(GetLastError() == ERROR_INVALID_HANDLE);
     CHECK(BRIDGE_MEM32(EVENT_VA + 4) == 0 && shadow_count() == slots);
-    /* The title's unrelated D3D notification event remains on its old path. */
+    /* An unrelated caller remains on the ordinary event path. */
     prepare_event(EVENT_VA + 0x20, 0, 0);
     CHECK(wait_event(EVENT_VA + 0x20, UNRELATED_PC, TIMEOUT_VA + 8) & 0x80000000u);
     CHECK(shadow_count() == slots);
@@ -328,7 +328,7 @@ int main(int argc, char **argv)
 {
     CHECK(argc == 2);
     _putenv_s("RECOMP_TITLE_KEVENTS", "0"); _putenv_s("RECOMP_ASYNC_WAIT_TRACE", "0");
-    _putenv_s("MM3_BUILDING_TRACE", "0"); _putenv_s("RECOMP_KERNEL_LOG_BUDGET", "0");
+    _putenv_s("RECOMP_KERNEL_LOG_BUDGET", "0");
     _putenv_s("RECOMP_GUEST_LOCK", "0");
     memory = VirtualAlloc(NULL, 0x100000, MEM_RESERVE, PAGE_NOACCESS);
     CHECK(memory && VirtualAlloc(memory, 0x40000, MEM_COMMIT, PAGE_READWRITE) == memory);

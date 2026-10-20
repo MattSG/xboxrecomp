@@ -45,8 +45,8 @@ static void guest_dpc(void)
     } else if (!strcmp(mode, "retire")) {
         memset(memory + TIMER, 0xA5, 40);
     } else if (!strcmp(mode, "audio_deadline")) {
-        /* MM3 sub_0027B554 -> sub_0027B389: deferred audio work that is
-         * still in the future rearms KeSetTimer at that absolute time. */
+        /* Deferred work with a future absolute deadline rearms the timer
+         * without running again on each polling tick. */
         if (system_now < audio_deadline) kernel_set_timer(TIMER, audio_deadline, 0, DPC);
         else completed_audio_work++;
     }

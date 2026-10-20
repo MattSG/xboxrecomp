@@ -477,16 +477,9 @@ int main(void)
               "IoCreateDevice rejects out-of-range guest output pointer", NULL);
     }
 
-    /* The builders create real fixed-width guest packets. Raw offsets below
-     * are independently grounded in MM3's driver code (default.xbe SHA-256
-     * 2b04b66c43e7f37bbcebbfb5b72ccb96a2aa99cc2c60c53eb7d3530bcc2a3d79):
-     * 0x35B2B3 reads stack+0x0c and 0x35B2B6 reads +0x04; 0x35B2D3 reads
-     * +0x10; 0x35B2F4 tests Flags+2 and 0x35B2FA reads Buffer+8. At 0x35B1DE
-     * it reads IoControlCode+0x10. This static disassembly establishes the
-     * title's expected byte offsets, not runtime reachability or hardware
-     * conformance. These tests verify guest packet ABI and dispatch only; the
-     * separate native kernel_io entrypoints remain unsupported and no test
-     * here claims a real backing-device transfer. */
+    /* Check raw fixed-width guest packet offsets independently of the C
+     * struct field accesses. This verifies the implemented ABI and dispatch,
+     * not backing-device transfers or full hardware conformance. */
     {
         const uint32_t build_ioctl = THUNK_VA + 6 * 4;
         const uint32_t build_fsd = THUNK_VA + 7 * 4;

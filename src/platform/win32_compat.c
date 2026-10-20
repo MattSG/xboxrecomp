@@ -2966,8 +2966,278 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
 }
 
+/* ---- Vectored exception handlers over SIGSEGV/SIGBUS ------------------ */
+#if defined(__x86_64__)
+#if defined(__APPLE__)
+#include <sys/ucontext.h>   /* <ucontext.h> is the deprecated, _XOPEN_SOURCE-only API */
+#else
+#include <ucontext.h>
+#endif
+
+#define VEH_MAX 16
+static PVECTORED_EXCEPTION_HANDLER s_veh[VEH_MAX];
+static int s_veh_count;
+static pthread_mutex_t s_veh_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct sigaction s_prev_segv, s_prev_bus, s_prev_trap;
+static LPTOP_LEVEL_EXCEPTION_FILTER s_unhandled_filter;
+static void veh_install(void);
+
+#if defined(__APPLE__)
+#define VEH_GREGS(uc) (&(uc)->uc_mcontext->__ss)
+#define VEH_REG(s, linux_name, mac_name) ((s)->mac_name)
+#else
+#define VEH_GREGS(uc) ((uc)->uc_mcontext.gregs)
+#define VEH_REG(s, linux_name, mac_name) ((s)[linux_name])
+#endif
+
+/* Each register once, in both directions. */
+#define VEH_REGS(X) \
+    X(Rax, REG_RAX, __rax) X(Rcx, REG_RCX, __rcx) X(Rdx, REG_RDX, __rdx) \
+    X(Rbx, REG_RBX, __rbx) X(Rsp, REG_RSP, __rsp) X(Rbp, REG_RBP, __rbp) \
+    X(Rsi, REG_RSI, __rsi) X(Rdi, REG_RDI, __rdi) X(R8, REG_R8, __r8)   \
+    X(R9, REG_R9, __r9) X(R10, REG_R10, __r10) X(R11, REG_R11, __r11)   \
+    X(R12, REG_R12, __r12) X(R13, REG_R13, __r13) X(R14, REG_R14, __r14) \
+    X(R15, REG_R15, __r15) X(Rip, REG_RIP, __rip)
+
+static void veh_signal(int sig, siginfo_t *si, void *raw)
+{
+    ucontext_t *uc = (ucontext_t *)raw;
+    CONTEXT ctx;
+    EXCEPTION_RECORD rec;
+    EXCEPTION_POINTERS info = { &rec, &ctx };
+    struct sigaction *prev = sig == SIGBUS ? &s_prev_bus :
+                             sig == SIGTRAP ? &s_prev_trap : &s_prev_segv;
+    int i, count = __atomic_load_n(&s_veh_count, __ATOMIC_ACQUIRE);
+#if defined(__APPLE__)
+    __typeof__(VEH_GREGS(uc)) g = VEH_GREGS(uc);
+    int write = (uc->uc_mcontext->__es.__err & 2) != 0;
+    ctx.EFlags = (uint32_t)g->__rflags;
+#else
+    greg_t *g = VEH_GREGS(uc);
+    int write = (g[REG_ERR] & 2) != 0;        /* page-fault error code: W */
+    ctx.EFlags = (uint32_t)g[REG_EFL];
+#endif
+#define VEH_LOAD(field, l, m) ctx.field = (uint64_t)VEH_REG(g, l, m);
+    VEH_REGS(VEH_LOAD)
+    memset(&rec, 0, sizeof rec);
+    rec.ExceptionAddress = (PVOID)(uintptr_t)ctx.Rip;
+    if (sig == SIGTRAP) {
+        /* After the trapped instruction (TF) or past the int3, as on Windows
+         * for single-step; a breakpoint's address is the int3 itself. */
+        rec.ExceptionCode = si->si_code == TRAP_BRKPT ? EXCEPTION_BREAKPOINT
+                                                      : EXCEPTION_SINGLE_STEP;
+        if (rec.ExceptionCode == EXCEPTION_BREAKPOINT)
+            rec.ExceptionAddress = (PVOID)(uintptr_t)(ctx.Rip - 1);
+        /* The signal's si_code, which says what trapped: TRAP_TRACE (the
+         * trap flag), TRAP_HWBKPT or TRAP_PERF (a hardware watchpoint) --
+         * what Dr6 tells a Win32 handler. */
+        rec.NumberParameters = 1;
+        rec.ExceptionInformation[0] = (ULONG_PTR)si->si_code;
+    } else {
+        rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        rec.NumberParameters = 2;
+        rec.ExceptionInformation[0] = (ULONG_PTR)write;
+        rec.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
+    }
+
+    for (i = 0; i < count; i++) {
+        PVECTORED_EXCEPTION_HANDLER h = s_veh[i];
+        if (h && h(&info) == EXCEPTION_CONTINUE_EXECUTION) {
+#define VEH_STORE(field, l, m) VEH_REG(g, l, m) = ctx.field;
+            VEH_REGS(VEH_STORE)
+#if defined(__APPLE__)
+            g->__rflags = (g->__rflags & ~0xFFFFFFFFull) | ctx.EFlags;
+#else
+            g[REG_EFL] = (greg_t)(((uint64_t)g[REG_EFL] & ~0xFFFFFFFFull) | ctx.EFlags);
+#endif
+            return;
+        }
+    }
+    {
+        LPTOP_LEVEL_EXCEPTION_FILTER filter =
+            __atomic_load_n(&s_unhandled_filter, __ATOMIC_ACQUIRE);
+        if (filter && filter(&info) == EXCEPTION_CONTINUE_EXECUTION) {
+            VEH_REGS(VEH_STORE)
+            return;
+        }
+    }
+    /* Unhandled: whatever was installed before, else the default (re-fault). */
+    if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction) { prev->sa_sigaction(sig, si, raw); return; }
+    } else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+        prev->sa_handler(sig);
+        return;
+    }
+    signal(sig, SIG_DFL);
+    /* A fault re-executes and dies on return; a trap or a raise() would
+     * just carry on, so deliver it again under the default action. */
+    if (sig == SIGTRAP || si->si_code <= 0)
+        raise(sig);
+}
+
+/* Once, under s_veh_lock. */
+static void veh_install(void)
+{
+    static int installed;
+    struct sigaction sa;
+    if (installed) return;
+    installed = 1;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = veh_signal;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &s_prev_segv);
+    sigaction(SIGBUS, &sa, &s_prev_bus);
+    sigaction(SIGTRAP, &sa, &s_prev_trap);
+}
+
+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter)
+{
+    LPTOP_LEVEL_EXCEPTION_FILTER old;
+    pthread_mutex_lock(&s_veh_lock);
+    veh_install();
+    old = __atomic_exchange_n(&s_unhandled_filter, filter, __ATOMIC_ACQ_REL);
+    pthread_mutex_unlock(&s_veh_lock);
+    return old;
+}
+
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
-{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
-ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
+{
+    PVOID result = NULL;
+    if (!Handler) return NULL;
+    pthread_mutex_lock(&s_veh_lock);
+    if (s_veh_count < VEH_MAX) {
+        veh_install();
+        if (First) {
+            memmove(&s_veh[1], &s_veh[0], (size_t)s_veh_count * sizeof s_veh[0]);
+            s_veh[0] = Handler;
+        } else {
+            s_veh[s_veh_count] = Handler;
+        }
+        __atomic_store_n(&s_veh_count, s_veh_count + 1, __ATOMIC_RELEASE);
+        result = (PVOID)Handler;
+    }
+    pthread_mutex_unlock(&s_veh_lock);
+    return result;
+}
+
+/* ponytail: removal clears the slot rather than compacting, so a fault in
+ * flight never sees the array shift; 16 registrations per process. */
+ULONG RemoveVectoredExceptionHandler(PVOID h)
+{
+    int i;
+    ULONG found = 0;
+    pthread_mutex_lock(&s_veh_lock);
+    for (i = 0; i < s_veh_count; i++)
+        if ((PVOID)s_veh[i] == h) { s_veh[i] = NULL; found = 1; break; }
+    pthread_mutex_unlock(&s_veh_lock);
+    return found;
+}
+#else
+PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+{ (void)First; (void)Handler; return NULL; }   /* MMIO decoding is x86-64 only */
+ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 0; }
+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER f)
+{ (void)f; return NULL; }
+#endif
+
+/* ---- Console control over signals ------------------------------------- */
+static PHANDLER_ROUTINE s_console_handler;
+
+static void console_signal(int sig)
+{
+    PHANDLER_ROUTINE h = __atomic_load_n(&s_console_handler, __ATOMIC_ACQUIRE);
+    DWORD event = sig == SIGINT ? CTRL_C_EVENT : CTRL_CLOSE_EVENT;
+    if (h && h(event)) return;
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* ponytail: one handler, the last one added; add a handler list if needed. */
+BOOL SetConsoleCtrlHandler(PHANDLER_ROUTINE handler, BOOL add)
+{
+    if (!handler) return TRUE;
+    __atomic_store_n(&s_console_handler, add ? handler : NULL, __ATOMIC_RELEASE);
+    signal(SIGINT, add ? console_signal : SIG_DFL);
+    signal(SIGTERM, add ? console_signal : SIG_DFL);
+    signal(SIGHUP, add ? console_signal : SIG_DFL);
+    return TRUE;
+}
+
+/* ---- Process and module queries --------------------------------------- */
+#include <dlfcn.h>
+#include <execinfo.h>
+#if defined(__linux__)
+#include <sys/uio.h>
+#endif
+
+HMODULE GetModuleHandleA(LPCSTR name)
+{
+    Dl_info info;
+    if (name) return NULL;
+    /* This file is linked into the executable, so its base is the module's. */
+    return dladdr((void *)GetModuleHandleA, &info) ? (HMODULE)info.dli_fbase : NULL;
+}
+
+HMODULE GetModuleHandleW(LPCWSTR name)
+{
+    return name ? NULL : GetModuleHandleA(NULL);
+}
+
+USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash)
+{
+    void *all[128];
+    int n = backtrace(all, 128), i, out = 0;
+    if (hash) *hash = 0;
+    for (i = (int)skip + 1; i < n && out < (int)count; i++)   /* +1: this frame */
+        frames[out++] = all[i];
+    return (USHORT)out;
+}
+
+BOOL ReadProcessMemory(HANDLE process, LPCVOID address, LPVOID buffer, SIZE_T size,
+                       SIZE_T *read)
+{
+    ssize_t got = -1;
+    (void)process;
+    if (read) *read = 0;
+#if defined(__linux__)
+    {
+        struct iovec local = { buffer, size }, remote = { (void *)address, size };
+        got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    }
+#elif defined(__APPLE__)
+    {
+        mach_vm_size_t n = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)address, size,
+                                   (mach_vm_address_t)buffer, &n) == KERN_SUCCESS)
+            got = (ssize_t)n;
+    }
+#endif
+    if (got < 0 || (SIZE_T)got != size) {
+        SetLastError(ERROR_PARTIAL_COPY);
+        if (read && got > 0) *read = (SIZE_T)got;
+        return FALSE;
+    }
+    if (read) *read = size;
+    return TRUE;
+}
+
+/* An empty value removes the variable, as on Windows. */
+int _putenv_s(const char *name, const char *value)
+{
+    if (!name || !value) return EINVAL;
+    return (*value ? setenv(name, value, 1) : unsetenv(name)) ? errno : 0;
+}
+
+int strcpy_s(char *dst, size_t size, const char *src)
+{
+    size_t len;
+    if (!dst || !size) return EINVAL;
+    if (!src) { dst[0] = '\0'; return EINVAL; }
+    len = strlen(src);
+    if (len >= size) { dst[0] = '\0'; return ERANGE; }
+    memcpy(dst, src, len + 1);
+    return 0;
+}
 
 #endif /* !_WIN32 */
