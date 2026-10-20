@@ -1,6 +1,6 @@
 /* mcpx_apu_phys from the real apu_core.c: each mapping resolves to its own
  * storage, an ordinary heap address inside the guest RAM map resolves to
- * itself (MM3 streams voices from heap pages), and an address past the map is
+ * itself, and an address past the map is
  * refused rather than wrapped into low guest RAM (the old a & 0x03FFFFFF
  * fallback). */
 #include "../../src/apu/apu_core.c"
@@ -19,6 +19,16 @@ int xbox_ContiguousRangeAllocated(uint32_t offset, uint32_t size)
 int xbox_ReserveRangeAllocated(uint32_t va)
 {
     return va >= reserve_begin && va < reserve_end;
+}
+/* Controlled runtime-ID namespace; other addresses exercise legacy mappings. */
+int xbox_PhysicalAddressResolve(uint32_t physical,uint32_t bytes,uint32_t *guest_va)
+{
+    CHECK(bytes == 1 && guest_va);
+    if (physical >= 0x09000000u && physical < 0x09001000u) {
+        *guest_va = 0x01234000u + (physical - 0x09000000u); return 1;
+    }
+    if (physical == 0x10001000u) { *guest_va = 0x01234000u; return 1; }
+    return 0;
 }
 uint32_t g_xbox_image_lo, g_xbox_image_hi;
 size_t g_xbox_map_size, g_xbox_total_ram;
@@ -73,7 +83,7 @@ int main(void)
     contig_begin = 0x1000; contig_end = 0x3000;
     reserve_begin = 0x06000000u; reserve_end = 0x07000000u;
     g_xbox_image_lo = 0x10000; g_xbox_image_hi = 0x20000;
-    g_xbox_total_ram = 0x04000000u; g_xbox_map_size = 0x08000000u; /* MM3: 128 MB map */
+    g_xbox_total_ram = 0x04000000u; g_xbox_map_size = 0x08000000u; /* synthetic 128 MB map */
 
     /* Mapped addresses: pointers only, since the window and reservations
      * are not backed by this buffer. */
@@ -82,10 +92,14 @@ int main(void)
     CHECK(mcpx_apu_phys(0x10040) == ram + 0x10040);
     CHECK(mcpx_apu_phys(0x06000010u) == ram + 0x06000010u);
 
-    /* Heap pages inside the map are identity-mapped: an MM3 voice buffer at
-     * 0x01191EA0 and one above 64 MB both resolve to themselves. */
-    CHECK(mcpx_apu_phys(0x01191EA0u) == ram + 0x01191EA0u);
+    /* Synthetic heap addresses below and above 64 MB resolve to themselves. */
+    CHECK(mcpx_apu_phys(0x01234560u) == ram + 0x01234560u);
     CHECK(mcpx_apu_phys(0x05000040u) == ram + 0x05000040u);
+
+    CHECK(mcpx_apu_phys(0x09000040u) == ram + 0x01234040u);
+    /* An over-wide resolved ID must not alias the cached contiguous page. */
+    uint8_t *overwide = mcpx_apu_phys(0x10001000u);
+    CHECK(overwide != ram + 0x80001000u && overwide[0] == 0);
 
     /* Past the 128 MB map: 0x08000000 would wrap to ram[0] and 0x0A000000 to
      * ram + 0x02000000. */

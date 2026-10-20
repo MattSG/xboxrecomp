@@ -129,7 +129,7 @@ The state snapshots are zero-initialized, read-only diagnostic structures from
 four mirrors, each with 24 metadata words and a `0x2200`-byte raw device block.
 The header carries the version and total byte size. Validity flags and
 `device_bytes` distinguish unavailable data from a real zero. Registered device
-pointers supply the roots; the helper does not hardcode the MM3 image global.
+pointers supply the roots; the helper does not hardcode an image global.
 The snapshots and ring copies do not suspend the producer and are not atomic;
 the fetched-word ledger is the evidence of what execution actually read.
 
@@ -142,7 +142,7 @@ only its own artifacts.
 
 Timer lifecycle cases cover signal publication before callbacks, rearming,
 retired timer storage, periodic cancellation, and absolute/relative deadlines.
-The `audio_deadline` case mirrors MM3's future-deadline rearm loop: one action
+The `audio_deadline` case checks a future-deadline rearm loop: one action
 must require one callback, rather than running again on every polling tick.
 DPC cancellation cases exercise wrapped FIFO order, duplicate rejection, and
 1,000 insert/cancel cycles without losing queue capacity.
@@ -164,12 +164,12 @@ trace-disable precedence; and unchanged default behavior for title-built
 KEVENTs. The inline case explicitly enables that existing option for the test.
 
 The inline-event caller cases exercise the public startup-only
-`xbox_kernel_set_inline_event_callers` API with MM3's verified XPP setter and
+`xbox_kernel_set_inline_event_callers` API with synthetic setter and
 wait return PCs. The global `RECOMP_TITLE_KEVENTS` option stays disabled.
 Real native completion workers pass through the kernel dispatch bridge,
 including completion before the first wait and completion while it blocks.
 A request-shaped sentinel must remain intact until completion. The timeout
-case follows XPP's 50 ms timeout and subsequent cancellation wait; a negative
+case uses a 50 ms timeout and subsequent cancellation wait; a negative
 control reproduces the old invalid-handle return and released request storage.
 
 Further cases check notification versus synchronization signal consumption,

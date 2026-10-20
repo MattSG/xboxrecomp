@@ -128,9 +128,8 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * they aliased, turning streamed audio into full-scale noise. */
     if (xbox_ReserveRangeAllocated(a))
         return g_apu_ram_ptr + a;
-    /* Ordinary heap pages are identity-mapped (MmGetPhysicalAddress hands a
-     * heap VA through), and MM3 streams voices from them. Only an address
-     * past the guest RAM map is unmapped. */
+    /* Ordinary heap pages are identity-mapped: MmGetPhysicalAddress hands
+     * their VA through. Addresses past the guest RAM map are unmapped. */
     if (a < XBOX_HEAP_TOP)
         return g_apu_ram_ptr + a;
     return mcpx_apu_unmapped(addr);

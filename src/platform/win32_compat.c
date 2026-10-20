@@ -3511,7 +3511,7 @@ static void console_signal(int sig)
     raise(sig);
 }
 
-/* ponytail: one handler, the last one added; MM3 registers exactly one. */
+/* ponytail: one handler, the last one added; add a handler list if needed. */
 BOOL SetConsoleCtrlHandler(PHANDLER_ROUTINE handler, BOOL add)
 {
     if (!handler) return TRUE;
