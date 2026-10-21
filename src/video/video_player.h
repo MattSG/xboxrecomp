@@ -3,8 +3,8 @@
  *
  * For a title whose video is a container Windows can already decode, the
  * decoder does not have to be emulated for the video to be watchable. The
- * recompiled title still decides when: it opens the file as its own logic
- * dictates, and the runtime plays the file it opened.
+ * port decides whether and when to use this host-side presentation substitute.
+ * Opening a guest file does not start playback in the generic runtime.
  */
 
 #ifndef XBOXRECOMP_VIDEO_PLAYER_H
@@ -33,20 +33,7 @@ int  video_is_finished(void);
 /* Close the current video and release resources. */
 void video_close(void);
 
-/* === Boot sequence state machine === */
-
-/* Boot phases */
-
-/* Get current boot phase */
-
-/* Advance boot state machine. Call once per frame.
- * skip=1 if user pressed a button to skip current video.
- * Returns the new phase. */
-
-/* Render current boot phase (video frame or press-start screen). */
-
-
-/* Play one video file, start to finish, in its own window on its own thread.
+/* Play one UTF-8 host path, start to finish, in its own window/thread.
  * Returns 0 if the pump started. Blocking work happens on that thread, so the
  * guest carries on running while the video plays. */
 int  xbox_VideoPlayFile(const char *host_path);
@@ -72,4 +59,4 @@ int  xbox_FramebufferDumpBmp(const char *path);
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
 
-#endif /* BURNOUT3_VIDEO_PLAYER_H */
+#endif /* XBOXRECOMP_VIDEO_PLAYER_H */

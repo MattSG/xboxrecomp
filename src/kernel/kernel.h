@@ -494,7 +494,7 @@ void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
 
 /**
  * Get the kernel thunk table address and entry count currently in effect.
- * Set during memory layout init from the XBE header. *xbox_va/*count are
+ * Set during memory layout init from the XBE header. Both outputs are
  * zeroed if never configured.
  */
 void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count);
@@ -573,6 +573,11 @@ BOOL xbox_get_save_directory(xbox_host_char* buffer, DWORD capacity);
  * device rule matches reach it: partition images and unrecognised paths
  * do not. */
 extern void (*g_xbox_path_hook)(const char *xbox_path);
+/* Startup-only observer of successful translated host opens. Runs on the
+ * caller's thread after handle/status publication. The native path is borrowed
+ * for this call. Do not invoke guest functions. NULL clears the observer.
+ * The observer does not change the open result or the caller's error state. */
+void xbox_SetFileOpenObserver(void (*observer)(const xbox_host_char *path));
 
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
@@ -784,6 +789,10 @@ BOOLEAN  __stdcall xbox_KeSynchronizeExecution(PXBOX_KINTERRUPT Interrupt, PVOID
  * ============================================================================ */
 
 VOID    __stdcall xbox_HalReadWritePCISpace(ULONG BusNumber, ULONG SlotNumber, ULONG RegisterNumber, PVOID Buffer, ULONG Length, BOOLEAN WritePCISpace);
+/* Optional host policy before firmware return terminates the process.
+ * Register before guest workers start; NULL clears. The callback may perform
+ * host cleanup, but must return and must not invoke guest functions. */
+void xbox_SetFirmwareReturnHook(void (*hook)(ULONG routine));
 VOID    __stdcall xbox_HalReturnToFirmware(ULONG Routine);
 ULONG   __stdcall xbox_HalReadSMCTrayState(PULONG TrayState, PULONG TrayStateChangeCount);
 VOID    __stdcall xbox_HalClearSoftwareInterrupt(KIRQL RequestIrql);

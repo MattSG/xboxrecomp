@@ -49,7 +49,7 @@ else()
     find_package(OpenSSL REQUIRED)
     target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
 endif()
-# kernel_bridge.c hands .wmv opens to the FMV player (xbox_VideoPlayFile).
+# Kernel GPU execution and memory-layout scanout use the video backend.
 # The two libraries need each other; CMake repeats such a cycle on the link
 # line, which single-pass linkers (GNU ld) need.
 target_link_libraries(xbox_kernel PUBLIC xbox_video)

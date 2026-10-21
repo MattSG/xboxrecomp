@@ -16,6 +16,7 @@
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "nv2a_notify_wait.h"
+#include "recomp_icall_feedback.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2832,6 +2833,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         fprintf(stderr, "  XBE sections: %u (headers at file offset 0x%08X)\n",
                 num_sections, sect_headers_off);
 
+        g_xbox_image_lo = g_xbox_image_hi = 0;
+        g_xbox_code_lo = g_xbox_code_hi = 0;
         for (DWORD si = 0; si < num_sections; si++) {
             if (sect_headers_off + (si + 1) * SECTHDR_SIZE > xbe_size) break;
 
@@ -2911,6 +2914,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     (sec_raw_size < sec_vsize) ? " (zero-filled tail)" : "");
         }
 
+        if (!RECOMP_ICALL_FEEDBACK_CONFIGURE(g_xbox_code_lo, g_xbox_code_hi - g_xbox_code_lo)) {
+            (void)RECOMP_ICALL_FEEDBACK_CONFIGURE(0, 0);
+            fprintf(stderr, "  ICALL feedback: executable window allocation failed\n");
+        }
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
         if (sections_short) {

@@ -16,13 +16,11 @@
  *
  * Opt-in: define RECOMP_ICALL_FEEDBACK. Without it this file compiles to
  * nothing and the RECOMP_ICALL_OBSERVE hook in recomp_types.h expands to
- * (void)0, so release builds pay neither the store nor the 8 MiB.
+ * (void)0, so default builds pay neither the store nor an observation array.
  *
- * Cost when enabled: one byte OR per indirect branch, into a flat array indexed
- * by guest VA. A byte array rather than a bitmap because a byte store needs no
- * read-modify-write, so concurrent recompiled threads cannot lose each other's
- * writes -- and 8 MiB is not worth a CAS loop. Dedup is free: the same target
- * hit a million times is still one byte.
+ * Cost when enabled: one byte OR per indirect branch into the configured
+ * executable window. Observations are best-effort under concurrent writers;
+ * repeated runs merge their flags. The same hot target occupies one byte.
  */
 
 #include <stdint.h>
@@ -35,10 +33,9 @@
 
 #include "recomp_icall_feedback.h"
 
-/* One byte per guest VA in the image window. Zero-initialised in BSS; the OS
- * only commits the pages actually touched, so a title that reaches 4k distinct
- * targets does not resident 8 MiB. */
-volatile unsigned char g_icall_seen[RECOMP_ICALL_FB_SIZE];
+/* No title-derived address window. The loader supplies executable bounds. */
+volatile unsigned char *g_icall_seen;
+uint32_t g_icall_fb_base, g_icall_fb_size;
 
 /* Guarded indirect-call arms taken and missed (RECOMP_ICALL_GUARD_HIT/MISS in
  * recomp_types.h), reported beside the per-site dump. */
@@ -61,6 +58,23 @@ typedef struct {
 } icall_site_rec;
 static icall_site_rec s_sites[SITE_SLOTS];
 static unsigned long s_site_records, s_site_saturated;
+
+int recomp_icall_feedback_configure(uint32_t base, uint32_t size)
+{
+    if ((uint64_t)base + size > UINT64_C(0x100000000)) return 0;
+    unsigned char *seen = size ? calloc(size, 1) : NULL;
+    if (size && !seen) return 0;
+    free((void *)g_icall_seen);
+    g_icall_seen = seen;
+    g_icall_fb_base = base;
+    g_icall_fb_size = size;
+    memset(s_sites, 0, sizeof s_sites);
+    memset(g_icall_site_hs, 0, sizeof g_icall_site_hs);
+    memset(g_icall_site_hl, 0, sizeof g_icall_site_hl);
+    s_site_records = s_site_saturated = 0;
+    g_icall_guard_hits = g_icall_guard_misses = 0;
+    return 1;
+}
 
 void recomp_icall_observe_site(uint32_t site, uint32_t va)
 {
@@ -146,11 +160,11 @@ void recomp_icall_feedback_dump(const char *path)
     unsigned long resolved = 0, unresolved = 0;
     fprintf(f, "# icall-feedback v1\n");
     fprintf(f, "# va flags   (1=resolved, 2=unresolved, 3=both)\n");
-    for (uint32_t off = 0; off < RECOMP_ICALL_FB_SIZE; off++) {
+    for (uint32_t off = 0; off < g_icall_fb_size; off++) {
         unsigned char v = g_icall_seen[off];
         if (!v)
             continue;
-        fprintf(f, "%08X %u\n", (unsigned)(RECOMP_ICALL_FB_BASE + off), v);
+        fprintf(f, "%08X %u\n", (unsigned)(g_icall_fb_base + off), v);
         if (v & RECOMP_ICALL_SEEN_RESOLVED)   resolved++;
         if (v & RECOMP_ICALL_SEEN_UNRESOLVED) unresolved++;
     }

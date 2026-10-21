@@ -13,3 +13,11 @@ target_link_libraries(kernel_bridge_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME kernel_bridge_test COMMAND kernel_bridge_test)
 set_tests_properties(kernel_bridge_test PROPERTIES TIMEOUT 20)
+
+foreach(mode hook default clear)
+    add_test(NAME kernel_firmware_${mode} COMMAND kernel_bridge_test firmware-${mode})
+    set_tests_properties(kernel_firmware_${mode} PROPERTIES TIMEOUT 5)
+endforeach()
+set_tests_properties(kernel_firmware_hook PROPERTIES PASS_REGULAR_EXPRESSION "FIRMWARE_HOOK=37" FAIL_REGULAR_EXPRESSION "FIRMWARE_RETURNED")
+set_tests_properties(kernel_firmware_default kernel_firmware_clear PROPERTIES
+    PASS_REGULAR_EXPRESSION "HalReturnToFirmware routine=37" FAIL_REGULAR_EXPRESSION "FIRMWARE_HOOK;FIRMWARE_RETURNED")
