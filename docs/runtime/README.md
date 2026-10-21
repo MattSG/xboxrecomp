@@ -60,3 +60,9 @@ Both guest thread-create APIs default to spawned host threads with independent
 registers and guest stacks. Ports that require the legacy first-call inline
 model can call `xbox_SetThreadMode(XBOX_THREAD_MODE_INLINE)` before guest startup.
 That is an explicit compatibility choice; normal callers need no selector.
+
+
+Host callbacks entering guest code use `xbox_worker_stack_alloc` and
+`xbox_worker_stack_free` for a guest stack slice. The kernel's DPC/timer,
+network, USB and APU paths use this pool; it is not limited to a host-driven
+game loop. Guest-created threads use `xbox_AllocThreadStack` instead.

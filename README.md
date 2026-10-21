@@ -341,7 +341,7 @@ xboxrecomp/
 - [Microsoft's Own Recompiler](docs/technical/ms-fusion-recompiler.md) — White-room analysis of Ficl/Fission: pipeline, address map, HLE boundary
 - [Ficl/Fission Codegen Teardown](docs/technical/ms-fusion-codegen-teardown.md) — IDA/Hex-Rays teardown of both their translators, and how it reframes our roadmap
 - [SVOD Extraction](docs/technical/svod-extraction.md) — reading the BC package container to get the donor title's guest XBE out, and the validation gate that catches a plausible-looking bad extraction
-- [Burnout 3 Reunification](docs/technical/burnout3-reunification.md) — bringing the origin title back onto the extracted toolkit: what's done, and the threading gate that makes the runtime a merge not a swap
+- [Runtime Integration](docs/runtime/README.md) — Generic runtime interfaces and guest thread startup
 
 ### Xbox Formats
 - [XBE File Format](docs/formats/xbe.md) — Xbox executable format reference

@@ -558,9 +558,8 @@ uint32_t xbox_AllocThreadTib(void);
  */
 void xbox_FreeThreadStack(uint32_t stack_top);
 
-/* Worker stack slices for host-tick-driven titles (see XBOX_WORKER_STACK_* and
- * docs/technical/burnout3-reunification.md). Additive; unused by default-model
- * titles. */
+/* Guest stack slices for host callbacks: DPCs, interrupts and host-driven
+ * guest calls. See XBOX_WORKER_STACK_* and docs/runtime/README.md. */
 int  xbox_worker_stack_alloc(void);   /* slice index, or -1 if none free */
 void xbox_worker_stack_free(int slot);
 void   xbox_set_game_thread(void *h);  /* HANDLE, recorded for the host watchdog */

@@ -59,7 +59,7 @@ One per stage, in the order you run them.
 - [Lessons Learned](technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
 - [Gap Analysis vs xemu](technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
 - [Candidate Games](technical/candidate-games.md) — Choosing a target, tiered by difficulty
-- [Burnout 3 Reunification](technical/burnout3-reunification.md) — Bringing the origin title back onto the extracted toolkit
+- [Runtime Integration](runtime/README.md) — Generic runtime interfaces and guest thread startup
 - [xemu GDB Debugging](technical/xemu-debugging.md) — xemu's GDB stub as a reference debugger for runtime state
 
 ## Xbox Formats
