@@ -61,8 +61,6 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
 { (void)st; (void)topology; (void)attr; (void)def; (void)program; (void)idx; (void)ni;
   (void)lo; (void)hi; (void)pos; STUB_HIT("nv2a_d3d_draw_ub"); }
 int nv2a_d3d_widescreen(void) { STUB_HIT("nv2a_d3d_widescreen"); return 0; }
-int nv2a_d3d_menu_rects_on(void) { STUB_HIT("nv2a_d3d_menu_rects_on"); return 0; }
-void nv2a_d3d_set_menu_tints(const uint32_t *tints) { (void)tints; STUB_HIT("nv2a_d3d_set_menu_tints"); }
 int nv2a_d3d_init(void) { return 1; }
 static uint32_t replay_observed_color;
 void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color, uint32_t zstencil,
