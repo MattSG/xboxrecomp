@@ -3,7 +3,7 @@
  *
  * Problem:
  *   Translated game code calls kernel functions via indirect calls through
- *   the kernel thunk table at VA 0x0036B7C0. In the XBE file, these entries
+ *   the kernel thunk table described by the loaded XBE. In the XBE file, these entries
  *   contain unresolved ordinals (0x80000000 | ordinal). On real Xbox hardware,
  *   the kernel loader replaces these with actual function pointers before the
  *   game runs.
@@ -11058,18 +11058,9 @@ recomp_func_t recomp_lookup_kernel(uint32_t xbox_va)
 
 /* ── Initialization ─────────────────────────────────────── */
 
-/*
- * Where this title's kernel thunk table lives. Defaults to the compile-time
- * constant, but every XBE puts it somewhere different (it comes from the
- * header's KernelImageThunkAddress), so xbox_MemoryLayoutInit() parses the
- * real address out of the binary and overrides it here.
- *
- * Halo build 2276 puts it at 0x00253090 against the default's 0x0036B7C0 --
- * without the override the bridge patches ordinals into whatever happens to
- * live at the wrong address and every kernel call goes somewhere arbitrary.
- */
-static uint32_t g_thunk_table_base  = XBOX_KERNEL_THUNK_TABLE_BASE;
-static uint32_t g_thunk_table_count = XBOX_KERNEL_THUNK_TABLE_SIZE;
+/* No title address is valid until the XBE loader or its caller supplies it. */
+static uint32_t g_thunk_table_base;
+static uint32_t g_thunk_table_count;
 
 /**
  * Return the kernel thunk table address and entry count currently in effect.
@@ -11092,7 +11083,8 @@ void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
 
     /* count indexes g_slot_* arrays, which are sized by the macro. A title
      * importing more slots than the real kernel exports would run off them. */
-    if (count && count <= XBOX_KERNEL_THUNK_TABLE_SIZE) {
+    if (!count) count = g_thunk_table_count ? g_thunk_table_count : XBOX_KERNEL_THUNK_TABLE_SIZE;
+    if (count <= XBOX_KERNEL_THUNK_TABLE_SIZE) {
         g_thunk_table_count = count;
     } else if (count > XBOX_KERNEL_THUNK_TABLE_SIZE) {
         fprintf(stderr,
@@ -11130,6 +11122,10 @@ void xbox_kernel_bridge_init(void)
     int unbridged = 0;
     DWORD old_protect;
 
+    if (!g_thunk_table_base || !g_thunk_table_count) {
+        fprintf(stderr, "  Kernel thunk bridge: no XBE thunk table configured\n");
+        return;
+    }
     kernel_log_init();
     /* A new thunk-table initialization accompanies a new guest-memory
      * generation; discard host ownership metadata from the prior mapping. */

@@ -6,8 +6,7 @@
  * ARP and DHCP, a DNS server at 10.0.2.3 that forwards to the host's (or
  * RECOMP_NET_DNS), and UDP to anywhere, each guest port carried by a host
  * socket. Xbox Live -- Kerberos and the security gateway -- is UDP, so this
- * is what a service like Insignia needs; the DNS server answers Xbox Live's
- * names with Insignia's itself (insignia_answer).
+ * supports those services. DNS aliases are optional caller-owned policy.
  *
  * ponytail: no TCP or ICMP through the NAT. Xbox Live titles talk UDP; add a
  * TCP relay if a title's service is found using it.
@@ -302,21 +301,17 @@ static SOCKET nat_socket(uint16_t guest_port)
     return s;
 }
 
-/* Xbox Live's names, answered the way insigniaDNS answers them (its zones,
- * insignia.live/dns_zones.json): each is another public name's address, so
- * Insignia works with the host's ordinary DNS and no console setting.
- * ponytail: the zones are copied, not fetched; fetch the JSON at startup if
- * Insignia moves them. */
-static const char *const k_insignia[][2] = {
-    {"macs.xboxlive.com", "macs.insig.uk"},
-    {"as.xboxlive.com",   "as.insig.uk"},
-    {"tgs.xboxlive.com",  "tgs.insig.uk"},
-    {"xds.xboxlive.com",  "xexds.xboxlive.com"},
-};
+static const XboxDnsAlias *s_dns_aliases;
+static unsigned s_dns_alias_count;
+void net_backend_set_dns_aliases(const XboxDnsAlias *aliases, unsigned count)
+{
+    s_dns_aliases = aliases;
+    s_dns_alias_count = aliases ? count : 0;
+}
 
 /* The answer to query q (n bytes) if it asks for one of those names, in
  * out; its length, or 0 to forward the query. */
-static int insignia_answer(const uint8_t *qry, int n, uint8_t *out)
+static int dns_alias_answer(const uint8_t *qry, int n, uint8_t *out)
 {
     char name[256];
     int i = 12, o = 0;
@@ -333,16 +328,17 @@ static int insignia_answer(const uint8_t *qry, int n, uint8_t *out)
     name[o] = 0;
     if (i + 5 > n)
         return 0;
-    i += 5;                                     /* the end, type, class */
-    for (int z = 0; z < (int)(sizeof k_insignia / sizeof k_insignia[0]); z++) {
+    if (rd16(qry + i + 1) != 1 || rd16(qry + i + 3) != 1) return 0;
+    i += 5;                                     /* the end, A, IN */
+    for (unsigned z = 0; z < s_dns_alias_count; z++) {
         struct addrinfo hints = {0}, *res = NULL;
-        if (_stricmp(name, k_insignia[z][0]))
+        if (_stricmp(name, s_dns_aliases[z].query))
             continue;
         memcpy(out, qry, i);
         wr16(out + 2, 0x8180);                  /* a response, recursion available */
         wr16(out + 6, 0); wr16(out + 8, 0); wr16(out + 10, 0);
         hints.ai_family = AF_INET;
-        if (rd16(qry + i - 4) == 1 && !getaddrinfo(k_insignia[z][1], NULL, &hints, &res)) {
+        if (rd16(qry + i - 4) == 1 && !getaddrinfo(s_dns_aliases[z].target, NULL, &hints, &res)) {
             uint8_t *a = out + i;
             wr16(a, 0xC00C); wr16(a + 2, 1); wr16(a + 4, 1);   /* the name, A, IN */
             wr32(a + 6, 300); wr16(a + 10, 4);
@@ -365,7 +361,7 @@ static void udp_out(const uint8_t *ip, const uint8_t *udp, uint32_t len)
     to.sin_family = AF_INET;
     if (dst == DNS_IP && dport == 53) {
         uint8_t reply[600];
-        int r = len - 8 <= 512 ? insignia_answer(udp + 8, (int)len - 8, reply) : 0;
+        int r = len - 8 <= 512 ? dns_alias_answer(udp + 8, (int)len - 8, reply) : 0;
         if (r) {
             send_udp_to_guest(st.guest_mac, DNS_IP, 53, st.guest_ip, sport, reply, (uint32_t)r);
             return;

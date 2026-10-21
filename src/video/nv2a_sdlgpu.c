@@ -2937,7 +2937,6 @@ static uint32_t s_ovl_w, s_ovl_h;
 static uint32_t s_ovl_serial = 0xFFFFFFFFu;
 static uint64_t s_last_present, s_last_flip;
 static Surface *s_shown;
-static float s_loading;
 
 /* Read a texture back and write it as a 24-bit BMP. */
 static void write_bmp(SDL_GPUTexture *tex, uint32_t w, uint32_t h, const char *path)
@@ -3051,9 +3050,6 @@ static void composite(SDL_GPUTexture *dst, uint32_t w, uint32_t h, Surface *s,
     pc->src_size[0] = (float)s->w; pc->src_size[1] = (float)s->h;
     pc->src_size[2] = (float)s->iw; pc->src_size[3] = (float)s->ih;
     pc->force_alpha[0] = 1.0f;
-    pc->force_alpha[1] = letterbox ? s_loading : 0.0f;
-    pc->force_alpha[2] = (float)w;
-    pc->force_alpha[3] = (float)h;
     if (pc->ovl_flags[0] && s->sx > s->sy * 1.001f) {
         pc->ovl_in[2] = s->sx / s->sy;
         pc->ovl_in[3] = (float)s->w * 0.5f;
@@ -3359,6 +3355,7 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
         s = scan_surface(surface_addr, pitch);
     s_shown = s;
     s_last_flip = SDL_GetTicks();
+    if (s_overlay.idle_present) s_overlay.idle_present((uint32_t)s_last_flip, 0, 0);
     {
         int64_t t0 = s_prof_on > 0 ? qpc() : 0, t1;
         writeback_surfaces();
@@ -3413,9 +3410,6 @@ void nv2a_d3d_tick(void)
 {
     uint64_t now;
     uint32_t va, pitch;
-    static int spinner = -1;
-    XboxOverlay ovl;
-    int movie;
     if (s_init_state <= 0 && !nv2a_d3d_init())
         return;
     fbw_sdl_pump();
@@ -3439,15 +3433,13 @@ void nv2a_d3d_tick(void)
     now = SDL_GetTicks();
     if (now - s_last_present < 16)
         return;
-    if (spinner < 0)
-        spinner = !getenv("RECOMP_LOADING_SPINNER") || atoi(getenv("RECOMP_LOADING_SPINNER")) != 0;
-    movie = xbox_FramebufferOverlay(&ovl);
-    s_loading = spinner && !movie && s_last_flip && now - s_last_flip > 700
-              ? 1.0f + (float)(now % 1000) / 1000.0f : 0.0f;
+    XboxOverlay ovl;
+    int movie = xbox_FramebufferOverlay(&ovl);
+    int redraw = s_overlay.idle_present && s_overlay.idle_present(
+        (uint32_t)now, s_last_flip ? (uint32_t)(now - s_last_flip) : 0, movie);
     if (xbox_FramebufferScanSource(&va, &pitch)) {
         Surface *s = scan_surface(va, pitch);
         present_surface(s, NULL);
-        s_loading = 0.0f;
         s_frame++;
         return;
     }
@@ -3458,10 +3450,9 @@ void nv2a_d3d_tick(void)
         if (s_shown->gen != generation)
             s_shown->cpu_present_pending = 1;
         if (s_shown->cpu_present_pending || movie ||
-            (s_loading > 0.0f && now - s_last_present >= 33))
+            (redraw && now - s_last_present >= 33))
             present_surface(s_shown, NULL);
         else
             s_last_present = now;
     }
-    s_loading = 0.0f;
 }

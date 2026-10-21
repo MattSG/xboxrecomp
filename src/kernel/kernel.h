@@ -471,11 +471,7 @@ typedef VOID (*PIO_APC_ROUTINE)(
  * The kernel thunk table is an array of function pointers at a game-specific VA.
  * The address is parsed from the XBE header at runtime. Game code calls kernel
  * functions via: call [thunk_addr]. We fill this table with our xbox_* implementations.
- *
- * Legacy define for backward compatibility (Burnout 3 address).
- * New code should use xbox_kernel_set_thunk_address() instead.
  */
-#define XBOX_KERNEL_THUNK_TABLE_BASE  0x0036B7C0  /* default; overridden at runtime */
 /* The real kernel's export directory has 378 slots, of which 371 are exported
  * (ordinals 367-373 are null). Verified identical in xboxkrnl.exe from builds
  * 3944, 4039 and 5455, so this is stable across the console's life. The old
@@ -492,7 +488,7 @@ typedef VOID (*PIO_APC_ROUTINE)(
  * Set the kernel thunk table address for the current game.
  * Call this BEFORE xbox_kernel_bridge_init(). The address is parsed
  * from the XBE header's KernelImageThunkAddress field.
- * If not called, the default (a legacy title's 0x0036B7C0) is used.
+ * If not configured, bridge initialization refuses to patch guest memory.
  */
 void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
 

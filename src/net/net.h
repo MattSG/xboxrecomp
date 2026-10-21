@@ -19,6 +19,13 @@ int  xbox_NicOwnsAddress(uint32_t xbox_va);
 int  xbox_NicHandleMmio(void *ctx, uint32_t xbox_va);  /* ctx: PCONTEXT */
 void xbox_NicReport(void);
 
+/* Optional DNS aliases, configured before network startup. The caller owns
+ * the table and non-NULL strings for the backend's lifetime; NULL clears it.
+ * No aliases are installed by default. A/IN requests for matching names resolve
+ * through the host; other names retain ordinary upstream DNS forwarding. */
+typedef struct { const char *query, *target; } XboxDnsAlias;
+void net_backend_set_dns_aliases(const XboxDnsAlias *aliases, unsigned count);
+
 /* The backend, called by the adapter. */
 int  net_backend_init(const char *mode);
 void net_backend_send(const uint8_t *frame, uint32_t len);   /* guest -> network */

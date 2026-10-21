@@ -144,6 +144,10 @@ typedef struct {
      * stored Z/W encoding. Cubic filtering is available for 2D stage zero. */
     int (*force_depth_test)(const NvD3DState *state, uint32_t source_width, uint32_t source_height);
     int (*cubic_filter_0)(const NvD3DState *state, int source_is_target, uint32_t levels);
+    /* Optional host-UI policy, on the executor thread: called at flips with
+     * idle_ms=0 and during idle scanout with elapsed time since the last flip.
+     * Nonzero requests redraws while idle. No hook means no extra presents. */
+    int (*idle_present)(uint32_t now_ms, uint32_t idle_ms, int movie);
 } NvOverlayHooks;
 void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks);
 /* Optional observer for consecutive NV097_NO_OPERATION parameters, called on
