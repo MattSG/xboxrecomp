@@ -291,7 +291,10 @@ Static analysis cannot see where a vtable call goes. Running the title can.
 
 Build with `RECOMP_ICALL_FEEDBACK` defined and every indirect branch records its
 target into a flat byte array indexed by guest VA — one subtract, one compare,
-one OR on the hot path, and nothing at all in a default build. Dump it from
+one OR on the hot path, and nothing at all in a default build. The XBE loader
+configures its executable bounds; there is no reference-title window to edit.
+Standalone hosts configure a window with `recomp_icall_feedback_configure(base, size)`
+before guest workers start. Reconfiguration discards the previous image's observations. Dump it from
 `atexit` and from your crash handler (a title that dies mid-boot is exactly the
 one whose targets you want):
 

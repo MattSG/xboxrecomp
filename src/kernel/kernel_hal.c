@@ -610,6 +610,12 @@ VOID __stdcall xbox_HalReadWritePCISpace(
  * exit the game cleanly.
  * ============================================================================ */
 
+static void (*s_firmware_return_hook)(ULONG);
+void xbox_SetFirmwareReturnHook(void (*hook)(ULONG routine))
+{
+    s_firmware_return_hook = hook;
+}
+
 VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
@@ -617,6 +623,7 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
     /* stderr too: the kernel log file is rewritten on every run, so a title
      * that ends itself otherwise leaves no trace in the run's own log. */
     fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
+    if (s_firmware_return_hook) s_firmware_return_hook(Routine);
     ExitProcess(0);
 }
 

@@ -22,6 +22,7 @@
  * platform-specific. */
 #include "kernel.h"
 #include "kernel_guest_io.h"
+#include "recomp_icall_feedback.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS */
 
 #include <stdio.h>
@@ -265,8 +266,19 @@ static uint32_t query_link(uint8_t *mem, uint32_t query, uint32_t handle,
     return status;
 }
 
-int main(void)
+static void firmware_observer(ULONG routine)
 {
+    fprintf(stderr,"FIRMWARE_HOOK=%u\n",(unsigned)routine);
+}
+int main(int argc, char **argv)
+{
+    if (argc == 2) {
+        if (strcmp(argv[1],"firmware-default")) xbox_SetFirmwareReturnHook(firmware_observer);
+        if (!strcmp(argv[1],"firmware-clear")) xbox_SetFirmwareReturnHook(NULL);
+        xbox_HalReturnToFirmware(37);
+        fprintf(stderr,"FIRMWARE_RETURNED\n");
+        return 99;
+    }
     setvbuf(stdout, NULL, _IONBF, 0);
     uint32_t unconfigured_base = 1, unconfigured_count = 1;
     xbox_kernel_get_thunk_address(&unconfigured_base, &unconfigured_count);
@@ -295,8 +307,31 @@ int main(void)
         xbe_word = 0x00010200u ^ 0x5B6D40B6u;
         memcpy(xbe + 0x158, &xbe_word, 4); /* retail encoded thunk VA */
     }
+    if (xbe) {
+        xbe_word=1; memcpy(xbe+0x11c,&xbe_word,4);
+        xbe_word=0x10200; memcpy(xbe+0x120,&xbe_word,4);
+        xbe_word=4; memcpy(xbe+0x200,&xbe_word,4); /* executable */
+        xbe_word=0x910000; memcpy(xbe+0x204,&xbe_word,4);
+        xbe_word=16; memcpy(xbe+0x208,&xbe_word,4);
+        check(xbox_MemoryLayoutInit(xbe,0x1000),"synthetic high-code image loads",NULL);
+        check(g_xbox_code_lo==0x910000 && g_xbox_code_hi==0x910010,
+              "code bounds come from the image",NULL);
+#ifdef RECOMP_ICALL_FEEDBACK
+        check(g_icall_fb_base==0x910000 && g_icall_fb_size==16,
+              "loader configures feedback beyond the old 8 MiB window",NULL);
+        RECOMP_ICALL_OBSERVE(0x91000F,RECOMP_ICALL_SEEN_UNRESOLVED);
+        check(g_icall_seen[15]==RECOMP_ICALL_SEEN_UNRESOLVED,"high code target recorded",NULL);
+#endif
+        xbox_MemoryLayoutShutdown();
+        xbe_word=0; memcpy(xbe+0x11c,&xbe_word,4);
+        xbe_word=0x10120; memcpy(xbe+0x120,&xbe_word,4);
+    }
     check(xbe != NULL && xbox_MemoryLayoutInit(xbe, 0x1000),
           "minimal XBE fixture initializes guest memory and heap", NULL);
+    check(!g_xbox_code_lo && !g_xbox_code_hi,"new image clears absent code bounds",NULL);
+#ifdef RECOMP_ICALL_FEEDBACK
+    check(!g_icall_fb_size && !g_icall_seen,"new image clears feedback window",NULL);
+#endif
     free(xbe);
     uint8_t *mem = (uint8_t *)xbox_GetMemoryBase();
     g_guest_mem = mem;

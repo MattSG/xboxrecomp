@@ -15,6 +15,24 @@ extern uint32_t xbox_LastFileError(void);
 void *recomp_lookup(ULONG address) { (void)address; abort(); }
 void *recomp_lookup_manual(ULONG address) { (void)address; abort(); }
 
+static volatile LONG observer_calls;
+static HANDLE observer_root;
+static WCHAR observed_path[MAX_PATH];
+static int observer_bad;
+static void opened_observer(const xbox_host_char *path)
+{
+    InterlockedIncrement(&observer_calls);
+    wcscpy_s(observed_path,MAX_PATH,path);
+    /* A nested failed host-side open must not replace the observed result. */
+    XBOX_ANSI_STRING name={0}; XBOX_OBJECT_ATTRIBUTES oa={0}; XBOX_IO_STATUS_BLOCK ios={0};
+    HANDLE h=NULL;
+    name.Buffer="observer-absent.bin"; name.Length=(USHORT)strlen(name.Buffer); name.MaximumLength=name.Length+1;
+    oa.RootDirectory=observer_root; oa.ObjectName=&name;
+    NTSTATUS status=xbox_NtCreateFile(&h,XBOX_GENERIC_READ,&oa,&ios,NULL,0,1,XBOX_FILE_OPEN,XBOX_FILE_NON_DIRECTORY_FILE);
+    if (status!=STATUS_OBJECT_NAME_NOT_FOUND || h) observer_bad=1;
+    SetLastError(12345);
+}
+
 typedef struct MissingOpen {
     HANDLE root, ready, release;
     NTSTATUS status, ios_status;
@@ -158,6 +176,8 @@ int main(int argc,char **argv)
                        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     if (exclusive == INVALID_HANDLE_VALUE || root == INVALID_HANDLE_VALUE)
         goto done;
+    observer_root=root;
+    xbox_SetFileOpenObserver(opened_observer);
     memset(&name, 0, sizeof name);
     name.Buffer = "sharing.bin";
     name.Length = (USHORT)strlen(name.Buffer);
@@ -179,6 +199,7 @@ int main(int argc,char **argv)
         goto done;
     }
 
+    if (observer_calls) { fprintf(stderr,"FAIL: observer ran for a failed open\n"); goto done; }
     /* Another streaming worker can miss an optional search candidate between
      * the host open and the bridge's diagnostic. Each thread must retain its
      * own error; the missing open must still fail with its exact status. */
@@ -236,6 +257,10 @@ int main(int argc,char **argv)
         fprintf(stderr, "FAIL: successful open retained a stale failure reason\n");
         goto done;
     }
+    if (observer_calls!=1 || observer_bad || !wcsstr(observed_path,L"sharing.bin") || GetLastError()==12345) {
+        fprintf(stderr,"FAIL: successful-open observer or caller error preservation\n"); goto done;
+    }
+    xbox_SetFileOpenObserver(NULL);
     SetEvent(missing.release);
     if (WaitForSingleObject(worker, 5000) != WAIT_OBJECT_0 ||
         missing.error_after != ERROR_FILE_NOT_FOUND || xbox_LastFileError() != 0) {
@@ -259,6 +284,7 @@ int main(int argc,char **argv)
     result = 0;
 
 done:
+    xbox_SetFileOpenObserver(NULL);
     if (worker) {
         SetEvent(missing.release);
         WaitForSingleObject(worker, 5000);

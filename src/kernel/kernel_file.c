@@ -96,6 +96,22 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  * simultaneously, so another thread must not replace that call's reason. */
 static XBOX_THREAD_LOCAL uint32_t g_xbox_last_file_error;
 
+static void (*s_file_open_observer)(const xbox_host_char *);
+void xbox_SetFileOpenObserver(void (*observer)(const xbox_host_char *path))
+{
+    s_file_open_observer = observer;
+}
+static void file_open_notify(const xbox_host_char *path)
+{
+    if (s_file_open_observer) {
+        DWORD error = GetLastError();
+        uint32_t file_error = g_xbox_last_file_error;
+        s_file_open_observer(path);
+        g_xbox_last_file_error = file_error;
+        SetLastError(error);
+    }
+}
+
 uint32_t xbox_LastFileError(void)
 {
     return g_xbox_last_file_error;
@@ -537,6 +553,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
     }
     XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %S -> handle=%p", win_path, h);
+    file_open_notify(win_path);
     return STATUS_SUCCESS;
 }
 
@@ -1358,6 +1375,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
     }
     XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %s -> handle=%p", host_path, *FileHandle);
+    file_open_notify(host_path);
     return STATUS_SUCCESS;
 }
 

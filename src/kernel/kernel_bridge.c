@@ -2005,30 +2005,6 @@ static void bridge_HalReturnToFirmware(void)
     RECOMP_ICALL_FEEDBACK_DUMP();
     bridge_unbridged_report();
 
-    /* The missing-file summary, for the same reason. On POSIX ExitProcess is
-     * exit() and atexit runs after all; the summary prints once either way. */
-    xbox_missing_summary("firmware");
-
-    /* Let a host-played FMV finish before the process goes away.
-     *
-     * The title is not the one presenting it, so it has no reason to wait --
-     * it opens the file, carries on, and quits, which would kill the video
-     * thread part-way through a five-second clip. Waiting here is what makes
-     * the clip actually watchable, and it costs nothing when no video is
-     * playing. Bounded, so a stuck player cannot stop the process exiting. */
-    {
-        extern int xbox_VideoIsPlaying(void);
-        int waited = 0;
-
-        while (xbox_VideoIsPlaying() && waited < 60000) {
-            Sleep(50);
-            waited += 50;
-        }
-        if (waited)
-            fprintf(stderr, "  [KERNEL] waited %dms for the video to finish\n",
-                    waited);
-    }
-
     xbox_HalReturnToFirmware(routine);
 }
 
@@ -4755,40 +4731,6 @@ static void bridge_NtCreateFile(void)
      * means the caller wants asynchronous completion on this handle. */
     if (g_eax == 0 && handle_va && (options & 0x30u) == 0u)
         bridge_note_async_handle(BRIDGE_MEM32(handle_va));
-
-    /* An FMV the host can decode itself.
-     *
-     * The title's own decoder is emulated like everything else, but it only
-     * produces pixels once there is something to execute its GPU work -- so on
-     * a bring-up where that does not exist yet, the video the game just asked
-     * for can still be shown. The trigger is the title opening the file, so
-     * this plays when the game decides to play it, not on a timer, and it
-     * plays the file the game chose.
-     *
-     * Off unless RECOMP_FMV_HOST is set: it is a substitute for the title's
-     * own output, and that should be a decision rather than a default. */
-    if (g_eax == 0 && getenv("RECOMP_FMV_HOST")) {
-        /* Declared here rather than included: the player lives in xbox_video,
-         * which links xbox_d3d8, and having the kernel include its header
-         * would make the dependency circular for no gain. Both land in the
-         * same executable. */
-        extern int xbox_VideoPlayFile(const char *host_path);
-        extern int xbox_VideoIsPlaying(void);
-
-        char host[MAX_PATH * 2];
-        size_t n = 0;
-
-        const wchar_t *w = xbox_LastHostPath();
-
-        while (n < sizeof(host) - 1 && w[n]) {
-            host[n] = (char)w[n];
-            n++;
-        }
-        host[n] = 0;
-        if (n > 4 && _stricmp(host + n - 4, ".wmv") == 0
-                && !xbox_VideoIsPlaying())
-            xbox_VideoPlayFile(host);
-    }
 
     /* Paired with the optional path trace: that says what was asked for,
      * this says whether it opened. A failed open is not itself
@@ -12299,7 +12241,7 @@ static uint32_t g_thunk_table_count;
 /**
  * Return the kernel thunk table address and entry count currently in effect.
  * The address is parsed from the XBE header during memory layout init, so the
- * values are per-title, not hardcoded. *base/*count are set to 0 if unavailable.
+ * values are per-title, not hardcoded. Both outputs are set to 0 if unavailable.
  */
 void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count)
 {

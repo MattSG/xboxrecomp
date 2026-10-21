@@ -15,23 +15,18 @@
 
 #include <stdint.h>
 
-/* Window covered by the observation array.
- *
- * CUSTOMIZE: must span every executable section of your XBE. The default covers
- * the whole image for a 7.7 MiB XBE (tools/disasm/config.py XBE_BASE_ADDRESS /
- * XBE_IMAGE_SIZE). Targets outside the window are ignored rather than clamped --
- * a wrong bucket is worse than a missing one, because it would seed function
- * detection at an address the title never actually branched to. */
-#define RECOMP_ICALL_FB_BASE 0x00010000u
-#define RECOMP_ICALL_FB_SIZE 0x00800000u  /* 8 MiB */
-
 /* Flags OR'd into g_icall_seen[va - base]. */
 #define RECOMP_ICALL_SEEN_RESOLVED   1u  /* dispatch found a translation */
 #define RECOMP_ICALL_SEEN_UNRESOLVED 2u  /* dispatch failed: a real gap */
 
 #ifdef RECOMP_ICALL_FEEDBACK
 
-extern volatile unsigned char g_icall_seen[RECOMP_ICALL_FB_SIZE];
+/* Configured before guest workers start, normally by the XBE loader.
+ * Reconfiguration discards the prior image's observations. Invalid ranges or
+ * allocation failures return zero without changing the current window. */
+int recomp_icall_feedback_configure(uint32_t base, uint32_t size);
+extern volatile unsigned char *g_icall_seen;
+extern uint32_t g_icall_fb_base, g_icall_fb_size;
 
 /**
  * Record an observed indirect-branch target.
@@ -41,8 +36,8 @@ extern volatile unsigned char g_icall_seen[RECOMP_ICALL_FB_SIZE];
  * one OR.
  */
 #define RECOMP_ICALL_OBSERVE(va, flags) do { \
-    uint32_t _obs_off = (uint32_t)(va) - RECOMP_ICALL_FB_BASE; \
-    if (_obs_off < RECOMP_ICALL_FB_SIZE) \
+    uint32_t _obs_off = (uint32_t)(va) - g_icall_fb_base; \
+    if (_obs_off < g_icall_fb_size) \
         g_icall_seen[_obs_off] |= (unsigned char)(flags); \
 } while (0)
 
@@ -88,12 +83,14 @@ void recomp_icall_feedback_init(void);
  * unconditionally without #ifdef -- both compile away when the feature is off,
  * which is the point: instrumentation the host has to bracket in #ifdef is
  * instrumentation that rots. */
+#define RECOMP_ICALL_FEEDBACK_CONFIGURE(base, size) recomp_icall_feedback_configure(base, size)
 #define RECOMP_ICALL_FEEDBACK_INIT() recomp_icall_feedback_init()
 #define RECOMP_ICALL_FEEDBACK_DUMP() \
     recomp_icall_feedback_dump(RECOMP_ICALL_FEEDBACK_PATH)
 
 #else  /* !RECOMP_ICALL_FEEDBACK */
 
+#define RECOMP_ICALL_FEEDBACK_CONFIGURE(base, size) (1)
 #define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
 #define RECOMP_ICALL_OBSERVE_SITE(site, va) ((void)0)
 #define RECOMP_ICALL_FEEDBACK_INIT()   ((void)0)

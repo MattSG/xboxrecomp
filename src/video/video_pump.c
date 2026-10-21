@@ -6,8 +6,8 @@
  * runs on the guest's thread, so a title that is still booting keeps booting
  * while its video plays.
  *
- * The guest decides when. A title opens its movie file at the point its own
- * logic reaches the intro; the runtime notices that open and plays that file.
+ * Playback starts only when a port calls xbox_VideoPlayFile. Selection and
+ * guest-file interception policy belong to that port.
  */
 #if defined(_WIN32)
 #define COBJMACROS
