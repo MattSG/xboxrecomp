@@ -54,6 +54,61 @@ static const struct {
 };
 
 /* ============================================================
+ * Front-end method queue
+ *
+ * The hardware feeds the title's methods to the front end through a FIFO,
+ * and a halted or trapped front end takes none. DirectSound relies on that:
+ * when a voice goes idle the voice processor traps the front end with
+ * SE2FE_IDLE_VOICE, and the service routine reads FEDECMETH/FEDECPARAM and
+ * unlinks the voice from its list before letting the front end run again.
+ * Methods used to run at once on the title's thread, beside that routine on
+ * the frame thread: one could overwrite FEDECPARAM before the routine read
+ * it, or link a new voice next to the one being unlinked and drop it from
+ * the list. A dropped voice never plays and never goes idle, so DirectSound
+ * never gets it back; enough of them and the title can start no sound at all
+ * (sound effects die mid-race while music plays on; a mission waiting on
+ * speech never ends). Methods written while the front end is stopped now
+ * wait here, and run when the title sets it running again.
+ * ============================================================ */
+
+#define FE_QUEUE_LEN 4096
+
+static QemuMutex s_fe_lock;
+static struct { uint32_t method, argument; } s_fe_queue[FE_QUEUE_LEN];
+static unsigned s_fe_queued;
+
+static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument);
+
+static bool fe_running(MCPXAPUState *d)
+{
+    return (qatomic_read(&d->regs[NV_PAPU_FECTL]) & NV_PAPU_FECTL_FEMETHMODE)
+           == NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
+}
+
+/* With s_fe_lock held: run what waited, in order, while the front end runs. */
+static void fe_drain(MCPXAPUState *d)
+{
+    unsigned i = 0;
+    while (i < s_fe_queued && fe_running(d)) {
+        fe_method(d, s_fe_queue[i].method, s_fe_queue[i].argument);
+        i++;
+    }
+    if (i) {
+        memmove(s_fe_queue, s_fe_queue + i,
+                (s_fe_queued - i) * sizeof s_fe_queue[0]);
+        s_fe_queued -= i;
+    }
+}
+
+/* FECTL was written: if the front end runs again, catch up. */
+void mcpx_apu_fe_resume(MCPXAPUState *d)
+{
+    qemu_mutex_lock(&s_fe_lock);
+    fe_drain(d);
+    qemu_mutex_unlock(&s_fe_lock);
+}
+
+/* ============================================================
  * Notify status helper
  * ============================================================ */
 
@@ -616,8 +671,37 @@ uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
     (void)opaque; (void)size;
 
     switch (addr) {
-    case NV1BA0_PIO_FREE:
-        return 0x80; /* Always pretend queue is empty */
+    case NV1BA0_PIO_FREE: {
+        /* Free FIFO bytes (32 entries of 4). Methods held back while the
+         * front end is trapped are what the hardware FIFO would still hold,
+         * and DirectSound waits for it to read empty (0x80) before editing
+         * the voice lists itself. Answering empty regardless lets those edits run
+         * ahead of a queued VOICE_ON: the voice then goes into a list after
+         * DirectSound has already taken it out, and starting it again links
+         * it to itself (MP list loops, half-second stalls, sound lost). The
+         * lock orders the drained methods' writes before the title's.
+         * A front end left stopped past 50 ms is not going to drain (see the
+         * overflow in mcpx_apu_vp_write): answer empty then, as before. */
+        static ULONGLONG busy_since;
+        static unsigned gave_up;
+        unsigned queued;
+        qemu_mutex_lock(&s_fe_lock);
+        queued = s_fe_queued;
+        qemu_mutex_unlock(&s_fe_lock);
+        if (!queued) {
+            busy_since = 0;
+            return 0x80;
+        }
+        if (!busy_since) {
+            busy_since = GetTickCount64();
+        } else if (GetTickCount64() - busy_since > 50) {
+            if (gave_up++ < 4)
+                fprintf(stderr, "[APU] front end stopped with %u methods queued for 50 ms;"
+                        " reporting the FIFO empty\n", queued);
+            return 0x80;
+        }
+        return queued >= 0x20 ? 0 : 0x80 - queued * 4;
+    }
     default:
         break;
     }
@@ -630,8 +714,22 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
     MCPXAPUState *d = (MCPXAPUState *)opaque;
     (void)size;
 
-    /* Dispatch known methods through fe_method */
-    fe_method(d, (uint32_t)addr, (uint32_t)val);
+    /* Dispatch known methods through fe_method, in order, or keep them for
+     * when a stopped front end runs again (see fe_drain). */
+    qemu_mutex_lock(&s_fe_lock);
+    fe_drain(d);
+    if (fe_running(d) && !s_fe_queued) {
+        fe_method(d, (uint32_t)addr, (uint32_t)val);
+    } else if (s_fe_queued < FE_QUEUE_LEN) {
+        s_fe_queue[s_fe_queued].method = (uint32_t)addr;
+        s_fe_queue[s_fe_queued].argument = (uint32_t)val;
+        s_fe_queued++;
+    } else {
+        /* A front end left stopped this long is not coming back: run it. */
+        fe_drain(d);
+        fe_method(d, (uint32_t)addr, (uint32_t)val);
+    }
+    qemu_mutex_unlock(&s_fe_lock);
 }
 
 /* ============================================================
@@ -1347,7 +1445,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                /* One trap at a time, as the hardware's front end takes
+                 * them: a stopped one hears of this voice next frame. */
+                qemu_mutex_lock(&s_fe_lock);
+                if (fe_running(d)) fe_method(d, SE2FE_IDLE_VOICE, v);
+                qemu_mutex_unlock(&s_fe_lock);
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_spin_lock(d, v);
@@ -1386,6 +1488,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
      * Keeping the table in the APU avoids lazy-init races and shared state. */
     d->vp.attenuation_rounding = -2;
     prepare_attenuation(d);
+    qemu_mutex_init(&s_fe_lock);
 }
 
 void mcpx_apu_vp_finalize(MCPXAPUState *d)
