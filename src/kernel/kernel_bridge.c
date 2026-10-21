@@ -609,10 +609,9 @@ RECOMP_TLS uint32_t g_xbox_kernel_caller;
  *   PXBOX_SYSTEM_ROUTINE StartRoutine  // arg9: Xbox function pointer
  * )
  *
- * For static recompilation, we don't create a real thread.
- * Instead we call the StartRoutine synchronously via RECOMP_ICALL.
- * This is correct because on Xbox, the entry point creates a system
- * thread and returns, and the thread runs the actual game.
+ * Guest thread creation normally starts an independent host thread with
+ * its own guest CPU state. Ports may explicitly request the legacy first-call
+ * inline execution model before starting guest code.
  */
 static int g_thread_call_count = 0;
 
@@ -960,47 +959,11 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     return th;
 }
 
-/* A worker with its guest thread object: the object is made first and holds
- * an extra reference until the handle token owns one, so a worker that ends
- * at once cannot free it underneath us. The KE shadow gets its own duplicate
- * of the host thread handle, which is what KeWaitForSingleObject waits on. */
-static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
-                                        uint32_t ctx2, uint32_t stack_top,
-                                        uint32_t handle_va, uint32_t tls_size)
-{
-    uint32_t obj = thobj_alloc();
-    HANDLE th, shadow = NULL;
-
-    thobj_ref(obj);
-    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size);
-    if (!th) {
-        thobj_unref(obj);   /* the thread's own: it never ran */
-    } else {
-        if (obj && DuplicateHandle(GetCurrentProcess(), th, GetCurrentProcess(),
-                                   &shadow, 0, FALSE, DUPLICATE_SAME_ACCESS))
-            ke_shadow_insert(obj, shadow);
-        if (handle_va) {
-            bridge_write_handle(handle_va, th);
-            thobj_attach_token(BRIDGE_MEM32(handle_va), obj);
-        }
-    }
-    thobj_unref(obj);
-    return th;
-}
-
-/* Two ways a title expects its first PsCreateSystemThreadEx to behave.
- *
- * INLINE (default): the first call IS the game starting -- run the routine
- * inline, inheriting register state, and it drives its own main loop forever.
- * This is what Halo and Crimson Skies need and the historical behavior.
- *
- * SPAWN: the title's entry spawns an init thread and RETURNS, expecting the host
- * to drive the per-frame tick afterwards (Burnout 3 is tick-driven). Here the
- * first call must spawn a real thread and return, so control comes back to the
- * host. Opt in with xbox_SetThreadMode before the game starts. See
- * docs/technical/burnout3-reunification.md. */
+/* Thread creation defaults to SPAWN for both guest APIs. INLINE is an
+ * explicit compatibility/diagnostic choice for ports whose entry drives the
+ * game synchronously. Configure the mode before starting guest threads. */
 /* XBOX_THREAD_MODE_* and xbox_SetThreadMode are declared in xbox_memory_layout.h. */
-static int g_thread_mode = XBOX_THREAD_MODE_INLINE;
+static int g_thread_mode = XBOX_THREAD_MODE_SPAWN;
 void xbox_SetThreadMode(int mode) { g_thread_mode = mode; }
 
 static void bridge_PsCreateSystemThreadEx(void)

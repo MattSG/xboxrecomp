@@ -157,9 +157,23 @@ static void test_start_io_callback(void)
     g_esp += 12;
 }
 
+#define TEST_THREAD_VA 0x45088u
+static DWORD thread_id;
+static uint32_t thread_context[2], thread_stack, thread_tib;
+static void test_thread_callback(void)
+{
+    thread_id = GetCurrentThreadId();
+    thread_context[0] = *(uint32_t *)(g_guest_mem + g_esp + 4);
+    thread_context[1] = *(uint32_t *)(g_guest_mem + g_esp + 8);
+    thread_stack = g_esp;
+    thread_tib = g_fs_base;
+    g_ebx = 0xBAD;
+}
+
 recomp_func_t recomp_lookup(uint32_t xbox_va);
 recomp_func_t recomp_lookup(uint32_t xbox_va)
 {
+    if (xbox_va == TEST_THREAD_VA) return test_thread_callback;
     if (xbox_va == TEST_DISPATCH_VA) return test_dispatch_callback;
     if (xbox_va == TEST_STARTIO_VA) return test_start_io_callback;
     return NULL;
@@ -272,7 +286,7 @@ static void firmware_observer(ULONG routine)
 }
 int main(int argc, char **argv)
 {
-    if (argc == 2) {
+    if (argc == 2 && !strncmp(argv[1],"firmware-",9)) {
         if (strcmp(argv[1],"firmware-default")) xbox_SetFirmwareReturnHook(firmware_observer);
         if (!strcmp(argv[1],"firmware-clear")) xbox_SetFirmwareReturnHook(NULL);
         xbox_HalReturnToFirmware(37);
@@ -326,6 +340,11 @@ int main(int argc, char **argv)
         xbe_word=0; memcpy(xbe+0x11c,&xbe_word,4);
         xbe_word=0x10120; memcpy(xbe+0x120,&xbe_word,4);
     }
+    if (xbe && argc == 2 && !strncmp(argv[1],"thread-",7)) {
+        /* A valid empty TLS directory still provides per-thread XAPI slot 0. */
+        xbe_word = 0x10300;
+        memcpy(xbe+0x12c,&xbe_word,4);
+    }
     check(xbe != NULL && xbox_MemoryLayoutInit(xbe, 0x1000),
           "minimal XBE fixture initializes guest memory and heap", NULL);
     check(!g_xbox_code_lo && !g_xbox_code_hi,"new image clears absent code bounds",NULL);
@@ -339,6 +358,48 @@ int main(int argc, char **argv)
     if (!mem) {
         printf("\n%d failure(s); the rest needs guest memory.\n", failures);
         return 1;
+    }
+
+    if (argc == 2 && !strncmp(argv[1],"thread-",7)) {
+        int inline_mode = strstr(argv[1],"inline") != NULL;
+        uint32_t ordinal = strstr(argv[1],"255") ? 255 : 254;
+        uint32_t args[10] = {0};
+        DWORD caller_id = GetCurrentThreadId();
+        uint32_t caller_tib = g_fs_base;
+        if (inline_mode) xbox_SetThreadMode(XBOX_THREAD_MODE_INLINE);
+        *(uint32_t *)(mem + THUNK_VA) = 0x80000000u | ordinal;
+        *(uint32_t *)(mem + THUNK_VA + 4) = 0x80000000u | 187;
+        xbox_kernel_set_thunk_address(THUNK_VA,2);
+        xbox_kernel_init();
+        xbox_kernel_bridge_init();
+        args[0] = 0x42000;
+        args[ordinal == 255 ? 5 : 4] = 0x12345678;
+        args[ordinal == 255 ? 6 : 5] = 0x87654321;
+        args[ordinal == 255 ? 9 : 6] = TEST_THREAD_VA;
+        g_ebx = 0x555;
+        uint32_t status = call_slot(mem,THUNK_VA,ordinal == 255 ? 10 : 7,args);
+        HANDLE worker = (HANDLE)xbox_thread_debug_handle();
+        if (!inline_mode && worker)
+            check(WaitForSingleObject(worker,5000) == WAIT_OBJECT_0,"spawned guest thread finishes",NULL);
+        check(status == 0,"thread-create returns success",NULL);
+        check(inline_mode ? thread_id == caller_id : thread_id && thread_id != caller_id,
+              "first thread follows explicit inline or default spawned mode",NULL);
+        check(thread_context[0] == 0x12345678 && thread_context[1] == 0x87654321,
+              "both thread-create APIs deliver start contexts",NULL);
+        check(inline_mode ? g_ebx == 0xBAD : g_ebx == 0x555,
+              "spawned thread owns registers; inline mode inherits them",NULL);
+        check(inline_mode ? thread_tib == caller_tib : thread_tib && thread_tib != caller_tib,
+              "spawned thread owns its TIB",NULL);
+        check(inline_mode ? thread_stack >= SCRATCH_SP-0x100 && thread_stack <= SCRATCH_SP+0x100 :
+                            thread_stack < SCRATCH_SP-0x100 || thread_stack > SCRATCH_SP+0x100,
+              "spawned thread owns its stack",NULL);
+        if (worker) {
+            args[0] = *(uint32_t *)(mem+0x42000);
+            check(call_slot(mem,THUNK_VA+4,1,args) == 0,"thread handle closes",NULL);
+        }
+        xbox_kernel_shutdown();
+        xbox_MemoryLayoutShutdown();
+        return failures ? 1 : 0;
     }
 
     /* Imports, in the form an XBE stores them: 0x80000000 | ordinal. Slot 0 is
