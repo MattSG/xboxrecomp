@@ -36,6 +36,7 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
     Returns:
         dict: Summary statistics.
     """
+    config.configure_from_xbe(xbe_path)
     functions_path = functions_path or config.DEFAULT_FUNCTIONS_JSON
     strings_path = strings_path or config.DEFAULT_STRINGS_JSON
     xrefs_path = xrefs_path or config.DEFAULT_XREFS_JSON

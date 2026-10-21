@@ -45,11 +45,6 @@ def main():
     args = parser.parse_args()
 
     try:
-        # Derive address ranges from the XBE being analyzed so classification
-        # is per-title, not tied to the reference fallback layout.
-        from . import config
-        config.configure_from_xbe(args.xbe_path)
-
         summary = run(
             xbe_path=args.xbe_path,
             functions_path=args.functions,
