@@ -2302,61 +2302,15 @@ int nv2a_d3d_widescreen(void)
     return widen() > 1.001f;
 }
 
-/* Menu pointing (see nv2a_d3d11.c). */
-typedef NvMenuRect MenuRect;
-#define MENU_RECTS 1024
-static MenuRect s_mr_frame[MENU_RECTS], s_mr_shown[MENU_RECTS];
-static int s_mr_frame_n, s_mr_shown_n;
+/* Last presentation rectangle, normalized to client coordinates. */
 static float s_present_rect[4];
-static SDL_SpinLock s_mr_lock;
-static SDL_AtomicInt s_mr_on;
-static const uint32_t *s_mr_tints;
+static SDL_SpinLock s_present_lock;
 
-void nv2a_d3d_collect_menu_rects(int on)
+void nv2a_d3d_get_present_rect(float present[4])
 {
-    SDL_SetAtomicInt(&s_mr_on, on != 0);
-}
-
-int nv2a_d3d_menu_rects_on(void)
-{
-    return SDL_GetAtomicInt(&s_mr_on) != 0;
-}
-
-void nv2a_d3d_set_menu_tints(const uint32_t *tints)
-{
-    s_mr_tints = tints;
-}
-
-int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4])
-{
-    int n;
-    SDL_LockSpinlock(&s_mr_lock);
-    n = s_mr_shown_n < max ? s_mr_shown_n : max;
-    memcpy(out, s_mr_shown, (size_t)n * sizeof *out);
+    SDL_LockSpinlock(&s_present_lock);
     memcpy(present, s_present_rect, sizeof s_present_rect);
-    SDL_UnlockSpinlock(&s_mr_lock);
-    return n;
-}
-
-
-static void note_menu_rects(const float (*pos)[4], const uint32_t *idx, uint32_t ni, uint32_t lo)
-{
-    uint32_t group = ni % 3 == 0 ? 3 : ni, k, j;
-    for (k = 0; k + group <= ni && s_mr_frame_n < MENU_RECTS; k += group) {
-        MenuRect r = { 1e30f, 1e30f, -1e30f, -1e30f, s_draw_tex_addr,
-                       s_mr_tints ? s_mr_tints[idx[k] - lo] : 0xFFFFFFFFu };
-        for (j = k; j < k + group; j++) {
-            const float *v = pos[idx[j] - lo];
-            if (v[3] != 1.0f) return;
-            if (v[0] < r.x0) r.x0 = v[0];
-            if (v[0] > r.x1) r.x1 = v[0];
-            if (v[1] < r.y0) r.y0 = v[1];
-            if (v[1] > r.y1) r.y1 = v[1];
-        }
-        if (s_mr_frame_n && !memcmp(&s_mr_frame[s_mr_frame_n - 1], &r, sizeof r))
-            continue;
-        s_mr_frame[s_mr_frame_n++] = r;
-    }
+    SDL_UnlockSpinlock(&s_present_lock);
 }
 
 /* ------------------------------------------------ z-pass pixel counting */
@@ -2457,8 +2411,6 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
     s_prof_draws++;
     if (!setup_pipeline(st, topology, &s, &gw, &gh, &zmax, 1))
         return;
-    if (pos && s_draw_textured && nv2a_d3d_menu_rects_on())
-        note_menu_rects(pos, idx, ni, lo);
     if (pos && s && s->sx > s->sy * 1.001f && s_overlay.place) {
         float xlo = 1e30f, xhi = -1e30f, ylo = 1e30f, yhi = -1e30f;
         uint32_t k;
@@ -3033,10 +2985,10 @@ static void composite(SDL_GPUTexture *dst, uint32_t w, uint32_t h, Surface *s,
         }
         x0 = ((float)w - target_w) * 0.5f;
         y0 = ((float)h - target_h) * 0.5f;
-        SDL_LockSpinlock(&s_mr_lock);
+        SDL_LockSpinlock(&s_present_lock);
         s_present_rect[0] = x0 / w; s_present_rect[1] = y0 / h;
         s_present_rect[2] = target_w / w; s_present_rect[3] = target_h / h;
-        SDL_UnlockSpinlock(&s_mr_lock);
+        SDL_UnlockSpinlock(&s_present_lock);
     }
     pc->dst_rect[0] = x0 / w * 2 - 1;
     pc->dst_rect[1] = 1 - y0 / h * 2;
@@ -3340,13 +3292,6 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
         return;
     fbw_sdl_pump();
     if (s_overlay.frame) s_overlay.frame();
-    if (s_mr_frame_n || s_mr_shown_n) {
-        SDL_LockSpinlock(&s_mr_lock);
-        memcpy(s_mr_shown, s_mr_frame, (size_t)s_mr_frame_n * sizeof *s_mr_frame);
-        s_mr_shown_n = s_mr_frame_n;
-        SDL_UnlockSpinlock(&s_mr_lock);
-        s_mr_frame_n = 0;
-    }
     s = surface_find(phys(surface_addr));
     if (!s && pitch)
         s = scan_surface(surface_addr, pitch);

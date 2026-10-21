@@ -258,7 +258,6 @@ static BOOL menu_keys_enabled(void)
  * fights the keys. A left click is held back until the focus has arrived,
  * then sent as A; *click says when. */
 extern int xbox_FramebufferMouse(float *x, float *y);
-extern void nv2a_d3d_collect_menu_rects(int on);
 static int (*s_menu_pointer)(float x, float y, int *offset);
 static int (*s_menu_click)(float x, float y);
 extern void xbox_FramebufferSetMousePressHandler(int (*handler)(float, float));
@@ -362,8 +361,6 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     load_keymap();
     memset(pState, 0, sizeof(*pState));
     s_menu = menu_keys_enabled() && (!s_in_menu || s_in_menu());
-    if (menu_keys_enabled() && s_menu_pointer)
-        nv2a_d3d_collect_menu_rects(s_menu);
 
     if (bound_down(K_UP))    b |= XBOX_GAMEPAD_DPAD_UP;
     if (bound_down(K_DOWN))  b |= XBOX_GAMEPAD_DPAD_DOWN;

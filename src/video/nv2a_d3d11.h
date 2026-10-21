@@ -90,20 +90,8 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology,
                       const float (*pos)[4]);
 /* Whether display-sized surfaces are widened (pos is worth computing). */
 int nv2a_d3d_widescreen(void);
-/* Menu pointing: while on, each frame's textured screen-space quads are
- * recorded (pos is then worth computing too). */
-typedef struct {
-    float x0, y0, x1, y1;   /* guest pixels */
-    uint32_t tex;           /* stage 0 texture address */
-    uint32_t argb;          /* first vertex's colour out of the vertex stage */
-} NvMenuRect;
-void nv2a_d3d_collect_menu_rects(int on);
-int nv2a_d3d_menu_rects_on(void);
-/* The last shown frame's quads (up to max), and where it landed in the
- * window: x0, y0, w, h as fractions of the client area. */
-int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4]);
-/* Each vertex's final colour (by index - lo) for the next draw, or NULL. */
-void nv2a_d3d_set_menu_tints(const uint32_t *tints);
+/* Last presentation rectangle: x0, y0, width, height as client fractions. */
+void nv2a_d3d_get_present_rect(float present[4]);
 
 /* Create the device (no window needed). 0 if D3D11 is unavailable. */
 int  nv2a_d3d_init(void);

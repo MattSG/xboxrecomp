@@ -2855,66 +2855,15 @@ int nv2a_d3d_widescreen(void)
     return widen() > 1.001f;
 }
 
-/* Menu pointing (RECOMP_MENU_KEYS): each frame's textured screen-space quads,
- * in guest pixels, with the colour their vertices leave the vertex stage
- * with, and where the last frame landed in the window. What is a button and
- * which one has the focus is the title's business (nv2a_d3d_menu_rects). */
-typedef NvMenuRect MenuRect;
-#define MENU_RECTS 1024
-static MenuRect s_mr_frame[MENU_RECTS], s_mr_shown[MENU_RECTS];
-static int s_mr_frame_n, s_mr_shown_n;
-static float s_present_rect[4];                  /* x0, y0, w, h as client fractions */
-static SRWLOCK s_mr_lock = SRWLOCK_INIT;
-static volatile LONG s_mr_on;
-static const uint32_t *s_mr_tints;               /* the current draw's, see header */
+/* Last presentation rectangle, normalized to client coordinates. */
+static float s_present_rect[4];
+static SRWLOCK s_present_lock = SRWLOCK_INIT;
 
-void nv2a_d3d_collect_menu_rects(int on)
+void nv2a_d3d_get_present_rect(float present[4])
 {
-    InterlockedExchange(&s_mr_on, on != 0);
-}
-
-int nv2a_d3d_menu_rects_on(void)
-{
-    return InterlockedCompareExchange(&s_mr_on, 0, 0) != 0;
-}
-
-void nv2a_d3d_set_menu_tints(const uint32_t *tints)
-{
-    s_mr_tints = tints;
-}
-
-int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4])
-{
-    int n;
-    AcquireSRWLockShared(&s_mr_lock);
-    n = s_mr_shown_n < max ? s_mr_shown_n : max;
-    memcpy(out, s_mr_shown, (size_t)n * sizeof *out);
+    AcquireSRWLockShared(&s_present_lock);
     memcpy(present, s_present_rect, sizeof s_present_rect);
-    ReleaseSRWLockShared(&s_mr_lock);
-    return n;
-}
-
-
-/* One rect per triangle: either half of an axis-aligned quad spans the
- * whole quad, so batched quads come apart without knowing how they pair. */
-static void note_menu_rects(const float (*pos)[4], const uint32_t *idx, uint32_t ni, uint32_t lo)
-{
-    uint32_t group = ni % 3 == 0 ? 3 : ni, k, j;
-    for (k = 0; k + group <= ni && s_mr_frame_n < MENU_RECTS; k += group) {
-        MenuRect r = { 1e30f, 1e30f, -1e30f, -1e30f, s_draw_tex_addr,
-                       s_mr_tints ? s_mr_tints[idx[k] - lo] : 0xFFFFFFFFu };
-        for (j = k; j < k + group; j++) {
-            const float *v = pos[idx[j] - lo];
-            if (v[3] != 1.0f) return;
-            if (v[0] < r.x0) r.x0 = v[0];
-            if (v[0] > r.x1) r.x1 = v[0];
-            if (v[1] < r.y0) r.y0 = v[1];
-            if (v[1] > r.y1) r.y1 = v[1];
-        }
-        if (s_mr_frame_n && !memcmp(&s_mr_frame[s_mr_frame_n - 1], &r, sizeof r))
-            continue;                            /* the quad's other half */
-        s_mr_frame[s_mr_frame_n++] = r;
-    }
+    ReleaseSRWLockShared(&s_present_lock);
 }
 
 void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr[16],
@@ -2980,8 +2929,6 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
             return;
         }
     }
-    if (pos && s_draw_textured && nv2a_d3d_menu_rects_on())
-        note_menu_rects(pos, idx, ni, lo);
     if (pos && s && s->sx > s->sy * 1.001f && s_overlay.place) {
         /* Screen-space 2D on a widened target spans the display unless the
          * title's overlay hooks place it otherwise. */
@@ -3763,10 +3710,10 @@ static void composite(ID3D11RenderTargetView *rtv, UINT w, UINT h, Surface *s,
         y0 = ((float)h - target_h) * 0.5f;
     }
     if (letterbox) {
-        AcquireSRWLockExclusive(&s_mr_lock);
+        AcquireSRWLockExclusive(&s_present_lock);
         s_present_rect[0] = x0 / w; s_present_rect[1] = y0 / h;
         s_present_rect[2] = target_w / w; s_present_rect[3] = target_h / h;
-        ReleaseSRWLockExclusive(&s_mr_lock);
+        ReleaseSRWLockExclusive(&s_present_lock);
     }
     pc->dst_rect[0] = x0 / w * 2 - 1;
     pc->dst_rect[1] = 1 - y0 / h * 2;
@@ -4127,13 +4074,6 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
     if (!nv2a_d3d_init())
         return;
     if (s_overlay.frame) s_overlay.frame();
-    if (s_mr_frame_n || s_mr_shown_n) {
-        AcquireSRWLockExclusive(&s_mr_lock);
-        memcpy(s_mr_shown, s_mr_frame, (size_t)s_mr_frame_n * sizeof *s_mr_frame);
-        s_mr_shown_n = s_mr_frame_n;
-        ReleaseSRWLockExclusive(&s_mr_lock);
-        s_mr_frame_n = 0;
-    }
     s = surface_find(phys(surface_addr));
     if (!s && pitch)
         s = scan_surface(surface_addr, pitch);
@@ -4296,11 +4236,8 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int t, const NvD3DAttrib a[16], cons
                       const float (*pos)[4])
 { (void)st; (void)t; (void)a; (void)d; (void)pr; (void)i; (void)n; (void)lo; (void)hi; (void)pos; }
 int nv2a_d3d_widescreen(void) { return 0; }
-void nv2a_d3d_collect_menu_rects(int on) { (void)on; }
-int nv2a_d3d_menu_rects_on(void) { return 0; }
-void nv2a_d3d_set_menu_tints(const uint32_t *tints) { (void)tints; }
-int nv2a_d3d_menu_rects(NvMenuRect *out, int max, float present[4])
-{ (void)out; (void)max; present[0] = present[1] = present[2] = present[3] = 0; return 0; }
+void nv2a_d3d_get_present_rect(float present[4])
+{ present[0] = present[1] = present[2] = present[3] = 0; }
 void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks) { (void)hooks; }
 void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}

@@ -2606,33 +2606,6 @@ static int use_d3d(void)
 static uint32_t *s_di, s_di_cap;
 static float (*s_pos)[4];
 static uint32_t s_pos_cap;
-static uint32_t *s_tint, s_tint_cap;       /* menu hover: each vertex's final colour */
-
-static uint32_t pack_argb(const float c[4])
-{
-    uint32_t out = 0;
-    int i;
-    for (i = 0; i < 4; i++) {
-        uint32_t ch = c[i] <= 0 ? 0 : c[i] >= 1 ? 255 : (uint32_t)(c[i] * 255 + 0.5f);
-        out |= ch << (i == 3 ? 24 : 16 - 8 * i);
-    }
-    return out;
-}
-
-/* The colour a vertex leaves the vertex stage with: what tells a focused
- * menu item from the rest when everything else about them is the same. */
-static uint32_t d3d_vertex_tint(uint32_t guest_idx, int program)
-{
-    float c[4] = { 1, 1, 1, 1 };
-    if (program) {
-        Nv2aVshOutput o;
-        if (transform_vertex(guest_idx, &o)) return pack_argb(o.d0);
-    } else if (s_gpu.attr[3].size && fetch_attr(&s_gpu.attr[3], guest_idx, c)) {
-        return pack_argb(c);
-    }
-    return pack_argb(c);
-}
-
 static int grow(void **p, uint32_t *cap, uint32_t need, size_t elem)
 {
     if (need <= *cap) return 1;
@@ -2837,7 +2810,7 @@ static void d3d_draw_batch(int program)
     ni = build_list(n, s_gpu.idx, s_di, &topo);
     if (!ni)
         return;
-    if ((nv2a_d3d_widescreen() || nv2a_d3d_menu_rects_on()) && hi - lo < 65536 &&
+    if (nv2a_d3d_widescreen() && hi - lo < 65536 &&
         grow((void **)&s_pos, &s_pos_cap, hi - lo + 1, sizeof *s_pos) &&
         d3d_screen_pos(s_gpu.idx[0], program, s_pos[s_gpu.idx[0] - lo]) &&
         s_pos[s_gpu.idx[0] - lo][3] == 1.0f) {
@@ -2851,14 +2824,8 @@ static void d3d_draw_batch(int program)
             if (!d3d_screen_pos(s_gpu.idx[i], program, s_pos[s_gpu.idx[i] - lo]))
                 return;                            /* no program loaded */
         pos = (const float (*)[4])s_pos;
-        if (nv2a_d3d_menu_rects_on() && grow((void **)&s_tint, &s_tint_cap, hi - lo + 1, sizeof *s_tint)) {
-            for (i = 0; i < n; i++)
-                s_tint[s_gpu.idx[i] - lo] = d3d_vertex_tint(s_gpu.idx[i], program);
-            nv2a_d3d_set_menu_tints(s_tint);
-        }
     }
     nv2a_d3d_draw_ub(&st, topo, attr, (const float (*)[4])def, program, s_di, ni, lo, hi, pos);
-    nv2a_d3d_set_menu_tints(NULL);
     s_gpu.batches_program += program;
     s_gpu.verts_program += program ? n : 0;
     s_gpu.xf_drawn += ni / 3;

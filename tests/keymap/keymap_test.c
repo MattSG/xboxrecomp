@@ -24,7 +24,6 @@ static void hook(XBOX_INPUT_STATE *s, BOOL menu)
     if (xbox_FramebufferKeyDown('R')) s->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
 }
 int xbox_FramebufferMouse(float *x, float *y) { *x = *y = 0; return 0; }
-void nv2a_d3d_collect_menu_rects(int on) { (void)on; }
 
 int main(int argc, char **argv)
 {
