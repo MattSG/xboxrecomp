@@ -1,7 +1,13 @@
 /* RECOMP_KEYMAP rebinds the keyboard pad; unnamed inputs keep their defaults.
  * RECOMP_MENU_KEYS adds menu navigation only while the probe reports a menu.
  * A title's keyboard hook sees the pad last, with the menu state. */
+#include "../../src/input/xinput_xbox.h"
+static ULONGLONG test_ticks = 1000;
+static ULONGLONG click_clock(void) { return test_ticks; }
+#define GetTickCount64 click_clock
 #include "../../src/input/xinput_device.c"
+#undef GetTickCount64
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef _WIN32
@@ -25,9 +31,28 @@ static void hook(XBOX_INPUT_STATE *s, BOOL menu)
 }
 int xbox_FramebufferMouse(float *x, float *y) { *x = *y = 0; return 0; }
 
+static int consume_click(float x, float y) { assert(x == 0 && y == 0); return 1; }
+
 int main(int argc, char **argv)
 {
     XBOX_INPUT_STATE s;
+    if (argc == 2 && !strcmp(argv[1], "menu-click")) {
+        assert(!menu_click());
+        xbox_InputSetMenuClickHandler(consume_click);
+        held[VK_LBUTTON] = 1;
+        assert(!menu_click()); /* Consumed native click never becomes pad A. */
+        assert(!menu_click());
+        held[VK_LBUTTON] = 0; assert(!menu_click());
+        xbox_InputSetMenuClickHandler(NULL);
+        held[VK_LBUTTON] = 1; assert(menu_click());
+        test_ticks += 79; assert(menu_click());
+        test_ticks++; assert(!menu_click()); /* Held button does not retrigger. */
+        held[VK_LBUTTON] = 0; assert(!menu_click());
+        held[VK_LBUTTON] = 1; assert(menu_click());
+        puts("PASS: consumed clicks and bounded mouse-to-A fallback");
+        return 0;
+    }
+
 #ifndef _WIN32
     if (argc == 2 && !strcmp(argv[1], "two-gamepads")) {
         SDL_VirtualJoystickDesc desc;

@@ -250,13 +250,8 @@ static BOOL menu_keys_enabled(void)
     return on ? TRUE : FALSE;
 }
 
-/* Pointing at a menu item moves the focus there: D-pad pulses, a row at a
- * time, until the title's pointer function (xbox_InputSetMenuPointer) sees
- * the focus under the pointer. Only after the pointer moves, so it never
- * fights the keys. A left click is held back until the focus has arrived,
- * then sent as A; *click says when. */
+/* Optional title click dispatch, with mouse-to-A fallback. */
 extern int xbox_FramebufferMouse(float *x, float *y);
-static int (*s_menu_pointer)(float x, float y, int *offset);
 static int (*s_menu_click)(float x, float y);
 extern void xbox_FramebufferSetMousePressHandler(int (*handler)(float, float));
 
@@ -273,65 +268,18 @@ void xbox_InputSetMenuClickHandler(int (*click)(float, float))
     xbox_FramebufferSetMousePressHandler(click ? menu_press : NULL);
 }
 
-void xbox_InputSetMenuPointer(int (*pointer)(float x, float y, int *offset))
+static BOOL menu_click(void)
 {
-    s_menu_pointer = pointer;
-}
-
-static WORD menu_hover(BOOL nav_keys, BOOL *click)
-{
-    static int seen_moves, active, was_down, pulsed_rows;
-    static ULONGLONG pulse_until, pulsed_at, click_at, a_until;
-    static WORD bit;
+    static int was_down;
+    static ULONGLONG a_until;
     ULONGLONG now = GetTickCount64();
     float x, y;
-    int moves = xbox_FramebufferMouse(&x, &y), rows = 0, on = 0, down = key_down(VK_LBUTTON);
-    if (moves != seen_moves) { seen_moves = moves; active = 1; }
-    if (nav_keys) active = 0;
-    if (active) {
-        /* Trust a reading only once three polls agree: the highlight
-         * animates, and a frame caught mid-way can point anywhere. */
-        static int last_on, last_rows, same;
-        on = s_menu_pointer ? s_menu_pointer(x, y, &rows) : 0;
-        same = on == last_on && rows == last_rows ? same + 1 : 0;
-        last_on = on; last_rows = rows;
-        if (same < 2 && on > 0) on = -1;
-    }
-    /* One row per pulse, the next only once the highlight is seen to have
-     * moved (titles fade it over a few hundred ms), or after 700 ms. */
-    if (on == 1 && rows && (rows != pulsed_rows || now - pulsed_at > 700) && now >= pulse_until + 30) {
-        bit = rows > 0 ? XBOX_GAMEPAD_DPAD_DOWN : XBOX_GAMEPAD_DPAD_UP;
-        pulse_until = now + 50;     /* a few title polls held, then let go */
-        pulsed_at = now;
-        pulsed_rows = rows;
-    }
-    /* A strip that scrolls (on == 2) moves on a click, not on hover: that
-     * many presses left or right, and no A. */
-    {
-        static int sideways;
-        if (down && !was_down && on == 2) {
-            sideways = rows;
-            down = 0;               /* the click is spent on the move */
-        }
-        if (sideways && now >= pulse_until + 120) {
-            bit = sideways > 0 ? XBOX_GAMEPAD_DPAD_RIGHT : XBOX_GAMEPAD_DPAD_LEFT;
-            sideways += sideways > 0 ? -1 : 1;
-            pulse_until = now + 50;
-        }
-    }
-    if (down && !was_down) {
-        if (s_menu_click && s_menu_click(x, y)) click_at = 0;
-        else click_at = now;
-    }
-    was_down = key_down(VK_LBUTTON);
-    /* Off an item the click goes straight through; on one it waits for the
-     * focus, or 800 ms where the highlight cannot be found. */
-    if (click_at && (on == 0 || (on > 0 && !rows) || now - click_at > 800)) {
-        click_at = 0;
+    int down = key_down(VK_LBUTTON);
+    xbox_FramebufferMouse(&x, &y);
+    if (down && !was_down && !(s_menu_click && s_menu_click(x, y)))
         a_until = now + 80;
-    }
-    *click = now < a_until;
-    return now < pulse_until ? bit : 0;
+    was_down = key_down(VK_LBUTTON);
+    return now < a_until;
 }
 
 static BOOL bound_down(int k)
@@ -373,7 +321,8 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
             if (key_down(s_menu_dirs[i].arrow) || key_down(s_menu_dirs[i].letter) ||
                 (s_keys[s_menu_dirs[i].stick] && key_down(s_keys[s_menu_dirs[i].stick])))
                 nav |= s_menu_dirs[i].bit;
-        b |= nav | menu_hover(nav != 0, &hover_click);
+        b |= nav;
+        hover_click = menu_click();
     }
     pState->Gamepad.wButtons = b;
 
