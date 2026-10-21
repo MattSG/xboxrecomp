@@ -5,14 +5,10 @@
  * translates them to Windows XInput. The Xbox controller API
  * differs from XInput in structure layout and polling model.
  *
- * The game uses 9 XPP entry points with 12 total calls:
- * - Controller state polling
- * - Vibration/force feedback
- * - Device enumeration
  */
 
-#ifndef BURNOUT3_XINPUT_XBOX_H
-#define BURNOUT3_XINPUT_XBOX_H
+#ifndef XBOXRECOMP_XINPUT_XBOX_H
+#define XBOXRECOMP_XINPUT_XBOX_H
 
 #include <stdint.h>
 #include "platform/xbox_winnt.h"
@@ -104,10 +100,6 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
 /* RECOMP_MENU_KEYS applies only while in_menu() returns nonzero (Windows). */
 void xbox_InputSetMenuProbe(int (*in_menu)(void));
-/* Menu pointing: pointer(x, y) for a client-area fraction returns 0 off any
- * item, 1 on one (*offset rows below the focused item, negative above), -1
- * on one whose focus cannot be told yet. Without it, clicks are just A/B. */
-void xbox_InputSetMenuPointer(int (*pointer)(float x, float y, int *offset));
 /* Register before polling. A nonzero result consumes a menu click so the
  * title can dispatch it on its guest thread instead of receiving pad A. */
 void xbox_InputSetMenuClickHandler(int (*click)(float x, float y));
@@ -131,4 +123,4 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 }
 #endif
 
-#endif /* BURNOUT3_XINPUT_XBOX_H */
+#endif /* XBOXRECOMP_XINPUT_XBOX_H */
