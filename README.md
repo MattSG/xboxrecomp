@@ -293,8 +293,8 @@ xboxrecomp/
 │   │   └── src/main.c           # Host entry point: loads XBE, boots guest
 │   └── runtime/                 # Runtime shim templates
 │       ├── recomp_types.h       # Register model + ICALL macros
-│       ├── xbox_memory.h        # Memory layout helpers
-│       └── kernel_stubs.h       # Kernel function stub templates
+│       ├── xbox_memory.h        # Includes runtime memory interface
+│       └── kernel_stubs.h       # Includes runtime kernel interface
 └── docs/                        # Documentation
     ├── pipeline/                # Step-by-step pipeline guides
     ├── technical/               # Deep technical documentation

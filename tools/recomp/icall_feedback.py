@@ -304,7 +304,7 @@ def cmd_merge(args):
         print("\n  These are the real gaps. Seed them:")
         print("    python -m tools.disasm ... --seed-functions %s" % args.db)
         print("  Then classify what the detector still cannot place:")
-        print("    python tools/recomp/analyze_unresolved.py")
+        print("    python tools/recomp/analyze_unresolved.py path/to/default.xbe")
     return 0
 
 
