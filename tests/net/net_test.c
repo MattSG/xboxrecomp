@@ -134,21 +134,30 @@ int main(void)
         if (n != 60 || rd16(r + 12) != 0x88B5) { puts("FAIL: tunnel frame not delivered"); return 11; }
     }
 
-    /* Xbox Live's names are answered here, as Insignia's (the address needs
-     * the host's DNS, so only the reply itself is required). */
+    /* Opt-in DNS alias through the actual guest packet path, with a numeric
+     * loopback destination: no external DNS or online service is required. */
     {
+        static const XboxDnsAlias aliases[] = {{"name.test", "127.0.0.1"}};
         static const uint8_t qry[] = {0xAB, 0xCD, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-            4, 'm', 'a', 'c', 's', 8, 'x', 'b', 'o', 'x', 'l', 'i', 'v', 'e', 3, 'c', 'o', 'm', 0,
-            0, 1, 0, 1};
+            4, 'n', 'a', 'm', 'e', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1};
+        uint8_t answer[600];
+        if (dns_alias_answer(qry,sizeof qry,answer)) { puts("FAIL: default DNS alias"); return 12; }
+        net_backend_set_dns_aliases(aliases,1);
+        if (dns_alias_answer(qry,16,answer)) { puts("FAIL: truncated DNS query"); return 13; }
+        uint8_t unknown[sizeof qry]; memcpy(unknown,qry,sizeof qry); unknown[13]='x';
+        if (dns_alias_answer(unknown,sizeof unknown,answer)) { puts("FAIL: unrelated DNS query"); return 13; }
+        unknown[13]='n'; unknown[sizeof unknown-3]=28; /* AAAA */
+        if (dns_alias_answer(unknown,sizeof unknown,answer)) { puts("FAIL: non-A DNS query"); return 13; }
         n = udp_frame(f, k_router_mac, yiaddr, DNS_IP, 1053, 53, qry, sizeof qry);
         net_backend_send(f, n);
         n = next_frame(r, 500);
         const uint8_t *d = r + 42;
-        if (n < 42 + sizeof qry || rd16(d) != 0xABCD || rd16(d + 2) != 0x8180 || rd16(r + 36) != 1053) {
-            puts("FAIL: no Insignia DNS answer"); return 12;
+        if (n != 42 + sizeof qry + 16 || rd16(d) != 0xABCD || rd16(d + 2) != 0x8180 ||
+            rd16(r + 36) != 1053 || rd16(d + 6) != 1 || rd32(r + n - 4) != 0x7F000001u) {
+            puts("FAIL: no synthetic DNS answer"); return 14;
         }
-        if (rd16(d + 6))
-            printf("macs.xboxlive.com -> %u.%u.%u.%u\n", d[n - 46], d[n - 45], d[n - 44], d[n - 43]);
+        net_backend_set_dns_aliases(NULL,0);
+        if (dns_alias_answer(qry,sizeof qry,answer)) { puts("FAIL: DNS alias clear"); return 15; }
     }
 
     puts("net: ok");

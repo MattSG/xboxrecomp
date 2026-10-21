@@ -9,7 +9,6 @@
  */
 
 #include "nv2a_state.h"
-#include "nv2a_pgraph_d3d11.h"
 
 /* ============================================================
  * Global state
@@ -551,15 +550,6 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
                    uint32_t method, uint32_t param)
 {
     g_pgraph_method_count++;
-
-    /* Route through D3D11 translator first */
-    if (pgraph_d3d11_method(subchannel, method, param)) {
-        /* Handled by D3D11 translator — still store in regs for state queries */
-        if (method < 0x2000 * 4) {
-            d->pgraph.regs[method / 4] = param;
-        }
-        return;
-    }
 
     /* Log unhandled methods (first 20 + periodic), behind the executor's
      * verbose flag, read once. */

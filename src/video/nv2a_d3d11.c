@@ -3743,8 +3743,6 @@ static void capture_backbuffer(ID3D11Texture2D *bb)
     remaining--;
 }
 
-/* Above 0 while a load keeps the last frame up: the spinner's phase. */
-static float s_loading;
 
 /* Draw surface `s` (with the overlay described in *pc) into a w x h target,
  * letterboxed to the display aspect when asked. */
@@ -3779,9 +3777,6 @@ static void composite(ID3D11RenderTargetView *rtv, UINT w, UINT h, Surface *s,
     pc->src_size[0] = (float)s->w; pc->src_size[1] = (float)s->h;
     pc->src_size[2] = (float)s->iw; pc->src_size[3] = (float)s->ih;
     pc->force_alpha[0] = 1.0f;
-    pc->force_alpha[1] = letterbox ? s_loading : 0.0f;   /* the window only */
-    pc->force_alpha[2] = (float)w;
-    pc->force_alpha[3] = (float)h;
     if (pc->ovl_flags[0] && s->sx > s->sy * 1.001f) {
         pc->ovl_in[2] = s->sx / s->sy;
         pc->ovl_in[3] = (float)s->w * 0.5f;
@@ -4144,6 +4139,7 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
         s = scan_surface(surface_addr, pitch);
     s_shown = s;
     s_last_flip = GetTickCount();
+    if (s_overlay.idle_present) s_overlay.idle_present((uint32_t)s_last_flip, 0, 0);
     {
         int64_t t0 = s_prof_on > 0 ? qpc() : 0, t1;
         writeback_surfaces();
@@ -4246,21 +4242,13 @@ void nv2a_d3d_tick(void)
     now = GetTickCount();
     if (now - s_last_present < 16)
         return;
-    /* A stop in flipping after the title has started, with no movie, is a
-     * load (a level takes ~5 s, shown by CPU scanout or not at all): the
-     * frame gets a turning arc so it does not look hung. With
-     * RECOMP_LOADING_SPINNER=0 it stays still, as on the console. */
-    static int spinner = -1;
     XboxOverlay ovl;
-    if (spinner < 0)
-        spinner = !getenv("RECOMP_LOADING_SPINNER") || atoi(getenv("RECOMP_LOADING_SPINNER")) != 0;
     int movie = xbox_FramebufferOverlay(&ovl);
-    s_loading = spinner && !movie && s_last_flip && now - s_last_flip > 700
-              ? 1.0f + (float)(now % 1000) / 1000.0f : 0.0f;
+    int redraw = s_overlay.idle_present && s_overlay.idle_present(
+        (uint32_t)now, s_last_flip ? (uint32_t)(now - s_last_flip) : 0, movie);
     if (xbox_FramebufferScanSource(&va, &pitch)) {
         Surface *s = scan_surface(va, pitch);
         present_surface(s, NULL);
-        s_loading = 0.0f;
         s_frame++;
         return;
     }
@@ -4279,12 +4267,11 @@ void nv2a_d3d_tick(void)
         /* Keep the update pending across swap-chain failures or occlusion;
          * a successful Present clears it. Unchanged idle buffers need no blit. */
         if (s_shown->cpu_present_pending || movie ||
-            (s_loading > 0.0f && now - s_last_present >= 33))
+            (redraw && now - s_last_present >= 33))
             present_surface(s_shown, NULL);
         else
             s_last_present = now;
     }
-    s_loading = 0.0f;
 }
 
 #else

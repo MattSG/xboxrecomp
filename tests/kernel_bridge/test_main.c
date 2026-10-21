@@ -268,6 +268,18 @@ static uint32_t query_link(uint8_t *mem, uint32_t query, uint32_t handle,
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    uint32_t unconfigured_base = 1, unconfigured_count = 1;
+    xbox_kernel_get_thunk_address(&unconfigured_base, &unconfigured_count);
+    check(!unconfigured_base && !unconfigured_count,
+          "unconfigured bridge has no title fallback", NULL);
+    xbox_kernel_bridge_init(); /* Must not touch unmapped guest memory. */
+    xbox_kernel_init();
+    unsigned no_imports = 1;
+    for (unsigned i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; ++i)
+        no_imports &= xbox_kernel_thunk_table[i] == 0;
+    check(no_imports, "no imports without an XBE", NULL);
+    xbox_kernel_shutdown();
+
 
     const uint32_t THUNK_VA = 0x10000, STACK_VA = 0x20000;
     uint32_t device_for_io = 0;
@@ -304,6 +316,11 @@ int main(void)
     for (uint32_t i = 0; i < THUNK_SLOTS; i++)
         *(uint32_t *)(mem + THUNK_VA + 4 * i) = 0x80000000u | ordinals[i];
     xbox_kernel_set_thunk_address(THUNK_VA, THUNK_SLOTS);
+    xbox_kernel_init();
+    check(xbox_kernel_thunk_table[0] == xbox_resolve_ordinal(173) &&
+          xbox_kernel_thunk_table[1] == xbox_resolve_ordinal(67) &&
+          xbox_kernel_thunk_table[THUNK_SLOTS] == 0,
+          "host imports follow synthetic XBE order and count", NULL);
     xbox_kernel_bridge_init();
 
     /* bridge_init rewrites each entry in place to a synthetic VA. */
@@ -1045,6 +1062,7 @@ int main(void)
         }
     }
 
+    xbox_kernel_shutdown();
     xbox_MemoryLayoutShutdown();
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;

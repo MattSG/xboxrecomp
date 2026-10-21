@@ -339,34 +339,6 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
 }
 
 /* ============================================================================
- * Fallback Ordinal List
- *
- * Reference import set kept in thunk-table order, used only when the XBE has
- * not been loaded into Xbox memory (no memory layout, no parsed thunk table).
- * When it is loaded, xbox_kernel_init() reads the actual ordinals out of the
- * mapped thunk table, so this fallback's specific titles never matter at
- * runtime -- it exists to keep the table populated when there is no XBE.
- * ============================================================================ */
-
-static const ULONG g_thunk_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE] = {
-      1,   2,   3,   4,   8,  15,  16,  17,  23,  24,   /* 0-9   */
-     40,  41,  42,  44,  46,  47,  49,  62,  65,  67,   /* 10-19 */
-     69,  71,  74,  81,  83,  84,  85,  86,  87,  95,   /* 20-29 */
-     97,  98,  99, 100, 107, 109, 113, 119, 124, 126,   /* 30-39 */
-    127, 128, 129, 137, 139, 142, 143, 145, 149, 150,   /* 40-49 */
-    151, 153, 156, 158, 159, 160, 161, 164, 165, 166,   /* 50-59 */
-    168, 169, 170, 171, 173, 175, 176, 178, 179, 180,   /* 60-69 */
-    181, 182, 184, 187, 189, 190, 193, 195, 196, 197,   /* 70-79 */
-    198, 199, 200, 202, 203, 207, 210, 211, 215, 217,   /* 80-89 */
-    218, 219, 222, 225, 226, 228, 233, 234, 236, 238,   /* 90-99 */
-    246, 247, 250, 252, 253, 255, 256, 258, 259, 260,   /* 100-109 */
-    269, 277, 279, 289, 291, 294, 301, 302, 304, 305,   /* 110-119 */
-    308, 312, 322, 323, 324, 325, 326, 327, 328, 335,   /* 120-129 */
-    336, 337, 338, 339, 340, 344, 345, 346, 347, 349,   /* 130-139 */
-    353, 354, 355, 356, 357, 358, 359,                   /* 140-146 */
-};
-
-/* ============================================================================
  * Unresolved Thunk Handler
  *
  * Called if game code tries to use a thunk slot that wasn't resolved.
@@ -388,7 +360,7 @@ static void __stdcall xbox_unresolved_thunk(void)
  * Must be called before any game code runs. Sets up:
  *   1. Logging system
  *   2. Path translation
- *   3. Thunk table (all 147 entries)
+ *   3. This loaded image's kernel imports
  * ============================================================================ */
 
 void xbox_kernel_init(void)
@@ -420,26 +392,15 @@ void xbox_kernel_init(void)
         xbox_KrnlVersion.Major, xbox_KrnlVersion.Minor,
         xbox_KrnlVersion.Build, xbox_KrnlVersion.Qfe);
 
-    /* Fill thunk table.
-     *
-     * The slot->ordinal mapping normally comes from the in-memory thunk table
-     * of the loaded XBE (0x80000000|ordinal per entry, same source the kernel
-     * bridge reads). That makes the table match any title's import order.
-     * Without a mapped XBE, fall back to the static reference list below. */
+    /* Import order belongs to the loaded image, never a reference title.
+     * Callers needing an export without an image use xbox_resolve_ordinal(). */
+    memset(xbox_kernel_thunk_table, 0, sizeof xbox_kernel_thunk_table);
     xbox_kernel_get_thunk_address(&thunk_base, &thunk_count);
-    for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        ULONG ordinal;
-
-        if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
-            uint32_t entry = *(volatile uint32_t *)
-                ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
-            if (entry == 0) {
-                break;  /* rest of the table is empty */
-            }
-            ordinal = entry & 0x7FFFFFFF;
-        } else {
-            ordinal = g_thunk_ordinals[i];
-        }
+    for (ULONG i = 0; thunk_base && xbox_GetMemoryBase() && i < thunk_count; i++) {
+        uint32_t entry = *(volatile uint32_t *)
+            ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
+        if (!entry) break;
+        ULONG ordinal = entry & 0x7FFFFFFF;
 
         ULONG_PTR ptr = xbox_resolve_ordinal(ordinal);
 
@@ -455,7 +416,7 @@ void xbox_kernel_init(void)
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
         "Thunk table: %u/%u resolved, %u unresolved",
-        resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, unresolved);
+        resolved, thunk_count, unresolved);
 
     if (unresolved > 0) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,

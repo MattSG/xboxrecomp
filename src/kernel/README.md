@@ -115,12 +115,11 @@ The `xbe_parser` tool outputs these values for any XBE.
 The Xbox kernel exposes functions via ordinal numbers. Games import them through a thunk table at a fixed address. We reproduce this:
 
 ```c
-// The thunk table lives at the same Xbox VA as the original
-#define XBOX_KERNEL_THUNK_TABLE_BASE  0x0036B7C0
-#define XBOX_KERNEL_THUNK_TABLE_SIZE  147
+// The XBE loader supplies this title's address/count; there is no title default.
+xbox_kernel_set_thunk_address(thunk_va, thunk_count);
 
-// Each entry maps ordinal → function pointer (as synthetic VA)
-extern ULONG_PTR xbox_kernel_thunk_table[147];
+// Storage is bounded by the kernel export directory (378 slots).
+extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE];
 ```
 
 ### Initialization

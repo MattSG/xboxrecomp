@@ -12,7 +12,6 @@ Hardware emulation of the Xbox's NV2A GPU (a custom NVIDIA chip derived from GeF
 | `nv2a_core.c` | 791 | Register read/write handlers for all GPU blocks + pgraph_method() |
 | `nv2a_mmio_hook.c` | 412 | VEH x86-64 instruction decoder for 0xFD000000+ MMIO |
 | `nv2a_mmio_hook.h` | 54 | MMIO hook public API |
-| `nv2a_pb_test.c` | 352 | Push buffer test harness (generates and validates GPU frames) |
 
 ## Quick Start
 
@@ -211,30 +210,13 @@ void pgraph_method(NV2AState *d, uint32_t subchannel, uint32_t method, uint32_t 
 // - SET_FLIP_WRITE/FLIP_STALL: page flip
 ```
 
-## Push Buffer Test
+## Rendering and diagnostics
 
-`nv2a_pb_test.c` validates the pipeline by generating a complete frame:
-
-```c
-// Generates 80 dwords of GPU commands:
-// - Viewport setup (640x480)
-// - Surface format (A8R8G8B8 color + D24S8 depth)
-// - Clear to cornflower blue
-// - Draw 5 triangles with inline vertex data
-// - Page flip
-
-// Toggle at runtime with G key (in game projects)
-nv2a_pb_test_frame();
-```
-
-To customize the push buffer addresses for your game:
-
-```c
-// Define BEFORE including nv2a_pb_test.c or in your CMakeLists:
-#define PB_BASE_ADDR   0x35D69C  // Your game's PB base pointer address
-#define PB_WRITE_ADDR  0x35D6A0  // Your game's PB write pointer address
-#define PB_END_ADDR    0x35D6A4  // Your game's PB end pointer address
-```
+The generic pushbuffer executor and host renderers live in `src/kernel` and
+`src/video`. This library retains GPU register/MMIO state. The old captured-menu
+renderer, title-address injection test and empty capture placeholders are no
+longer built or shipped here; they were not a hardware renderer or a standalone
+regression test.
 
 ## QEMU Shim Layer
 

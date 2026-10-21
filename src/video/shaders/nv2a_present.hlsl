@@ -42,14 +42,5 @@ float4 present_ps(PO i) : SV_Target {
       if (show) c = OvlTexL.Sample(LinSL, (ovl_walk.xy + d * ovl_walk.zw) / ovl_in.xy);
     }
   }
-/* Loading (force_alpha.y > 0, a phase): a turning arc in the bottom-right
- * corner while the title has stopped flipping; .zw is the target's size. */
-  if (force_alpha.y > 0) {
-    float s = force_alpha.w / 720.0;
-    float2 d = i.pos.xy - (force_alpha.zw - 40.0 * s);
-    float ring = saturate(2.0 * s - abs(length(d) - 13.0 * s));
-    float a = frac(atan2(d.y, d.x) / 6.2831853 - force_alpha.y);
-    c.rgb = lerp(c.rgb, float3(0.91, 0.64, 0.24), ring * smoothstep(0.15, 1.0, a));
-  }
   return force_alpha.x >= 0 ? float4(c.rgb, force_alpha.x) : c;
 }
