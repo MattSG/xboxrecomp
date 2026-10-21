@@ -21,3 +21,10 @@ endforeach()
 set_tests_properties(kernel_firmware_hook PROPERTIES PASS_REGULAR_EXPRESSION "FIRMWARE_HOOK=37" FAIL_REGULAR_EXPRESSION "FIRMWARE_RETURNED")
 set_tests_properties(kernel_firmware_default kernel_firmware_clear PROPERTIES
     PASS_REGULAR_EXPRESSION "HalReturnToFirmware routine=37" FAIL_REGULAR_EXPRESSION "FIRMWARE_HOOK;FIRMWARE_RETURNED")
+
+foreach(ordinal 254 255)
+    foreach(mode default inline)
+        add_test(NAME kernel_thread_${ordinal}_${mode} COMMAND kernel_bridge_test thread-${ordinal}-${mode})
+        set_tests_properties(kernel_thread_${ordinal}_${mode} PROPERTIES TIMEOUT 10)
+    endforeach()
+endforeach()

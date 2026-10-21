@@ -445,21 +445,10 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * Worker stack slices (host-tick-driven titles)
  * ================================================================
  *
- * A second way to drive a recompiled title, ported from the Burnout 3 fork as
- * the runtimes reunite (see docs/technical/burnout3-reunification.md).
- *
- * The default model (Halo, Crimson Skies) runs the game's entry routine inline
- * and it drives its own main loop. Some titles instead return from their entry
- * after spawning an init thread, and expect the *host* to drive the per-frame
- * tick -- Burnout 3 is tick-driven, not main-loop-driven. To call recompiled
- * code from the host's own message-loop thread, that thread needs a guest stack
- * (its g_esp starts at 0), which is what a worker slice provides.
- *
- * These slices carve the low end of the same 8 MB stack region xbox_AllocThreadStack
- * uses, and a title uses one model or the other -- never both -- so they do not
- * coexist at runtime. For a title that never calls xbox_worker_stack_alloc
- * (every default-model title), this is unused address space and dead code, so
- * adding it changes nothing for them.
+ * A host thread calling guest code needs a guest stack. These optional slices
+ * provide one for host-driven entry/tick calls. Guest-created threads use
+ * xbox_AllocThreadStack instead; ports must not mix slices with other uses of
+ * the same reserved stack region.
  */
 #define XBOX_WORKER_STACK_SIZE   (256 * 1024)
 #define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 */
@@ -577,10 +566,9 @@ void xbox_worker_stack_free(int slot);
 void   xbox_set_game_thread(void *h);  /* HANDLE, recorded for the host watchdog */
 void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline model */
 
-/* PsCreateSystemThreadEx behaviour. Default INLINE runs the first call as the
- * game (Halo, Crimson Skies). SPAWN makes every call a real thread so a
- * host-tick-driven title's entry can return and let the host drive -- call
- * xbox_SetThreadMode(XBOX_THREAD_MODE_SPAWN) before the game starts. */
+/* Both guest thread-create APIs default to independent spawned threads.
+ * Ports may explicitly opt into first-call INLINE compatibility before guest
+ * execution starts; later calls still use the worker policy. */
 #define XBOX_THREAD_MODE_INLINE 0
 #define XBOX_THREAD_MODE_SPAWN  1
 void xbox_SetThreadMode(int mode);

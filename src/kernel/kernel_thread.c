@@ -400,17 +400,13 @@ NTSTATUS __stdcall xbox_NtResumeThread(
  * Worker stack slices + game-thread tracking (host-tick-driven titles)
  * ================================================================
  *
- * Ported from the Burnout 3 fork as the runtimes reunite. A host-driven title
- * returns from its entry after spawning an init thread and expects the host's
- * own thread to drive the per-frame tick; to call recompiled code from there it
- * needs a guest stack, which a worker slice provides. Additive: a default-model
- * title never calls any of this, so it is inert for Halo, Crimson Skies, etc.
- * See docs/technical/burnout3-reunification.md and XBOX_WORKER_STACK_* in
- * xbox_memory_layout.h.
+ * Optional guest stack slices for host threads entering recompiled code,
+ * plus a handle to the latest spawned guest thread for host diagnostics.
+ * See XBOX_WORKER_STACK_* in xbox_memory_layout.h.
  */
 
 /* The game's own thread, kept so a wedged boot can be inspected from the host
- * watchdog. Set when a title's game thread is spawned; NULL under the default
+ * watchdog. Set when a title's game thread is spawned; NULL under the explicitly selected
  * inline model, where there is no separate thread to sample. */
 static HANDLE g_game_thread = NULL;
 

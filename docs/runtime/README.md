@@ -52,3 +52,11 @@ Beyond the four pillars, each game needs:
 - **Game-specific workarounds** — vtable guards for corrupted pointers, state machine patches, etc.
 
 These go in the game-specific repo, not in the generic xboxrecomp toolkit.
+
+
+## Guest thread startup
+
+Both guest thread-create APIs default to spawned host threads with independent
+registers and guest stacks. Ports that require the legacy first-call inline
+model can call `xbox_SetThreadMode(XBOX_THREAD_MODE_INLINE)` before guest startup.
+That is an explicit compatibility choice; normal callers need no selector.
