@@ -48,9 +48,6 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     find_package(Threads REQUIRED)
-    target_link_libraries(platform PUBLIC Threads::Threads recomp_exit_hook host_time)
-    if(NOT APPLE)
-        target_link_libraries(platform PUBLIC m)   # feclearexcept etc.; libSystem has them on macOS
-    endif()
+    target_link_libraries(platform PUBLIC Threads::Threads m)
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
