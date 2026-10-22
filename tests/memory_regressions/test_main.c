@@ -226,6 +226,9 @@ int main(int argc, char **argv)
     check(*G(XBOX_FS_BASE + 0x28) == 0,
           "loader does not install an application context chain", NULL);
 
+    check(*G(XBOX_FS_BASE + 0x20) == XBOX_FS_BASE + XBOX_KPCR_PRCB_OFFSET,
+          "main KPCR points at its own inline PrcbData", NULL);
+
     void *kernel_probe = xbox_GetKernelMemoryBase();
     if (xbox_IsContiguousMemoryAvailable())
         check(kernel_probe == G(0x80010000u), "kernel probe exposes its mapped storage", NULL);
