@@ -313,6 +313,7 @@ int main(int argc, char **argv)
     uint8_t *xbe = (uint8_t *)calloc(1, 0x1000);
     uint32_t xbe_word;
     if (xbe) {
+        memcpy(xbe, "XBEH", 4);
         xbe_word = 0x00010000u; memcpy(xbe + 0x104, &xbe_word, 4); /* base */
         xbe_word = 0x1000u; memcpy(xbe + 0x108, &xbe_word, 4); /* header size */
         xbe_word = 0; memcpy(xbe + 0x11c, &xbe_word, 4); /* no sections */
@@ -327,7 +328,9 @@ int main(int argc, char **argv)
         xbe_word=4; memcpy(xbe+0x200,&xbe_word,4); /* executable */
         xbe_word=0x910000; memcpy(xbe+0x204,&xbe_word,4);
         xbe_word=16; memcpy(xbe+0x208,&xbe_word,4);
-        check(xbox_MemoryLayoutInit(xbe,0x1000),"synthetic high-code image loads",NULL);
+        BOOL loaded = xbox_MemoryLayoutInit(xbe, 0x1000);
+        check(loaded, "synthetic high-code image loads", NULL);
+        if (!loaded) { free(xbe); return 1; }
         check(g_xbox_code_lo==0x910000 && g_xbox_code_hi==0x910010,
               "code bounds come from the image",NULL);
 #ifdef RECOMP_ICALL_FEEDBACK
@@ -359,7 +362,9 @@ int main(int argc, char **argv)
         xbox_MemoryLayoutShutdown();
         check(xbox_worker_stack_alloc()<0,"shutdown disables callback leases",NULL);
         xbe_word=0x1100000; memcpy(xbe+0x204,&xbe_word,4);
-        check(xbox_MemoryLayoutInit(xbe,0x1000),"image above conventional heap loads",NULL);
+        loaded = xbox_MemoryLayoutInit(xbe, 0x1000);
+        check(loaded, "image above conventional heap loads", NULL);
+        if (!loaded) { free(xbe); return 1; }
         uint32_t heap=xbox_HeapAlloc(4096,4096);
         check(heap>=XBOX_WORKER_STACK_END,"heap excludes relocated callback pool",NULL);
         xbox_MemoryLayoutShutdown();

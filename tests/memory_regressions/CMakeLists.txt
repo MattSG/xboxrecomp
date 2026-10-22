@@ -24,3 +24,8 @@ add_test(NAME memory_regressions_tls_layout COMMAND memory_regressions_test tls-
 add_test(NAME memory_regressions_tls_bad_directory COMMAND memory_regressions_test tls-bad-directory ${XBE})
 add_test(NAME memory_regressions_tls_bad_range COMMAND memory_regressions_test tls-bad-range ${XBE})
 add_test(NAME memory_regressions_tls_size_overflow COMMAND memory_regressions_test tls-size-overflow ${XBE})
+add_test(NAME memory_regressions_image_high COMMAND memory_regressions_test image-high ${XBE})
+add_test(NAME memory_regressions_image_bad_range COMMAND memory_regressions_test image-bad-range ${XBE})
+add_test(NAME memory_regressions_image_bad_raw COMMAND memory_regressions_test image-bad-raw ${XBE})
+add_test(NAME memory_regressions_image_bad_table COMMAND memory_regressions_test image-bad-table ${XBE})
+add_test(NAME memory_regressions_image_short_header COMMAND memory_regressions_test image-short-header ${XBE})

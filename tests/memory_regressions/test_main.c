@@ -192,6 +192,11 @@ int main(int argc, char **argv)
     int ext = ext128 || !strcmp(mode, "ext-vma");
     int reserve_heap = !strcmp(mode, "reserve-heap");
     int car_churn = !strcmp(mode, "car-churn");
+    int high_image = !strcmp(mode, "image-high");
+    int bad_raw = !strcmp(mode, "image-bad-raw");
+    int bad_table = !strcmp(mode, "image-bad-table");
+    int short_header = !strcmp(mode, "image-short-header");
+    int bad_image = !strcmp(mode, "image-bad-range") || bad_raw || bad_table || short_header;
     int tls_bad_directory = !strcmp(mode, "tls-bad-directory");
     int tls_bad_range = !strcmp(mode, "tls-bad-range");
     int tls_size_overflow = !strcmp(mode, "tls-size-overflow");
@@ -203,7 +208,7 @@ int main(int argc, char **argv)
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !reserve_heap && !car_churn && !scene_churn && !tls_layout && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !reserve_heap && !car_churn && !scene_churn && !tls_layout && !high_image && !bad_image && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -213,7 +218,7 @@ int main(int argc, char **argv)
         set_env("RECOMP_HEAP_RECLAIM", "");
     if (ext)
         set_env("RECOMP_EXT_VMA", "1");
-    if (ext128)
+    if (ext128 || high_image || bad_image)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
     if (reserve_heap || scene_churn)
         xbox_SetMapSize(XBOX_DEVKIT_RAM);
@@ -223,7 +228,8 @@ int main(int argc, char **argv)
         printf("cannot read %s -- run: python tools/conformance/mkxbe.py\n", path);
         return 2;
     }
-    if (tls_layout) {
+    if (tls_layout || high_image || bad_image) {
+        uint32_t section_va = high_image ? 0x04010000u : (!strcmp(mode, "image-bad-range") ? 0xFFFFF000u : 0x770000u);
         /* Add a data section in the former scratch range without changing text. */
         uint32_t base = *(uint32_t *)(xbe + 0x104);
         uint32_t count = *(uint32_t *)(xbe + 0x11C);
@@ -238,12 +244,12 @@ int main(int argc, char **argv)
         xbe_len = raw + 0x2000u;
         section = (uint32_t *)(xbe + table + 56u);
         memset(section, 0, 56);
-        section[0] = 2; section[1] = 0x770000; section[2] = 0x2000;
+        section[0] = 2; section[1] = section_va; section[2] = 0x2000;
         section[3] = raw; section[4] = 0x2000; section[5] = base + 0x470;
         memcpy(xbe + 0x470, ".tls", 5);
         *(uint32_t *)(xbe + 0x11C) = 2;
-        *(uint32_t *)(xbe + 0x10C) = 0x772000u - base;
-        *(uint32_t *)(xbe + 0x12C) = 0x770A00;
+        *(uint32_t *)(xbe + 0x10C) = section_va + 0x2000u - base;
+        *(uint32_t *)(xbe + 0x12C) = tls_layout ? 0x770A00u : 0;
         data = xbe + raw;
         memset(data, 0xA5, 0x2000);
         memset(data + 0xA00, 0, 24);
@@ -254,10 +260,13 @@ int main(int argc, char **argv)
         if (tls_bad_directory) *(uint32_t *)(xbe + 0x12C) = UINT32_MAX - 7u;
         if (tls_bad_range) *(uint32_t *)(data + 0xA04) = 0x7700FF;
         if (tls_size_overflow) *(uint32_t *)(data + 0xA10) = UINT32_MAX;
+        if (bad_raw) section[3] = 0xFFFFF000u;
+        if (bad_table) *(uint32_t *)(xbe + 0x120) = base - 16u;
+        if (short_header) xbe_len = 16;
     }
     BOOL layout_ok = xbox_MemoryLayoutInit(xbe, xbe_len);
-    if (tls_invalid) {
-        check(!layout_ok, "invalid TLS is rejected", NULL);
+    if (tls_invalid || bad_image) {
+        check(!layout_ok, "invalid image/TLS is rejected", NULL);
         if (layout_ok) xbox_MemoryLayoutShutdown();
         check(xbox_GetMemoryBase() == NULL && xbox_GetKernelMemoryBase() == NULL,
               "invalid TLS leaves no owned memory mapping", NULL);
@@ -281,6 +290,12 @@ int main(int argc, char **argv)
     if (kernel_probe)
         check(*(uint32_t *)((uint8_t *)kernel_probe + 0x3C) == 0,
               "loader does not fabricate a kernel PE offset", NULL);
+
+    if (high_image) {
+        check(*G(0x04010000u) == 0xA5A5A5A5u && g_xbox_image_hi == 0x04012000u,
+              "devkit image section above 64 MiB is loaded", NULL);
+        goto shutdown;
+    }
 
     if (tls_layout) {
         uint32_t total = 0x334;

@@ -2336,6 +2336,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
+    if (!xbe || xbe_size < XBE_TLS_ADDR_OFFSET + 4u || memcmp(xbe, "XBEH", 4)) {
+        fprintf(stderr, "xbox_MemoryLayoutInit: invalid XBE header\n");
+        return FALSE;
+    }
+
 
     if (g_memory_base) {
         fprintf(stderr, "xbox_MemoryLayoutInit: already initialized\n");
@@ -2629,15 +2634,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         /* The certificate's title name (UTF-16, 40 chars at +0x0C), for
          * the framebuffer window's title bar. */
         DWORD cert_off = *(const DWORD *)(xbe + 0x118) - base_addr;
-        if (cert_off + 0x0C + 80 <= xbe_size) {
+        if ((uint64_t)cert_off + 0x0C + 80 <= xbe_size) {
             extern void xbox_FramebufferWindowSetTitle(const uint16_t *, int);
             xbox_FramebufferWindowSetTitle(
                 (const uint16_t *)(xbe + cert_off + 0x0C), 40);
         }
-        int sections_short = 0;
         size_t total_bytes = 0;
 
-        if (num_sections > 64) num_sections = 64;  /* sanity cap */
+        if (sect_headers_va < base_addr ||
+            (uint64_t)sect_headers_off + (uint64_t)num_sections * SECTHDR_SIZE > xbe_size ||
+            (uint64_t)sect_headers_off + (uint64_t)num_sections * SECTHDR_SIZE > UINT32_MAX) {
+            fprintf(stderr, "  XBE: invalid section table range\n");
+            xbox_MemoryLayoutShutdown();
+            return FALSE;
+        }
 
         fprintf(stderr, "  XBE sections: %u (headers at file offset 0x%08X)\n",
                 num_sections, sect_headers_off);
@@ -2645,8 +2655,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         g_xbox_image_lo = g_xbox_image_hi = 0;
         g_xbox_code_lo = g_xbox_code_hi = 0;
         for (DWORD si = 0; si < num_sections; si++) {
-            if (sect_headers_off + (si + 1) * SECTHDR_SIZE > xbe_size) break;
-
             const uint8_t *sh = xbe + sect_headers_off + si * SECTHDR_SIZE;
             DWORD sec_va       = *(const DWORD *)(sh + SECTHDR_VA);
             DWORD sec_vsize    = *(const DWORD *)(sh + SECTHDR_VSIZE);
@@ -2655,43 +2663,37 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             DWORD sec_name_va  = *(const DWORD *)(sh + SECTHDR_NAME_ADDR);
 
             /* Read section name from XBE header */
-            const char *sec_name = "?";
+            char sec_name[32] = "?";
             DWORD name_off = sec_name_va - base_addr;
-            if (name_off < xbe_size && name_off + 8 <= xbe_size)
-                sec_name = (const char *)(xbe + name_off);
+            if (sec_name_va >= base_addr && name_off < xbe_size) {
+                size_t bytes = xbe_size - name_off;
+                if (bytes >= sizeof sec_name) bytes = sizeof sec_name - 1;
+                memcpy(sec_name, xbe + name_off, bytes);
+                sec_name[bytes] = 0;
+            }
 
-            /* Validate: section must fit within our 64MB mapped region */
-            if (sec_va < XBOX_BASE_ADDRESS || sec_va + sec_vsize > XBOX_TOTAL_RAM)
-                continue;
+            /* Section addresses are guest VAs in this run's backed range.
+             * Widen before adding so a wrapped end cannot pass validation. */
+            if (sec_va < XBOX_BASE_ADDRESS ||
+                (uint64_t)sec_va + sec_vsize > g_memory_size ||
+                (uint64_t)sec_va + sec_vsize > UINT32_MAX) {
+                fprintf(stderr, "  XBE: invalid section range %08X + %08X\n",
+                        (unsigned)sec_va, (unsigned)sec_vsize);
+                xbox_MemoryLayoutShutdown();
+                return FALSE;
+            }
 
             /* Determine copy size (raw_size may exceed vsize due to alignment) */
             DWORD copy_size = (sec_raw_size < sec_vsize) ? sec_raw_size : sec_vsize;
 
-            /* Zero the full virtual size first (handles BSS) */
-            memset(XBOX_VA(sec_va), 0, sec_vsize);
-
-            /*
-             * Copy initialized data from XBE.
-             *
-             * A section whose raw data runs past the end of the buffer is a
-             * truncated or corrupt image, not a BSS section, and it must not
-             * be counted among the sections loaded. Reporting it as loaded is
-             * how a 4MB title read through a 1MB buffer produced "Loaded
-             * 17/17 sections" with every byte of every section still zero --
-             * including the kernel thunk table, which then resolved 0 imports
-             * and looked like a title that calls no kernel functions.
-             */
-            int have_data = (copy_size == 0) ||
-                            (sec_raw_off + copy_size <= xbe_size);
-            if (copy_size > 0 && have_data) {
-                memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
-            } else if (!have_data) {
-                fprintf(stderr,
-                        "  WARNING: section %u (%s) raw data 0x%08X+%u runs past "
-                        "the %zu-byte image -- left zeroed\n",
-                        si, sec_name, sec_raw_off, copy_size, xbe_size);
-                sections_short++;
+            if (copy_size && (uint64_t)sec_raw_off + copy_size > xbe_size) {
+                fprintf(stderr, "  XBE: invalid section data %08X + %08X\n",
+                        (unsigned)sec_raw_off, (unsigned)copy_size);
+                xbox_MemoryLayoutShutdown();
+                return FALSE;
             }
+            memset(XBOX_VA(sec_va), 0, sec_vsize);
+            if (copy_size) memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
 
             /* Every loaded section, executable or not. Anything that writes
              * guest memory from outside the title -- the pushbuffer executor
@@ -2712,10 +2714,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     g_xbox_code_hi = sec_va + sec_vsize;
             }
 
-            if (have_data) {
-                sections_loaded++;
-                total_bytes += copy_size;
-            }
+            sections_loaded++;
+            total_bytes += copy_size;
 
             fprintf(stderr, "  [%2u] %-12s VA=0x%08X vsize=%-8u raw=0x%08X rsize=%-8u%s\n",
                     si, sec_name, sec_va, sec_vsize, sec_raw_off, sec_raw_size,
@@ -2729,12 +2729,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
-        if (sections_short) {
-            fprintf(stderr,
-                    "  ERROR: %d section(s) had no data in the image -- the XBE "
-                    "is truncated or was read short; the title will not run\n",
-                    sections_short);
-        }
+
     }
 
     /* Callback stacks may not cover any loaded section. Keep their whole
