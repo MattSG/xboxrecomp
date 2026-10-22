@@ -264,6 +264,12 @@ static HRESULT __stdcall ds_CreateSoundBuffer(IDirectSound8 *self, const DSBUFFE
         buf->bits_per_sample = wfx->wBitsPerSample;
     }
 
+    /* Allocate storage before binding the voice, including the Lock path. */
+    if (desc && desc->dwBufferBytes > 0) {
+        buf->buffer_data = calloc(1, desc->dwBufferBytes);
+        buf->buffer_size = desc->dwBufferBytes;
+    }
+
     /* Allocate a mixer voice slot */
     buf->mixer_slot = apu_mixer_alloc_voice();
     if (buf->mixer_slot >= 0) {
@@ -271,13 +277,9 @@ static HRESULT __stdcall ds_CreateSoundBuffer(IDirectSound8 *self, const DSBUFFE
         if (v) {
             v->num_channels = buf->channels;
             v->sample_rate = buf->frequency;
+            v->pcm_data = buf->bits_per_sample == 16 ? buf->buffer_data : NULL;
+            v->pcm_bytes = v->pcm_data ? buf->buffer_size : 0;
         }
-    }
-
-    /* Pre-allocate buffer if size specified */
-    if (desc && desc->dwBufferBytes > 0) {
-        buf->buffer_data = calloc(1, desc->dwBufferBytes);
-        buf->buffer_size = desc->dwBufferBytes;
     }
 
     static int create_log_count = 0;
