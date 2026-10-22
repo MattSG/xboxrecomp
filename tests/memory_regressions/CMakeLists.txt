@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(memory_regressions_test C)
+project(memory_regressions_test C CXX)
 # Cross-platform, like tests/kernel_bridge: the heap and the memory bridge are
 # the same code on both hosts.
 set(CMAKE_C_STANDARD 11)
@@ -29,3 +29,9 @@ add_test(NAME memory_regressions_image_bad_range COMMAND memory_regressions_test
 add_test(NAME memory_regressions_image_bad_raw COMMAND memory_regressions_test image-bad-raw ${XBE})
 add_test(NAME memory_regressions_image_bad_table COMMAND memory_regressions_test image-bad-table ${XBE})
 add_test(NAME memory_regressions_image_short_header COMMAND memory_regressions_test image-short-header ${XBE})
+
+# Compile as a real C++ consumer: late thread APIs must keep the runtime C ABI.
+add_executable(memory_cpp_linkage_test cpp_linkage.cpp)
+target_include_directories(memory_cpp_linkage_test PRIVATE ../../src/kernel)
+target_link_libraries(memory_cpp_linkage_test PRIVATE xboxrecomp)
+add_test(NAME memory_cpp_linkage COMMAND memory_cpp_linkage_test)

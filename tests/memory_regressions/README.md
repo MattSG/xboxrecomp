@@ -93,3 +93,7 @@ The block table's lock is not exercised: nothing here allocates from two
 threads. `tests/kernel_dispatch/reserve_heap_ownership_test.c` separately checks
 both allocation orders, exact alignment gaps, arithmetic overflow, and eight
 simultaneous reservation/heap allocation threads.
+
+The `memory_cpp_linkage` case compiles a C++ consumer and links all nine late
+thread/worker APIs to their production C definitions. It checks public linkage,
+not thread scheduling or allocator behavior.

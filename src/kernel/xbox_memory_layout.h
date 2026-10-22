@@ -417,9 +417,6 @@ int xbox_HeapReclaimEnabled(void);
  */
 HANDLE xbox_GetMappingHandle(void);
 
-#ifdef __cplusplus
-}
-#endif
 
 
 /* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
@@ -454,5 +451,9 @@ void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline 
 #define XBOX_THREAD_MODE_INLINE 0
 #define XBOX_THREAD_MODE_SPAWN  1
 void xbox_SetThreadMode(int mode);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* XBOX_MEMORY_LAYOUT_H */
