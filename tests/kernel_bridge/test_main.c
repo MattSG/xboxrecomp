@@ -336,6 +336,37 @@ int main(int argc, char **argv)
         RECOMP_ICALL_OBSERVE(0x91000F,RECOMP_ICALL_SEEN_UNRESOLVED);
         check(g_icall_seen[15]==RECOMP_ICALL_SEEN_UNRESOLVED,"high code target recorded",NULL);
 #endif
+        {
+            int slots[XBOX_WORKER_STACK_COUNT];
+            uint8_t *loaded = xbox_GetMemoryBase();
+            memset(loaded+0x910000,0xA5,16);
+            for (int i=0;i<XBOX_WORKER_STACK_COUNT;i++) {
+                slots[i]=xbox_worker_stack_alloc();
+                check(slots[i]>=0,"callback stack lease available",NULL);
+                if (slots[i]>=0) {
+                    uint32_t top=XBOX_WORKER_STACK_TOP(slots[i]);
+                    uint32_t bottom=top+16-XBOX_WORKER_STACK_SIZE;
+                    check(top>=g_xbox_image_hi && bottom>=g_xbox_image_hi,
+                          "callback stacks follow loaded image",NULL);
+                    memset(loaded+bottom,0x5A,XBOX_WORKER_STACK_SIZE);
+                }
+            }
+            check(all_value(loaded+0x910000,16,0xA5),
+                  "callback stack writes preserve image bytes",NULL);
+            check(xbox_worker_stack_alloc()<0,"callback pool exhausts",NULL);
+            for (int i=0;i<XBOX_WORKER_STACK_COUNT;i++) xbox_worker_stack_free(slots[i]);
+        }
+        xbox_MemoryLayoutShutdown();
+        check(xbox_worker_stack_alloc()<0,"shutdown disables callback leases",NULL);
+        xbe_word=0x1100000; memcpy(xbe+0x204,&xbe_word,4);
+        check(xbox_MemoryLayoutInit(xbe,0x1000),"image above conventional heap loads",NULL);
+        uint32_t heap=xbox_HeapAlloc(4096,4096);
+        check(heap>=XBOX_WORKER_STACK_END,"heap excludes relocated callback pool",NULL);
+        xbox_MemoryLayoutShutdown();
+        xbe_word=0x3FFFFF0; memcpy(xbe+0x204,&xbe_word,4);
+        check(xbox_MemoryLayoutInit(xbe,0x1000),"image at mapped RAM limit loads",NULL);
+        check(xbox_worker_stack_alloc()<0,"insufficient room disables callback pool",NULL);
+        check(!xbox_HeapAlloc(4096,4096),"heap cannot cover high image",NULL);
         xbox_MemoryLayoutShutdown();
         xbe_word=0; memcpy(xbe+0x11c,&xbe_word,4);
         xbe_word=0x10120; memcpy(xbe+0x120,&xbe_word,4);
@@ -348,6 +379,8 @@ int main(int argc, char **argv)
     check(xbe != NULL && xbox_MemoryLayoutInit(xbe, 0x1000),
           "minimal XBE fixture initializes guest memory and heap", NULL);
     check(!g_xbox_code_lo && !g_xbox_code_hi,"new image clears absent code bounds",NULL);
+    check(XBOX_WORKER_STACK_BASE==XBOX_STACK_BASE,
+          "new image replaces callback pool placement",NULL);
 #ifdef RECOMP_ICALL_FEEDBACK
     check(!g_icall_fb_size && !g_icall_seen,"new image clears feedback window",NULL);
 #endif

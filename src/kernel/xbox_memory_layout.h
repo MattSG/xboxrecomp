@@ -446,12 +446,13 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * ================================================================
  *
  * A host thread calling guest code needs a guest stack. These optional slices
- * provide one for host-driven entry/tick calls. Guest-created threads use
- * xbox_AllocThreadStack instead; ports must not mix slices with other uses of
- * the same reserved stack region.
+ * provide one for host-driven entry/tick calls. The loader places the pool
+ * after the loaded image and excludes it from heap allocations. Guest-created
+ * threads use xbox_AllocThreadStack instead.
  */
 #define XBOX_WORKER_STACK_SIZE   (256 * 1024)
-#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 */
+extern uint32_t g_xbox_worker_stack_base;
+#define XBOX_WORKER_STACK_BASE   g_xbox_worker_stack_base
 #define XBOX_WORKER_STACK_COUNT  16                          /* 4 MB total */
 #define XBOX_WORKER_STACK_END    (XBOX_WORKER_STACK_BASE + \
                                   XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT)
@@ -560,6 +561,8 @@ void xbox_FreeThreadStack(uint32_t stack_top);
 
 /* Guest stack slices for host callbacks: DPCs, interrupts and host-driven
  * guest calls. See XBOX_WORKER_STACK_* and docs/runtime/README.md. */
+/* Startup/quiesced reset; zero disables leases. Base is caller-owned guest RAM. */
+void xbox_worker_stack_reset(uint32_t base);
 int  xbox_worker_stack_alloc(void);   /* slice index, or -1 if none free */
 void xbox_worker_stack_free(int slot);
 void   xbox_set_game_thread(void *h);  /* HANDLE, recorded for the host watchdog */

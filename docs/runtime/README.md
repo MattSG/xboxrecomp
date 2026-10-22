@@ -66,3 +66,10 @@ Host callbacks entering guest code use `xbox_worker_stack_alloc` and
 `xbox_worker_stack_free` for a guest stack slice. The kernel's DPC/timer,
 network, USB and APU paths use this pool; it is not limited to a host-driven
 game loop. Guest-created threads use `xbox_AllocThreadStack` instead.
+
+The loader places the callback pool after the image, page aligned, and keeps
+ordinary heap allocations outside it. Pool leases are disabled if the complete
+pool cannot fit in mapped guest RAM. Shutdown clears placement; loading another
+image computes it again. Standalone hosts with their own guest mapping can use
+`xbox_worker_stack_reset(base)` before workers start (or after they have stopped)
+to supply a mapped pool; zero disables it. Slot count and size are unchanged.

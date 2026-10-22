@@ -112,3 +112,6 @@ int main(void)
     printf("APU phys: mapped windows resolve to their own storage; unmapped refused\n");
     return 0;
 }
+
+/* Callback paths are forbidden by this focused fixture. */
+uint32_t g_xbox_worker_stack_base;

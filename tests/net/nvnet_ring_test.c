@@ -130,3 +130,6 @@ int main(void)
     printf("NIC rings: bad next pointers refused (rx and tx); legitimate wrap kept\n");
     return 0;
 }
+
+/* Callback paths are forbidden by this focused fixture. */
+uint32_t g_xbox_worker_stack_base;
