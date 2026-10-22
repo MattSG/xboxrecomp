@@ -16,8 +16,8 @@
  * system link discovery, ARP for another console -- also goes to each peer
  * as a UDP datagram on RECOMP_NET_PORT, and frames peers send are delivered
  * to the guest. A peer that sends first is learned, so only one side needs
- * the other's address. Each console's address comes from its MAC, so two of
- * them behind the same 10.0.2.0/24 never collide.
+ * the other's address. Each guest gets a stable address from its MAC; the
+ * 200-address mapping does not guarantee unique leases across peers.
  */
 #include "net.h"
 #include "net_platform.h"
@@ -179,7 +179,7 @@ static void send_udp_to_guest(const uint8_t dst_mac[6], uint32_t src_ip, uint16_
     deliver(f, 14 + 20 + 8 + n);
 }
 
-/* The guest's address: 10.0.2.16-215 from its MAC, so consoles never collide. */
+/* Stable guest address: 10.0.2.16-215 selected from its MAC. */
 static void learn_mac(const uint8_t mac[6])
 {
     if (st.have_mac)
