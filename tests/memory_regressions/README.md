@@ -31,6 +31,13 @@ data and zero-fill, with separate adjacent per-thread storage in an owned heap
 allocation. Invalid directory bounds, reversed template bounds and overflowing
 sizes must fail initialization and release the guest mapping.
 
+The image-range cases retain the original text section and add a synthetic data
+section above 64 MiB with a configured 128 MiB mapping. Its initialized bytes
+and image extent must load. A section whose end wraps the 32-bit address space
+must fail initialization and release owned mappings before any section write.
+Wrapped raw offsets, invalid section-table pointers and short headers likewise
+fail rather than reading outside the supplied image.
+
 ## Heap reuse and `RECOMP_HEAP_RECLAIM`
 
 Splitting reused blocks, coalescing neighbours and contiguous reuse are always
