@@ -705,6 +705,8 @@ static struct {
     int command_mode, command_pending;
     uint32_t command_dma, command_offset, command_value, command_fence_va;
     XBOX_COMMAND_FENCE *command_head, *command_tail;
+    int capture_layout_valid;
+    XBOX_NV2A_CAPTURE_LAYOUT capture_layout;
 } g_fence_mirrors[XBOX_MAX_FENCE_MIRRORS];
 static int g_fence_mirror_count = 0;
 
@@ -739,6 +741,18 @@ int xbox_Nv2aCommandFence(uint32_t device_ptr_va,
     }
     return -1;
 }
+int xbox_Nv2aCaptureLayout(uint32_t device_ptr_va,
+                           const XBOX_NV2A_CAPTURE_LAYOUT *layout)
+{
+    for (int i = 0; i < g_fence_mirror_count; i++) {
+        if (g_fence_mirrors[i].device_ptr_va != device_ptr_va) continue;
+        if (layout) g_fence_mirrors[i].capture_layout = *layout;
+        g_fence_mirrors[i].capture_layout_valid = layout != NULL;
+        return 0;
+    }
+    return -1;
+}
+
 /* A guest address is usable only once the window is mapped and it lands
  * inside it; the chain is followed fresh every poll because the title may not
  * have built it yet. */
@@ -1127,7 +1141,7 @@ void xbox_Nv2aCaptureSnapshot(XBOX_NV2A_CAPTURE_STATE *out)
 {
     if (!out) return;
     memset(out, 0, sizeof *out);
-    out->version = 1; out->bytes = (uint32_t)sizeof *out;
+    out->version = 2; out->bytes = (uint32_t)sizeof *out;
     out->mmio_valid = capture_word(XBOX_NV2A_BASE, NV2A_USER_DMA_PUT, &out->user_put);
     capture_word(XBOX_NV2A_BASE, NV2A_USER_DMA_GET, &out->user_get);
     capture_word(XBOX_NV2A_BASE, NV2A_PFIFO_DMA_PUT, &out->pfifo_put);
@@ -1168,16 +1182,20 @@ void xbox_Nv2aCaptureSnapshot(XBOX_NV2A_CAPTURE_STATE *out)
         capture_word(m->device_va, m->put_offset, &m->put_value);
         if (capture_word(m->device_va, m->get_ptr_offset, &m->fence_va))
             m->fence_valid = capture_word(m->fence_va, 0, &m->fence_value);
-        /* XDK channel pointers are also contained in the raw device block.
-         * Resolve the pointed-to registers while the snapshot is taken, as
-         * they can name a software channel rather than the NV2A aperture. */
-        if (capture_word(m->device_va, 0x17C0, &m->channel_va)) {
-            m->channel_valid = capture_word(m->channel_va, 0x40, &m->channel_put);
-            m->channel_valid &= capture_word(m->channel_va, 0x44, &m->channel_get);
+        if (g_fence_mirrors[i].capture_layout_valid) {
+            const XBOX_NV2A_CAPTURE_LAYOUT *layout = &g_fence_mirrors[i].capture_layout;
+            if (capture_word(m->device_va, layout->channel_ptr_offset, &m->channel_va)) {
+                m->channel_valid = capture_word(m->channel_va, layout->channel_put_offset,
+                                                &m->channel_put);
+                m->channel_valid &= capture_word(m->channel_va, layout->channel_get_offset,
+                                                 &m->channel_get);
+            }
+            if (capture_word(m->device_va, layout->pfifo_ptr_offset, &m->pfifo_va))
+                m->pfifo_valid = capture_word(m->pfifo_va, NV2A_PFIFO_DMA_SUBROUTINE,
+                                              &m->pfifo_subroutine);
+            m->ring_valid = capture_word(m->device_va, layout->ring_first_offset, &m->ring_first);
+            m->ring_valid &= capture_word(m->device_va, layout->ring_last_offset, &m->ring_last);
         }
-        if (capture_word(m->device_va, 0x4F8, &m->pfifo_va))
-            m->pfifo_valid = capture_word(m->pfifo_va, NV2A_PFIFO_DMA_SUBROUTINE,
-                                          &m->pfifo_subroutine);
     }
 }
 

@@ -380,9 +380,8 @@ static void pb_capture_begin(uint32_t start, uint32_t end, uint32_t pc)
         const XBOX_NV2A_CAPTURE_MIRROR *m = &s_capture.initial_state.mirrors[i];
         uint32_t low, high, bytes;
         uint8_t *copy;
-        if (m->device_bytes < 0x2C) continue;
-        memcpy(&low, m->device + 0x24, sizeof low);
-        memcpy(&high, m->device + 0x28, sizeof high);
+        if (!m->ring_valid) continue;
+        low = m->ring_first; high = m->ring_last;
         if (low < XBOX_CONTIG_BASE || high < low ||
             high > XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - 4u) continue;
         bytes = high - low + 4u; /* Include the boundary's possible JUMP word. */
@@ -427,15 +426,6 @@ static int pb_capture_write(const char *suffix, const void *data, size_t size)
     return result;
 }
 
-static uint32_t pb_capture_device_word(const XBOX_NV2A_CAPTURE_MIRROR *m,
-                                       uint32_t offset)
-{
-    uint32_t value = 0;
-    if (m->device_bytes >= offset + sizeof value)
-        memcpy(&value, m->device + offset, sizeof value);
-    return value;
-}
-
 static int pb_capture_state_json(char *buffer, size_t capacity,
                                  const XBOX_NV2A_CAPTURE_STATE *state)
 {
@@ -467,22 +457,14 @@ static int pb_capture_state_json(char *buffer, size_t capacity,
             "\"command_mode\":%u,\"command_dma\":%u,\"command_offset\":%u,"
             "\"command_pending\":%u,\"command_value\":%u,"
             "\"command_fence_va\":%u,\"command_queue_count\":%u,"
-            "\"cursor\":%u,\"limit\":%u,\"flags\":%u,\"ring_low\":%u,"
-            "\"ring_high\":%u,\"next_fence\":%u,\"fence_pointer\":%u,"
-            "\"fence_index\":%u,\"fence_mask\":%u,\"ring_used\":%u,"
-            "\"fence_table\":%u}", i ? "," : "",
+            "\"ring_first\":%u,\"ring_last\":%u,\"ring_valid\":%u}", i ? "," : "",
             m->device_ptr_va, m->device_va, m->device_valid, m->device_bytes,
             m->put_offset, m->get_ptr_offset, m->put_value, m->fence_va,
             m->fence_value, m->fence_valid, m->channel_va, m->channel_valid,
             m->channel_put, m->channel_get, m->pfifo_va, m->pfifo_valid,
             m->pfifo_subroutine, m->command_mode, m->command_dma, m->command_offset,
             m->command_pending, m->command_value, m->command_fence_va,
-            m->command_queue_count, pb_capture_device_word(m, 0),
-            pb_capture_device_word(m, 4), pb_capture_device_word(m, 8),
-            pb_capture_device_word(m, 0x24), pb_capture_device_word(m, 0x28),
-            pb_capture_device_word(m, 0x2C), pb_capture_device_word(m, 0x30),
-            pb_capture_device_word(m, 0x34), pb_capture_device_word(m, 0x38),
-            pb_capture_device_word(m, 0x40), pb_capture_device_word(m, 0x48));
+            m->command_queue_count, m->ring_first, m->ring_last, m->ring_valid);
     }
     PB_CAPTURE_JSON("]}");
 #undef PB_CAPTURE_JSON

@@ -57,11 +57,12 @@ void xbox_Nv2aCaptureSnapshot(XBOX_NV2A_CAPTURE_STATE *out)
     uint32_t high = low + 4u * 1024u * 1024u - 4u;
     snapshot_calls++;
     memset(out, 0, sizeof *out);
-    out->version = 1; out->bytes = sizeof *out; out->mirror_count = 1;
+    out->version = 2; out->bytes = sizeof *out; out->mirror_count = 1;
     out->user_put = snapshot_calls; out->user_get = 7;
     out->mirrors[0].device_bytes = XBOX_NV2A_CAPTURE_DEVICE_BYTES;
-    memcpy(out->mirrors[0].device + 0x24, &low, sizeof low);
-    memcpy(out->mirrors[0].device + 0x28, &high, sizeof high);
+    out->mirrors[0].ring_first = low;
+    out->mirrors[0].ring_last = high;
+    out->mirrors[0].ring_valid = 1;
 }
 
 void nv2a_d3d_kick(void) { kick_calls++; }
@@ -413,6 +414,7 @@ int main(int argc, char **argv)
             file = fopen(path, "rb"); CHECK(file);
             CHECK(fread(&state, sizeof state, 1, file) == 1);
             CHECK(!fclose(file) && state.user_put + 1 == snapshot_calls);
+            CHECK(state.version == 2 && state.bytes == 35320 && state.mirrors[0].ring_valid);
             snprintf(path, sizeof path, "%s.state-final.bin", argv[2]);
             file = fopen(path, "rb"); CHECK(file);
             CHECK(fread(&state, sizeof state, 1, file) == 1);
@@ -443,9 +445,9 @@ int main(int argc, char **argv)
             file = fopen(path, "rb"); CHECK(file);
             length = fread(metadata, 1, sizeof metadata - 1, file);
             metadata[length] = 0; CHECK(!fclose(file));
-            CHECK(strstr(metadata, "\"initial\":{\"version\":1"));
-            CHECK(strstr(metadata, "\"final\":{\"version\":1"));
-            CHECK(strstr(metadata, "\"ring_high\":2152726524"));
+            CHECK(strstr(metadata, "\"initial\":{\"version\":2"));
+            CHECK(strstr(metadata, "\"final\":{\"version\":2"));
+            CHECK(strstr(metadata, "\"ring_last\":2152726524,\"ring_valid\":1"));
             for (unsigned i = 0; i < sizeof suffixes / sizeof suffixes[0]; i++) {
                 snprintf(path, sizeof path, "%s%s", argv[2], suffixes[i]);
                 CHECK(!remove(path));
