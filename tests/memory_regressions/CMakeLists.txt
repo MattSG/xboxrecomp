@@ -19,3 +19,8 @@ add_test(NAME memory_regressions_heap_reclaim COMMAND memory_regressions_test he
 add_test(NAME memory_regressions_ext_vma COMMAND memory_regressions_test ext-vma ${XBE})
 add_test(NAME memory_regressions_ext_vma_128 COMMAND memory_regressions_test ext-vma-128 ${XBE})
 add_test(NAME memory_regressions_reserve_heap COMMAND memory_regressions_test reserve-heap ${XBE})
+
+add_test(NAME memory_regressions_tls_layout COMMAND memory_regressions_test tls-layout ${XBE})
+add_test(NAME memory_regressions_tls_bad_directory COMMAND memory_regressions_test tls-bad-directory ${XBE})
+add_test(NAME memory_regressions_tls_bad_range COMMAND memory_regressions_test tls-bad-range ${XBE})
+add_test(NAME memory_regressions_tls_size_overflow COMMAND memory_regressions_test tls-size-overflow ${XBE})

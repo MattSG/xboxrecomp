@@ -192,13 +192,18 @@ int main(int argc, char **argv)
     int ext = ext128 || !strcmp(mode, "ext-vma");
     int reserve_heap = !strcmp(mode, "reserve-heap");
     int car_churn = !strcmp(mode, "car-churn");
+    int tls_bad_directory = !strcmp(mode, "tls-bad-directory");
+    int tls_bad_range = !strcmp(mode, "tls-bad-range");
+    int tls_size_overflow = !strcmp(mode, "tls-size-overflow");
+    int tls_invalid = tls_bad_directory || tls_bad_range || tls_size_overflow;
+    int tls_layout = !strcmp(mode, "tls-layout") || tls_invalid;
     size_t xbe_len = 0;
     unsigned char *xbe;
     char d[160];
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !reserve_heap && !car_churn && !scene_churn && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !reserve_heap && !car_churn && !scene_churn && !tls_layout && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -218,7 +223,48 @@ int main(int argc, char **argv)
         printf("cannot read %s -- run: python tools/conformance/mkxbe.py\n", path);
         return 2;
     }
-    if (!xbox_MemoryLayoutInit(xbe, xbe_len)) {
+    if (tls_layout) {
+        /* Add a data section in the former scratch range without changing text. */
+        uint32_t base = *(uint32_t *)(xbe + 0x104);
+        uint32_t count = *(uint32_t *)(xbe + 0x11C);
+        uint32_t table = *(uint32_t *)(xbe + 0x120) - base;
+        uint32_t raw = (uint32_t)((xbe_len + 4095u) & ~4095u);
+        uint32_t *section;
+        uint8_t *data;
+        if (count != 1 || table + 112u > 0x470u) return 2;
+        xbe = realloc(xbe, raw + 0x2000u);
+        if (!xbe) return 2;
+        memset(xbe + xbe_len, 0, raw + 0x2000u - xbe_len);
+        xbe_len = raw + 0x2000u;
+        section = (uint32_t *)(xbe + table + 56u);
+        memset(section, 0, 56);
+        section[0] = 2; section[1] = 0x770000; section[2] = 0x2000;
+        section[3] = raw; section[4] = 0x2000; section[5] = base + 0x470;
+        memcpy(xbe + 0x470, ".tls", 5);
+        *(uint32_t *)(xbe + 0x11C) = 2;
+        *(uint32_t *)(xbe + 0x10C) = 0x772000u - base;
+        *(uint32_t *)(xbe + 0x12C) = 0x770A00;
+        data = xbe + raw;
+        memset(data, 0xA5, 0x2000);
+        memset(data + 0xA00, 0, 24);
+        *(uint32_t *)(data + 0xA00) = 0x770100;
+        *(uint32_t *)(data + 0xA04) = 0x770400;
+        *(uint32_t *)(data + 0xA08) = 0x770A40;
+        *(uint32_t *)(data + 0xA10) = 0x30;
+        if (tls_bad_directory) *(uint32_t *)(xbe + 0x12C) = UINT32_MAX - 7u;
+        if (tls_bad_range) *(uint32_t *)(data + 0xA04) = 0x7700FF;
+        if (tls_size_overflow) *(uint32_t *)(data + 0xA10) = UINT32_MAX;
+    }
+    BOOL layout_ok = xbox_MemoryLayoutInit(xbe, xbe_len);
+    if (tls_invalid) {
+        check(!layout_ok, "invalid TLS is rejected", NULL);
+        if (layout_ok) xbox_MemoryLayoutShutdown();
+        check(xbox_GetMemoryBase() == NULL && xbox_GetKernelMemoryBase() == NULL,
+              "invalid TLS leaves no owned memory mapping", NULL);
+        free(xbe);
+        return failures ? 1 : 0;
+    }
+    if (!layout_ok) {
         puts("xbox_MemoryLayoutInit failed");
         return 2;
     }
@@ -235,6 +281,21 @@ int main(int argc, char **argv)
     if (kernel_probe)
         check(*(uint32_t *)((uint8_t *)kernel_probe + 0x3C) == 0,
               "loader does not fabricate a kernel PE offset", NULL);
+
+    if (tls_layout) {
+        uint32_t total = 0x334;
+        uint32_t block = *G(XBOX_FS_BASE + 4) - total;
+        uint8_t *bytes = (uint8_t *)G(block);
+        check(*G(0x770000) == 0xA5A5A5A5 && *G(0x770100) == 0xA5A5A5A5,
+              "TLS setup preserves the loaded data section", NULL);
+        check(block >= g_xbox_image_hi && *G(block) == block + total,
+              "TLS owns storage beyond the image with adjacent thread data", NULL);
+        for (unsigned n = 4; n < 0x300; n++)
+            if (bytes[n] != 0xA5) { check(0, "TLS template bytes are preserved", NULL); break; }
+        for (unsigned n = 0x300; n < total + 64; n++)
+            if (bytes[n] != 0) { check(0, "TLS zero-fill and thread data do not overlap", NULL); break; }
+        goto shutdown;
+    }
 
     scratch = xbox_HeapAlloc(0x10000, 4096);
     for (i = 0; i < N_SLOTS; i++)

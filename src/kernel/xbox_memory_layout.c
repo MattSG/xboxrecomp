@@ -2843,66 +2843,49 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         /* Prcb references the same inline state used by DPC/IRQL handling. */
         MEM32_INIT(XBOX_FS_BASE + 0x20, XBOX_FS_BASE + XBOX_KPCR_PRCB_OFFSET);
 
-        /*
-         * XBE TLS directory.
-         *
-         * An image with __declspec(thread) data carries one, and on hardware
-         * the loader acts on it. Nothing here did, so thread-local access read
-         * whatever memory happened to be under fs:[4].
-         *
-         * Xbox reaches thread-local data through NtTib.StackBase -- fs:[4] --
-         * not Win32's fs:[0x2C], and the block sits BELOW that pointer: the
-         * image's entry point computes its own index, negative, as
-         * -(blocksize/4). The loader's block placement and rounding must
-         * match that guest index calculation.
-         *
-         * The index itself is deliberately NOT written here: the title
-         * computes and stores it. What the loader owes it is a block in the
-         * right place.
-         *
-         * Slot 0 holds a pointer to per-thread data -- XAPI's SetLastError is
-         * [[fs:[4] + index*4] + 4] = err -- so it gets a zeroed block rather
-         * than being left NULL, which had SetLastError writing the error code
-         * over fs:[4] itself and the next call faulting at guest 0xFFFFFFEF.
-         *
-         * ponytail: one block for the whole process, not one per thread.
-         * Every guest thread therefore shares LastError. Give this a per-thread
-         * allocation when a title is observed to care.
-         */
-        #define FAKE_TLS_BLOCK_VA  0x00770000  /* image TLS data          */
-        #define FAKE_TLS_THREAD_VA 0x00770200  /* what slot 0 points at   */
+        /* The main TLS block and its slot-zero thread data share one owned
+         * allocation. Workers clone the template into their own allocation. */
+        g_tls_template_va = 0;
+        g_tls_total = 0;
         {
             DWORD tls_dir_va = *(const DWORD *)(xbe + XBE_TLS_ADDR_OFFSET);
-
             if (tls_dir_va) {
-                const uint32_t *tls = (const uint32_t *)XBOX_VA(tls_dir_va);
-                uint32_t data_start = tls[0];
-                uint32_t data_end   = tls[1];
-                uint32_t zero_fill  = tls[4];
-                uint32_t init_size  = (data_end > data_start)
-                                    ? data_end - data_start : 0;
-                uint32_t total      = ((init_size + zero_fill + 0xF) & ~0xFu) + 4;
-
-                memset(XBOX_VA(FAKE_TLS_BLOCK_VA), 0, total);
-                memset(XBOX_VA(FAKE_TLS_THREAD_VA), 0, 64);
-                if (init_size)
-                    memcpy(XBOX_VA(FAKE_TLS_BLOCK_VA),
-                           XBOX_VA(data_start), init_size);
-
-                MEM32_INIT(FAKE_TLS_BLOCK_VA, FAKE_TLS_THREAD_VA);
-                MEM32_INIT(XBOX_FS_BASE + 0x04, FAKE_TLS_BLOCK_VA + total);
-
-                g_tls_template_va = FAKE_TLS_BLOCK_VA;
-                g_tls_total       = total;
-
-                fprintf(stderr, "  TLS: %u-byte block at 0x%08X,"
-                        " fs:[4] = 0x%08X (index will be %d)\n",
-                        total, FAKE_TLS_BLOCK_VA, FAKE_TLS_BLOCK_VA + total,
-                        -(int)(total / 4));
+                const uint32_t *tls;
+                uint32_t data_start, data_end, zero_fill, init_size, total, block;
+                uint64_t wide;
+                if (tls_dir_va < XBOX_BASE_ADDRESS || (tls_dir_va & 3u) ||
+                    (uint64_t)tls_dir_va + 24u > g_memory_size) {
+                    fprintf(stderr, "  TLS: invalid directory range\n");
+                    xbox_MemoryLayoutShutdown();
+                    return FALSE;
+                }
+                tls = (const uint32_t *)XBOX_VA(tls_dir_va);
+                data_start = tls[0]; data_end = tls[1]; zero_fill = tls[4];
+                init_size = data_end >= data_start ? data_end - data_start : 0;
+                wide = (((uint64_t)init_size + zero_fill + 15u) & ~UINT64_C(15)) + 4u;
+                if (data_end < data_start ||
+                    (init_size && (data_start < XBOX_BASE_ADDRESS || data_end > g_memory_size)) ||
+                    wide + g_tls_thread_size > UINT32_MAX) {
+                    fprintf(stderr, "  TLS: invalid template range or size\n");
+                    xbox_MemoryLayoutShutdown();
+                    return FALSE;
+                }
+                total = (uint32_t)wide;
+                block = xbox_HeapAlloc(total + g_tls_thread_size, 16);
+                if (!block) {
+                    fprintf(stderr, "  TLS: allocation failed\n");
+                    xbox_MemoryLayoutShutdown();
+                    return FALSE;
+                }
+                if (init_size) memcpy(XBOX_VA(block), XBOX_VA(data_start), init_size);
+                MEM32_INIT(block, block + total);
+                MEM32_INIT(XBOX_FS_BASE + 0x04, block + total);
+                g_tls_template_va = block;
+                g_tls_total = total;
+                fprintf(stderr, "  TLS: %u-byte block at 0x%08X, fs:[4] = 0x%08X\n",
+                        total, block, block + total);
             }
         }
-        #undef FAKE_TLS_BLOCK_VA
-        #undef FAKE_TLS_THREAD_VA
 
         fprintf(stderr, "  TIB: initialized at VA 0x%X\n", XBOX_FS_BASE);
 
