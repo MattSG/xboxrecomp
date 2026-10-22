@@ -192,6 +192,12 @@ int main(int argc, char **argv)
     int ext = ext128 || !strcmp(mode, "ext-vma");
     int reserve_heap = !strcmp(mode, "reserve-heap");
     int car_churn = !strcmp(mode, "car-churn");
+    int stack_config = !strcmp(mode, "stack-config");
+    int stack_bad_base = !strcmp(mode, "stack-bad-base");
+    int stack_bad_size = !strcmp(mode, "stack-bad-size");
+    int stack_unbacked = !strcmp(mode, "stack-unbacked");
+    int stack_invalid = stack_bad_base || stack_bad_size || stack_unbacked;
+    int stack_layout = !strcmp(mode, "stack-layout");
     int high_image = !strcmp(mode, "image-high");
     int bad_raw = !strcmp(mode, "image-bad-raw");
     int bad_table = !strcmp(mode, "image-bad-table");
@@ -208,7 +214,7 @@ int main(int argc, char **argv)
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !reserve_heap && !car_churn && !scene_churn && !tls_layout && !high_image && !bad_image && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !reserve_heap && !car_churn && !scene_churn && !tls_layout && !high_image && !bad_image && !stack_layout && !stack_config && !stack_invalid && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -220,7 +226,7 @@ int main(int argc, char **argv)
         set_env("RECOMP_EXT_VMA", "1");
     if (ext128 || high_image || bad_image)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
-    if (reserve_heap || scene_churn)
+    if (reserve_heap || scene_churn || stack_config)
         xbox_SetMapSize(XBOX_DEVKIT_RAM);
 
     xbe = load_file(path, &xbe_len);
@@ -228,8 +234,8 @@ int main(int argc, char **argv)
         printf("cannot read %s -- run: python tools/conformance/mkxbe.py\n", path);
         return 2;
     }
-    if (tls_layout || high_image || bad_image) {
-        uint32_t section_va = high_image ? 0x04010000u : (!strcmp(mode, "image-bad-range") ? 0xFFFFF000u : 0x770000u);
+    if (tls_layout || high_image || bad_image || stack_layout || stack_bad_base) {
+        uint32_t section_va = (stack_layout || stack_bad_base) ? 0x780000u : high_image ? 0x04010000u : (!strcmp(mode, "image-bad-range") ? 0xFFFFF000u : 0x770000u);
         /* Add a data section in the former scratch range without changing text. */
         uint32_t base = *(uint32_t *)(xbe + 0x104);
         uint32_t count = *(uint32_t *)(xbe + 0x11C);
@@ -264,9 +270,21 @@ int main(int argc, char **argv)
         if (bad_table) *(uint32_t *)(xbe + 0x120) = base - 16u;
         if (short_header) xbe_len = 16;
     }
+    if (stack_layout) *(uint32_t *)(xbe + 0x130) = 0x3100;
+    if (stack_bad_size) *(uint32_t *)(xbe + 0x130) = UINT32_MAX;
+    if (stack_bad_base) check(xbox_ConfigureMainStack(0x780000, 0x4000), "overlap is checked against the loaded image", NULL);
+    if (stack_unbacked) check(xbox_ConfigureMainStack(0x3FFF000, 0x2000), "backing is checked at initialization", NULL);
+    if (stack_config) {
+        check(xbox_ConfigureMainStack(0x5000000, 0x300000), "port can request a backed main stack", NULL);
+        check(!xbox_ConfigureMainStack(0x5000001, 0x1000) &&
+              !xbox_ConfigureMainStack(0, 17) &&
+              !xbox_ConfigureMainStack(0xFFFFF000, 0x2000) &&
+              !xbox_ConfigureMainStack(0x5000000, 0),
+              "unaligned, wrapped and incomplete policy is rejected", NULL);
+    }
     BOOL layout_ok = xbox_MemoryLayoutInit(xbe, xbe_len);
-    if (tls_invalid || bad_image) {
-        check(!layout_ok, "invalid image/TLS is rejected", NULL);
+    if (tls_invalid || bad_image || stack_invalid) {
+        check(!layout_ok, "invalid image/TLS/stack is rejected", NULL);
         if (layout_ok) xbox_MemoryLayoutShutdown();
         check(xbox_GetMemoryBase() == NULL && xbox_GetKernelMemoryBase() == NULL,
               "invalid TLS leaves no owned memory mapping", NULL);
@@ -290,6 +308,48 @@ int main(int argc, char **argv)
     if (kernel_probe)
         check(*(uint32_t *)((uint8_t *)kernel_probe + 0x3C) == 0,
               "loader does not fabricate a kernel PE offset", NULL);
+
+    if (stack_config) {
+        uint32_t heap, reserve, contig;
+        check(XBOX_STACK_BASE == 0x5000000 && XBOX_STACK_SIZE == 0x300000,
+              "accepted policy survives rejected changes", NULL);
+        check(!xbox_ConfigureMainStack(0, 0), "active layout rejects policy changes", NULL);
+        check(XBOX_WORKER_STACK_BASE == 0x5300000,
+              "callback pool begins after the whole main stack", NULL);
+        reserve = xbox_ReserveAlloc(4096, 4096);
+        heap = xbox_HeapAlloc(4096, 4096);
+        check(reserve >= XBOX_WORKER_STACK_END && heap >= reserve + 4096,
+              "above-RAM reservation and heap exclude both stack ranges", NULL);
+        contig = xbox_ContiguousAlloc(4096, 4096);
+        check(contig && xbox_ContiguousRangeAllocated(contig - 0x80000000u, 4096) &&
+              xbox_ReserveRangeAllocated(reserve), "populate positive ownership caches", NULL);
+        xbox_MemoryLayoutShutdown();
+        check(!XBOX_STACK_BASE && !XBOX_STACK_SIZE && !XBOX_STACK_TOP &&
+              xbox_worker_stack_alloc() < 0, "shutdown retires every stack range", NULL);
+        check(xbox_ConfigureMainStack(0, 0), "port can restore image-derived defaults", NULL);
+        xbox_SetMapSize(0);
+        if (!xbox_MemoryLayoutInit(xbe, xbe_len)) { free(xbe); return 1; }
+        check(XBOX_STACK_SIZE == 4096 && XBOX_STACK_BASE < 0x5000000,
+              "new layout uses default minimum instead of prior port policy", NULL);
+        check(!xbox_HeapBlockSize(heap) && !xbox_ReserveRangeAllocated(reserve) &&
+              !xbox_ContiguousRangeAllocated(contig - 0x80000000u, 4096),
+              "new layout discards old allocations and positive caches", NULL);
+        check(xbox_HeapAlloc(4096, 4096) >= XBOX_WORKER_STACK_END,
+              "new heap excludes the new stack layout", NULL);
+        goto shutdown;
+    }
+
+    if (stack_layout) {
+        check(XBOX_STACK_BASE >= g_xbox_image_hi,
+              "main stack does not cover the loaded image", NULL);
+        check(XBOX_STACK_SIZE == 0x4000 && g_esp == XBOX_STACK_TOP,
+              "main stack uses page-rounded image stack commit", NULL);
+        check(XBOX_WORKER_STACK_BASE >= XBOX_STACK_BASE + XBOX_STACK_SIZE,
+              "callback pool does not overlap the main stack", NULL);
+        check(*G(0x780000) == 0xA5A5A5A5u,
+              "stack setup preserves image data at the former stack base", NULL);
+        goto shutdown;
+    }
 
     if (high_image) {
         check(*G(0x04010000u) == 0xA5A5A5A5u && g_xbox_image_hi == 0x04012000u,

@@ -120,16 +120,16 @@ void sub_00011A30(void) {
 
 ## Stack Simulation
 
-The Xbox stack lives in mapped Xbox memory. `g_esp` starts at the top of an 8 MB region:
+The guest stack lives in mapped guest memory. `xbox_MemoryLayoutInit` establishes
+its checked range and initializes `g_esp = XBOX_STACK_TOP`. `XBOX_STACK_BASE`,
+`XBOX_STACK_SIZE` and `XBOX_STACK_TOP` describe the active layout at runtime;
+they are not constant expressions. The loader places callback slices after the
+main stack and excludes both from ordinary allocation.
 
-```c
-#define XBOX_STACK_BASE  0x00780000
-#define XBOX_STACK_SIZE  (8 * 1024 * 1024)
-#define XBOX_STACK_TOP   (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
-
-// During init:
-g_esp = XBOX_STACK_TOP;  // 0x00F7FFF0
-```
+A port can call `xbox_ConfigureMainStack(base, size)` before initialization.
+Zero base selects placement after the loaded image/kernel data; zero size uses
+the page-rounded XBE stack commit with a one-page minimum. Check the setter and
+initializer results. Keep application-specific extra capacity in the port.
 
 Push and pop operations read/write through the MEM macros, which translate Xbox virtual addresses to actual mapped memory:
 

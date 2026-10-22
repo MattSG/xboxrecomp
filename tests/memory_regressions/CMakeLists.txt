@@ -35,3 +35,9 @@ add_executable(memory_cpp_linkage_test cpp_linkage.cpp)
 target_include_directories(memory_cpp_linkage_test PRIVATE ../../src/kernel)
 target_link_libraries(memory_cpp_linkage_test PRIVATE xboxrecomp)
 add_test(NAME memory_cpp_linkage COMMAND memory_cpp_linkage_test)
+
+add_test(NAME memory_regressions_stack_layout COMMAND memory_regressions_test stack-layout ${XBE})
+
+foreach(case stack-config stack-bad-base stack-bad-size stack-unbacked)
+    add_test(NAME memory_regressions_${case} COMMAND memory_regressions_test ${case} ${XBE})
+endforeach()

@@ -57,6 +57,12 @@ int main(void)
     uint32_t heap, heap_cross, heap_later, first, aligned, fill, after_heap, reused, gap;
     uint32_t alignment_gap, second_alignment_gap, large_alignment_gap, heap_skip_gap;
     CHECK(arena);
+    /* This synthetic main-stack end deliberately aligns the tested heap gaps
+     * to 64 KiB; runtime image-derived floors need not have that alignment. */
+    g_xbox_stack_base = 0x600000;
+    g_xbox_stack_size = 0x200000;
+    CHECK(VirtualAlloc(arena + XBOX_STACK_BASE, XBOX_STACK_SIZE,
+                       MEM_COMMIT, PAGE_READWRITE));
     CHECK(VirtualAlloc(arena + XBOX_CONTIG_BASE, XBOX_CONTIG_SIZE,
                        MEM_COMMIT, PAGE_READWRITE));
     CHECK(VirtualAlloc(arena + XBOX_HEAP_BASE, 0x20000,

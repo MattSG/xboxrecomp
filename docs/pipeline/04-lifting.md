@@ -95,7 +95,9 @@ The Xbox stack lives in Xbox memory. `g_esp` is an Xbox virtual address pointing
 
 Note that `PUSH32` evaluates the value *before* decrementing `sp`. This matches x86 semantics where `push [esp+N]` reads the operand at the old ESP before adjusting.
 
-The stack is initialized to `XBOX_STACK_TOP` (0x00F7FFF0) -- the top of an 8 MB region allocated in Xbox memory space.
+The loader initializes `g_esp` to the runtime value `XBOX_STACK_TOP`. Its checked
+stack range follows the loaded image and kernel data by default; ports may
+select extra capacity through `xbox_ConfigureMainStack` before initialization.
 
 ## Instruction Translation
 

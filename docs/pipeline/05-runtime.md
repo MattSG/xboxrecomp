@@ -43,7 +43,8 @@ addresses or a previous port's memory setup:
    Release the retained XBE buffer. Follow the same lifetime order on failures.
 
 The memory API distinguishes installed RAM from the backed guest address range.
-`xbox_SetTotalRam` and `xbox_SetMapSize` are pre-initialization choices; neither
+`xbox_SetTotalRam`, `xbox_SetMapSize` and optional `xbox_ConfigureMainStack`
+are pre-initialization choices; none
 is an implicit request to alias arbitrary virtual addresses. Use the shared
 address helpers for guest pointers and physical IDs. Keep image-specific
 configuration and observed memory layouts in the port.
