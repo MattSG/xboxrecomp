@@ -53,6 +53,13 @@ register apertures, forcing success from waits, or patching a GPU read cursor to
 its writer can conceal missing execution and completion. Such experiments do
 not establish a working renderer or belong in generic startup code.
 
+GPU progress must come from executed work. Register a device fence with
+`xbox_Nv2aMirrorFence`, then select its executed semaphore releases with
+`xbox_Nv2aCommandFence`; registration alone does not publish completion.
+`xbox_Nv2aFrameCounter` counts executed non-replay flips. The former
+`xbox_Nv2aMirrorCounter` API and clock-driven frame fallback are removed;
+ports requiring synthetic pacing own that policy outside the shared runtime.
+
 ## Guest-call contracts and diagnostics
 
 Manual integration code must use `recomp_types.h` for the thread-local register

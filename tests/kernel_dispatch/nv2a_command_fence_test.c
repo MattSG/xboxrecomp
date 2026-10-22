@@ -69,10 +69,21 @@ int main(void)
 
     /* Startup/idle cannot invent a first release, even before DMA_PUT moves. */
     generation = xbox_nv2a_wake_snapshot(&g_nv2a_wake);
-    fence_mirrors_tick(0); fence_mirrors_tick(1);
     nv2a_publish_readback_complete(regs);
     CHECK(*guest(0x30000) == 23 && *get == 111 && !readback_polls);
     CHECK(xbox_nv2a_wake_snapshot(&g_nv2a_wake) == generation);
+
+    /* Registered frame counters track executed flips, with uint32 wrap.
+     * Missing device chains are skipped and submitted fences stay untouched. */
+    *guest(0x16000) = 0x28000;
+    *guest(0x28080) = UINT32_MAX;
+    CHECK(xbox_Nv2aFrameCounter(0x16000, 0x80) == 0);
+    CHECK(xbox_Nv2aFrameCounter(0x18000, 0x80) == 0);
+    CHECK(xbox_Nv2aFrameCounter(4, 0x80) == 0);
+    xbox_Nv2aFrameCounterFlip();
+    CHECK(*guest(0x28080) == 0 && *guest(0x2002C) == 99);
+    xbox_Nv2aFrameCounterFlip();
+    CHECK(*guest(0x28080) == 1 && *guest(0x30000) == 23);
 
     /* Actual dispatch filters the configured DMA, offset and 3D subchannel. */
     method(0x01A8, 0xD); method(0x1D6C, 0); method(0x1D70, 100);
@@ -92,7 +103,6 @@ int main(void)
     CHECK(command_fences_pending());
     nv2a_publish_readback_complete(regs);
     *guest(0x2002C) = 12345;
-    fence_mirrors_tick(0); fence_mirrors_tick(1);
     CHECK(*guest(0x30000) == 23 && *get == 111);
     CHECK(xbox_nv2a_wake_snapshot(&g_nv2a_wake) == generation);
     readback_busy = 0;
@@ -217,16 +227,15 @@ int main(void)
     nv2a_publish_readback_complete(regs);
     CHECK(!command_fences_pending() && *guest(0x31000) == 17);
 
-    /* Other titles retain the original generic counter-snapshot behavior. */
+    /* Registration alone cannot turn a submitted snapshot into completion. */
     *guest(0x12000) = 0x24000;
     *guest(0x24030) = 0x34000;
     *guest(0x2402C) = 76;
     *guest(0x34000) = 55;
     CHECK(xbox_Nv2aMirrorFence(0x12000, 0x2C, 0x30) == 0);
-    fence_mirrors_tick(0);
     *guest(0x2402C) = 77;
-    fence_mirrors_tick(1);
-    CHECK(*guest(0x34000) == 76 && *guest(0x31000) == 17);
+    nv2a_publish_readback_complete(regs);
+    CHECK(*guest(0x34000) == 55 && *guest(0x31000) == 17);
 
     /* Diagnostics distinguish the real aperture from a guest software
      * channel, retain raw device fields, and never query/read back the GPU. */
@@ -246,7 +255,7 @@ int main(void)
     CHECK(snapshot.mmio_valid && snapshot.user_put == 999 && snapshot.user_get == 222);
     CHECK(snapshot.scan_incomplete == 1 && !snapshot.get_held);
     CHECK(snapshot.notify_count == 7 && snapshot.notify_param == 5);
-    CHECK(snapshot.mirror_count == 2 && !snapshot.counter_mirrors && !snapshot.frame_counters);
+    CHECK(snapshot.mirror_count == 2 && !snapshot.counter_mirrors && snapshot.frame_counters == 3);
     CHECK(snapshot.mirrors[0].device_ptr_va == 0x10000 && snapshot.mirrors[0].device_va == 0x22000);
     CHECK(snapshot.mirrors[0].channel_valid && snapshot.mirrors[0].channel_va == 0x14000);
     CHECK(snapshot.mirrors[0].channel_put == 0x4444 && snapshot.mirrors[0].channel_get == 0x5555);
@@ -266,7 +275,7 @@ int main(void)
     xbox_Nv2aCaptureSnapshot(NULL);
 
     puts("PASS: real semaphore dispatch, no idle early fence, readback/cap/GET "
-         "ordering, uint32 wrap, captured targets, generic fallback and read-only state capture");
+         "ordering, uint32 wrap, captured targets, unconfigured registration and read-only state capture");
     g_memory_base = NULL;
     free(registers);
     CHECK(VirtualFree(arena, 0, MEM_RELEASE));

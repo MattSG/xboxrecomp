@@ -125,55 +125,10 @@ void xbox_SetTotalRam(size_t bytes);
  */
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
 
-/**
- * Release the reserved Xbox memory layout.
- */
-/**
- * Mirror a GPU completion fence the title spins on.
- *
- * The NV2A tables in xbox_memory_layout.c acknowledge handshakes that live at
- * fixed aperture offsets. Some titles instead wait on a semaphore the GPU
- * writes into contiguous memory: D3D seeds it, submits work, then spins until
- * it reaches the submitted count. Wreckless does this at guest 0x000FE920,
- * waiting on the 96-byte MmAllocateContiguousMemoryEx block its device struct
- * points at.
- *
- * Nothing executes the push buffer -- the D3D11 layer draws -- so everything
- * submitted is complete, and advancing the fence is the same honest
- * acknowledgement the register tables make.
- *
- * The fence has no fixed address; it is reached through the title's device
- * struct, so it is registered as the chain of indirections to follow:
- *
- *     device = MEM32(device_ptr_va)
- *     fence  = MEM32(device + get_ptr_off)
- *     MEM32(fence) = MEM32(device + put_off)
- *
- * Every step is bounds-checked each poll, so registering a chain that is not
- * yet initialised (or never becomes valid) is harmless.
- *
- * Returns 0 on success, -1 if the table is full.
- */
-/* Advance a frame/swap counter inside the D3D device at ~60 Hz.
- *
- * A title that waits a frame reads the device's swap count and spins until it
- * moves. Nothing here presents, so without this the count never changes and
- * the wait never ends. Followed through the device pointer, like the fence,
- * because the device is allocated at runtime.
- *
- * Returns 0 on success, -1 if the table is full. */
-/* Mirror one field of the device struct onto another, for the counter pair a
- * swap throttle waits on: the title bumps "frames submitted" itself and waits
- * for "frames completed", which only the GPU moves on hardware. Unlike
- * xbox_Nv2aFrameCounter this cannot run ahead of the title, so the unsigned
- * submitted - completed it gets compared against cannot underflow. */
-int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
-                           uint32_t src_off, uint32_t dst_off);
-
+/* Register a device-field counter before guest execution. It advances once
+ * per executed non-replay flip, never from wall-clock time. Caller supplies
+ * the image-specific pointer global/offset. Returns 0, or -1 if full. */
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
-/* Advance those counters now, because a swap really completed. Called by the
- * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
- * stands down, so the count follows what was actually drawn. */
 void xbox_Nv2aFrameCounterFlip(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
@@ -188,6 +143,10 @@ int xbox_ContiguousFree(uint32_t xbox_va);              /* 0: not ours */
 uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va);
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size);
 
+/* Register a caller-described device PUT and indirect fence target before
+ * guest execution. Registration alone never publishes completion. Configure
+ * CommandFence below for execution-driven semaphore completion.
+ * Returns 0, or -1 if full; invalid chains are skipped. */
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 /* Configure an existing mirror before entering guest code. It then accepts
