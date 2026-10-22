@@ -489,6 +489,13 @@ typedef VOID (*PIO_APC_ROUTINE)(
  * Call this BEFORE xbox_kernel_bridge_init(). The address is parsed
  * from the XBE header's KernelImageThunkAddress field.
  * If not configured, bridge initialization refuses to patch guest memory.
+ * The count selects an exact span (NULL gaps are allowed), at most
+ * XBOX_KERNEL_THUNK_TABLE_SIZE slots. Zero address/count clears selection.
+ * Invalid alignment/range/count clears selection rather than guessing or
+ * clamping. Configured runtime backing is checked when available; standalone
+ * hosts remain responsible for mapping their selected guest span.
+ * Neighboring words are never treated as undeclared imports. Configure only
+ * while guest execution is quiesced; the getter reports the accepted range.
  */
 void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
 

@@ -41,3 +41,10 @@ add_test(NAME memory_regressions_stack_layout COMMAND memory_regressions_test st
 foreach(case stack-config stack-bad-base stack-bad-size stack-unbacked)
     add_test(NAME memory_regressions_${case} COMMAND memory_regressions_test ${case} ${XBE})
 endforeach()
+
+add_executable(memory_thunk_table_test thunk_table.c)
+target_include_directories(memory_thunk_table_test PRIVATE ../../src/kernel)
+target_link_libraries(memory_thunk_table_test PRIVATE xboxrecomp)
+foreach(case high-retail high-debug empty none encoded-none partial unterminated bad-ordinal bad-marker maximum sparse remapped)
+    add_test(NAME memory_thunk_${case} COMMAND memory_thunk_table_test ${case})
+endforeach()

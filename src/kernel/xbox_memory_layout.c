@@ -2345,6 +2345,23 @@ static void *xbox_map_device_section(HANDLE *mapping, uint32_t base, uint32_t by
     return view;
 }
 
+/* Validate a complete terminated run before publishing any import metadata. */
+static int xbox_read_kernel_thunks(uint32_t va, uint32_t *count)
+{
+    if (va < XBOX_BASE_ADDRESS || (va & 3u)) return 0;
+    for (uint32_t n = 0; n <= XBOX_KERNEL_THUNK_TABLE_SIZE; ++n) {
+        uint64_t address = (uint64_t)va + (uint64_t)n * 4;
+        uint32_t entry, ordinal;
+        if (address + 4 > g_memory_size || address + 4 > UINT32_MAX) return 0;
+        memcpy(&entry, (const void *)((uintptr_t)address + g_memory_offset), 4);
+        if (!entry) { *count = n; return 1; }
+        ordinal = entry & 0x7fffffffu;
+        if (n == XBOX_KERNEL_THUNK_TABLE_SIZE || !(entry & 0x80000000u) ||
+            !ordinal) return 0;
+    }
+    return 0;
+}
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     if (!g_allocator_lock_initialized) {
@@ -2364,6 +2381,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         fprintf(stderr, "xbox_MemoryLayoutInit: already initialized\n");
         return FALSE;
     }
+    xbox_kernel_set_thunk_address(0, 0);
 
     /*
      * Calculate the full range we need to map.
@@ -2780,39 +2798,23 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         xbox_allocators_reset();
     }
 
-    /* Decode the XBE kernel thunk pointer using the retail and debug keys.
-     * The current range heuristic selects retail when it passes, otherwise
-     * debug; this is not full validation of either thunk table. */
+    /* Only the header-selected, validated import run is registered. Ports
+     * may later select a different exact span through the same public API. */
     if (xbe_size >= 0x015C) {
-        uint32_t thunk_raw = *(const uint32_t *)(xbe + 0x0158);
-        uint32_t thunk_retail = thunk_raw ^ 0x5B6D40B6;  /* retail XOR key */
-        uint32_t thunk_debug  = thunk_raw ^ 0xEFB1F152;  /* debug XOR key  */
-        uint32_t thunk_va;
-
-        if (thunk_retail >= XBOX_BASE_ADDRESS && thunk_retail < XBOX_TOTAL_RAM) {
-            thunk_va = thunk_retail;
-        } else {
-            thunk_va = thunk_debug;
-        }
-
-        /* Validate: thunk VA should be within our mapped region */
-        if (thunk_va >= XBOX_BASE_ADDRESS && thunk_va < XBOX_TOTAL_RAM) {
-            /* Count thunk entries by scanning until we hit 0 */
-            uint32_t thunk_count = 0;
-            /* XBOX_KERNEL_THUNK_TABLE_SIZE, not 366: the kernel exports 378
-             * slots, and kernel.h notes 366 is short by 12. A title importing
-             * a high ordinal would have had its table truncated here. */
-            for (uint32_t t = 0; t < XBOX_KERNEL_THUNK_TABLE_SIZE; t++) {
-                uint32_t entry = *(volatile uint32_t *)((uintptr_t)(thunk_va + t * 4) + g_memory_offset);
-                if (entry == 0) break;
-                thunk_count++;
+        uint32_t raw = *(const uint32_t *)(xbe + 0x0158);
+        const uint32_t retail_key = 0x5B6D40B6u, debug_key = 0xEFB1F152u;
+        if (raw && raw != retail_key && raw != debug_key) {
+            uint32_t va = raw ^ retail_key, count = 0;
+            if (!xbox_read_kernel_thunks(va, &count)) {
+                va = raw ^ debug_key;
+                if (!xbox_read_kernel_thunks(va, &count)) {
+                    fprintf(stderr, "  XBE: invalid or unterminated kernel thunk table\n");
+                    xbox_MemoryLayoutShutdown();
+                    return FALSE;
+                }
             }
-            xbox_kernel_set_thunk_address(thunk_va, thunk_count);
-            fprintf(stderr, "  Kernel thunks: %u entries at Xbox VA 0x%08X\n",
-                    thunk_count, thunk_va);
-        } else {
-            fprintf(stderr, "  WARNING: kernel thunk VA 0x%08X out of range (raw=0x%08X)\n",
-                    thunk_va, thunk_raw);
+            if (count) xbox_kernel_set_thunk_address(va, count);
+            fprintf(stderr, "  Kernel thunks: %u entries at Xbox VA 0x%08X\n", count, va);
         }
     }
 
@@ -3399,6 +3401,7 @@ void xbox_MemoryLayoutShutdown(void)
     g_xbox_stack_base = g_xbox_stack_size = 0;
     g_esp = 0;
     xbox_allocators_reset();
+    xbox_kernel_set_thunk_address(0, 0);
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }
 

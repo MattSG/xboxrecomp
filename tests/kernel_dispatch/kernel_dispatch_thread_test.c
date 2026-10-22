@@ -20,10 +20,15 @@ int main(void) {
     if (!memory) return 10;
     g_xbox_mem_offset=(ptrdiff_t)memory;
     uint32_t *imports=(uint32_t *)(memory+0x10000);
+    imports[-1]=0x80000000u|103; /* ordinary data outside the declared import range */
     imports[0]=0x80000000u|103; /* KeGetCurrentIrql: no stack argument. */
     imports[1]=0x80000000u|151; /* KeStallExecutionProcessor: one argument. */
     xbox_kernel_set_thunk_address(0x10000,2);
     xbox_kernel_bridge_init();
+    if (imports[-1] != (0x80000000u|103)) {
+        fprintf(stderr, "undeclared ordinal-shaped data was patched\n");
+        return 15;
+    }
     guest_fn selected=recomp_lookup_kernel(imports[0]);
     other_service=imports[1];
     HANDLE thread=CreateThread(NULL,0,lookup_other,NULL,0,NULL);
