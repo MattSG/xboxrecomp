@@ -2920,6 +2920,16 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    /* Callback stacks may not cover any loaded section. Keep their whole
+     * reserved pool in mapped guest RAM; failure disables pool leases so the
+     * existing callers can use their allocation-failure/fallback paths. */
+    {
+        uint64_t base = ((uint64_t)g_xbox_image_hi + 4095u) & ~UINT64_C(4095);
+        if (base < XBOX_STACK_BASE) base = XBOX_STACK_BASE;
+        uint64_t end = base + (uint64_t)XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT;
+        xbox_worker_stack_reset(end <= g_memory_size ? (uint32_t)base : 0);
+    }
+
     /*
      * Parse the kernel thunk table address from the XBE header.
      * The XBE stores KernelImageThunkAddress at offset 0x0158, XOR-encrypted.
@@ -3586,6 +3596,27 @@ void xbox_MemoryLayoutShutdown(void)
         memset(&g_iomaps[i], 0, sizeof g_iomaps[i]);
     }
     ReleaseSRWLockExclusive(&g_iomap_lock);
+
+    /* The acknowledgement thread runs the pushbuffer executor and the
+     * renderer, and reads guest memory throughout: stop it before releasing
+     * anything. A frame on a slow device (a software Vulkan driver) can take
+     * longer than a second, and releasing the memory under a thread still
+     * inside one crashed the process on its way out. If it does not stop at
+     * all, leave the memory mapped -- a leak at exit, not a fault. */
+    if (g_nv2a_ack_thread) {
+        DWORD waited;
+        InterlockedExchange(&g_nv2a_ack_stop, 1);
+        xbox_nv2a_wake_publish(&g_nv2a_wake);
+        waited = WaitForSingleObject(g_nv2a_ack_thread, 30000);
+        CloseHandle(g_nv2a_ack_thread);
+        g_nv2a_ack_thread = NULL;
+        if (waited != WAIT_OBJECT_0) {
+            fprintf(stderr, "xbox_MemoryLayoutShutdown: the NV2A thread did not stop;"
+                            " guest memory stays mapped\n");
+            return;
+        }
+    }
+    xbox_worker_stack_reset(0);
     if (g_kernel_memory && g_kernel_memory_owned) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
     }
@@ -4014,11 +4045,22 @@ int xbox_ReserveRangeAllocated(uint32_t va)
     return result;
 }
 
+/* The image and callback pool are permanent low-address ownership. */
+static uint32_t heap_runtime_floor(void)
+{
+    uint32_t floor = g_xbox_image_hi > XBOX_HEAP_BASE ? g_xbox_image_hi : XBOX_HEAP_BASE;
+    if (g_xbox_worker_stack_base && XBOX_WORKER_STACK_END > floor)
+        floor = XBOX_WORKER_STACK_END;
+    return floor;
+}
+
 /* Find the next ordinary heap address outside the sorted union of permanent
  * contiguous and reservation ownership. A skip can land in the other table,
  * so walk them together, not as two independent passes. Caller holds lock. */
 static uint64_t heap_unowned_start(uint32_t lo, uint32_t size, uint32_t alignment)
 {
+    uint32_t floor = heap_runtime_floor();
+    if (lo < floor) lo = floor;
     uint64_t candidate = ((uint64_t)lo + alignment - 1) &
                          ~((uint64_t)alignment - 1);
     LONG contig = 0;
@@ -4359,7 +4401,8 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         }
         addr = g_heap_blocks[i].addr;
         span = g_heap_blocks[i].size;
-        candidate = ((uint64_t)addr + alignment - 1u) &
+        uint32_t floor = heap_runtime_floor();
+        candidate = ((uint64_t)(addr > floor ? addr : floor) + alignment - 1u) &
                     ~((uint64_t)alignment - 1u);
         if (candidate + size > (uint64_t)addr + span) {
             continue;
