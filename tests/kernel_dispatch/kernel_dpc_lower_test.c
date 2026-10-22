@@ -16,7 +16,8 @@
 } } while (0)
 
 enum { DPC = 0x20000, HEAD = 0x22000, VOICE = 0x24000,
-       ROUTINE = 0x26000, LIVE_VTABLE = 0x362978, DEAD_VTABLE = 0x362910 };
+       ROUTINE = 0x26000, LIVE_VTABLE = 0x28000, DEAD_VTABLE = 0x28004,
+       RETURN_PC = 0x2A000 };
 static uint8_t *memory;
 static int callbacks, max_depth;
 static RECOMP_TLS int callback_depth;
@@ -124,7 +125,7 @@ static void guest_dpc(void)
         uint32_t saved_esp = g_esp;
         for (unsigned i = 0; i < 48; i++) {
             g_esp -= 4;
-            BRIDGE_MEM32(g_esp) = 0x0035FBD3;
+            BRIDGE_MEM32(g_esp) = RETURN_PC;
         }
         g_esp = saved_esp;
         if (BRIDGE_MEM32(0x80000 - 0x54 + 8) != 0x5A5A5A5A)
