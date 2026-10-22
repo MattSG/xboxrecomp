@@ -221,6 +221,7 @@ int main(int argc, char **argv)
     memory = VirtualAlloc(NULL, 16 * 1024 * 1024,
                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     CHECK(memory);
+    xbox_worker_stack_reset(0x400000); /* owned slices within this private arena */
     g_xbox_mem_offset = (ptrdiff_t)memory;
     g_fs_base = 0x10000;
     g_esp = 0x80000;
@@ -311,6 +312,7 @@ int main(int argc, char **argv)
     bridge_KeIsExecutingDpc();
     CHECK(g_eax == 0);
     CHECK(xbox_IrqlRaisedCount() == 0);
+    xbox_worker_stack_reset(0);
     CHECK(VirtualFree(memory, 0, MEM_RELEASE));
     printf("PASS: DPC lower %s\n", mode);
     return 0;

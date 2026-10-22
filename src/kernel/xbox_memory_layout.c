@@ -34,6 +34,7 @@ void nv2a_d3d_prof_add(int slot, long long ticks, unsigned verts);
 #define XBE_SECTION_COUNT_OFFSET 0x011C
 #define XBE_SECTION_HEADERS_OFFSET 0x0120
 #define XBE_TLS_ADDR_OFFSET     0x012C
+#define XBE_STACK_COMMIT_OFFSET 0x0130
 
 /* XBE section header layout (56 bytes each) */
 #define SECTHDR_FLAGS       0x00
@@ -46,6 +47,23 @@ void nv2a_d3d_prof_add(int slot, long long ticks, unsigned verts);
 
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
+uint32_t g_xbox_stack_base, g_xbox_stack_size;
+static uint32_t s_main_stack_base, s_main_stack_size;
+static void xbox_allocators_reset(void);
+static void xbox_allocator_cache_sync(void);
+static uint32_t heap_runtime_floor(void);
+
+BOOL xbox_ConfigureMainStack(uint32_t base, uint32_t size)
+{
+    if (g_memory_base || (base & 4095u) || (size & 4095u) ||
+        (base && (!size || base < XBOX_BASE_ADDRESS)) ||
+        (uint64_t)base + size > UINT32_MAX)
+        return FALSE;
+    s_main_stack_base = base;
+    s_main_stack_size = size;
+    return TRUE;
+}
+
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 /* One lock for heap, contiguous and reservation ownership metadata. */
 static CRITICAL_SECTION g_allocator_lock;
@@ -2732,14 +2750,34 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     }
 
-    /* Callback stacks may not cover any loaded section. Keep their whole
-     * reserved pool in mapped guest RAM; failure disables pool leases so the
-     * existing callers can use their allocation-failure/fallback paths. */
+    /* Establish permanent stack ownership before TLS/heap allocation. */
     {
-        uint64_t base = ((uint64_t)g_xbox_image_hi + 4095u) & ~UINT64_C(4095);
-        if (base < XBOX_STACK_BASE) base = XBOX_STACK_BASE;
-        uint64_t end = base + (uint64_t)XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT;
-        xbox_worker_stack_reset(end <= g_memory_size ? (uint32_t)base : 0);
+        uint64_t floor = g_xbox_image_hi;
+        uint64_t bytes = s_main_stack_size, base, end;
+        if (floor < XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE)
+            floor = XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE;
+        floor = (floor + 4095u) & ~UINT64_C(4095);
+        if (!bytes) {
+            if (xbe_size >= XBE_STACK_COMMIT_OFFSET + 4)
+                bytes = *(const uint32_t *)(xbe + XBE_STACK_COMMIT_OFFSET);
+            if (!bytes) bytes = 4096;
+            bytes = (bytes + 4095u) & ~UINT64_C(4095);
+        }
+        base = s_main_stack_base ? s_main_stack_base : floor;
+        end = base + bytes;
+        if (base < floor || end > g_memory_size || end > UINT32_MAX) {
+            fprintf(stderr, "  Stack: invalid range or overlap with image/kernel data\n");
+            xbox_MemoryLayoutShutdown();
+            return FALSE;
+        }
+        g_xbox_stack_base = (uint32_t)base;
+        g_xbox_stack_size = (uint32_t)bytes;
+        /* Optional callback leases must never share the downward-growing
+         * main stack. Disable the pool if its whole span cannot be backed. */
+        base = end;
+        end += (uint64_t)XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT;
+        xbox_worker_stack_reset(end <= g_memory_size && end <= UINT32_MAX ? (uint32_t)base : 0);
+        xbox_allocators_reset();
     }
 
     /* Decode the XBE kernel thunk pointer using the retail and debug keys.
@@ -3357,6 +3395,10 @@ void xbox_MemoryLayoutShutdown(void)
         g_placeholder_span = 0;
 #endif
     }
+    xbox_worker_stack_reset(0);
+    g_xbox_stack_base = g_xbox_stack_size = 0;
+    g_esp = 0;
+    xbox_allocators_reset();
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }
 
@@ -3414,7 +3456,7 @@ ptrdiff_t xbox_GetMemoryOffset(void)
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
  * No free support (bump-only for now).
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
+static uint32_t g_heap_next;
 
 static int g_heap_alloc_count = 0;
 
@@ -3428,14 +3470,8 @@ static struct { uint32_t addr; uint32_t size; uint8_t free; }
     g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
 
-/*
- * Simulated stacks for spawned threads.
- *
- * The main thread owns the top of the XBOX_STACK region and grows down; worker
- * stacks are carved from the bottom upward so the two cannot meet until the
- * whole 8 MB is gone. Xbox VAs, not host memory: recompiled code addresses its
- * stack through MEM32() like any other Xbox pointer.
- */
+/* Spawned threads receive separate heap-backed guest stacks. Recompiled
+ * code accesses them through guest MEM macros, like the main stack. */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 #define XBOX_THREAD_STACK_SIZE  (512 * 1024)
@@ -3517,20 +3553,8 @@ uint32_t xbox_AllocThreadStack(void)
         return 0;
     }
 
-    /* From the heap, not from XBOX_STACK_BASE.
-     *
-     * The stack region begins at 0x00780000, which is fine only while the
-     * title's image ends below that. Half-Life 2's image runs to 0x009B68C0,
-     * so the first thread stack (0x00780000..0x00800000) landed inside its
-     * .rdata and .data: the worker spawned during engine init wrote its
-     * frames over the game's own static data. Nothing faults -- the pages are
-     * mapped and writable -- so it shows up later as globals that were
-     * correct when written and wrong when read.
-     *
-     * The heap already starts above the image and knows how big it is, so
-     * taking slices from it is correct for any image size instead of only
-     * for small ones.
-     */
+    /* Allocate a separate owned heap block above the image and permanent
+     * main/callback stack storage; never carve a worker out of a live stack. */
     base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
     if (!base)
         return 0;
@@ -3634,7 +3658,7 @@ static int contig_heap_gap(uint32_t lo, uint64_t hi, uint32_t size,
 
 uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align)
 {
-    uint32_t base;
+    uint32_t base, next;
     uint64_t limit = g_memory_size;
     if (g_memory_size <= g_xbox_total_ram || !size || g_xbox_total_ram > UINT32_MAX)
         return 0;
@@ -3643,9 +3667,10 @@ uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align)
     /* Both the returned base and the next bump are 32-bit guest addresses. */
     if (limit > UINT32_MAX) limit = UINT32_MAX;
     EnterCriticalSection(&g_allocator_lock);
+    next = g_reserve_next ? g_reserve_next : (uint32_t)g_xbox_total_ram;
+    if (next < heap_runtime_floor()) next = heap_runtime_floor();
     if (g_reserve_alloc_count >= XBOX_RESERVE_MAX_ALLOCS ||
-        !contig_heap_gap(g_reserve_next ? g_reserve_next : (uint32_t)g_xbox_total_ram,
-                         limit, size, align, &base)) {
+        !contig_heap_gap(next, limit, size, align, &base)) {
         LeaveCriticalSection(&g_allocator_lock);
         return 0;
     }
@@ -3661,6 +3686,7 @@ int xbox_ReserveRangeAllocated(uint32_t va)
 {
     int lo = 0, hi, result = 0;
     if ((size_t)va < g_xbox_total_ram) return 0;
+    xbox_allocator_cache_sync();
     /* Only positive coverage is cached: these spans never change backing or
      * lose ownership. A miss can become allocated on the next call. */
     if (va >= t_reserve_begin && va < t_reserve_end) return 1;
@@ -3887,7 +3913,8 @@ int xbox_HeapReclaimEnabled(void)
 /* Only positive coverage is permanent. Alignment gaps and ordinary RAM are
  * not contiguous allocations, and a miss can become positive on the next
  * allocation. Keep this small hint local to each DMA thread. The allocation
- * table has no reset path; a future reset must also invalidate these hints. */
+ * table resets only while execution is quiesced. A generation invalidates
+ * hints lazily on every host thread when it next accesses a new layout. */
 #define XBOX_CONTIG_RANGE_CACHE_SIZE 32
 typedef struct { uint32_t begin, end; } XBOX_CONTIG_RANGE;
 static RECOMP_TLS XBOX_CONTIG_RANGE t_contig_ranges[XBOX_CONTIG_RANGE_CACHE_SIZE];
@@ -3945,6 +3972,7 @@ int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
      * hint, with a wide end so uint32 wrapping cannot turn a miss into a hit. */
     if (physical_offset >= XBOX_CONTIG_SIZE || end > XBOX_CONTIG_SIZE)
         return 0;
+    xbox_allocator_cache_sync();
     range = &t_contig_ranges[t_contig_range_last];
     if (physical_offset >= range->begin && end <= range->end)
         return 1;
@@ -3999,6 +4027,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     if (alignment < 4) alignment = 4;
     if (alignment & (alignment - 1)) return 0;
     EnterCriticalSection(&g_allocator_lock);
+    if (g_heap_next < heap_runtime_floor()) g_heap_next = heap_runtime_floor();
     if (size >= 16u * 1024u * 1024u) {
         static unsigned large_reports;
         if (large_reports++ < 24) {
@@ -4239,4 +4268,27 @@ void xbox_HeapFree(uint32_t xbox_va)
 HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
+}
+
+/* Startup/quiesced teardown only; no guest execution may retain old storage. */
+static uint64_t s_allocator_generation;
+static RECOMP_TLS uint64_t t_allocator_generation;
+static void xbox_allocators_reset(void)
+{
+    g_heap_next = XBOX_HEAP_BASE;
+    g_heap_block_count = g_heap_alloc_count = g_thread_stacks_used = 0;
+    g_reserve_next = 0;
+    g_reserve_alloc_count = 0;
+    g_contig_next = XBOX_CONTIG_BASE + 0x1000u;
+    g_contig_alloc_count = 0;
+    ++s_allocator_generation;
+}
+
+static void xbox_allocator_cache_sync(void)
+{
+    if (t_allocator_generation == s_allocator_generation) return;
+    memset(t_contig_ranges, 0, sizeof t_contig_ranges);
+    t_contig_range_last = 0;
+    t_reserve_begin = t_reserve_end = 0;
+    t_allocator_generation = s_allocator_generation;
 }

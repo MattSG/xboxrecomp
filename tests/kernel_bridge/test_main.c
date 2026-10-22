@@ -369,7 +369,10 @@ int main(int argc, char **argv)
         check(heap>=XBOX_WORKER_STACK_END,"heap excludes relocated callback pool",NULL);
         xbox_MemoryLayoutShutdown();
         xbe_word=0x3FFFFF0; memcpy(xbe+0x204,&xbe_word,4);
-        check(xbox_MemoryLayoutInit(xbe,0x1000),"image at mapped RAM limit loads",NULL);
+        check(!xbox_MemoryLayoutInit(xbe,0x1000),"image leaving no main-stack room is rejected",NULL);
+        check(!xbox_GetMemoryBase(),"stack placement failure releases mappings",NULL);
+        xbe_word=0x3FFEFF0; memcpy(xbe+0x204,&xbe_word,4);
+        check(xbox_MemoryLayoutInit(xbe,0x1000),"image leaving exactly one main-stack page loads",NULL);
         check(xbox_worker_stack_alloc()<0,"insufficient room disables callback pool",NULL);
         check(!xbox_HeapAlloc(4096,4096),"heap cannot cover high image",NULL);
         xbox_MemoryLayoutShutdown();
@@ -384,7 +387,7 @@ int main(int argc, char **argv)
     check(xbe != NULL && xbox_MemoryLayoutInit(xbe, 0x1000),
           "minimal XBE fixture initializes guest memory and heap", NULL);
     check(!g_xbox_code_lo && !g_xbox_code_hi,"new image clears absent code bounds",NULL);
-    check(XBOX_WORKER_STACK_BASE==XBOX_STACK_BASE,
+    check(XBOX_WORKER_STACK_BASE==XBOX_STACK_BASE+XBOX_STACK_SIZE,
           "new image replaces callback pool placement",NULL);
 #ifdef RECOMP_ICALL_FEEDBACK
     check(!g_icall_fb_size && !g_icall_seen,"new image clears feedback window",NULL);

@@ -17,12 +17,16 @@ void *recomp_lookup_manual(ULONG address) { (void)address; abort(); }
 
 static volatile LONG observer_calls;
 static HANDLE observer_root;
-static WCHAR observed_path[MAX_PATH];
+static int observer_path_matched;
 static int observer_bad;
 static void opened_observer(const xbox_host_char *path)
 {
     InterlockedIncrement(&observer_calls);
-    wcscpy_s(observed_path,MAX_PATH,path);
+#ifdef _WIN32
+    observer_path_matched = wcsstr(path, L"sharing.bin") != NULL;
+#else
+    observer_path_matched = strstr(path, "sharing.bin") != NULL;
+#endif
     /* A nested failed host-side open must not replace the observed result. */
     XBOX_ANSI_STRING name={0}; XBOX_OBJECT_ATTRIBUTES oa={0}; XBOX_IO_STATUS_BLOCK ios={0};
     HANDLE h=NULL;
@@ -257,7 +261,7 @@ int main(int argc,char **argv)
         fprintf(stderr, "FAIL: successful open retained a stale failure reason\n");
         goto done;
     }
-    if (observer_calls!=1 || observer_bad || !wcsstr(observed_path,L"sharing.bin") || GetLastError()==12345) {
+    if (observer_calls!=1 || observer_bad || !observer_path_matched || GetLastError()==12345) {
         fprintf(stderr,"FAIL: successful-open observer or caller error preservation\n"); goto done;
     }
     xbox_SetFileOpenObserver(NULL);

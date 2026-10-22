@@ -26,6 +26,23 @@ instead of a title-derived bit mask or guessed alias. Consult
 [`xbox_memory_layout.h`](../../src/kernel/xbox_memory_layout.h) and
 [`kernel.h`](../../src/kernel/kernel.h) for current contracts.
 
+## Main stack configuration
+
+The main stack defaults to page-rounded XBE stack commit (header offset `0x130`),
+with a one-page minimum for an absent/zero value. Placement follows the loaded
+image and kernel data. Callback slices follow the whole main stack; an
+insufficient callback span disables leases, while insufficient main-stack space
+fails initialization and releases mappings.
+
+`xbox_ConfigureMainStack(base, size)` is an optional pre-initialization port
+policy. Base and size must be page-aligned; zero base chooses placement and
+zero size chooses the image value. `(0,0)` restores both defaults. Invalid or
+active-layout requests fail without changing policy. The initializer checks
+backing and overlap. Keep inherited fixed placements or extra capacity in the
+port. `XBOX_STACK_*` and the heap floor are runtime values, not integer constant
+expressions. Stack values and allocator ownership retire at shutdown; callers
+must quiesce guest/device execution before reset or reinitialization.
+
 ## Thread and application state
 
 The shared runtime owns guest KPCR/TIB storage and image-derived TLS setup.

@@ -97,3 +97,10 @@ simultaneous reservation/heap allocation threads.
 The `memory_cpp_linkage` case compiles a C++ consumer and links all nine late
 thread/worker APIs to their production C definitions. It checks public linkage,
 not thread scheduling or allocator behavior.
+
+The stack cases place initialized image data at the former fixed stack base,
+check page-rounded XBE stack commit, and require disjoint main/callback/heap
+storage. Port overrides reject invalid arguments, image overlap and insufficient
+backing; runtime changes are refused. The configured above-RAM case also checks
+reservation exclusion, shutdown/reinitialization and stale positive-cache
+invalidation when switching back to the default layout.

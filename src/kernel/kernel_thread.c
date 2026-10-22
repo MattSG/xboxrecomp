@@ -423,9 +423,8 @@ void *xbox_thread_debug_handle(void) { return (void *)g_game_thread; }
  * allocate a slice from the host thread while recompiled code allocates one for
  * a spawned worker, so the allocator itself must be thread-safe. */
 static volatile LONG g_worker_stack_used[XBOX_WORKER_STACK_COUNT];
-/* Standalone hosts use the conventional runtime stack region. The XBE loader
- * replaces it with an image-aware range before guest workers are started. */
-uint32_t g_xbox_worker_stack_base = XBOX_STACK_BASE;
+/* No slices are owned until the loader or standalone host supplies a range. */
+uint32_t g_xbox_worker_stack_base;
 
 void xbox_worker_stack_reset(uint32_t base)
 {

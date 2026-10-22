@@ -272,9 +272,6 @@ void xbox_WatchInit(void);
  * anything to point at, so Buffer held whatever was in that page. */
 #define KDATA_XE_IMAGE_BUF      0x4B0  /* image path text (up to 64 bytes) */
 
-/* Default simulated main-stack budget. Extra capacity does not repair a
- * guest calling-convention or stack-balance defect. */
-
 /* Thread-local storage class for the recompiled register set. Must match
  * templates/runtime/recomp_types.h -- a mismatch is a link-time surprise. */
 #if defined(_MSC_VER)
@@ -314,7 +311,16 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
-#define XBOX_STACK_SIZE     (8 * 1024 * 1024)
+/* Configure before init: page-aligned base/size, zero base selects placement
+ * after the image/kernel data, zero size selects the XBE stack commit (rounded
+ * up, minimum one page). (0,0) restores defaults. FALSE leaves policy unchanged
+ * on invalid arguments or an active layout. Init rejects unbacked/overlapping
+ * placement. Extra stack capacity does not repair a guest ABI defect. */
+BOOL xbox_ConfigureMainStack(uint32_t base, uint32_t size);
+/* Active layout values, zero after shutdown. These macros are runtime values,
+ * not integer constant expressions; initialized by MemoryLayoutInit. */
+extern uint32_t g_xbox_stack_base, g_xbox_stack_size;
+#define XBOX_STACK_SIZE     g_xbox_stack_size
 
 /* Initial KPCR storage is above the low guard region used by supported host
  * page sizes. Segment accesses resolve through thread-local g_fs_base.
@@ -329,11 +335,11 @@ typedef union RecompXmm {
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 
-/* Fixed main-stack default; worker stacks use owned allocations. */
-#define XBOX_STACK_BASE     0x00780000
+/* Main and spawned-thread stacks have disjoint owned storage. */
+#define XBOX_STACK_BASE     g_xbox_stack_base
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
-#define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
+#define XBOX_STACK_TOP      (XBOX_STACK_SIZE ? XBOX_STACK_BASE + XBOX_STACK_SIZE - 16u : 0u)
 
 /* ================================================================
  * Worker stack slices (host-tick-driven titles)
@@ -341,7 +347,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
  *
  * A host thread calling guest code needs a guest stack. These optional slices
  * provide one for host-driven entry/tick calls. The loader places the pool
- * after the loaded image and excludes it from heap allocations. Guest-created
+ * after the main stack and excludes it from heap allocations. Guest-created
  * threads use xbox_AllocThreadStack instead.
  */
 #define XBOX_WORKER_STACK_SIZE   (256 * 1024)
@@ -359,8 +365,12 @@ extern uint32_t g_xbox_worker_stack_base;
  * Xbox dynamic heap (for MmAllocateContiguousMemory, etc.)
  * ================================================================ */
 
-/** Base VA of the dynamic heap area (above stack). */
-#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 */
+/* Minimum heap floor, above main-stack and kernel-data storage. Allocation
+ * also excludes loaded image, callback slices and other issued ownership. */
+#define XBOX_HEAP_BASE      ((XBOX_STACK_BASE + XBOX_STACK_SIZE > \
+                              XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE) ? \
+                             XBOX_STACK_BASE + XBOX_STACK_SIZE : \
+                             XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE)
 
 /* Exclusive heap ceiling: configured backed span, or installed RAM when no
  * separate span was requested. Allocation checks exclude image, callback-stack
