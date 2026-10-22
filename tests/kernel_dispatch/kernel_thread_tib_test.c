@@ -26,7 +26,7 @@ int main(int argc, char **argv)
     for (i = 0; i < g_tls_total; i++) bytes(g_tls_template_va)[i] = (uint8_t)(0x60 + i);
     memset(bytes(XBOX_TIB_MAIN), 0xCC, 0x280);
     *word(XBOX_TIB_MAIN + 0x08) = 0x780000;
-    *word(XBOX_TIB_MAIN + 0x20) = 0x761000;
+    *word(XBOX_TIB_MAIN + 0x20) = XBOX_TIB_MAIN + XBOX_KPCR_PRCB_OFFSET;
     bytes(XBOX_TIB_MAIN)[0x24] = 2; /* creator happens to be in a DPC */
     *word(XBOX_TIB_MAIN + 0x58) = 1;
     tib = xbox_AllocThreadTib(); other = xbox_AllocThreadTib();
@@ -34,7 +34,8 @@ int main(int argc, char **argv)
     context = *word(tib + 0x28); block = *word(context + 0x28); thread_data = *word(block);
     CHECK(*word(tib) == 0xFFFFFFFFu && *word(tib + 0x18) == tib);
     CHECK(*word(tib + 0x04) == block + g_tls_total && *word(tib + 0x08) == 0x780000);
-    CHECK(*word(tib + 0x20) == 0x761000);
+    CHECK(*word(tib + 0x20) == tib + XBOX_KPCR_PRCB_OFFSET);
+    CHECK(*word(other + 0x20) == other + XBOX_KPCR_PRCB_OFFSET);
     CHECK(thread_data == block + g_tls_total && context == thread_data + g_tls_thread_size);
     CHECK(!memcmp(bytes(block + 4), bytes(g_tls_template_va + 4), g_tls_total - 4));
     CHECK(context != *word(other + 0x28));
@@ -44,6 +45,8 @@ int main(int argc, char **argv)
         CHECK(bytes(XBOX_TIB_MAIN)[0x24] == 2 && *word(XBOX_TIB_MAIN + 0x58) == 1);
         *word(tib + 0x58) = 1;
         CHECK(*word(other + 0x58) == 0);
+        CHECK(*word(*word(tib + 0x20) + 0x30) == 1);
+        CHECK(*word(*word(other + 0x20) + 0x30) == 0);
     } else {
         uint8_t snapshot[64 + 64 + 0x200];
         CHECK(sizeof snapshot == g_tls_total + g_tls_thread_size + 0x200);

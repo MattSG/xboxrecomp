@@ -402,6 +402,7 @@ typedef union RecompXmm {
 /* Xbox FS addresses a KPCR: 0x28-byte prefix plus the 0x258-byte KPRCB.
  * DpcRoutineActive is a ULONG at PrcbData + 0x30, beyond the NT_TIB. */
 #define XBOX_KPCR_SIZE              0x280u
+#define XBOX_KPCR_PRCB_OFFSET       0x28u
 #define XBOX_KPCR_IRQL_OFFSET       0x24u
 #define XBOX_KPCR_DPC_ACTIVE_OFFSET 0x58u
 #define XBOX_TIB_MAIN       0x00004000

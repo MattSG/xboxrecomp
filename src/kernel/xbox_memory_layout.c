@@ -2840,22 +2840,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         MEM32_INIT(XBOX_FS_BASE + 0x08, XBOX_STACK_BASE);  /* Stack limit (low address) */
         MEM32_INIT(XBOX_FS_BASE + 0x18, XBOX_FS_BASE);     /* Self pointer */
 
-        /*
-         * fs:[0x20] - On Xbox KPCR, this is the Prcb pointer.
-         * Game code reads [fs:[0x20] + 0x250] which on the real Xbox
-         * accesses a D3D cache structure. We set it to 0 so the read
-         * at offset 0x250 returns 0, causing the cache init to be skipped.
-         */
-        /* A zeroed block rather than a null pointer. The read is
-         * [fs:[0x20] + 0x250], and this used to be left at 0 so that read
-         * landed on guest address 0x250 and returned zero by accident -- which
-         * only worked while page zero was mapped. Pointing at real zeroed
-         * memory says the same thing to the title and survives that page being
-         * unmapped, which is what makes a genuine null dereference visible. */
-        #define FAKE_PRCB_VA 0x00761000  /* zeroed KPCR Prcb stand-in */
-        memset(XBOX_VA(FAKE_PRCB_VA), 0, 0x400);
-        MEM32_INIT(XBOX_FS_BASE + 0x20, FAKE_PRCB_VA);
-        #undef FAKE_PRCB_VA
+        /* Prcb references the same inline state used by DPC/IRQL handling. */
+        MEM32_INIT(XBOX_FS_BASE + 0x20, XBOX_FS_BASE + XBOX_KPCR_PRCB_OFFSET);
 
         /*
          * XBE TLS directory.
@@ -3636,9 +3622,9 @@ uint32_t xbox_AllocThreadTib(void)
 
     /* Xbox FS addresses a full KPCR, not just an NT_TIB. In particular,
      * DpcRoutineActive is at +0x58; a 0x40-byte prefix put it inside the TLS
-     * image below. Start processor state clean, copying only the TIB and
-     * existing self/PRCB-pointer fields before IRQL at +0x24. A new thread
-     * must not inherit the creator's active DPC or raised IRQL. */
+     * image below. Copy the prefix, then rebase its self/Prcb pointers to the
+     * new KPCR. A new thread must not inherit the creator's active DPC,
+     * raised IRQL or pointer to another KPCR's processor state. */
     memset(TIB_VA(tib), 0, tib_size);
     memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), XBOX_KPCR_IRQL_OFFSET);
     memcpy(TIB_VA(block), TIB_VA(g_tls_template_va), total);
@@ -3654,6 +3640,7 @@ uint32_t xbox_AllocThreadTib(void)
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
     *(uint32_t *)TIB_VA(tib + 0x18) = tib;
     *(uint32_t *)TIB_VA(tib + 0x1C) = tib;             /* KPCR self       */
+    *(uint32_t *)TIB_VA(tib + 0x20) = tib + XBOX_KPCR_PRCB_OFFSET;
     *(uint32_t *)TIB_VA(tib + 0x28) = context;
     if (getenv("RECOMP_THREAD_TLS_TRACE"))
         fprintf(stderr, "[THREAD_TLS] tib=%08X fs4=%08X context=%08X block=%08X slot0=%08X\n",
