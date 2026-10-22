@@ -525,24 +525,17 @@ void xbox_kernel_bridge_init(void);
  * opt-in; titles registering nothing retain the original behavior. */
 int xbox_kernel_set_inline_event_callers(const uint32_t *callers, unsigned count);
 
-/**
- * Per-title kernel ordinal remap.
- *
- * The bridge routes ordinals with one hardcoded table -- the ordinal ABI of the
- * XDK it was written against (Halo's 3911 / Crimson's 5659). A title built with
- * a different XDK numbers the same kernel functions differently: Burnout 3's
- * XDK 5849 has HalRequestSoftwareInterrupt at 49 where the older XDKs have
- * HalReturnToFirmware. Without this, swapping such a title onto the shared kernel
- * misroutes it (Burnout 3 exited via HalReturnToFirmware during engine setup).
- *
- * `map[title_ordinal] = canonical_ordinal` translates a title's ordinals into
- * the kernel's canonical space before every routing decision. An entry of 0
- * (or a title_ordinal past `count`) means identity -- no title needs a real
- * ordinal 0. Call BEFORE xbox_kernel_bridge_init. A title whose XDK already
- * matches the kernel calls nothing and gets identity, so existing titles are
- * unaffected. Generate the map with tools/kernel_audit/gen_ordinal_remap.py.
- */
+/* Optional port-supplied source-to-canonical ordinal policy. Configure before
+ * both xbox_kernel_init and xbox_kernel_bridge_init, while execution is
+ * quiesced. The borrowed table must stay alive and unchanged until replaced
+ * or cleared. NULL or count <= 0 selects identity; a zero entry or source ID
+ * outside count also selects identity. Mapping is applied once, never chained.
+ * Derive port policy from independently verified import names/IDs rather than
+ * assuming an XDK version implies different kernel numbering. */
 void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
+/* Translate one source ID for native pointer-table and bridge initialization.
+ * xbox_resolve_ordinal always takes a canonical ID and does not remap it. */
+ULONG xbox_kernel_canonical_ordinal(ULONG source_ordinal);
 
 /* ============================================================================
  * Path Translation (kernel_path.c)
