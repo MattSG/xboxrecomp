@@ -147,3 +147,15 @@ target_include_directories(dsp_recomp_frame_replay PRIVATE ../../src/apu/dsp)
 target_compile_features(dsp_recomp_frame_replay PRIVATE c_std_11)
 target_compile_definitions(dsp_recomp_frame_replay PRIVATE _CRT_SECURE_NO_WARNINGS DSP_RECOMP_INC="${recomp_inc}")
 add_test(NAME dsp_recomp_replay COMMAND dsp_recomp_frame_replay ${recomp_capture})
+
+
+add_executable(dsp_program_dump_test dsp_program_dump_test.c)
+target_link_libraries(dsp_program_dump_test PRIVATE dsp_runtime)
+target_compile_features(dsp_program_dump_test PRIVATE c_std_11)
+target_compile_definitions(dsp_program_dump_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+foreach(processor gp ep)
+    add_test(NAME dsp_program_dump_${processor} COMMAND "${CMAKE_COMMAND}" -E env
+      "RECOMP_DSP_PROGRAM_DIR=${CMAKE_CURRENT_BINARY_DIR}/program-dump-${processor}"
+      "RECOMP_DSP_FRAME_DUMP=" "$<TARGET_FILE:dsp_program_dump_test>" ${processor})
+    set_tests_properties(dsp_program_dump_${processor} PROPERTIES TIMEOUT 10)
+endforeach()
