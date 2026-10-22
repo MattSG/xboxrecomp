@@ -7,15 +7,17 @@ existing constant buffer. It shares the validated bytecode cache directory and
 uses a separate `.psm` sidecar. Schema, field layout, source, shader target,
 entry-point/variant family and compiler flags determine its namespace.
 
-Build from the game repository after entering `scripts/enter-env.ps1`:
+Build from the toolkit root. On Windows use native CMake/CTest and an
+MSVC/Windows SDK build environment:
 
-```powershell
-cmake -S tools/xboxrecomp/tests/nv2a_ps_prewarm -B conformance_tmp/stutter-ps-prewarm-test -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build conformance_tmp/stutter-ps-prewarm-test
-ctest --test-dir conformance_tmp/stutter-ps-prewarm-test --output-on-failure
+```sh
+cmake -S tests/nv2a_ps_prewarm -B build/ps-prewarm
+cmake --build build/ps-prewarm --config Release
+ctest --test-dir build/ps-prewarm -C Release --output-on-failure --timeout 45
 ```
 
-The ten tests cover canonical little-endian round trips at the 512-record
+The SDL3 GPU case checks that specialization/warmup switches are inert on that
+backend. The Windows D3D11 cases cover canonical little-endian round trips at the 512-record
 limit; malformed magic/schema/record length/count/reserved fields/family/SHA;
 truncation and trailing bytes; empty manifests; cache-directory override;
 shader/cache/prewarm bypasses; invalid variants; duplicate imported keys;
