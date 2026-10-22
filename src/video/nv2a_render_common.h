@@ -31,6 +31,16 @@ static float env_aspect(void)
     return 0;
 }
 
+/* Apply caller policy to the existing vertex alignment shader parameters. */
+static void vertex_alignment(const NvOverlayHooks *hooks, uint32_t width,
+                             uint32_t height, float place[4])
+{
+    place[2] = 1.0f;
+    place[3] = 0.0f;
+    if (hooks->vertex_alignment)
+        hooks->vertex_alignment(width, height, &place[2], &place[3]);
+}
+
 typedef struct {
     uint32_t c_icw[8], a_icw[8], c_ocw[8], a_ocw[8];
     float cf0[8][4], cf1[8][4], fin_c0[4], fin_c1[4];

@@ -73,3 +73,12 @@ pool cannot fit in mapped guest RAM. Shutdown clears placement; loading another
 image computes it again. Standalone hosts with their own guest mapping can use
 `xbox_worker_stack_reset(base)` before workers start (or after they have stopped)
 to supply a mapped pool; zero disables it. Slot count and size are unchanged.
+
+
+## Renderer policy
+
+`NvOverlayHooks.vertex_alignment` lets a port choose the existing shader's
+pixel-zero snap and screen-offset parameters from guest target dimensions.
+Without a hook, snapping is enabled and the screen offset is zero for every
+target size. Authored pass selection belongs to the port; the shared shader
+implements the coordinate operations for both renderers.

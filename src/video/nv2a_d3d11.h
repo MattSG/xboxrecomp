@@ -136,6 +136,9 @@ typedef struct {
      * idle_ms=0 and during idle scanout with elapsed time since the last flip.
      * Nonzero requests redraws while idle. No hook means no extra presents. */
     int (*idle_present)(uint32_t now_ms, uint32_t idle_ms, int movie);
+    /* Optional alignment policy for vertex output. Defaults: pixel-zero snap
+     * enabled, screen offset zero. Dimensions are the guest target's size. */
+    void (*vertex_alignment)(uint32_t width, uint32_t height, float *snap, float *screen_offset);
 } NvOverlayHooks;
 void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks);
 /* Optional observer for consecutive NV097_NO_OPERATION parameters, called on
