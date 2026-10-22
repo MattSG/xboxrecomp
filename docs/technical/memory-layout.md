@@ -26,6 +26,22 @@ instead of a title-derived bit mask or guessed alias. Consult
 [`xbox_memory_layout.h`](../../src/kernel/xbox_memory_layout.h) and
 [`kernel.h`](../../src/kernel/kernel.h) for current contracts.
 
+## Kernel imports
+
+The loader decodes the header's retail/debug thunk pointer and validates a
+terminated ordinal-marked run within the actual mapped span, up to the supported
+slot capacity. A missing or empty table leaves no configured imports. Invalid
+pointers, malformed entries and missing terminators fail initialization.
+
+A port can select an exact known span with `xbox_kernel_set_thunk_address` before
+kernel/bridge initialization. NULL gaps are allowed; neighboring words are never
+scanned for possible imports. Zero address/count clears selection, and invalid
+ranges/counts leave it cleared rather than inferring or clamping a count.
+The getter reports accepted selection. Standalone hosts supply their own mapped
+storage; initialized layouts check the selected span against their backing.
+The loader validates markers without requiring canonical export IDs; the bridge
+retains port-configured ordinal remapping. Shutdown retires import metadata.
+
 ## Main stack configuration
 
 The main stack defaults to page-rounded XBE stack commit (header offset `0x130`),

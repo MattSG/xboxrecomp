@@ -104,3 +104,10 @@ storage. Port overrides reject invalid arguments, image overlap and insufficient
 backing; runtime changes are refused. The configured above-RAM case also checks
 reservation exclusion, shutdown/reinitialization and stale positive-cache
 invalidation when switching back to the default layout.
+
+`memory_thunk_*` uses synthetic XBE headers and sections, without title assets.
+It covers retail/debug tables above 64 MiB, absent/empty tables, invalid markers,
+zero ordinals, unbacked pointers, missing terminators and the supported slot
+limit. Explicit NULL-separated spans and a noncanonical source ordinal exercise
+port selection/remapping without guessing neighboring imports. Reinitialization
+and explicit clearing must discard old import metadata.

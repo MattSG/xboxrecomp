@@ -11012,23 +11012,25 @@ void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count)
 
 void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
 {
-    if (!xbox_va) {
+    uint64_t end = (uint64_t)xbox_va + (uint64_t)count * 4;
+    size_t mapped = xbox_GetMemoryBase() ? xbox_GetMappedSize() : 0;
+    /* Explicit selection replaces the whole prior import generation. Zero
+     * means unconfigured, never an inferred count or a retained old table. */
+    g_thunk_table_base = g_thunk_table_count = 0;
+    memset(g_slot_ordinals, 0, sizeof g_slot_ordinals);
+    memset(g_slot_bridges, 0, sizeof g_slot_bridges);
+    memset(g_slot_arg_bytes, 0, sizeof g_slot_arg_bytes);
+    memset(g_slot_arg_unknown, 0, sizeof g_slot_arg_unknown);
+    if (!xbox_va || !count) return;
+    if (xbox_va < XBOX_BASE_ADDRESS || (xbox_va & 3u) ||
+        count > XBOX_KERNEL_THUNK_TABLE_SIZE || end > UINT32_MAX ||
+        (mapped && end > mapped)) {
+        fprintf(stderr, "  Kernel thunk bridge: invalid explicit range %08X + %u slots\n",
+                xbox_va, count);
         return;
     }
-
     g_thunk_table_base = xbox_va;
-
-    /* count indexes g_slot_* arrays, which are sized by the macro. A title
-     * importing more slots than the real kernel exports would run off them. */
-    if (!count) count = g_thunk_table_count ? g_thunk_table_count : XBOX_KERNEL_THUNK_TABLE_SIZE;
-    if (count <= XBOX_KERNEL_THUNK_TABLE_SIZE) {
-        g_thunk_table_count = count;
-    } else if (count > XBOX_KERNEL_THUNK_TABLE_SIZE) {
-        fprintf(stderr,
-                "  Kernel thunk bridge: XBE declares %u thunk slots, clamping to %d\n",
-                count, XBOX_KERNEL_THUNK_TABLE_SIZE);
-        g_thunk_table_count = XBOX_KERNEL_THUNK_TABLE_SIZE;
-    }
+    g_thunk_table_count = count;
 }
 
 /**
@@ -11071,14 +11073,14 @@ void xbox_kernel_bridge_init(void)
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);
 
-    /* The thunk table lives in .rdata which is marked PAGE_READONLY.
-     * Temporarily make it writable so we can patch the ordinals. */
-    VirtualProtect(
+    /* Temporarily permit writes to the selected span, preserving its prior
+     * protection. Never scan or patch neighboring ordinal-shaped data. */
+    if (!VirtualProtect(
         (LPVOID)((uintptr_t)g_thunk_table_base + g_xbox_mem_offset),
-        g_thunk_table_count * 4,
-        PAGE_READWRITE,
-        &old_protect
-    );
+        g_thunk_table_count * 4, PAGE_READWRITE, &old_protect)) {
+        fprintf(stderr, "  Kernel thunk bridge: selected range is not writable\n");
+        return;
+    }
 
     /* Initialize kernel data export values first */
     kernel_data_init();
@@ -11130,59 +11132,6 @@ void xbox_kernel_bridge_init(void)
             BRIDGE_MEM32(va) = synthetic;
             resolved++;
         }
-    }
-
-    /*
-     * Thunk entries below the header-declared base.
-     *
-     * KernelImageThunkAddress points at the main import run, but the linker can
-     * emit further runs just before it, separated by a NULL. Halo has three at
-     * base-0x10 (ordinals 52, 51 and 5). Those stay unpatched, so game code
-     * doing "mov ebx,[thunk]; call ebx" jumps to the raw 0x8000xxxx marker
-     * instead of a kernel function. The indirect call cannot resolve it, yields
-     * 0, and a caller looping until it sees an error code never sees one - in
-     * Halo that hung main() in a file-enumeration loop before it reached any
-     * initialisation.
-     *
-     * Only entries still carrying the ordinal marker are touched, so scanning
-     * back over unrelated .rdata is harmless.
-     */
-    {
-        const int LOOKBEHIND = 16;   /* entries, i.e. 64 bytes */
-        DWORD scan_protect;
-        uint32_t low = g_thunk_table_base - LOOKBEHIND * 4;
-
-        VirtualProtect((LPVOID)((uintptr_t)low + g_xbox_mem_offset),
-                       LOOKBEHIND * 4, PAGE_READWRITE, &scan_protect);
-
-        for (i = 1; i <= LOOKBEHIND; i++) {
-            uint32_t va = g_thunk_table_base - i * 4;
-            uint32_t current = BRIDGE_MEM32(va);
-            int slot;
-
-            if (!(current & 0x80000000)) {
-                continue;            /* NULL separator or ordinary data */
-            }
-            slot = g_thunk_table_count + i;   /* park these above the main run */
-            if (slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
-                break;
-            }
-
-            g_slot_ordinals[slot] = current & 0x7FFFFFFF;
-            g_slot_bridges[slot] = bridge_for_ordinal(g_slot_ordinals[slot]);
-            { int _n = stdcall_args_for_ordinal(g_slot_ordinals[slot]);
-              g_slot_arg_unknown[slot] = (uint8_t)(_n < 0);
-              g_slot_arg_bytes[slot] = (_n < 0) ? 0 : _n; }
-            BRIDGE_MEM32(va) = KERNEL_VA_BASE + slot * 4;
-            resolved++;
-            if (g_slot_bridges[slot]) bridged++; else unbridged++;
-
-            fprintf(stderr, "  [KERNEL] extra thunk at 0x%08X: ordinal %u (slot %d)\n",
-                    va, g_slot_ordinals[slot], slot);
-        }
-
-        VirtualProtect((LPVOID)((uintptr_t)low + g_xbox_mem_offset),
-                       LOOKBEHIND * 4, scan_protect, &scan_protect);
     }
 
     /* Restore original protection */

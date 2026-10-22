@@ -319,8 +319,8 @@ int main(int argc, char **argv)
         xbe_word = 0; memcpy(xbe + 0x11c, &xbe_word, 4); /* no sections */
         xbe_word = 0x00010120u; memcpy(xbe + 0x120, &xbe_word, 4); /* section table */
         xbe_word = 0x00010180u; memcpy(xbe + 0x118, &xbe_word, 4); /* certificate */
-        xbe_word = 0x00010200u ^ 0x5B6D40B6u;
-        memcpy(xbe + 0x158, &xbe_word, 4); /* retail encoded thunk VA */
+        xbe_word = 0;
+        memcpy(xbe + 0x158, &xbe_word, 4); /* no image imports */
     }
     if (xbe) {
         xbe_word=1; memcpy(xbe+0x11c,&xbe_word,4);

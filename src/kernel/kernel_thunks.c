@@ -399,7 +399,7 @@ void xbox_kernel_init(void)
     for (ULONG i = 0; thunk_base && xbox_GetMemoryBase() && i < thunk_count; i++) {
         uint32_t entry = *(volatile uint32_t *)
             ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
-        if (!entry) break;
+        if (!entry) continue; /* explicit port spans may contain NULL gaps */
         ULONG ordinal = entry & 0x7FFFFFFF;
 
         ULONG_PTR ptr = xbox_resolve_ordinal(ordinal);
