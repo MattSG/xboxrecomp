@@ -59,11 +59,9 @@ extern size_t g_xbox_total_ram;
  * allocates above the mapped range is not backed by anything: it faults, which
  * is what an unmapped virtual address does on the console too.
  *
- * Half-Life 2 needs this: its allocator sub-allocates past the top of RAM, and
- * at 64 MB its first commit past the boundary (0x04F80000) aliases the base of
- * the live heap (0x00F80000). A CUtlRBTree element array landed at 0x0CB80000,
- * aliasing 0x00B80000, and its links were overwritten between one insert and
- * the next search.
+ * A port can request a larger backed virtual range when guest reservations
+ * exceed installed RAM. These pages must remain distinct rather than aliasing
+ * live RAM allocations. The port supplies the required range before init.
  *
  * Raising g_xbox_total_ram instead does not work: the heap top and anything
  * the guest is told about memory derive from that, so the title sizes itself
