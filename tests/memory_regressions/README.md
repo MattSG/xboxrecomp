@@ -23,6 +23,14 @@ One test per mode, one process each, because the switches are read once and cach
 | `memory_regressions_ext_vma_128` | `RECOMP_EXT_VMA=1` on a 128 MB map. The tracker stays off. |
 | `memory_regressions_reserve_heap` | Retail RAM on a 128 MB map. Heap growth preserves above-RAM reservations, partial commit retains its address, and the existing reserve release/decommit no-ops retain ownership. Later reservations skip issued heap blocks. |
 
+## TLS directory and storage
+
+The TLS cases add a synthetic data section where fixed bootstrap buffers used
+to live. A template larger than 512 bytes must retain its input section, copied
+data and zero-fill, with separate adjacent per-thread storage in an owned heap
+allocation. Invalid directory bounds, reversed template bounds and overflowing
+sizes must fail initialization and release the guest mapping.
+
 ## Heap reuse and `RECOMP_HEAP_RECLAIM`
 
 Splitting reused blocks, coalescing neighbours and contiguous reuse are always
