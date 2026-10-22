@@ -306,6 +306,13 @@ static void test_depth(void)
     puts("PASS: 512 native depth-view pixels at scales 1/2/4/8, single-sample and 4x MSAA; quarter-pixel compensation and left clamping preserve packed depth");
 }
 
+static void fixture_vertex_alignment(uint32_t width, uint32_t height, float *snap, float *offset)
+{
+    (void)width; (void)height;
+    *snap = 0;
+    *offset = .53125f;
+}
+
 static void test_placement(void)
 {
     static const char suffix[] =
@@ -325,8 +332,11 @@ static void test_placement(void)
         ID3D10Blob_GetBufferPointer(code),ID3D10Blob_GetBufferSize(code),&declaration,1,
         &stride,1,D3D11_SO_NO_RASTERIZED_STREAM,NULL,&geometry)));
     ID3D10Blob_Release(code);
-    for (target = 0; target < 2; ++target) {
-        unsigned w = target ? 64 : 640, h = target ? 64 : 480;
+    for (target = 0; target < 4; ++target) {
+        unsigned w = target >= 2 ? 64 : 640, h = target >= 2 ? 64 : 480;
+        NvOverlayHooks hooks = {0};
+        if (target & 1) hooks.vertex_alignment = fixture_vertex_alignment;
+        nv2a_d3d_set_overlay_hooks(&hooks);
         NvD3DState st = state_for(w,h); NvD3DAttrib attr[16] = {{0}};
         float def[16][4] = {{0}}, captured[7][4]; ID3D11Buffer *none = NULL;
         Surface *surface; uint32_t gw,gh,z;
@@ -346,7 +356,7 @@ static void test_placement(void)
         for (i = 0; i < 7; ++i) {
             double x = vertices[i][0], y = vertices[i][1], rw = vertices[i][3],
                    clip_w = 1.0 / rw, fx = x - floor(x), fy = y - floor(y);
-            if (target) {
+            if (!(target & 1)) {
                 if (x >= .5 && x < .5625) x = 0;
                 if (y >= .5 && y < .5625) y = 0;
             } else {
@@ -362,8 +372,9 @@ static void test_placement(void)
             CHECK(captured[i][2] == 0 && fabs(captured[i][3] - clip_w) < 1e-6);
         }
     }
+    nv2a_d3d_set_overlay_hooks(NULL);
     ID3D11Buffer_Release(output); ID3D11GeometryShader_Release(geometry);
-    puts("PASS: production vertex output places display full-screen edges exactly at bounds, retains integer menu coordinates, translates perspective geometry, and preserves offscreen pixel-zero snap");
+    puts("PASS: production vertex output honors default snapping and optional alignment policy on both target sizes");
 }
 
 static uint32_t volume_pixel(uint32_t addr, unsigned x, unsigned y)

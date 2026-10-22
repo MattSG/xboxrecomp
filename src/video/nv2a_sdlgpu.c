@@ -2495,8 +2495,7 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
     uc.fogf[1] = st->fog_param[1];
     uc.place[0] = shift;
     uc.place[1] = yscale;
-    uc.place[2] = s && s->w == GUEST_W && s->h == GUEST_H ? 0.0f : 1.0f;
-    uc.place[3] = uc.place[2] == 0.0f ? 0.53125f : 0.0f;
+    vertex_alignment(&s_overlay, s ? s->w : 0, s ? s->h : 0, uc.place);
     rec_uniform(0, 0, &uc, sizeof uc);
     rec_uniform(1, 0, s_zero_block, sizeof s_zero_block);
     draw_op(OP_DRAWI, ni, first_index);

@@ -3032,13 +3032,7 @@ void nv2a_d3d_draw_ub(const NvD3DState *st, int topology, const NvD3DAttrib attr
     uc.fogf[1] = st->fog_param[1];
     uc.place[0] = shift;
     uc.place[1] = yscale;
-    /* Display passes must translate position and texture interpolation
-     * together. Snapping only the first edge slid glare reads half a guest
-     * pixel and left bright silhouette rims; retaining the Xbox offset
-     * instead left the first host row/column uncovered. Whole-pixel menu
-     * vertices keep their placement; offscreen ripple maps keep the snap. */
-    uc.place[2] = s && s->w == GUEST_W && s->h == GUEST_H ? 0.0f : 1.0f;
-    uc.place[3] = uc.place[2] == 0.0f ? 0.53125f : 0.0f;
+    vertex_alignment(&s_overlay, s ? s->w : 0, s ? s->h : 0, uc.place);
     if (!upload_cb(s_cb_ub, &uc, sizeof uc)) {
         RECOMP_PROFILE_END();
         return;
