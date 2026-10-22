@@ -3,11 +3,8 @@
  *
  * Records which guest addresses the title actually reaches through indirect
  * branches, so the next codegen run can seed function detection with them
- * instead of guessing. This is the local equivalent of the two inputs
- * Microsoft's own recompiler takes -- VirtualDispatchTraceFiles (recorded
- * indirect-branch target sets) and UpdateEnlightenments (a persisted analysis
- * database the compiler rewrites every build). See
- * docs/technical/ms-fusion-codegen-teardown.md.
+ * instead of guessing. Observations and filtered seeds belong to the port;
+ * see docs/technical/indirect-calls.md for the runtime feedback workflow.
  *
  * Static analysis cannot see where a vtable call goes. Running the title can.
  * tools/recomp/analyze_unresolved.py currently classifies unresolved targets by

@@ -7,7 +7,7 @@
  * a template and this stays a runtime detail.
  *
  * See src/kernel/icall_feedback.c for the rationale and
- * docs/technical/ms-fusion-codegen-teardown.md for where the idea comes from.
+ * docs/technical/indirect-calls.md for the runtime feedback workflow.
  */
 
 #ifndef RECOMP_ICALL_FEEDBACK_H

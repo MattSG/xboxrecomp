@@ -325,11 +325,9 @@ in an earlier run is never dropped because a later run did not reach it. That is
 what makes the loop converge — each pass translates more code, which lets the
 title reach further, which surfaces more targets.
 
-This is the local equivalent of the two feedback inputs Microsoft's own
-recompiler takes: `VirtualDispatchTraceFiles` (recorded indirect-branch target
-sets) and `UpdateEnlightenments: true` (a persisted analysis database the
-compiler rewrites on every build). See
-[ms-fusion-codegen-teardown.md](ms-fusion-codegen-teardown.md).
+Recorded targets feed a cumulative database and filtered detection seeds.
+Caller-supplied foreign-module comparison is a separate analysis aid; see
+[Reference Analysis](fusion-analysis.md) for its inputs and limitations.
 
 It replaces inference with measurement. `analyze_unresolved.py` classifies
 unresolved addresses by where they land relative to known functions, which is a

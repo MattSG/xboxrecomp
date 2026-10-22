@@ -29,7 +29,7 @@ _md = Cs(CS_ARCH_X86, CS_MODE_64)
 _md.detail = True
 
 # host reg id -> guest name. The 64-bit host regs used for *addressing* are the
-# guest 32-bit registers (docs/technical/ms-fusion-recompiler.md §3): guest eax..
+# guest 32-bit registers (docs/technical/fusion-analysis.md): guest eax..
 # ebp are host eax..ebp, guest esp is r14, guest RAM base is r15.
 _GUEST = {
     X86_REG_R14D: "esp", X86_REG_R14: "esp",

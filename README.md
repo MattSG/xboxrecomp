@@ -33,10 +33,9 @@ This is a complete toolkit for **statically recompiling original Xbox (2001-2005
 
 Static recompilation takes the raw x86 machine code from an Xbox binary and translates every function — every `mov`, every `jmp`, every `call` — into equivalent C source code. That C code compiles with MSVC into a native x86-64 `.exe` that runs on modern Windows. The game's original logic executes directly on your CPU, not through an interpreter or JIT compiler.
 
-**This is the first *public* static recompilation toolkit for the original Xbox.**
-Microsoft got here first: their internal Ficl/Fission recompiler shipped Xbox
-back-compat on the 360. We have since studied it — see
-[Microsoft's Own Recompiler](docs/technical/ms-fusion-recompiler.md).
+Reference-analysis helpers inspect supplied BC module metadata and guest
+executables. See [Reference Analysis](docs/technical/fusion-analysis.md) for
+current interfaces and their proof limits.
 
 The technique has been proven on other platforms — [N64Recomp](https://github.com/N64Recomp/N64Recomp) showed MIPS-to-C was viable, [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) brought it to Xbox 360's PowerPC — but nobody had tackled the OG Xbox until now. Its x86 architecture makes it both easier (same instruction set family as the host) and harder (variable-length instructions, complex addressing modes, x87 FPU stack) than MIPS or PPC targets.
 
@@ -338,9 +337,7 @@ xboxrecomp/
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
 - [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
 - [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
-- [Microsoft's Own Recompiler](docs/technical/ms-fusion-recompiler.md) — White-room analysis of Ficl/Fission: pipeline, address map, HLE boundary
-- [Ficl/Fission Codegen Teardown](docs/technical/ms-fusion-codegen-teardown.md) — IDA/Hex-Rays teardown of both their translators, and how it reframes our roadmap
-- [SVOD Extraction](docs/technical/svod-extraction.md) — reading the BC package container to get the donor title's guest XBE out, and the validation gate that catches a plausible-looking bad extraction
+- [Reference Analysis](docs/technical/fusion-analysis.md) — Generic module, package, signature and comparison helpers
 - [Runtime Integration](docs/runtime/README.md) — Generic runtime interfaces and guest thread startup
 
 ### Xbox Formats

@@ -46,13 +46,9 @@ One per stage, in the order you run them.
 - [NV2A Shader Translation](technical/nv2a-shaders.md) — Register combiners and vertex microcode to HLSL
 - [D3D8LTCG Device Context](technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions
 
-### Microsoft's own recompiler
+### Reference analysis
 
-- [Microsoft's Own Recompiler](technical/ms-fusion-recompiler.md) — White-room analysis of Ficl/Fission: pipeline, address map, HLE boundary
-- [Ficl/Fission Codegen Teardown](technical/ms-fusion-codegen-teardown.md) — What both translators emit, and how it reframes the roadmap
-- [Ficl/Fission Across Four Titles](technical/ms-fusion-corpus.md) — What the recompiler does, separated from what one title needed
-- [Adopting the Crimson Skies Findings](technical/ms-fusion-adoption-plan.md) — Working plan and status
-- [SVOD Extraction](technical/svod-extraction.md) — Getting the guest XBE out of a BC package, and the gate that catches a plausible-looking bad extraction
+- [Reference Analysis](technical/fusion-analysis.md) — Caller-supplied modules, packages, signature candidates and proof limits
 
 ### Project
 
