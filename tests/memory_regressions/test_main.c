@@ -226,6 +226,13 @@ int main(int argc, char **argv)
     check(*G(XBOX_FS_BASE + 0x28) == 0,
           "loader does not install an application context chain", NULL);
 
+    void *kernel_probe = xbox_GetKernelMemoryBase();
+    if (xbox_IsContiguousMemoryAvailable())
+        check(kernel_probe == G(0x80010000u), "kernel probe exposes its mapped storage", NULL);
+    if (kernel_probe)
+        check(*(uint32_t *)((uint8_t *)kernel_probe + 0x3C) == 0,
+              "loader does not fabricate a kernel PE offset", NULL);
+
     scratch = xbox_HeapAlloc(0x10000, 4096);
     for (i = 0; i < N_SLOTS; i++)
         *G(THUNK_VA + 4 * i) = 0x80000000u | ORD[i];
@@ -565,6 +572,7 @@ shutdown: ;
     void *host_base = (void *)((uintptr_t)xbox_GetMemoryOffset());
 #endif
     xbox_MemoryLayoutShutdown();
+    check(xbox_GetKernelMemoryBase() == NULL, "shutdown retires the kernel probe view", NULL);
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION host_info;
     /* Released means no longer ours: free, or already reused by an unrelated

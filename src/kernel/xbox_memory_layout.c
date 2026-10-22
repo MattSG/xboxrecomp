@@ -1488,9 +1488,13 @@ static void xbox_Nv2aAckStart(void)
     }
 }
 
-/* Separate allocation for Xbox kernel address space (0x80010000+).
- * Some RenderWare code reads the kernel PE header to detect features. */
+/* Runtime-owned kernel probe page; may share the contiguous mapping. */
 static void *g_kernel_memory = NULL;
+
+void *xbox_GetKernelMemoryBase(void)
+{
+    return g_kernel_memory;
+}
 
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
@@ -3149,16 +3153,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         xbox_Nv2aAckStart();
     }
 
-    /*
-     * Allocate a page at Xbox kernel address space (0x80010000).
-     *
-     * RenderWare's Xbox driver code (xbcache.c) reads MEM32(0x8001003C)
-     * to parse the Xbox kernel's PE header and find the INIT section for
-     * CPU cache line sizing. On PC, we provide a minimal fake PE header
-     * with 0 sections so the function gracefully skips the cache init.
-     *
-     * The actual native address is 0x80010000 + g_memory_offset.
-     */
+    /* Map a zeroed kernel probe page. A port may populate compatibility data
+     * through xbox_GetKernelMemoryBase before guest execution. */
     {
         #define XBOX_KERNEL_BASE 0x80010000u
         #define KERNEL_PAGE_SIZE 4096
@@ -3172,12 +3168,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         if (!g_contig_memory && g_kernel_memory)
             g_kernel_memory_owned = 1;
         if (g_kernel_memory) {
-            /* Zero-fill then set e_lfanew = 0x80 (offset to PE header).
-             * With the rest zeroed, NumberOfSections = 0 and the INIT
-             * section search finds nothing, which is the safe path. */
             memset(g_kernel_memory, 0, KERNEL_PAGE_SIZE);
-            *(uint32_t *)((uint8_t *)g_kernel_memory + 0x3C) = 0x80;  /* e_lfanew */
-            fprintf(stderr, "  Kernel: fake PE header at Xbox VA 0x%08X (native %p)\n",
+            fprintf(stderr, "  Kernel: probe page at Xbox VA 0x%08X (native %p)\n",
                     XBOX_KERNEL_BASE, g_kernel_memory);
         } else {
             fprintf(stderr, "  WARNING: could not map Xbox kernel VA 0x%08X\n",

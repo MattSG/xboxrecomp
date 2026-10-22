@@ -223,6 +223,10 @@ BOOL xbox_IsXboxAddress(uintptr_t address);
  * Returns NULL if memory layout is not initialized.
  */
 void *xbox_GetMemoryBase(void);
+/* Runtime-owned 4 KiB kernel probe page, zeroed at initialization. NULL when
+ * unavailable; invalid after memory shutdown. Contains no emulated PE image.
+ * Ports may populate compatibility data before guest execution. */
+void *xbox_GetKernelMemoryBase(void);
 
 /**
  * Get the offset from Xbox VA to actual mapped address.
