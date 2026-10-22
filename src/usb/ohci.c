@@ -456,14 +456,7 @@ static int guest_ok(uint32_t va, uint32_t bytes)
 
     if (va == 0 || mapped == 0)
         return 0;
-    /* Descriptors live where a driver puts DMA memory, and on Xbox that is
-     * MmAllocateContiguousMemory -- the contiguous window, not low RAM. The
-     * bound below reads as "is this in RAM", which is not the question: the
-     * window is mapped too, at the same offset, and is exactly where the Xbox
-     * USB stack builds its endpoint and transfer descriptors. Rejecting it
-     * made every rd32 return 0 and every wr32 a no-op, so the walker looked at
-     * an empty list and the driver waited forever for a done queue that could
-     * not be written. DDS9's first control transfer sits at 0x80408940. */
+    /* Contiguous DMA memory is a separate mapped window above low RAM. */
     if (va >= OHCI_CONTIG_BASE
             && (uint64_t)va + bytes <= (uint64_t)OHCI_CONTIG_BASE
                                      + OHCI_CONTIG_SIZE)
@@ -471,31 +464,8 @@ static int guest_ok(uint32_t va, uint32_t bytes)
     return (uint64_t)va + bytes <= (uint64_t)mapped;
 }
 
-/* A host controller is a bus master: every pointer the driver hands it --
- * HcHCCA, HcControlHeadED, ED and TD links, buffer pointers -- is a PHYSICAL
- * address. On hardware physical P and the contiguous window's 0x80000000 + P
- * are the same bytes. Here the window is separate storage, so a physical
- * address a driver took from MmGetPhysicalAddress names nothing it wrote.
- *
- * Burnout 3's XPP does exactly that: it builds its descriptors in
- * MmAllocateContiguousMemory at 0x825B50C0, converts, and writes 0x025B50C0.
- * Read as RAM, every ED came back all zeroes, the controller saw an empty
- * list, and enumeration waited forever for a transfer that never moved.
- * (DDS9's driver writes window addresses directly, which guest_ok already
- * accepts, so it never needed this.)
- *
- * Resolved the way the pushbuffer executor resolves surface offsets
- * (dma_resolve in nv2a_pb_exec.c): below the contiguous allocator's
- * high-water mark an address is memory some MmAllocateContiguousMemory call
- * returned, and its bytes live in the window.
- *
- * Except inside the loaded image. A driver also points transfers at its own
- * statics -- Burnout 3's first GET_DESCRIPTOR reads into 0x0041A904, in .data
- * -- and MmGetPhysicalAddress passes those through unchanged. A real kernel
- * never hands out contiguous memory that overlaps the image, so an address
- * inside it is the image. Sending that one to the window delivered the
- * descriptor where the driver never looked, and it reset the port and asked
- * again, forever. */
+/* Resolve bus-master descriptor and payload addresses through the runtime's
+ * physical memory map, retaining legacy loaded-image VA precedence. */
 uint32_t xbox_OhciResolvePhysical(uint32_t addr, uint32_t bytes)
 {
     uint32_t guest_va;
@@ -512,12 +482,6 @@ uint32_t xbox_OhciResolvePhysical(uint32_t addr, uint32_t bytes)
      * contiguous allocation. */
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
-    /* XPP's private arena ends at 0x80001000 and bypasses the contiguous
-     * allocator. Its report buffers still carry physical DMA addresses.
-     * Page zero is reserved from allocations, so the allocation table cannot
-     * identify these buffers; their bytes live in the contiguous view. */
-    if (addr < 0x1000u && (uint64_t)addr + bytes <= 0x1000u)
-        return OHCI_CONTIG_BASE + addr;
     if (kind == 2)
         return guest_va;
     return addr;

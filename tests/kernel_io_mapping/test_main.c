@@ -141,6 +141,8 @@ int main(int argc, char **argv)
     low_phys = low_base + 0x11234;
     low_native_probe = native(0x11234);
     contig_probe = native(0x80001000u);
+    CHECK(xbox_OhciResolvePhysical(0x80, 4) == 0x80000080u);
+    CHECK(xbox_OhciResolvePhysical(0xffc, 4) == 0x80000ffcu);
     *(volatile uint32_t *)contig_probe = 0x31415926;
     descriptor_va = xbox_OhciResolvePhysical(0x1000, 4);
     CHECK(descriptor_va == 0x80001000 &&
@@ -464,6 +466,7 @@ int main(int argc, char **argv)
     }
 #endif
     CHECK(xbox_MapPhysicalMemory(0x12000, 32, PAGE_READWRITE) == NULL);
+    CHECK(xbox_OhciResolvePhysical(0x80, 4) == 0x80);
     CHECK(xbox_MmGetPhysicalAddress(contig_probe) == 0);
     CHECK(xbox_MmGetPhysicalAddress(low_native_probe) == 0);
     xbox_MemoryLayoutShutdown();
