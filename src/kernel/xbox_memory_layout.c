@@ -686,9 +686,9 @@ static int g_apu_mmio_trapped = 0;
 
 /*
  * GPU completion fences the title waits on in guest memory rather than in the
- * aperture. See xbox_Nv2aMirrorFence in the header for why this is the same
- * acknowledgement the NV2A_ACK table makes, and why the address has to be
- * followed through the device struct instead of being a constant.
+ * aperture. The port supplies its device pointer/field layout and semaphore
+ * selector; the executor supplies the actual release target/value. Publication
+ * waits for consumption and prior GPU readbacks.
  */
 #define XBOX_MAX_FENCE_MIRRORS 4
 
@@ -782,101 +782,14 @@ static void fence_skip_note(int mirror, int site, const char *what, uint32_t va)
             mirror, what, va);
 }
 
-/*
- * Two counters inside the device, one of which the GPU owns.
- *
- * D3D's swap throttle is a pair: the title bumps "frames submitted" itself and
- * waits for "frames completed", which on hardware only the GPU moves. The Xbox
- * dashboard's is exactly that, at guest 0x000AF121 --
- *
- *     eax = [esi+0x2518]        ; completed
- *     ecx = [esi+0x2B60]        ; submitted
- *     ecx = ecx - eax
- *     if (ecx < 2) proceed      ; else spin on a 400-iteration delay loop
- *
- * -- and with nothing moving completed it spins there forever once two frames
- * are outstanding. That delay loop was 99.8 million of the dashboard's calls,
- * against 35 thousand for the next function down.
- *
- * This differs from xbox_Nv2aFrameCounter, which advances a counter on a 60 Hz
- * clock, in the way that matters for this pair: a free-running counter can
- * pass submitted, and then submitted - completed underflows to about four
- * billion, which is >= 2, and the spin never ends again. Mirroring cannot do
- * that, because completed is only ever whatever submitted already is.
- *
- * It is also simply true here. The pushbuffer is executed at submit, so by the
- * time the title asks whether the frame is finished, it is.
- */
-#define XBOX_MAX_COUNTER_MIRRORS 4
-
-static struct {
-    uint32_t device_ptr_va;
-    uint32_t src_off, dst_off;
-} g_counter_mirrors[XBOX_MAX_COUNTER_MIRRORS];
-static int g_counter_mirror_count = 0;
-
-int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
-                           uint32_t src_off, uint32_t dst_off)
-{
-    if (g_counter_mirror_count >= XBOX_MAX_COUNTER_MIRRORS)
-        return -1;
-    g_counter_mirrors[g_counter_mirror_count].device_ptr_va = device_ptr_va;
-    g_counter_mirrors[g_counter_mirror_count].src_off = src_off;
-    g_counter_mirrors[g_counter_mirror_count].dst_off = dst_off;
-    g_counter_mirror_count++;
-    fprintf(stderr, "  NV2A counter mirror: device at 0x%08X,"
-            " +0x%X -> +0x%X\n", device_ptr_va, src_off, dst_off);
-    return 0;
-}
-
-static void counter_mirrors_tick(void)
-{
-    for (int i = 0; i < g_counter_mirror_count; i++) {
-        uint32_t dev;
-
-        if (!fence_readable(g_counter_mirrors[i].device_ptr_va, 4))
-            continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_counter_mirrors[i].device_ptr_va
-                                     + g_memory_offset);
-        if (!fence_readable(dev + g_counter_mirrors[i].src_off, 4)
-                || !fence_readable(dev + g_counter_mirrors[i].dst_off, 4))
-            continue;
-        {
-            volatile uint32_t *dst =
-                (volatile uint32_t *)((uintptr_t)(dev + g_counter_mirrors[i].dst_off)
-                                      + g_memory_offset);
-            uint32_t src =
-                *(volatile uint32_t *)((uintptr_t)(dev + g_counter_mirrors[i].src_off)
-                                       + g_memory_offset);
-            if (*dst != src)
-                *dst = src;
-        }
-    }
-}
-
-/*
- * Frame counters the title polls to pace itself.
- *
- * D3D keeps a swap count inside the device and bumps it once per presented
- * frame; a title that wants to wait a frame reads it and spins until it moves.
- * Wreckless does exactly that at guest 0x000DC5E0 -- "loop while the counter
- * has advanced by less than 2" -- so a counter that never moves is not a
- * dropped frame, it is a hang with a full asset load behind it.
- *
- * Nothing here presents, so nothing would ever move it. Advancing it on a
- * clock is what makes the wait terminate, and 60 Hz is the rate the title
- * expects the display to run at. Followed through the device pointer for the
- * same reason the fence is: the device is allocated at runtime.
- */
+/* Caller-registered guest counters advance only on executed, non-replay flips. */
 #define XBOX_MAX_FRAME_COUNTERS 4
-#define XBOX_FRAME_PERIOD_MS    16      /* ~60 Hz */
 
 static struct {
     uint32_t device_ptr_va;
     uint32_t counter_off;
 } g_frame_counters[XBOX_MAX_FRAME_COUNTERS];
 static int   g_frame_counter_count = 0;
-static DWORD g_frame_counter_last_ms = 0;
 
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
 {
@@ -885,31 +798,15 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
     g_frame_counters[g_frame_counter_count].device_ptr_va = device_ptr_va;
     g_frame_counters[g_frame_counter_count].counter_off   = counter_off;
     g_frame_counter_count++;
-    fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X @ %d Hz\n",
-            device_ptr_va, counter_off, 1000 / XBOX_FRAME_PERIOD_MS);
+    fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X on executed flip\n",
+            device_ptr_va, counter_off);
     return 0;
 }
-
-/* A real swap happened: advance every registered counter, and remember when.
- *
- * The timer below exists for a title nothing presents for. Once the
- * pushbuffer executor is actually running flips, the timer is the wrong
- * clock and an actively harmful one: Half-Life 2's loader paces its intro on
- * this count, so a 62 Hz timer against an executor managing a fraction of a
- * frame per second ran the video forward in virtual time far faster than it
- * could be drawn. Only every few hundredth frame was ever presented, each one
- * sampled part way through its own decode -- which looks exactly like a
- * stalling, blocky video rather than a clock running away.
- */
-static DWORD g_frame_counter_flip_ms;
 
 void xbox_Nv2aFrameCounterFlip(void)
 {
     int i;
 
-    g_frame_counter_flip_ms = GetTickCount();
-    if (!g_frame_counter_flip_ms)
-        g_frame_counter_flip_ms = 1;          /* 0 means "never" */
     for (i = 0; i < g_frame_counter_count; i++) {
         uint32_t dev;
 
@@ -922,93 +819,6 @@ void xbox_Nv2aFrameCounterFlip(void)
         *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
                                + g_memory_offset) += 1;
     }
-}
-
-static void frame_counters_tick(void)
-{
-    DWORD now;
-    int i;
-
-    if (!g_frame_counter_count)
-        return;
-    now = GetTickCount();
-    if (g_frame_counter_last_ms
-            && (now - g_frame_counter_last_ms) < XBOX_FRAME_PERIOD_MS)
-        return;
-    /* Something is presenting: let it drive the count instead. Two seconds,
-     * because the executor's flips are not evenly spaced and a title that
-     * genuinely stops presenting still has to be got moving again. */
-    if (g_frame_counter_flip_ms && (now - g_frame_counter_flip_ms) < 2000) {
-        g_frame_counter_last_ms = now;
-        return;
-    }
-    g_frame_counter_last_ms = now;
-
-    for (i = 0; i < g_frame_counter_count; i++) {
-        uint32_t dev;
-
-        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
-            continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
-                                     + g_memory_offset);
-        if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
-            continue;
-        *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
-                               + g_memory_offset) += 1;
-    }
-}
-
-/* What the fence may claim: the fences submitted when a push-buffer segment
- * starts executing, published once it has executed (and its flip has been
- * read back), with DMA_GET. Claiming them at the top of the tick, before the
- * segment ran, let a title that runs ahead of the executor recycle buffers
- * its queued draws still read. Fences the title has inserted but not yet
- * kicked off still count as done, as they always have here. */
-static uint32_t s_fence_snap[XBOX_MAX_FENCE_MIRRORS];
-static int s_fence_snap_ok[XBOX_MAX_FENCE_MIRRORS];
-
-static void fence_mirrors_tick(int publish)
-{
-    int changed = 0;
-    for (int i = 0; i < g_fence_mirror_count; i++) {
-        uint32_t dev, get_ptr;
-
-        if (g_fence_mirrors[i].command_mode) continue;
-
-        if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
-            continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
-                                     + g_memory_offset);
-        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4)
-                || !fence_readable(dev + g_fence_mirrors[i].put_off, 4)) {
-            /* dev is 0 until the title creates the device; that is not a stall. */
-            if (dev)
-                fence_skip_note(i, FENCE_SKIP_TICK_CHAIN, "GET/PUT slot",
-                                dev + g_fence_mirrors[i].get_ptr_off);
-            continue;
-        }
-        get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
-                                         + g_memory_offset);
-        if (!fence_readable(get_ptr, 4)) {
-            fence_skip_note(i, FENCE_SKIP_TICK_CHAIN, "fence", get_ptr);
-            continue;
-        }
-        {
-            volatile uint32_t *fence =
-                (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
-            uint32_t put =
-                *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
-                                       + g_memory_offset);
-            if (!publish) {
-                s_fence_snap[i] = put;
-                s_fence_snap_ok[i] = 1;
-            } else if (s_fence_snap_ok[i] && *fence != s_fence_snap[i]) {
-                *fence = s_fence_snap[i];
-                changed = 1;
-            }
-        }
-    }
-    if (changed) xbox_nv2a_wake_publish(&g_nv2a_wake);
 }
 
 /* The title increments its next-fence counter before publishing DMA_PUT.
@@ -1329,7 +1139,7 @@ void xbox_Nv2aCaptureSnapshot(XBOX_NV2A_CAPTURE_STATE *out)
     out->notify_param = g_notify_param;
     out->notify_device_ptr = g_notify_device_ptr;
     out->notify_event_offset = g_notify_event_off;
-    out->counter_mirrors = (uint32_t)g_counter_mirror_count;
+    /* counter_mirrors remains zero in the version-1 capture layout. */
     out->frame_counters = (uint32_t)g_frame_counter_count;
     out->mirror_count = (uint32_t)g_fence_mirror_count;
     for (int i = 0; i < g_fence_mirror_count; i++) {
@@ -1382,7 +1192,6 @@ static void nv2a_publish_consumed(volatile uint32_t *regs, uint32_t get,
             get != *(volatile uint32_t *)((char *)regs + NV2A_PFIFO_DMA_PUT);
     }
     ReleaseSRWLockExclusive(&g_nv2a_dma_lock);
-    fence_mirrors_tick(1);
     if (!s_scan_incomplete) command_fences_publish();
     /* A later PUT need not be consumed for this actual NOP to complete, but
      * this checkpoint's GET must be visible before the notify waiter returns. */
@@ -1464,13 +1273,6 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          *
          * The advance now happens after the scan, further down, which is
          * also the only ordering that gives the title real back-pressure. */
-        if (!s_get_held && !s_scan_incomplete) {
-            fence_mirrors_tick(0);
-            /* nothing left to execute: as before, all of it is done */
-            if (*(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET) ==
-                *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT))
-                fence_mirrors_tick(1);
-        }
         trace_begin = nv2a_ack_hitch_checkpoint(trace_frequency.QuadPart,
                                                trace_begin, "ack_status", 8);
         /* What was executed behind a flip becomes visible -- DMA_GET and any
@@ -1480,8 +1282,6 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                                trace_begin, "ack_readback_publish", 8);
 
         poke_tick();
-        counter_mirrors_tick();
-        frame_counters_tick();
         framebuffer_probe_tick();
         trace_begin = nv2a_ack_hitch_checkpoint(trace_frequency.QuadPart,
                                                trace_begin, "ack_tick_helpers", 8);
