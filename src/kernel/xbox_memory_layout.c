@@ -1495,19 +1495,9 @@ static void *g_kernel_memory = NULL;
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
 
-/* Bounds of the title's executable sections, from its own XBE section table.
- *
- * RECOMP_ICALL uses these to decide whether an indirect-call target is code
- * before dispatching it. This used to be a hardcoded "0x00400000..0xFE000000 is
- * not code" test, which is true for Burnout 3 -- its .text ends at 0x002CC200,
- * so everything above 0x400000 really is data -- and false for any title with
- * more code than that. Half-Life 2's .text runs to 0x005F4A6C, so the constant
- * silently discarded every indirect call into the top two thirds of the game,
- * including the one that enters its main. No log, no crash: eax = 0 and carry
- * on, which looks exactly like a function that returned early.
- *
- * Zero until the layout is initialised, which the macro treats as "allow" so
- * nothing breaks before the title is loaded. */
+/* Image and executable section bounds come from the loaded XBE. Indirect
+ * dispatch uses these bounds rather than an assumed code-size ceiling.
+ * Zero bounds allow dispatch before image initialization. */
 uint32_t g_xbox_image_lo = 0;
 uint32_t g_xbox_image_hi = 0;
 uint32_t g_xbox_code_lo = 0;
@@ -2823,23 +2813,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     fprintf(stderr, "  Stack: %u KB at Xbox VA 0x%08X (ESP = 0x%08X)\n",
             XBOX_STACK_SIZE / 1024, XBOX_STACK_BASE, g_esp);
 
-    /*
-     * Populate the fake Thread Information Block (TIB) at Xbox VA 0x0.
-     *
-     * The original Xbox code uses fs:[offset] to read per-thread data,
-     * but the recompiler drops the fs: segment prefix and generates
-     * MEM32(offset) instead. Since we mapped low memory (0x0-0xFFFF),
-     * we populate the TIB fields that game code accesses:
-     *
-     *   fs:[0x00] = SEH exception list (-1 = end of chain)
-     *   fs:[0x04] = stack base (top of stack)
-     *   fs:[0x08] = stack limit (bottom of stack)
-     *   fs:[0x18] = self pointer (TIB address)
-     *   fs:[0x20] = KPCR Prcb pointer (→ fake structure)
-     *   fs:[0x28] = TLS / RW engine context pointer
-     *
-     * We use free space in the BSS area for the fake structures.
-     */
+    /* Initialize guest KPCR/TIB storage at XBOX_FS_BASE. Thread-local guest
+     * segment state selects this region; image TLS is handled below. Shared
+     * stand-ins remain separate from application-owned context pointers. */
     {
         #define XBOX_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
         #define MEM32_INIT(va, val) (*(uint32_t *)XBOX_VA(va) = (uint32_t)(val))
@@ -2870,19 +2846,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #undef FAKE_PRCB_VA
 
         /*
-         * fs:[0x28] - Thread local storage / RW engine context.
-         * The RW engine reads [fs:[0x28] + 0x28] to get a pointer
-         * to its data area. We allocate a fake structure at 0x00760000
-         * (in the BSS area) and a data buffer at 0x00700000.
-         */
-        #define FAKE_TLS_VA     0x00760000  /* Fake TLS structure (in BSS) */
-        #define FAKE_RWDATA_VA  0x00700000  /* RW engine data area (in BSS) */
-
-        MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
-        /* TLS[0x28] = pointer to RW data area */
-        MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
-
-        /*
          * XBE TLS directory.
          *
          * An image with __declspec(thread) data carries one, and on hardware
@@ -2892,10 +2855,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * Xbox reaches thread-local data through NtTib.StackBase -- fs:[4] --
          * not Win32's fs:[0x2C], and the block sits BELOW that pointer: the
          * image's entry point computes its own index, negative, as
-         * -(blocksize/4). Wreckless does this at guest 0x000EB57E and arrives
-         * at -5 for its 20-byte block, so [fs:[4] + index*4] is the block's
-         * first dword. The rounding below mirrors that arithmetic exactly,
-         * because fs:[4] has to land where the title's own index says it is.
+         * -(blocksize/4). The loader's block placement and rounding must
+         * match that guest index calculation.
          *
          * The index itself is deliberately NOT written here: the title
          * computes and stores it. What the loader owes it is a block in the
@@ -2945,11 +2906,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         #undef FAKE_TLS_BLOCK_VA
         #undef FAKE_TLS_THREAD_VA
 
-        fprintf(stderr, "  TIB: fake TIB at VA 0x%X, TLS at 0x%08X, RW data at 0x%08X\n",
-                XBOX_FS_BASE, FAKE_TLS_VA, FAKE_RWDATA_VA);
+        fprintf(stderr, "  TIB: initialized at VA 0x%X\n", XBOX_FS_BASE);
 
-        #undef FAKE_TLS_VA
-        #undef FAKE_RWDATA_VA
         #undef MEM32_INIT
         #undef XBOX_VA
     }
