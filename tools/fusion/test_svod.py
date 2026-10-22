@@ -8,7 +8,7 @@ So each is pinned here against arithmetic or synthetic input:
   - the directory-entry parser, against a handcrafted table and against the
     malformations it has to reject for base derivation to work at all;
   - base derivation, against a synthetic image carrying decoy tables of the
-    kind Conker's packed directory sectors actually produce.
+    kind adjacent packed directory sectors can produce.
 
 No BC package is needed or referenced; the repository ships none.
 """
@@ -83,16 +83,15 @@ def _table(rows):
 
 
 def test_parses_a_handcrafted_table():
-    tab = _table([("default.xbe", 462518, 3219456, 0x21),
-                  ("media", 2027275, 104, 0x10),
-                  ("coverart.jpg", 428987, 91590, 0x20)])
+    tab = _table([("default.xbe", 50, 4096, 0x21),
+                  ("media", 70, 128, 0x10),
+                  ("coverart.jpg", 100, 512, 0x20)])
     by_name = {e.name: e for e in parse_directory_table(tab)}
     assert set(by_name) == {"default.xbe", "media", "coverart.jpg"}
-    assert by_name["default.xbe"].sector == 462518
-    assert by_name["default.xbe"].size == 3219456
+    assert by_name["default.xbe"].sector == 50
+    assert by_name["default.xbe"].size == 4096
     assert by_name["media"].is_dir
-    # attr is not a file/dir discriminator beyond bit 4: the shipped titles use
-    # 0x21, 0x20 and 0x80 for plain files. Only 0x10 means directory.
+    # Only the directory bit controls membership; other file attributes vary.
     assert not by_name["default.xbe"].is_dir and not by_name["coverart.jpg"].is_dir
 
 
@@ -229,9 +228,9 @@ def test_gate_fails_when_the_thunk_run_is_not_at_the_declared_va():
 
 
 def test_gate_fails_a_wild_tls_zero_fill():
-    # the observed corrupt value was ~1.9 billion
+    # A synthetic oversized value must fail the plausibility check.
     g = xbe_gate(_xbe([0x80000000 | n for n in range(1, 40)] + [0],
-                      tls_zerofill=1_986_098_990))
+                      tls_zerofill=0x7FFFFFFF))
     assert g["thunks"][0] and not g["tls"][0]
 
 

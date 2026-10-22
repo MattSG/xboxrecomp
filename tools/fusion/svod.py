@@ -1,63 +1,20 @@
-"""Read the SVOD container in a Microsoft Xbox BC package and extract from it.
+"""Read a caller-supplied Xbox BC SVOD package and extract its XDVDFS files.
 
-tools/fusion/coverage_oracle.py grades our function-boundary detection against
-Microsoft's `PrecompiledSymbolTable`, which names *guest* functions. To use it
-you need the guest binary those names point at -- the donor title's original
-Xbox `default.xbe`. That XBE is not in the recompiled DLL; it is inside the
-package's SVOD container, which is why the oracle has sat in the tree with no
-way to feed it a second argument. This reads the container.
+The logical stream omits interleaved SHA-1 hash blocks. Each full Data file
+contains one L1 block and 203 groups of one L0 block plus 204 data blocks.
+Hash checks sample the block stride; they do not authenticate the whole tree.
 
-The container is not encrypted. It is a plain XDVDFS filesystem with SHA-1
-hash blocks interleaved into it at a fixed stride, so a flat `dd` of the Data
-files yields a file that *still parses* -- correct title, build date, base
-address, section names, even the right XDK library version -- and is wrong
-every 0x1000 bytes. See `xbe_gate()` for the checks that actually catch that.
+XDVDFS directory sectors refer to the original disc. Resolve their base from
+package-header hints by checking that the root table parses and default.xbe
+resolves to an XBE header under that same base. A parseable root alone is not
+sufficient. Callers may supply an explicit sector base through SvodImage.
 
-White-room: the guest XBE is the user's own property, read out of a package
-they own. Nothing here ships Microsoft data; this is a reader, and the
-repository carries no container, no XBE and no test fixture derived from one.
+    python -m tools.fusion.svod ls      <package_dir> [inner_path]
+    python -m tools.fusion.svod extract <package_dir> <inner_path> <out>
+    python -m tools.fusion.svod verify  <package_dir>
 
-    py -3 -m tools.fusion.svod ls      <package_dir> [inner_path]
-    py -3 -m tools.fusion.svod extract <package_dir> <inner_path> <out>
-    py -3 -m tools.fusion.svod verify  <package_dir>
-
-Layout, measured on all four shipped BC titles (Fuzion Frenzy, Blinx, Crimson
-Skies, Conker L&R) on 2026-09-19. A package is:
-
-    Content/Game/DefaultPackage             0xB000 PIRS header
-    Content/Game/DefaultPackage.data/Data0000..N
-
-Every full Data file is 0xA290000 bytes = 41,616 blocks of 0x1000:
-
-    block 0                             L1 hash block
-    then 203 x [1 L0 hash block + 204 data blocks]
-
-    1 + 203 * (1 + 204) == 41,616                      exactly, no slack
-    203 * 204           == 41,412 logical blocks per full file
-
-The hash blocks are checkable and that is the cheap proof the stride is right:
-for a hash block at physical H, `sha1(data[H+0x1000:H+0x2000])` equals
-`data[H:H+20]` -- each hash block's first entry covers the block after it.
-`verify_hashes()` does this; it is the first thing to run against a new title.
-
-Inside, `MICROSOFT*XBOX*MEDIA` sits at logical offset 0 (physical 0x2000 of
-Data0000). The XDVDFS volume descriptor gives the root directory's sector at
-+0x14 and its size at +0x18.
-
-The sector base is per title, and this is the part that bites:
-
-    Fuzion Frenzy    base      32    root dir sector        34
-    Crimson Skies    base      32    root dir sector        34
-    Blinx            base 880,036    root dir sector 1,693,790
-    Conker L&R       base 956,202    root dir sector 1,711,833
-
-    logical_byte = (sector - base) * 2048
-
-Sector numbers in the filesystem are original-disc sectors; the SVOD stream is
-a slice of that disc and `base` is where the slice starts. For the two titles
-whose slice is the whole game partition it is the XDVDFS constant 32. For the
-other two it is not, and assuming 32 silently reads the wrong data rather than
-failing. `derive_base()` solves for it instead -- see there for the gate.
+The module ships no package or guest executable. Its XBE output checks are
+heuristic diagnostics, not a complete XBE validator or gameplay acceptance.
 """
 import hashlib
 import os
@@ -115,9 +72,8 @@ class DirEntry:
 
     `left`/`right` are offsets to the subtree nodes *in 4-byte units* from the
     start of the table; 0 means no child. `attr` is DOS-ish, and only the
-    directory bit is worth reading: the four titles use 0x21, 0x20 and 0x80
-    for plain files with no pattern, so anything that keys off "is it 0x20"
-    will drop files on some titles and not others. 0x10 is reliable.
+    directory bit determines directory membership. Other attribute bits do not
+    require a plain file to have one exact attribute value.
     """
     __slots__ = ("name", "sector", "size", "attr")
 
@@ -168,20 +124,12 @@ def parse_directory_table(table):
 
 # ---- base derivation ------------------------------------------------------
 def derive_base(read, root_sector, root_size, candidates):
-    """Find the sector base: the disc sector the logical stream starts at.
+    """Find a sector base using the root directory and default.xbe header.
 
-    `read(offset, length)` reads the logical stream. Each candidate base is
-    tested by actually using it, because a wrong base does not fail loudly:
-
-      1. the root directory table at (root_sector - base) * 2048 must parse;
-      2. it must contain `default.xbe` -- every Xbox game partition has one;
-      3. that entry's own sector, resolved with the same base, must start
-         `XBEH`.
-
-    Step 1 alone is not enough. Conker's directory tables are packed into
-    consecutive sectors, so bases of 956,201 through 956,207 all parse into
-    plausible-looking entry lists; only 956,202 has a root that also resolves
-    default.xbe to an XBE header. Steps 2 and 3 are what make it unambiguous.
+    read(offset, length) supplies logical bytes. Candidate roots must parse,
+    contain default.xbe, and resolve that entry to XBEH under the same base.
+    Adjacent directory sectors can contain plausible decoys, so neither a
+    parseable table nor a matching filename alone establishes the base.
     """
     for base in candidates:
         if base > root_sector:
@@ -201,20 +149,11 @@ def derive_base(read, root_sector, root_size, candidates):
 
 
 def header_base_hints(package_header_path):
-    """Candidate bases read out of the 0xB000 PIRS header, nearest first.
+    """Return nearby candidate sector bases from a PIRS volume descriptor.
 
-    The XContent SVOD volume descriptor at +0x379 carries a data-block offset
-    at +0x1C. On all four titles `2 * <that value as little-endian u24>` lands
-    on the true base or two sectors past it:
-
-        Fuzion / Crimson   feature 0x00   value      16   base      32
-        Blinx              feature 0x40   value 440,019   base 880,036
-        Conker             feature 0x40   value 478,102   base 956,202
-
-    Four samples is not enough to claim the off-by-one on the enhanced-layout
-    titles is anything but a unit convention we have not pinned down, so these
-    are hints that shorten the search, never an answer. `derive_base()` still
-    proves whichever one it takes.
+    The little-endian u24 data-block offset at descriptor +0x1C is scaled to
+    sectors. Nearby values are hints, not established bases: derive_base must
+    check the actual directory and XBE data before selecting one.
     """
     try:
         with open(package_header_path, "rb") as f:
@@ -232,7 +171,7 @@ def header_base_hints(package_header_path):
 class SvodImage:
     """The de-interleaved logical stream of a BC package, as a filesystem.
 
-        img = SvodImage("/path/to/BC/Fuzion Frenzy")
+        img = SvodImage("/path/to/package")
         img.verify_hashes()                      # prove the stride
         for path, e in img.walk():
             print(path, e.size)
@@ -421,24 +360,12 @@ def _xbe_va_to_off(data, va):
 
 
 def xbe_gate(data):
-    """Sanity checks that catch a *structurally plausible* bad extraction.
+    """Return heuristic checks for a structurally plausible bad extraction.
 
-    A flat contiguous copy of the Data files -- hash blocks and all -- still
-    reports the right title, build date, base address, section names and XDK
-    library version, because all of that lives in the first 0x1000 bytes and
-    the first data block is genuine. Three extractions passed a header check
-    on 2026-09-19 and were wrong. These are the tells that fired:
-
-      thunks   the kernel import table is a run of 0x8000xxxx ordinals ending
-               in 0, and it must actually be at the VA the header declares
-               (+0x158, XOR'd with the retail or debug key). Corruption
-               displaces it and the run is not there.
-      tls      the TLS directory's zero-fill size is a few bytes; a corrupt
-               read gives ~1.9 billion, or reads 0x20202020 out of a text
-               block that has landed where the directory should be.
-
-    Returns {check: (bool, detail)}. `thunks` is the strong one -- it is the
-    check that failed on every bad extraction and passed on every good one.
+    Check XBE magic/header fields, a kernel-thunk ordinal run at its declared
+    VA, and TLS extent/zero-fill plausibility. These confidence thresholds are
+    diagnostics rather than universal validity rules for all legal XBEs.
+    Returns {check: (bool, detail)}; passing is not complete extraction proof.
     """
     out = {}
     out["magic"] = (data[:4] == b"XBEH", repr(data[:4]))
