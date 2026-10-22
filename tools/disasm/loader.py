@@ -197,7 +197,7 @@ def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImag
 
     Args:
         xbe_path: Path to the .xbe file.
-        analysis_json: Optional path to burnout3_analysis.json.
+        analysis_json: Optional XBE parser analysis JSON for this image.
                        If None, auto-detected from standard locations.
 
     Returns:

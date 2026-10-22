@@ -269,9 +269,12 @@ The generated code is intentionally verbose and mechanical — it's not meant to
 
 ## Regeneration
 
-If you regenerate the recompiled code (after fixing the recompiler or re-running with new options), you'll need to **re-apply manual patches** to the gen files. Keep a list of your patches — this is the most error-prone part of the workflow.
+Fix reusable translation errors in the lifter and regenerate the C output.
+Keep port-specific overrides and hook configuration in the port's source tree,
+separate from generated files. See [runtime integration and manual overrides](../docs/pipeline/05-runtime.md)
+for the replacement boundary.
 
-Recommended workflow:
-1. Keep manual overrides in a separate file (`recomp_manual.c`)
-2. Use `#if 0` / `#endif` to disable gen functions that have manual replacements
-3. Track gen patches in a document (see CLAUDE.md in the burnout3 repo for an example)
+Record each override's purpose and guest ABI assumptions. After regeneration,
+rebuild and rerun its focused checks to verify that the intended replacement
+is still linked and reached. A source patch or successful code generation alone
+does not establish runtime behavior.
