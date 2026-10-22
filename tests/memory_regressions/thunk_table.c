@@ -37,7 +37,7 @@ int main(int argc, char **argv)
     if (!strcmp(mode,"none") || !strcmp(mode,"encoded-none")) expected=0;
     if (!strcmp(mode,"partial")) table_va=0x08000000;
     if (!strcmp(mode,"bad-ordinal")) put(xbe,0x2040,0x80000000u);
-    if (!strcmp(mode,"remapped")) put(xbe,0x2040,0x800001ff);
+    if (!strcmp(mode,"remapped") || !strcmp(mode,"remapped-data")) put(xbe,0x2040,0x800001ff);
     if (!strcmp(mode,"bad-marker")) put(xbe,0x2040,103);
     if (!strcmp(mode,"unterminated") || !strcmp(mode,"maximum")) {
         for (unsigned i=0;i<XBOX_KERNEL_THUNK_TABLE_SIZE+1;i++) put(xbe,0x2040+i*4,0x80000067);
@@ -69,20 +69,41 @@ int main(int argc, char **argv)
         CHECK(*word(table_va-4) == 0x80000067);
         xbox_kernel_shutdown();
     }
-    if (!strcmp(mode,"remapped")) {
+    if (!strcmp(mode,"remapped") || !strcmp(mode,"remapped-data")) {
+        int data = !strcmp(mode,"remapped-data");
         unsigned short map[512] = {0};
         extern void (*recomp_lookup_kernel(uint32_t))(void);
         extern RECOMP_TLS uint32_t g_eax, g_esp;
-        map[511] = 103; /* noncanonical source ordinal -> KeGetCurrentIrql */
+        ULONG target = data ? 16 : 151; /* ExEventObjectType or KeStallExecutionProcessor */
+        map[511] = (unsigned short)target;
+        map[target] = 173; /* distinguish one translation from recursive remapping */
         xbox_kernel_set_ordinal_remap(map,512);
+        CHECK(xbox_kernel_canonical_ordinal(511) == target);
+        CHECK(xbox_kernel_canonical_ordinal(510) == 510 &&
+              xbox_kernel_canonical_ordinal(512) == 512 &&
+              xbox_kernel_canonical_ordinal(UINT32_MAX) == UINT32_MAX);
+        xbox_kernel_init();
+        CHECK(xbox_resolve_ordinal(target) && xbox_kernel_thunk_table[0] == xbox_resolve_ordinal(target));
+        CHECK(xbox_kernel_thunk_table[1] == xbox_resolve_ordinal(data ? 151 : 173));
         xbox_kernel_bridge_init();
-        void (*call)(void) = recomp_lookup_kernel(*word(table_va));
-        uint32_t sp = XBOX_STACK_TOP;
-        *word(sp) = 0;
-        g_esp=sp; g_eax=0xdeadbeef;
-        CHECK(call != NULL);
-        if (call) { call(); CHECK(g_eax == 0 && g_esp == sp+4); }
+        if (data) {
+            CHECK(*word(table_va) == XBOX_KERNEL_DATA_BASE + KDATA_EVENT_OBJ_TYPE);
+        } else {
+            void (*call)(void) = recomp_lookup_kernel(*word(table_va));
+            uint32_t sp = XBOX_STACK_TOP;
+            *word(sp) = 0; *word(sp+4) = 0; /* zero-microsecond stall */
+            g_esp=sp; g_eax=0xdeadbeef;
+            CHECK(call != NULL);
+            if (call) { call(); CHECK(g_eax == 0 && g_esp == sp+8); }
+        }
+        xbox_kernel_set_ordinal_remap(map,-1);
+        CHECK(xbox_kernel_canonical_ordinal(511) == 511);
+        xbox_kernel_set_ordinal_remap(map,0);
+        CHECK(xbox_kernel_canonical_ordinal(511) == 511);
+        xbox_kernel_set_ordinal_remap(NULL,512);
+        CHECK(xbox_kernel_canonical_ordinal(511) == 511);
         xbox_kernel_set_ordinal_remap(NULL,0);
+        xbox_kernel_shutdown();
     }
     xbox_MemoryLayoutShutdown();
     xbox_kernel_get_thunk_address(&actual_base,&actual_count);

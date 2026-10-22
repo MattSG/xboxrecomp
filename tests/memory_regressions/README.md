@@ -111,3 +111,9 @@ zero ordinals, unbacked pointers, missing terminators and the supported slot
 limit. Explicit NULL-separated spans and a noncanonical source ordinal exercise
 port selection/remapping without guessing neighboring imports. Reinitialization
 and explicit clearing must discard old import metadata.
+
+Remapped function/data cases compare native export pointers to canonical
+resolution and verify bridge function cleanup or guest data-export addresses.
+A second mapping at the target ID catches accidental double translation;
+zero/missing/out-of-range entries and disabled/negative-count maps keep identity.
+These cases cover implemented exports, not all native/bridge export coverage.

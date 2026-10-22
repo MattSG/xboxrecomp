@@ -103,6 +103,24 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...)
  * arm logs it, rather than pointing at a neighbouring function.
  * ============================================================================ */
 
+/* Source-to-canonical policy is supplied by the port before initialization.
+ * Resolution itself consumes canonical IDs, so translation happens once. */
+static const unsigned short *g_ordinal_remap;
+static unsigned g_ordinal_remap_count;
+
+void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count)
+{
+    g_ordinal_remap = map && count > 0 ? map : NULL;
+    g_ordinal_remap_count = g_ordinal_remap ? (unsigned)count : 0;
+}
+
+ULONG xbox_kernel_canonical_ordinal(ULONG source)
+{
+    if (g_ordinal_remap && source < g_ordinal_remap_count && g_ordinal_remap[source])
+        return g_ordinal_remap[source];
+    return source;
+}
+
 ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
 {
     switch (ordinal) {
@@ -400,7 +418,7 @@ void xbox_kernel_init(void)
         uint32_t entry = *(volatile uint32_t *)
             ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
         if (!entry) continue; /* explicit port spans may contain NULL gaps */
-        ULONG ordinal = entry & 0x7FFFFFFF;
+        ULONG ordinal = xbox_kernel_canonical_ordinal(entry & 0x7FFFFFFF);
 
         ULONG_PTR ptr = xbox_resolve_ordinal(ordinal);
 

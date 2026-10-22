@@ -1,25 +1,13 @@
 #!/usr/bin/env python3
-"""
-Generate a per-title kernel ordinal remap for xbox_kernel_set_ordinal_remap.
+"""Generate an explicit source-to-canonical ordinal map from import names.
 
-    py -3 -m tools.kernel_audit.gen_ordinal_remap <analysis.json> --out remap.h
+    python -m tools.kernel_audit.gen_ordinal_remap analysis.json --out remap.h
 
-The kernel bridge routes ordinals with one hardcoded table -- the ordinal ABI of
-the XDK it was written against. A title built with a different XDK numbers the
-same functions differently (Burnout 3's XDK 5849 has HalRequestSoftwareInterrupt
-at 49 where the older XDKs have HalReturnToFirmware). The kernel functions are
-the same; only the ordinal that names each differs.
-
-This maps a title's ordinals into the kernel's canonical space by NAME: for each
-kernel function the title imports, look up which ordinal the kernel's own table
-gives that function, and emit `map[title_ordinal] = canonical_ordinal` where they
-differ. Names the title's parser could not resolve, or that the kernel's table
-does not have, are left identity and reported -- a title that never calls them
-boots regardless, and one that does surfaces a real gap rather than a silent
-misroute.
-
-The output is a C header a title includes and hands to
-xbox_kernel_set_ordinal_remap before xbox_kernel_bridge_init.
+Input names must identify the imported functions independently when correcting
+source IDs. Matching parser labels alone do not prove a title's ABI. Entries
+with unknown/missing canonical names are reported and left identity; emitted
+mappings are application policy for the port to review, not detected XDK facts.
+Install a verified map before both xbox_kernel_init and xbox_kernel_bridge_init.
 """
 
 import argparse
@@ -44,7 +32,7 @@ def canonical_name_to_ordinal():
 
 
 def build_remap(analysis_path):
-    imports = json.load(open(analysis_path))["kernel_imports"]
+    imports = json.load(open(analysis_path, encoding="utf-8"))["kernel_imports"]
     canon = canonical_name_to_ordinal()
     remap = {}          # title_ordinal -> canonical_ordinal (only where differ)
     identity = 0
@@ -97,7 +85,7 @@ def emit_header(remap, out_path, title, analysis_path):
         "",
     ]
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    open(out_path, "w").write("\n".join(lines))
+    open(out_path, "w", encoding="utf-8").write("\n".join(lines))
 
 
 def main(argv=None):
@@ -108,22 +96,21 @@ def main(argv=None):
     ap.add_argument("--out", required=True, help="C header to write")
     args = ap.parse_args(argv)
 
-    data = json.load(open(args.analysis))
+    data = json.load(open(args.analysis, encoding="utf-8"))
     title = data.get("title", os.path.basename(args.analysis))
     remap, identity, unresolved, total = build_remap(args.analysis)
 
     emit_header(remap, args.out, title, args.analysis)
 
     print("%s -- %d kernel imports" % (title, total))
-    print("  identity (XDK matches kernel) : %d" % identity)
+    print("  identity (matching labels)   : %d" % identity)
     print("  remapped (same name, diff ord): %d" % len(remap))
     print("  unresolved (left identity)    : %d" % len(unresolved))
     for o, n in unresolved:
         print("      ordinal %d  %s" % (o, n))
     print("  wrote %s" % args.out)
     if not remap:
-        print("  (no remap needed -- this title's XDK matches the kernel;"
-              " it need not call xbox_kernel_set_ordinal_remap)")
+        print("  No non-identity mappings emitted; review unresolved imports and ABI evidence.")
     return 0
 
 

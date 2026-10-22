@@ -39,8 +39,14 @@ scanned for possible imports. Zero address/count clears selection, and invalid
 ranges/counts leave it cleared rather than inferring or clamping a count.
 The getter reports accepted selection. Standalone hosts supply their own mapped
 storage; initialized layouts check the selected span against their backing.
-The loader validates markers without requiring canonical export IDs; the bridge
-retains port-configured ordinal remapping. Shutdown retires import metadata.
+The loader validates markers without requiring canonical export IDs. A verified
+port map is installed with `xbox_kernel_set_ordinal_remap` before both native
+kernel and bridge initialization; both use `xbox_kernel_canonical_ordinal`
+exactly once. The borrowed table must stay alive and unchanged until replaced
+or cleared while execution is quiesced. NULL/nonpositive count selects identity;
+zero entries and out-of-range source IDs also remain identity. Direct
+`xbox_resolve_ordinal` calls take canonical IDs. Shutdown retires import metadata;
+the port's remapping policy remains explicitly installed until changed.
 
 ## Main stack configuration
 
