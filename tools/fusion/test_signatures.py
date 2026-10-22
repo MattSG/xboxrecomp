@@ -41,6 +41,18 @@ def test_typical_prologue_is_fully_fixed():
     assert sum(m) == 0
 
 
+def test_later_operands_use_their_instruction_offset():
+    prefix = b"\x55\x8B\xEC"  # push ebp; mov ebp,esp
+    for instruction in (b"\xE8\x11\x22\x33\x00",  # relative call
+                        b"\xA1\x00\x00\x20\x00",  # absolute load
+                        b"\xB8\x00\x00\x20\x00"):  # image-address immediate
+        pattern, mask = masked_pattern(prefix + instruction, 0x11000, LO, HI)
+        assert mask[:4] == bytes(4)
+        assert mask[4:] == b"\x01" * 4
+        assert pattern[:4] == prefix + instruction[:1]
+        assert pattern[4:] == bytes(4)
+
+
 def test_pattern_capped_at_pat_len():
     pat, mask = masked_pattern(b"\x90" * 64, 0x11000, LO, HI)
     assert len(pat) == PAT_LEN and len(mask) == PAT_LEN

@@ -1,31 +1,17 @@
-"""Lifter validation against Microsoft's recompile (idea 4).
+"""Render reference host-code listings in guest-register terms for comparison.
 
-Both Microsoft (Ficl/Fission) and this project lift the *same* guest x86-32
-function. Microsoft's lift ships and runs the games, so it is a trusted oracle:
-where our recompiled C diverges from what Microsoft's host code does, we very
-likely have a lifter bug -- in exactly the classes we keep fixing (flags, x87,
-SEH, stack).
+The analyzed Ficl/Fission register model uses host eax..ebp for the corresponding
+guest registers, r14 for guest esp and r15 for the guest RAM base. This reader
+formats accesses under that model; it does not prove a different compiler build
+uses the same conventions or validate complete instruction semantics.
 
-Rather than run Ghidra's decompiler over Microsoft's flat jmp-connected arena
-(messy, no clean function boundaries), we disassemble their host x86-64 with
-capstone and rewrite it back into *guest terms* using their documented register
-model (docs/technical/ms-fusion-recompiler.md §3):
+Compare listings only when the donor module and guest XBE represent the same
+build and function. Offset/call differences can otherwise reflect different
+input bytes. These are manual analysis aids, not an automated lifter oracle.
+The caller supplies all binaries and generated-code paths.
 
-    guest eax..ebp   = host eax..ebp        (same names)
-    guest esp        = host r14d
-    guest RAM base   = host r15
-    [greg + r15 + d] = guest memory [greg + d]
-    [r15 + d]        = guest global [d]
-
-That reads directly as guest semantics, comparable to our C. The automated
-signal is the set of guest memory field offsets each side touches and the set
-of guest addresses each calls; a mismatch is a concrete divergence to inspect.
-
-White-room: Microsoft's host bytes are read for analysis only -- nothing is
-copied into the toolkit. The output is a diff describing *our* correctness.
-
-    py -3 -m tools.fusion.lifter_diff ms   <module.dll> <name_or_0xaddr>
-    py -3 -m tools.fusion.lifter_diff diff <module.dll> <gen_dir> <name_or_0xaddr>
+    python -m tools.fusion.lifter_diff ms <module.dll> <name_or_0xaddr>
+    python -m tools.fusion.lifter_diff diff <module.dll> <gen_dir> <name_or_0xaddr>
 """
 import glob
 import os
@@ -178,13 +164,9 @@ def cmd_ms(module_path, key):
 def cmd_diff(module_path, gen_dir, key):
     """Side-by-side: MS's lift (guest terms) and ours, for the same guest addr.
 
-    NOTE: this is a *reference aid for manual reading*, not an automated oracle.
-    A clean automated diff needs both sides to lift the identical guest bytes,
-    which in turn needs Microsoft's exact source XBE. The BC package's XBE is a
-    (subtly) different build from a retail-disc XBE -- e.g. Crimson's guest
-    0x1C448A is a thunk in the disc build and an inlined body in Microsoft's --
-    so an offset mismatch here can be a build difference, not a lifter bug. Read
-    the two listings; do not trust a mechanical set-diff.
+    Compare only matching donor builds/functions. Differences in guest bytes
+    can change layouts or inlining, so inspect both listings rather than treating
+    a mechanical offset set difference as a lifter bug.
     """
     m = FusionModule(module_path)
     s = _find(m, key)
