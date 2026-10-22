@@ -44,7 +44,7 @@ One per stage, in the order you run them.
 
 - [D3D8 to D3D11 Translation](technical/d3d-translation.md) — Bridging Xbox's graphics API to modern DirectX
 - [NV2A Shader Translation](technical/nv2a-shaders.md) — Register combiners and vertex microcode to HLSL
-- [D3D8LTCG Device Context](technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions
+- [D3D8LTCG Device Context](technical/d3d8ltcg-device-context.md) — Per-image state recovery, queue contracts and hook ownership
 
 ### Reference analysis
 

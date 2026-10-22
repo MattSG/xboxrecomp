@@ -332,7 +332,7 @@ xboxrecomp/
 - [Indirect Call Dispatch](docs/technical/indirect-calls.md) — The RECOMP_ICALL problem and how to solve it
 - [D3D8 to D3D11 Translation](docs/technical/d3d-translation.md) — Bridging Xbox's graphics API to modern DirectX
 - [NV2A Shader Translation](docs/technical/nv2a-shaders.md) — Register combiners and vertex microcode to HLSL
-- [D3D8LTCG Device Context](docs/technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions
+- [D3D8LTCG Device Context](docs/technical/d3d8ltcg-device-context.md) — Per-image state recovery, queue contracts and hook ownership
 - [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping Xbox kernel ordinals to Win32
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
 - [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
