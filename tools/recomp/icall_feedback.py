@@ -4,10 +4,8 @@ Indirect-branch target feedback: merge runtime observations into a persisted
 database, and feed them back as function-detection seeds.
 
 Static analysis cannot see where a vtable call goes. Running the title can.
-This closes that loop, the same way Microsoft's own recompiler does with
-VirtualDispatchTraceFiles (recorded indirect-branch target sets) and
-UpdateEnlightenments (a persisted analysis database the compiler rewrites on
-every build). See docs/technical/ms-fusion-codegen-teardown.md.
+This closes that loop with a caller-owned observation database and filtered
+function-detection seeds. See docs/technical/indirect-calls.md.
 
 Workflow:
 
