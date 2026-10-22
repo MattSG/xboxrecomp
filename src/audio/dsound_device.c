@@ -1,15 +1,8 @@
 /**
  * Xbox DirectSound → XAudio2 Compatibility Layer
  *
- * Implements the Xbox DirectSound interfaces. Currently provides
- * stub sound buffer objects that accept all method calls silently.
- * This allows the game to initialize audio and create buffers without
- * crashing, while actual audio playback is deferred to a later phase.
- *
- * Architecture:
- * - XAudio2 mastering voice for output (future)
- * - Each DirectSound buffer maps to an XAudio2 source voice (future)
- * - 3D audio emulated using X3DAudio (future)
+ * PCM buffer operations delegate to the shared APU mixer. Several stream,
+ * listener and spatial methods remain compatibility stubs.
  */
 
 #include "dsound_xbox.h"
@@ -20,10 +13,7 @@
 #include <math.h>
 
 /* ================================================================
- * Sound buffer stub implementation
- *
- * Returns a valid buffer object for every CreateSoundBuffer call.
- * All audio methods are no-ops that return S_OK.
+ * Sound buffer compatibility implementation
  * ================================================================ */
 
 typedef struct DSoundBuffer {
@@ -381,6 +371,6 @@ HRESULT xbox_DirectSoundCreate(void *pGuid, IDirectSound8 **ppDS, void *pUnkOute
     (void)pGuid; (void)pUnkOuter;
     if (!ppDS) return E_INVALIDARG;
     *ppDS = &g_dsound;
-    fprintf(stderr, "Audio: DirectSound created (stub - no audio output)\n");
+    fprintf(stderr, "Audio: DirectSound compatibility interface created\n");
     return S_OK;
 }

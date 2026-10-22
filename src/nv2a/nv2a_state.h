@@ -8,8 +8,8 @@
  * Full PGRAPH integration comes in Phase 3-4.
  */
 
-#ifndef BURNOUT3_NV2A_STATE_H
-#define BURNOUT3_NV2A_STATE_H
+#ifndef XBOXRECOMP_NV2A_STATE_H
+#define XBOXRECOMP_NV2A_STATE_H
 
 #include "qemu_shim.h"
 #include "nv2a_regs.h"
@@ -229,4 +229,4 @@ void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size)
 /* Get the global NV2A state instance */
 NV2AState *nv2a_get_state(void);
 
-#endif /* BURNOUT3_NV2A_STATE_H */
+#endif /* XBOXRECOMP_NV2A_STATE_H */

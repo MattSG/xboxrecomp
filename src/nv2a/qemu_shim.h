@@ -7,8 +7,8 @@
  * This file is included instead of the real QEMU headers.
  */
 
-#ifndef BURNOUT3_QEMU_SHIM_H
-#define BURNOUT3_QEMU_SHIM_H
+#ifndef XBOXRECOMP_QEMU_SHIM_H
+#define XBOXRECOMP_QEMU_SHIM_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -390,4 +390,4 @@ typedef struct Error { char msg[256]; } Error;
 /* Config stubs */
 static inline bool xemu_is_xbe_loaded(void) { return true; }
 
-#endif /* BURNOUT3_QEMU_SHIM_H */
+#endif /* XBOXRECOMP_QEMU_SHIM_H */

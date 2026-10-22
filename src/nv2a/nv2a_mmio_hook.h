@@ -11,8 +11,8 @@
  * the xemu NV2A GPU emulation.
  */
 
-#ifndef BURNOUT3_NV2A_MMIO_HOOK_H
-#define BURNOUT3_NV2A_MMIO_HOOK_H
+#ifndef XBOXRECOMP_NV2A_MMIO_HOOK_H
+#define XBOXRECOMP_NV2A_MMIO_HOOK_H
 
 #include "platform/xbox_winnt.h"
 #include <stdint.h>
@@ -56,4 +56,4 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
  */
 bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va);
 
-#endif /* BURNOUT3_NV2A_MMIO_HOOK_H */
+#endif /* XBOXRECOMP_NV2A_MMIO_HOOK_H */
