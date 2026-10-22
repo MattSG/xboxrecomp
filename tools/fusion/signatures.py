@@ -1,26 +1,19 @@
-"""XDK library signature database from Fission symbol tables.
+"""Build and match candidate function names from caller-supplied guest code.
 
-Idea: every Xbox game statically links the same XDK libraries (D3D8, D3DX,
-DirectSound, XAPI, XGRAPHICS, XNet, CRT). Microsoft's Fission symbol tables name
-those functions with exact (guest_start, size). Combined with the game's own XBE
-(which we have -- it is our legitimate input), that yields a byte signature per
-named function that transfers to *any* XBE: a FLIRT-style name-recovery database
-sourced from Microsoft's own symbols.
+A supplied Fission module provides symbol names, addresses and sizes. Signature
+bytes come from the corresponding guest XBE, whose section bounds are read from
+its header. No donor binaries or generated signature databases are bundled here;
+keep title-derived databases in the port.
 
-White-room: the signature bytes come from the GUEST xbe (our input), not from
-Microsoft's recompiled output. The Fission table only supplies (name, address,
-size) -- facts about the guest binary.
+Patterns mask selected address/branch operands while retaining opcode/structure
+bytes. Matching function length and a masked prefix produces candidate names,
+not semantic equivalence; collisions and unsupported encodings remain possible.
+Use the same donor build for its module and guest XBE. Regenerate saved signature
+databases after changes to the masker.
 
-Signatures are masked with capstone so that operands that legitimately differ
-between two games (absolute addresses of globals/callees, branch targets) are
-wildcards; opcodes and structure are matched. A match requires equal function
-length plus agreement on all non-wildcard bytes of the first 32 -- strong enough
-that cross-title hits are almost entirely the identical XDK library code.
-
-Usage:
-    py -3 -m tools.fusion.signatures build <module.dll> <source.xbe> <out.json>
-    py -3 -m tools.fusion.signatures match <sigs.json> <target.xbe> <functions.json> <names.json>
-    py -3 -m tools.fusion.signatures selftest <module.dll> <source.xbe> [<funcs.json>]
+    python -m tools.fusion.signatures build <module.dll> <source.xbe> <out.json>
+    python -m tools.fusion.signatures match <sigs.json> <target.xbe> <functions.json> <names.json>
+    python -m tools.fusion.signatures selftest <module.dll> <source.xbe> [<funcs.json>]
 """
 import json
 import struct
@@ -80,22 +73,25 @@ def masked_pattern(code, va, lo, hi):
         if consumed >= len(code):
             break
         enc = insn.encoding
+        offset = insn.address - va
         # rel32 branch target, or imm32 that is an image address
         if enc.imm_size == 4 and enc.imm_offset:
             val = int.from_bytes(bytes(insn.bytes[enc.imm_offset:enc.imm_offset + 4]),
                                  "little", signed=False)
             is_branch = insn.mnemonic in ("call", "jmp") or insn.mnemonic.startswith("j")
             if is_branch or (lo <= val < hi):
-                for b in range(enc.imm_offset, min(enc.imm_offset + 4, len(mask))):
+                start = offset + enc.imm_offset
+                for b in range(start, min(start + 4, len(mask))):
                     mask[b] = 1
         # absolute [disp32] (not a small [reg+disp] struct offset)
         if enc.disp_size == 4 and enc.disp_offset:
             disp = int.from_bytes(bytes(insn.bytes[enc.disp_offset:enc.disp_offset + 4]),
                                   "little", signed=True)
             if abs(disp) >= 0x10000:
-                for b in range(enc.disp_offset, min(enc.disp_offset + 4, len(mask))):
+                start = offset + enc.disp_offset
+                for b in range(start, min(start + 4, len(mask))):
                     mask[b] = 1
-        consumed = (insn.address - va) + insn.size
+        consumed = offset + insn.size
     # zero out wildcard bytes in the pattern for a canonical form
     for i in range(len(pat)):
         if mask[i]:
@@ -113,10 +109,8 @@ def build_sigs(module_path, xbe_path):
     m = FusionModule(module_path)
     xbe = XbeCode(xbe_path)
     lo, hi = xbe.image_lo, xbe.image_hi
-    # a guest RVA in the symbol table is a VA when added to base; the map/table
-    # use RVAs relative to 0, but names sit at file VA = base + rva. The XBE
-    # loads at base 0x10000 and the symtab guest_start values already include it
-    # (e.g. 0x1c440b), so read directly.
+    # Symbol starts name guest VAs in the supplied donor. Read those addresses
+    # directly and use the donor's actual section span to mask image operands.
     sigs = []
     seen = collections.Counter()
     for s in m.symbols:
