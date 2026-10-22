@@ -16,9 +16,18 @@
 
 static uint8_t guest[0x4000]; /* guest physical memory, from address 0 */
 static unsigned sends;
+static uint8_t sent_frame[60];
+#define RAM_ID_BASE 0x04000000u
 
 ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)guest; }
 size_t xbox_GetMappedSize(void) { return sizeof(guest); }
+int xbox_PhysicalAddressResolve(uint32_t physical, uint32_t bytes, uint32_t *va)
+{
+    if (!bytes || physical < RAM_ID_BASE ||
+        (uint64_t)physical + bytes > RAM_ID_BASE + sizeof(guest)) return 0;
+    *va = physical - RAM_ID_BASE;
+    return 1;
+}
 int xbox_ContiguousRangeAllocated(uint32_t offset, uint32_t size)
 {
     (void)offset; (void)size;
@@ -26,7 +35,8 @@ int xbox_ContiguousRangeAllocated(uint32_t offset, uint32_t size)
 }
 void net_backend_send(const uint8_t *frame, uint32_t len)
 {
-    (void)frame; (void)len;
+    CHECK(len == sizeof(sent_frame));
+    memcpy(sent_frame, frame, len);
     sends++;
 }
 
@@ -127,7 +137,25 @@ int main(void)
     CHECK(get(R_TX_NEXT_DESC) == 0x0800);
     CHECK(desc_flags(0x1100) == (NV_TX_VALID | NV_TX_LASTPACKET));
 
-    printf("NIC rings: bad next pointers refused (rx and tx); legitimate wrap kept\n");
+    /* Runtime physical IDs must resolve for descriptors and payloads, on
+     * both DMA directions. Raw-VA cases above keep their old behavior. */
+    put(R_RX_RING, RAM_ID_BASE + 0x1000);
+    put(R_RX_NEXT_DESC, RAM_ID_BASE + 0x1000);
+    desc_put(0x1000, RAM_ID_BASE + 0x2000, 1500, NV_RX_AVAIL);
+    memset(guest + 0x2000, 0, sizeof(frame));
+    CHECK(receive(frame, sizeof(frame)) == 1);
+    CHECK(!memcmp(guest + 0x2000, frame, sizeof(frame)));
+    CHECK(desc_flags(0x1000) == (NV_RX_BIT4 | NV_RX_DESCRIPTORVALID));
+    CHECK(get(R_RX_NEXT_DESC) == RAM_ID_BASE + 0x1008);
+    put(R_TX_RING, RAM_ID_BASE + 0x1100);
+    put(R_TX_NEXT_DESC, RAM_ID_BASE + 0x1100);
+    desc_put(0x1100, RAM_ID_BASE + 0x2200, 59, NV_TX_VALID | NV_TX_LASTPACKET);
+    transmit();
+    CHECK(sends == 2);
+    CHECK(!memcmp(sent_frame, guest + 0x2200, sizeof(sent_frame)));
+    CHECK(!(desc_flags(0x1100) & NV_TX_VALID));
+    CHECK(bus_ptr(RAM_ID_BASE + sizeof(guest) - 4, 8) == NULL);
+    printf("NIC rings: pointer bounds, wrap and runtime physical DMA IDs passed\n");
     return 0;
 }
 

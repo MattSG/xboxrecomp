@@ -120,20 +120,20 @@ static struct {
     unsigned tx_frames, rx_frames, rx_dropped, decode_fail, irqs;
 } s;
 
-/* ---- guest memory: the bus resolver the OHCI model uses ---------------- */
+/* ---- guest DMA memory ------------------------------------------------- */
 
 #define CONTIG_BASE 0x80000000u
 #define CONTIG_SIZE (64u * 1024u * 1024u)
 
 static uint8_t *bus_ptr(uint32_t addr, uint32_t bytes)
 {
-    /* XNet's rings and buffers are MmAllocateContiguousMemory, handed over as
-     * physical addresses -- which can fall inside the image's virtual range
-     * (its rings sit at physical 0x47F000, under BINKDATA). Unlike the USB
-     * driver it never points the controller at its own statics, so the
-     * allocator's answer wins. */
+    uint32_t guest_va;
     size_t mapped = xbox_GetMappedSize();
-    if (addr < CONTIG_BASE && xbox_ContiguousRangeAllocated(addr, bytes))
+    /* Runtime RAM IDs are disjoint from guest VAs. For legacy low addresses,
+     * allocated contiguous DMA memory takes precedence over an image VA. */
+    if (xbox_PhysicalAddressResolve(addr, bytes, &guest_va) == 1)
+        addr = guest_va;
+    else if (addr < CONTIG_BASE && xbox_ContiguousRangeAllocated(addr, bytes))
         addr += CONTIG_BASE;
     if (addr >= CONTIG_BASE
             ? (uint64_t)addr + bytes > (uint64_t)CONTIG_BASE + CONTIG_SIZE
