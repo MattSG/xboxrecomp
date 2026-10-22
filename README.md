@@ -18,7 +18,7 @@ community hub for sp00nznet's recomp projects, where ps3recomp development
 happens in the open. Good place to ask questions, show a port you are working
 on, or find out what people are stuck on before you duplicate the effort.
 
-**Title-agnostic.** The runtime, kernel layer, D3D8 abstraction, NV2A translator, and the Python pipeline (parser → disasm → func_id → abi_analysis → recomp) all derive per-title layout and behavior from the XBE itself. *Burnout 3: Takedown* was the reference title the toolkit was built against, so many docs use its metrics as examples — see `docs/technical/candidate-games.md` for ports in progress.
+**Reusable pipeline and runtime.** The Python pipeline derives executable layout from the supplied XBE. Ports own guest-address overrides, authored assets and game policy; shared lifter/runtime fixes belong here. See [Target Evaluation](docs/technical/candidate-games.md) for the evidence needed to scope a port.
 
 ### Recent Changes
 
@@ -366,27 +366,11 @@ so there is one place to keep correct:
 - **[SEH and Exception Handling](docs/technical/seh-handling.md)** — how
   `__SEH_prolog`/`__SEH_epilog` are detected per title and bridged.
 
-## Games That Work Well As Targets
+## Evaluating a Target
 
-Based on our experience with Burnout 3, the best candidates for Xbox static recomp share these traits:
-
-| Factor | Easier | Harder |
-|--------|--------|--------|
-| **Engine** | RenderWare (shared patterns) | Custom engine (unique quirks) |
-| **Threading** | Single-threaded | Multi-threaded with sync |
-| **GPU usage** | Standard D3D8 calls | NV2A push buffer microcode |
-| **Code size** | Small .text section | Large with LTCG |
-| **Online** | Offline only | Xbox Live dependent |
-| **PC port** | No PC version (worth the effort!) | Good PC port exists |
-
-See [docs/technical/candidate-games.md](docs/technical/candidate-games.md) for a detailed list of promising targets.
-
-## Projects Using This Toolkit
-
-- **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The origin title and most mature target. 22,097 functions lifted. An earlier build was playable to the main menu at 60fps, but leaned on hand-written menu and render scaffolding; that is being replaced with genuinely recompiled code, and the honest bring-up currently reaches engine/RenderWare init. Treat the old "playable" claim as retired until the recompiled path gets back there.
-- **[Xbox Dashboard](https://github.com/sp00nznet/xboxdashboard)** — The original Xbox system shell (build 3944); the toolkit on system software rather than a game. Nothing renders yet: the earlier "green orb at 60fps" was the project's own scaffolding drawing a disc, and has been retired along with the fake scene root and hand-rolled asset loader around it. What runs is the dashboard's own code — full init chain, its own D3D8 sizing and allocating its own 640x480 surfaces, its own NV2A pushbuffer, its own `default.xip` read. Its UI is driven by a **VRML97 + JavaScript scene engine** (text→bytecode compiler + stack-machine VM + node-class reflection registry), which is the piece still to come online.
-- **[Wreckless: The Yakuza Missions](https://github.com/sp00nznet/wreckless)** — Xbox launch title (2002). Custom engine, 3,407 functions, boots through CRT init into game main. Debugging early gameplay crash.
-- **[Blood Wake](https://github.com/sp00nznet/bloodwake)** — First-party Microsoft naval combat (2001). Stormfront Studios custom engine. 4,608 functions, 367K lines of C generated (99.1% success). Project scaffolded, working toward first build.
+Inspect the executable, required runtime behavior and unresolved paths before
+estimating a port. See [Target Evaluation](docs/technical/candidate-games.md)
+for the evidence checklist and reusable-mechanism/port-policy boundary.
 
 ## How You Can Help
 
