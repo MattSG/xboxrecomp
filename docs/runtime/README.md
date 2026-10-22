@@ -82,3 +82,10 @@ pixel-zero snap and screen-offset parameters from guest target dimensions.
 Without a hook, snapping is enabled and the screen offset is zero for every
 target size. Authored pass selection belongs to the port; the shared shader
 implements the coordinate operations for both renderers.
+
+
+The Windows new-game starter uses `xbox_HostHardwareInit` and
+`xbox_HostGraphicsInit`, then shuts hardware down before releasing guest memory.
+It explicitly selects INLINE for its simple guest-driven loop. A port with its
+own host loop selects SPAWN and owns worker lifetime and joining. The starter's
+VEH is diagnostic only; shared host setup owns hardware MMIO routing.

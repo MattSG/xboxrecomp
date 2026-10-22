@@ -33,7 +33,7 @@ add_compile_definitions(
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH
     "Path to the xboxrecomp toolkit root directory")
 
-# Add xboxrecomp as a subdirectory -- this builds all 6 runtime libraries
+# Add xboxrecomp as a subdirectory -- this builds the selected runtime libraries
 # and provides the 'xboxrecomp' umbrella target to link against.
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
@@ -68,7 +68,7 @@ add_executable(${PROJECT_NAME} WIN32
     ${RECOMP_GEN_SOURCES}
 )
 
-# Link against the xboxrecomp umbrella target (all 6 runtime libraries)
+# Link against the xboxrecomp umbrella target (selected runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
 # Include paths for generated recomp headers
