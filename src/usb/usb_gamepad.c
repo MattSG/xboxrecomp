@@ -333,8 +333,7 @@ static int same_word(const char *a, const char *b, size_t n)
 static int pad_button_bits(const char *name, size_t n, uint8_t *dig,
                            uint8_t *ana, uint8_t *stick)
 {
-    /* Stick directions, for screens and games that read the stick and
-     * ignore the d-pad: Burnout 3 steers and picks map locations with it. */
+    /* Stick directions are independent of digital d-pad input. */
     static const struct { const char *name; uint8_t bit; } sk[] = {
         {"lleft", 0x01}, {"lright", 0x02}, {"lup", 0x04}, {"ldown", 0x08},
         {"rleft", 0x10}, {"rright", 0x20}, {"rup", 0x40}, {"rdown", 0x80},
