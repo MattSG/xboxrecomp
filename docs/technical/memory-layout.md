@@ -198,20 +198,13 @@ const char *name = (const char *)(g_xbe_data + file_offset);
 
 Some BSS addresses (around 0x76000000) would need mirror views at addresses that Windows 11 reserves for system use. About 4 out of 33 mirror views fail to map. This is acceptable -- the game only accesses those addresses through the base view, and the RenderWare walker handles missing mirrors gracefully.
 
-### Fake Thread Information Block
+### Guest thread state
 
-The recompiler drops the `fs:` segment prefix from memory accesses like `mov eax, fs:[0x28]`. These become `MEM32(0x28)`, reading from low memory. A fake TIB is populated at address 0x0:
-
-```c
-MEM32(0x00) = 0xFFFFFFFF;      // SEH: end of chain
-MEM32(0x04) = XBOX_STACK_TOP;  // Stack base (high address)
-MEM32(0x08) = XBOX_STACK_BASE; // Stack limit (low address)
-MEM32(0x18) = 0x00000000;      // Self pointer
-MEM32(0x20) = 0x00000000;      // KPCR Prcb pointer
-MEM32(0x28) = FAKE_TLS_VA;     // TLS / RW engine context
-```
-
-The RenderWare engine reads `[fs:[0x28] + 0x28]` to find its per-thread data area. A fake structure chain is set up in BSS memory.
+The runtime initializes guest thread/KPCR state through the memory and thread
+APIs. XBE TLS initialization follows the image's own TLS directory. Application
+context pointers and scratch chains are port policy; the shared loader does not
+install a RenderWare context at fixed guest addresses. See the current
+`xbox_memory_layout.h` declarations and [runtime setup](../pipeline/05-runtime.md).
 
 ### Xbox Kernel PE Header
 

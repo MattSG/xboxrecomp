@@ -223,6 +223,9 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    check(*G(XBOX_FS_BASE + 0x28) == 0,
+          "loader does not install an application context chain", NULL);
+
     scratch = xbox_HeapAlloc(0x10000, 4096);
     for (i = 0; i < N_SLOTS; i++)
         *G(THUNK_VA + 4 * i) = 0x80000000u | ORD[i];
