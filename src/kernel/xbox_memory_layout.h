@@ -165,6 +165,16 @@ void xbox_Nv2aDmaWait(uint32_t pfifo_base_va);
 
 /* Opt-in parser diagnostics only. Roots come from registered fence mirrors;
  * the raw device bytes let a title's producer layout be decoded off-line. */
+/* Optional diagnostics layout, configured before guest execution. Offsets are
+ * caller-owned; last ring word is inclusive. NULL disables layout decoding.
+ * Returns -1 for an unknown fence root, otherwise 0. */
+typedef struct {
+    uint32_t channel_ptr_offset, channel_put_offset, channel_get_offset;
+    uint32_t pfifo_ptr_offset, ring_first_offset, ring_last_offset;
+} XBOX_NV2A_CAPTURE_LAYOUT;
+int xbox_Nv2aCaptureLayout(uint32_t device_ptr_va,
+                           const XBOX_NV2A_CAPTURE_LAYOUT *layout);
+
 #define XBOX_NV2A_CAPTURE_MIRRORS 4
 #define XBOX_NV2A_CAPTURE_DEVICE_BYTES 0x2200
 typedef struct {
@@ -174,6 +184,7 @@ typedef struct {
     uint32_t pfifo_va, pfifo_valid, pfifo_subroutine;
     uint32_t command_mode, command_dma, command_offset, command_pending;
     uint32_t command_value, command_fence_va, command_queue_count;
+    uint32_t ring_first, ring_last, ring_valid;
     uint8_t device[XBOX_NV2A_CAPTURE_DEVICE_BYTES];
 } XBOX_NV2A_CAPTURE_MIRROR;
 typedef struct {

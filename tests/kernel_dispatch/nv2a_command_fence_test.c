@@ -157,7 +157,7 @@ int main(void)
     CHECK(g_fence_mirrors[0].command_tail->target == 0x31000);
     CHECK(g_fence_mirrors[0].command_tail->value == 14);
     xbox_Nv2aCaptureSnapshot(&snapshot);
-    CHECK(snapshot.version == 1 && snapshot.bytes == sizeof snapshot);
+    CHECK(snapshot.version == 2 && snapshot.bytes == sizeof snapshot);
     CHECK(snapshot.mirrors[0].command_queue_count == 3);
     CHECK(snapshot.mirrors[0].device_bytes == XBOX_NV2A_CAPTURE_DEVICE_BYTES);
     nv2a_publish_readback_complete(regs);
@@ -241,10 +241,18 @@ int main(void)
      * channel, retain raw device fields, and never query/read back the GPU. */
     g_nv2a_memory = registers;
     *guest(0x22008) = 0x2000;
-    *guest(0x237C0) = 0x14000;
-    *guest(0x14040) = 0x4444; *guest(0x14044) = 0x5555;
-    *guest(0x224F8) = XBOX_NV2A_BASE;
+    *guest(0x22110) = 0x14000;
+    *guest(0x14010) = 0x4444; *guest(0x14014) = 0x5555;
+    *guest(0x22114) = XBOX_NV2A_BASE;
     *(uint32_t *)(registers + NV2A_PFIFO_DMA_SUBROUTINE) = 0x7777;
+    xbox_Nv2aCaptureSnapshot(&snapshot);
+    CHECK(!snapshot.mirrors[0].channel_valid && !snapshot.mirrors[0].pfifo_valid &&
+          !snapshot.mirrors[0].ring_valid);
+    XBOX_NV2A_CAPTURE_LAYOUT layout = {0x110, 0x10, 0x14, 0x114, 0x118, 0x11C};
+    CHECK(xbox_Nv2aCaptureLayout(0x19000, &layout) == -1);
+    CHECK(xbox_Nv2aCaptureLayout(0x10000, &layout) == 0);
+    *guest(0x22118) = XBOX_CONTIG_BASE + 0x100000;
+    *guest(0x2211C) = XBOX_CONTIG_BASE + 0x100100;
     CHECK(xbox_Nv2aNotifyEvent(0x10000, 0x196C, 5) == 0);
     g_notify_count = 7;
     s_scan_incomplete = 1;
@@ -260,13 +268,29 @@ int main(void)
     CHECK(snapshot.mirrors[0].channel_valid && snapshot.mirrors[0].channel_va == 0x14000);
     CHECK(snapshot.mirrors[0].channel_put == 0x4444 && snapshot.mirrors[0].channel_get == 0x5555);
     CHECK(snapshot.mirrors[0].pfifo_valid && snapshot.mirrors[0].pfifo_subroutine == 0x7777);
+    CHECK(snapshot.mirrors[0].ring_valid &&
+          snapshot.mirrors[0].ring_first == XBOX_CONTIG_BASE + 0x100000 &&
+          snapshot.mirrors[0].ring_last == XBOX_CONTIG_BASE + 0x100100);
+    CHECK(!snapshot.mirrors[1].channel_valid && !snapshot.mirrors[1].ring_valid);
     CHECK(*(uint32_t *)(snapshot.mirrors[0].device + 8) == 0x2000);
     CHECK(snapshot.mirrors[0].fence_valid && snapshot.mirrors[0].fence_value == 17);
     CHECK(snapshot.mirrors[0].command_mode && !snapshot.mirrors[0].command_queue_count);
-    *guest(0x237C0) = XBOX_NV2A_BASE + 0x800000;
+    layout.channel_put_offset = 0x40; layout.channel_get_offset = 0x44;
+    CHECK(xbox_Nv2aCaptureLayout(0x10000, &layout) == 0);
+    *guest(0x22110) = XBOX_NV2A_BASE + 0x800000;
     xbox_Nv2aCaptureSnapshot(&snapshot);
     CHECK(snapshot.mirrors[0].channel_valid && snapshot.mirrors[0].channel_put == 999 &&
           snapshot.mirrors[0].channel_get == 222);
+    layout.channel_ptr_offset = UINT32_MAX;
+    layout.pfifo_ptr_offset = UINT32_MAX;
+    layout.ring_first_offset = UINT32_MAX;
+    CHECK(xbox_Nv2aCaptureLayout(0x10000, &layout) == 0);
+    xbox_Nv2aCaptureSnapshot(&snapshot);
+    CHECK(!snapshot.mirrors[0].channel_valid && !snapshot.mirrors[0].pfifo_valid &&
+          !snapshot.mirrors[0].ring_valid);
+    CHECK(xbox_Nv2aCaptureLayout(0x10000, NULL) == 0);
+    xbox_Nv2aCaptureSnapshot(&snapshot);
+    CHECK(!snapshot.mirrors[0].channel_va && !snapshot.mirrors[0].ring_valid);
     g_nv2a_memory = NULL;
     *guest(0x10000) = UINT32_MAX - 8;
     xbox_Nv2aCaptureSnapshot(&snapshot);

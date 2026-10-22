@@ -125,11 +125,17 @@ artifacts, then stops recording:
 | `.producer.json` | Named initial/final USER/PFIFO pointers, held GET, notification state and registered fence/device fields. |
 
 The state snapshots are zero-initialized, read-only diagnostic structures from
-`xbox_memory_layout.h`. Version 1 is 35,272 bytes: an 18-word header followed by
-four mirrors, each with 24 metadata words and a `0x2200`-byte raw device block.
+`xbox_memory_layout.h`. Version 2 is 35,320 bytes: an 18-word header followed by
+four mirrors, each with 27 metadata words and a `0x2200`-byte raw device block.
 The header carries the version and total byte size. Validity flags and
 `device_bytes` distinguish unavailable data from a real zero. Registered device
 pointers supply the roots; the helper does not hardcode an image global.
+Configure `xbox_Nv2aCaptureLayout` before guest execution to decode the port's
+channel, PFIFO pointer and inclusive ring bounds. With no layout, these fields
+remain unavailable; raw device and hardware state capture still works. Version 2
+adds `ring_first`, `ring_last` and `ring_valid` to each mirror. The JSON contains
+these generic fields; device-layout-specific cursor/fence decoding belongs in
+the port's diagnostic tools. Old version-1 readers must reject the new size/version.
 The snapshots and ring copies do not suspend the producer and are not atomic;
 the fetched-word ledger is the evidence of what execution actually read.
 
