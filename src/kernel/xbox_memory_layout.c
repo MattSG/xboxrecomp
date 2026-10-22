@@ -1061,7 +1061,7 @@ static int s_nv2a_report = 0;  /* periodic survey/executor report */
  * second so a run can answer the only question that matters before building a
  * presenter: is the guest putting pixels anywhere at all, and do they change
  * from frame to frame. */
-static uint32_t s_fb_va, s_fb_pitch, s_fb_height = 480;
+static uint32_t s_fb_va, s_fb_pitch;
 
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch)
 {
@@ -1092,7 +1092,8 @@ static void framebuffer_probe_tick(void)
     static DWORD last_ms;
     static uint32_t last_sum;
     DWORD now;
-    uint32_t sum = 0, nonzero = 0, i, n;
+    uint32_t sum = 0, nonzero = 0, i, n, mode_pitch, height;
+    uint64_t bytes;
     const uint32_t *p;
 
     if (!s_nv2a_trace || !s_fb_va || !s_fb_pitch)
@@ -1101,10 +1102,14 @@ static void framebuffer_probe_tick(void)
     if (last_ms && (now - last_ms) < 1000)
         return;
     last_ms = now;
-    if ((size_t)s_fb_va + s_fb_pitch * s_fb_height > g_memory_size)
+    if (!xbox_GetDisplayMode(&mode_pitch, NULL, NULL, &height) ||
+        mode_pitch != s_fb_pitch)
+        return;
+    bytes = (uint64_t)s_fb_pitch * height;
+    if (bytes > UINT32_MAX || !fence_readable(s_fb_va, (uint32_t)bytes))
         return;
     p = (const uint32_t *)((uintptr_t)s_fb_va + g_memory_offset);
-    n = (s_fb_pitch * s_fb_height) / 4;
+    n = (uint32_t)(bytes / 4);
     for (i = 0; i < n; i++) {
         sum = sum * 33u + p[i];
         if (p[i]) nonzero++;

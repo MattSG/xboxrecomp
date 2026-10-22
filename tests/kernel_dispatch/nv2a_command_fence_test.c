@@ -5,6 +5,24 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+
+static char framebuffer_report[256];
+static int test_fprintf(FILE *file, const char *format, ...)
+{
+    va_list args, copy;
+    int result;
+    va_start(args, format);
+    if (!strncmp(format, "  [FB]", 6)) {
+        va_copy(copy, args);
+        vsnprintf(framebuffer_report, sizeof framebuffer_report, format, copy);
+        va_end(copy);
+    }
+    result = vfprintf(file, format, args);
+    va_end(args);
+    return result;
+}
 
 static int readback_busy;
 static unsigned readback_polls;
@@ -21,8 +39,10 @@ static int test_writeback_busy(void)
 }
 #define nv2a_d3d_writeback_busy test_writeback_busy
 #define malloc test_malloc
+#define fprintf test_fprintf
 #include "../../src/kernel/xbox_memory_layout.c"
 #undef malloc
+#undef fprintf
 #undef nv2a_d3d_writeback_busy
 
 void *recomp_lookup(ULONG address) { (void)address; abort(); }
@@ -298,6 +318,26 @@ int main(void)
           !snapshot.mirrors[0].device_bytes);
     xbox_Nv2aCaptureSnapshot(NULL);
 
+    /* The trace probe must hash the final PAL row in a contiguous framebuffer,
+     * using the existing display-mode decoder rather than a 480-line guess. */
+    {
+        ptrdiff_t saved_offset = g_memory_offset;
+        uint32_t *pixels = (uint32_t *)(arena + 0x50000);
+        memset(pixels, 0, 16 * 576);
+        pixels[16 * 576 / 4 - 1] = 0xCAFEBABE;
+        g_contig_memory = arena;
+        g_memory_offset = (ptrdiff_t)arena - XBOX_CONTIG_BASE;
+        xbox_AvSetDisplayMode(NULL, 0,
+            AV_PACK_HDTV | (AV_STANDARD_PAL_I << AV_STANDARD_SHIFT) | AV_REFRESH_50Hz,
+            0x1E, 16, 0x50000);
+        xbox_SetDisplayFramebuffer(XBOX_CONTIG_BASE + 0x50000, 16);
+        s_nv2a_trace = 1;
+        framebuffer_probe_tick();
+        CHECK(strstr(framebuffer_report, "sum=CAFEBABE nonzero=1/2304"));
+        s_nv2a_trace = 0;
+        g_contig_memory = NULL;
+        g_memory_offset = saved_offset;
+    }
     puts("PASS: real semaphore dispatch, no idle early fence, readback/cap/GET "
          "ordering, uint32 wrap, captured targets, unconfigured registration and read-only state capture");
     g_memory_base = NULL;
