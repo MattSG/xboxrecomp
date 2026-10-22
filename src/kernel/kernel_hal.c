@@ -323,6 +323,25 @@ void xbox_IrqlLeaveInterrupt(int saved)
         LeaveCriticalSection(&g_isr_lock);
 }
 
+/* Wait until no device interrupt is running.
+ *
+ * A device interrupt runs beside a thread at DISPATCH_LEVEL here (see
+ * xbox_IrqlEnterInterrupt), where on the console it would have run between
+ * two of that thread's instructions. DirectSound guards its voice lists with
+ * a counter its interrupt checks before unlinking an idle voice; with the two
+ * truly concurrent, the interrupt could pass the check just before the title
+ * raised the counter, and both then edited the lists at once (a removed voice
+ * left linked: the list loops, and every voice stop waits out DirectSound's
+ * 0.5 s timeout). The title calls this right after raising such a counter:
+ * an interrupt that began before it either saw the counter or is finished
+ * when this returns, as on the console. */
+void xbox_IrqlSyncInterrupts(void)
+{
+    InitOnceExecuteOnce(&g_dispatch_lock_once, dispatch_lock_init, NULL, NULL);
+    EnterCriticalSection(&g_isr_lock);
+    LeaveCriticalSection(&g_isr_lock);
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).

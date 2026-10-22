@@ -447,6 +447,7 @@ void mcpx_apu_vp_init(MCPXAPUState *d);
 void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
+void mcpx_apu_fe_resume(MCPXAPUState *d);
 
 /* DSP functions */
 void mcpx_apu_dsp_init(MCPXAPUState *d);

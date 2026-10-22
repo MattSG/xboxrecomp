@@ -308,6 +308,8 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                                 " (SECTL=%08X FECTL=%08X)\n", sectl, fectl);
             }
         }
+        if (addr == NV_PAPU_FECTL)
+            mcpx_apu_fe_resume(d);      /* methods that waited for it */
         qemu_cond_broadcast(&d->cond);
         break;
     case NV_PAPU_FEMEMDATA:
