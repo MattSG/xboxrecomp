@@ -133,3 +133,8 @@ foreach(case early late cancel negative scope invalid reuse capacity concurrent)
     add_test(NAME kernel-inline-event-callers-${case} COMMAND kernel-inline-event-callers-test ${case})
     set_tests_properties(kernel-inline-event-callers-${case} PROPERTIES TIMEOUT 10)
 endforeach()
+
+add_executable(guest-vmem-prefix-test guest_vmem_prefix_test.c)
+target_include_directories(guest-vmem-prefix-test PRIVATE ../../src ../../src/kernel)
+target_link_libraries(guest-vmem-prefix-test PRIVATE platform)
+add_test(NAME guest-vmem-prefix COMMAND guest-vmem-prefix-test)

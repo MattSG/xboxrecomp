@@ -3126,10 +3126,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
-    if (g_nv2a_memory) {
-        xbox_Nv2aAckStart();
-    }
-
     /* Map a zeroed kernel probe page. A port may populate compatibility data
      * through xbox_GetKernelMemoryBase before guest execution. */
     {
@@ -3346,6 +3342,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     AcquireSRWLockExclusive(&g_iomap_lock);
     g_iomap_available = 1;
     ReleaseSRWLockExclusive(&g_iomap_lock);
+    /* Finish reserving guest VA before the executor can allocate host graphics
+     * resources. Otherwise those allocations can occupy the released upper
+     * range between its carve-out and guest_vmem_init's fixed reservation. */
+    if (g_nv2a_memory) xbox_Nv2aAckStart();
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }

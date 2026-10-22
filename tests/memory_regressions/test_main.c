@@ -575,11 +575,13 @@ int main(int argc, char **argv)
             snprintf(d, sizeof d, "status 0x%08X, base 0x%08X", st, base);
             check(st == 0 && base == hi && size == 0x100000,
                   "reserve at 0x76000000 returns that address", d);
+            if (st != 0 || base != hi || size != 0x100000) goto shutdown;
 
             /* Commit the first 64 KB and use it. */
             base = hi; size = 0x10000;
             st = nt_alloc_at(&base, &size, 0x1000);
             check(st == 0 && base == hi, "commit inside the reservation succeeds", NULL);
+            if (st != 0 || base != hi) goto shutdown;
             *G(hi) = 0xC0FFEE01u;
             *G(hi + 0xFFFC) = 0xC0FFEE02u;
             check(*G(hi) == 0xC0FFEE01u && *G(hi + 0xFFFC) == 0xC0FFEE02u,

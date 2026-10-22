@@ -30,6 +30,7 @@ typedef struct {
     uint32_t reserve_protect; /* protection the reservation was created with */
 } guest_page_t;
 
+static int s_requested;        /* opt-in remains meaningful if reservation fails */
 static guest_page_t *s_pages;   /* one entry per page from s_lo to s_top */
 static uint32_t s_slots_lo;     /* first address above the mapped range */
 static uint32_t s_lo;           /* first tracked address: the top of the slots */
@@ -78,8 +79,12 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t slots_lo, uint64_t slots_top,
     size_t bytes;
     void *host;
 
-    if (s_pages || !getenv("RECOMP_EXT_VMA"))
-        return 0;
+    if (s_pages) return 0;
+    s_requested = getenv("RECOMP_EXT_VMA") != NULL;
+    if (!s_requested) return 0;
+    s_slots_lo = slots_lo < GUEST_VMEM_TOP ? (uint32_t)slots_lo : GUEST_VMEM_TOP;
+    s_lo = slots_top < GUEST_VMEM_TOP ? (uint32_t)slots_top : GUEST_VMEM_TOP;
+    s_top = s_lo;
     if (slots_top >= GUEST_VMEM_TOP) {
         fprintf(stderr, "  Extended VMA: the slots reach 0x%llX, past user space;"
                         " nothing above them to track\n",
@@ -88,8 +93,6 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t slots_lo, uint64_t slots_top,
     }
 
     s_offset = offset;
-    s_slots_lo = (uint32_t)slots_lo;
-    s_lo = (uint32_t)slots_top;
     host = (void *)((uintptr_t)s_lo + (uintptr_t)offset);
 
     s_placeholder = 0;
@@ -111,8 +114,11 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t slots_lo, uint64_t slots_top,
     {
         (void)placeholder;
         bytes = host_free_run((uintptr_t)host, GUEST_VMEM_TOP - s_lo) & ~(size_t)0xFFFF;
-        if (bytes && !VirtualAlloc(host, bytes, MEM_RESERVE, PAGE_NOACCESS))
-            bytes = 0;
+        /* ponytail: startup-only 64 KiB backoff. Use a native free-range
+         * query if heavily fragmented startup cost becomes material. Each
+         * fixed reservation refuses foreign mappings; retain the free prefix. */
+        while (bytes && !VirtualAlloc(host, bytes, MEM_RESERVE, PAGE_NOACCESS))
+            bytes -= 0x10000u;
     }
     if (!bytes) {
         fprintf(stderr, "  Extended VMA: could not reserve host memory at %p (error %lu);"
@@ -127,6 +133,7 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t slots_lo, uint64_t slots_top,
                     | (s_placeholder ? MEM_PRESERVE_PLACEHOLDER : 0)
 #endif
                     );
+        s_top = s_lo;
         fprintf(stderr, "  Extended VMA: out of memory for the page table\n");
         return 0;
     }
@@ -146,6 +153,8 @@ void guest_vmem_shutdown(void)
                     );
     free(s_pages);
     s_pages = NULL;
+    s_requested = 0;
+    s_slots_lo = s_lo = s_top = 0;
 }
 
 /* Commits [start, end) of the host reservation. Zeroes the pages, as
@@ -263,8 +272,9 @@ int guest_vmem_allocate(uint32_t *base, uint32_t *size, uint32_t alloc_type,
     int handled;
 
     /* base = 0 means "anywhere", and anything below the slots is the heap's. */
-    if (!s_pages || *base < s_slots_lo)
+    if (!s_requested || *base < s_slots_lo)
         return 0;
+    if (!s_pages) { *status = STATUS_CONFLICTING_ADDRESSES; return 1; }
     AcquireSRWLockExclusive(&s_lock);
     handled = allocate_locked(base, size, alloc_type, protect, status);
     ReleaseSRWLockExclusive(&s_lock);
@@ -331,8 +341,9 @@ int guest_vmem_free(uint32_t *base, uint32_t *size, uint32_t free_type,
 {
     int handled;
 
-    if (!s_pages || *base < s_slots_lo)
+    if (!s_requested || *base < s_slots_lo)
         return 0;
+    if (!s_pages) { *status = STATUS_INVALID_PARAMETER; return 1; }
     AcquireSRWLockExclusive(&s_lock);
     handled = free_locked(base, size, free_type, status);
     ReleaseSRWLockExclusive(&s_lock);
@@ -356,7 +367,7 @@ int guest_vmem_query(uint32_t address, uint32_t info[7])
     guest_page_t first;
     uint32_t start, end;
 
-    if (!s_pages || address < s_slots_lo || address >= GUEST_VMEM_TOP)
+    if (!s_requested || address < s_slots_lo || address >= GUEST_VMEM_TOP)
         return 0;
 
     /* The slots are never tracked, so left alone a query reports them as one

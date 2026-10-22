@@ -14,6 +14,8 @@
  *
  * Opt-in, RECOMP_EXT_VMA=1. Without it nothing here is initialised and every
  * function answers "not mine" (returns 0), so the bridge behaves as before.
+ * When explicitly enabled but host reservation fails, fixed upper requests
+ * fail and queries report unavailable space as reserved; no heap substitution.
  *
  * Everything below the top of the slots is not this file's business. The slots
  * (the 28 map-sized ranges above the mapped range) are reserved no-access by the
@@ -39,9 +41,9 @@ void guest_vmem_shutdown(void);
 /* True once guest_vmem_init has succeeded. */
 int guest_vmem_active(void);
 
-/* Each returns 0 when the request is not the tracker's (it is not live, or the
- * address is below the slots' start), in which case the caller carries on
- * with its own path. Otherwise they return 1 with *status set. */
+/* Each returns 0 when opt-in is disabled or the address is below the slots'
+ * start, so the caller uses its ordinary path. Otherwise they return 1 with
+ * *status set, including explicit failure when host backing is unavailable. */
 int guest_vmem_allocate(uint32_t *base, uint32_t *size, uint32_t alloc_type,
                         uint32_t protect, uint32_t *status);
 int guest_vmem_free(uint32_t *base, uint32_t *size, uint32_t free_type,

@@ -197,3 +197,10 @@ ctest --test-dir build/kernel-dispatch -C Release --output-on-failure
 
 Build all targets before running CTest so the timer, DPC and thread-layout
 regressions are included.
+
+
+`guest-vmem-prefix` uses real host mapping blockers. A blocker at the end must
+leave the free prefix usable; a blocker at the start must make fixed requests
+fail without changing their address, report unavailable space as reserved, and
+leave foreign mappings intact through shutdown. The fixture links the platform
+library directly, including its transitive POSIX math dependency.
