@@ -8,7 +8,7 @@
  *   1. Build xboxrecomp as a static library (cmake --build)
  *   2. Link against the 'xboxrecomp' umbrella target (or individual libs)
  *   3. Implement the required callbacks (see "Game Integration Points" below)
- *   4. Call xbox_memory_init() to set up the 64MB Xbox address space
+ *   4. Call xbox_MemoryLayoutInit() with the original XBE to load its memory image
  *   5. Call xbox_kernel_init() / xbox_kernel_bridge_init() to wire up kernel imports
  *
  * Libraries provided:
@@ -34,9 +34,9 @@
  *
  * Global state (defined in xbox_memory_layout.c):
  *   extern ptrdiff_t g_xbox_mem_offset;  // Native-to-Xbox VA offset
- *   extern uint32_t  g_eax, g_ecx, g_edx, g_esp;  // Volatile registers
- *   extern uint32_t  g_ebx, g_esi, g_edi;          // Callee-saved registers
- *   extern uint32_t  g_seh_ebp;                      // SEH frame pointer
+ *   extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;  // Volatile registers
+ *   extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;          // Callee-saved registers
+ *   extern RECOMP_TLS uint32_t g_seh_ebp;                      // SEH frame pointer
  */
 
 #ifndef XBOXRECOMP_H
@@ -48,6 +48,7 @@
 #include "d3d8_xbox.h"          /* D3D8 compatibility interface */
 #include "dsound_xbox.h"        /* DirectSound compatibility */
 #include "xinput_xbox.h"        /* XInput compatibility */
+#include "xbox_host.h"          /* Shared hardware/graphics bring-up */
 #include "apu.h"                /* MCPX APU public API */
 
 /* NV2A headers */
