@@ -68,6 +68,16 @@ int main(int argc, char **argv)
         probe.core.opaque = &probe;
         probe.dma.mem_opaque = &probe.core;
         uint32_t control = 0;
+        static DSPState before;
+        /* A different guest opcode must fall back without executing the
+         * generated instruction or consuming any guest state. */
+        probe.core.pram[probe.core.pc] ^= 1;
+        before = probe;
+        CHECK(dsp56k_execute_recompiled(&probe.core, 1, &control, 1) == 0);
+        CHECK(!memcmp(&probe, &before, sizeof(probe)));
+        probe = *processor;
+        probe.core.opaque = &probe;
+        probe.dma.mem_opaque = &probe.core;
         CHECK(dsp56k_execute_recompiled(&probe.core, 1, &control, 1) > 0);
     }
 #endif
