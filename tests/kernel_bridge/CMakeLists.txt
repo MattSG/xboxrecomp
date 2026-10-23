@@ -33,3 +33,8 @@ foreach(mode large-stack bad-stack)
     add_test(NAME kernel_thread_255_${mode} COMMAND kernel_bridge_test thread-255-${mode})
     set_tests_properties(kernel_thread_255_${mode} PROPERTIES TIMEOUT 10)
 endforeach()
+
+foreach(mode main worker callback kernel exit unreachable-target truncated-arguments cross-target cross-chain last-frame truncated low-space unowned cycle unknown record record-low)
+    add_test(NAME kernel_unwind_${mode} COMMAND kernel_bridge_test unwind-${mode})
+    set_tests_properties(kernel_unwind_${mode} PROPERTIES TIMEOUT 10)
+endforeach()

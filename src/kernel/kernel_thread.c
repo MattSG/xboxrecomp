@@ -427,6 +427,20 @@ void xbox_worker_stack_reset(uint32_t base)
         g_worker_stack_used[i] = 0;
 }
 
+/* Internal bounds lookup for a retained callback lease. Reset is quiesced. */
+BOOL xbox_worker_stack_bounds(uint32_t address, uint32_t *low, uint32_t *high)
+{
+    uint32_t base=g_xbox_worker_stack_base;
+    uint64_t end=(uint64_t)base+XBOX_WORKER_STACK_SIZE*XBOX_WORKER_STACK_COUNT;
+    unsigned slot;
+    if (!base || address<base || address>=end || end>UINT32_MAX) return FALSE;
+    slot=(address-base)/XBOX_WORKER_STACK_SIZE;
+    if (!InterlockedCompareExchange(&g_worker_stack_used[slot],0,0)) return FALSE;
+    *low=base+slot*XBOX_WORKER_STACK_SIZE;
+    *high=*low+XBOX_WORKER_STACK_SIZE;
+    return TRUE;
+}
+
 int xbox_worker_stack_alloc(void)
 {
     int i;

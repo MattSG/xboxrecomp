@@ -101,6 +101,29 @@ metadata/CreateThread failure releases the selected guest stack and reports
 STATUS_INSUFFICIENT_RESOURCES. This does not implement all thread-object,
 suspension, native-export or teardown semantics.
 
+## Stack bounds and unwind
+
+`xbox_GetStackBounds` reports the allocation containing a guest SP: main stack,
+owned worker/kernel stack or retained callback lease. Bounds are exclusive at
+the high end; unknown/retired addresses return FALSE and zero optional outputs.
+Retain ownership while using a result. This checks allocation metadata, not
+host-thread identity or arbitrary mapping/backing permissions.
+
+The low-level guest kernel-stack helpers preserve exact requested size and the
+existing high-address return convention, independently of worker minimum policy.
+Delete requires the original high/low pair and the kernel allocation kind;
+ordinary heap blocks and worker stacks cannot be retired through that path.
+Guard-page and debugger placement behavior is not emulated.
+
+The unwind bridge uses its calling stack for argument/registration bounds,
+synthetic-record and handler-call scratch, and concrete target validation.
+Only complete aligned frame pairs in that same allocation are traversed.
+Unresolved/cyclic/out-of-range chains stop visibly, without forcing the head to
+an unvisited target. Normal handler returns restore the caller SP. Callers must
+supply a valid runtime TIB and valid non-NULL exception record when providing
+one. Target-IP/return-value transfer, collided dispositions, full record probing
+and native SEH behavior remain incomplete; these checks do not certify them.
+
 ## Kernel export storage
 
 Memory initialization places the kernel-data page after copied headers and all

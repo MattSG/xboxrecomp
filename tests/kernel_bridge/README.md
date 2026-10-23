@@ -94,3 +94,16 @@ Worker resource cases exhaust the guest heap for both create APIs and require
 STATUS_NO_MEMORY, cleared handle output and no inline/spawned execution. Ex
 also tests a multi-megabyte requested stack and an overflowing request. Native
 host allocation/CreateThread failure cleanup is reviewed but not fault-injected.
+
+## Unwind bounds
+
+Seventeen cases exercise main, worker, retained callback and guest kernel-stack
+bounds, targeted/exit walks, last complete/truncated frames, foreign or absent
+targets, cyclic/unresolved chains, truncated arguments, insufficient/unowned
+scratch and supplied records. Actual cdecl-style handler returns must preserve
+caller ESP. The kernel-stack case uses the real create/delete bridge routes;
+existing spawned-thread callbacks also query their owned stack bounds.
+
+These are bounded traversal/ownership checks. They do not establish full SEH,
+context transfer, handler dispositions or validation of caller-provided TIB and
+exception-record mappings.

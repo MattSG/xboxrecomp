@@ -3704,77 +3704,74 @@ static void bridge_XeUnloadSection(void) { bridge_XeSection(0); }
 
 static void bridge_RtlUnwind(void)
 {
-    uint32_t target_frame = STACK_ARG(0);
-    uint32_t exc_record   = STACK_ARG(2);
-    uint32_t reg          = BRIDGE_MEM32(XBOX_FS_BASE);
-    uint32_t prev_reg     = 0;
-    uint32_t scratch      = 0;
-    int      guard;
-
-    /* An unwind with no record of its own still has to tell the handlers it
-     * is an unwind, so synthesise one below the stack pointer. */
-    if (!exc_record) {
-        g_esp -= 0x50;
-        scratch = g_esp;
-        memset((uint8_t *)XBOX_TO_NATIVE(scratch), 0, 0x50);
-        BRIDGE_MEM32(scratch) = 0xC0000027u;   /* STATUS_UNWIND */
-        exc_record = scratch;
+    uint32_t target_frame,exc_record;
+    uint32_t entry_sp=g_esp, low,high,reg,prev_reg=0;
+    int guard;
+    if (!xbox_GetStackBounds(entry_sp,&low,&high) || (uint64_t)entry_sp+16>high) {
+        fprintf(stderr,"  RtlUnwind: argument frame is outside an owned stack\n");
+        return;
     }
-    BRIDGE_MEM32(exc_record + 4) |= XBOX_EXCEPTION_UNWINDING
-        | (target_frame ? 0u : XBOX_EXCEPTION_EXIT_UNWIND);
-
-    for (guard = 0; guard < XBOX_SEH_MAX_FRAMES; guard++) {
-        uint32_t next, handler;
-
-        if (reg == XBOX_SEH_END_OF_CHAIN || reg == 0 || reg == target_frame)
+    target_frame=STACK_ARG(0); exc_record=STACK_ARG(2);
+    if ((uint64_t)low+(exc_record?20u:100u)>entry_sp) {
+        fprintf(stderr,"  RtlUnwind: no owned stack space for unwind frame\n");
+        return;
+    }
+    if (target_frame && target_frame!=XBOX_SEH_END_OF_CHAIN &&
+        ((target_frame&3u) || target_frame<low || (uint64_t)target_frame+8>high)) {
+        fprintf(stderr,"  RtlUnwind: target is outside the calling stack\n");
+        return;
+    }
+    reg=BRIDGE_MEM32(XBOX_FS_BASE);
+    if (!exc_record) {
+        g_esp-=0x50;
+        exc_record=g_esp;
+        memset(XBOX_TO_NATIVE(exc_record),0,0x50);
+        BRIDGE_MEM32(exc_record)=0xC0000027u; /* STATUS_UNWIND */
+    }
+    BRIDGE_MEM32(exc_record+4)|=XBOX_EXCEPTION_UNWINDING |
+        (target_frame?0u:XBOX_EXCEPTION_EXIT_UNWIND);
+    for (guard=0;guard<XBOX_SEH_MAX_FRAMES;guard++) {
+        uint32_t next,handler;
+        recomp_func_t fn=NULL;
+        if (reg==XBOX_SEH_END_OF_CHAIN || !reg || reg==target_frame) break;
+        if ((reg&3u) || reg<low || (uint64_t)reg+8>high || (prev_reg && reg<=prev_reg)) {
+            fprintf(stderr,"  RtlUnwind: invalid registration chain\n");
             break;
-        if ((reg & 3u) || reg < XBOX_STACK_BASE || reg >= XBOX_STACK_TOP)
-            break;                       /* not a stack frame: chain is broken */
-        if (prev_reg && reg <= prev_reg)
-            break;                       /* not climbing: cycle or corruption */
-
-        next    = BRIDGE_MEM32(reg);
-        handler = BRIDGE_MEM32(reg + 4);
-
-        /* Pop before dispatching. The handler may raise, and it must not see
-         * its own frame still on the chain. */
-        BRIDGE_MEM32(XBOX_FS_BASE) = next;
-
+        }
+        next=BRIDGE_MEM32(reg); handler=BRIDGE_MEM32(reg+4);
         if (handler) {
-            recomp_func_t fn = recomp_lookup(handler);
-            if (!fn) fn = recomp_lookup_manual(handler);
-            if (!fn) fn = recomp_lookup_kernel(handler);
-            if (fn) {
-                /* EXCEPTION_DISPOSITION handler(record, frame, context,
-                 * dispatcher) -- cdecl, so the caller pops. */
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = reg;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = exc_record;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* return address */
-                fn();
-                /* 16, not 20: the handler's own `ret` has already taken the
-                 * return address off, leaving just the four arguments for the
-                 * caller to drop. Cleaning 20 leaves esp four bytes high, and
-                 * every argument the unwound-into frame reads after that comes
-                 * from one slot over. */
-                g_esp += 16;
+            fn=recomp_lookup(handler);
+            if (!fn) fn=recomp_lookup_manual(handler);
+            if (!fn) fn=recomp_lookup_kernel(handler);
+            if (!fn) {
+                fprintf(stderr,"  RtlUnwind: unresolved handler %08X\n",handler);
+                break;
             }
         }
-
-        prev_reg = reg;
-        reg      = next;
+        /* Pop a validated frame before invoking it, so a nested raise does not
+         * see its own registration. A normal handler return restores this SP. */
+        BRIDGE_MEM32(XBOX_FS_BASE)=next;
+        if (fn) {
+            uint32_t handler_sp=g_esp;
+            g_esp-=4; BRIDGE_MEM32(g_esp)=0;
+            g_esp-=4; BRIDGE_MEM32(g_esp)=0;
+            g_esp-=4; BRIDGE_MEM32(g_esp)=reg;
+            g_esp-=4; BRIDGE_MEM32(g_esp)=exc_record;
+            g_esp-=4; BRIDGE_MEM32(g_esp)=0;
+            fn();
+            g_esp=handler_sp;
+        }
+        prev_reg=reg; reg=next;
     }
-
-    /* Land on the target even if the walk stopped early: leaving fs:[0] on a
-     * discarded frame is worse than losing a __finally. */
-    if (target_frame && target_frame != XBOX_SEH_END_OF_CHAIN)
-        BRIDGE_MEM32(XBOX_FS_BASE) = target_frame;
-
-    if (scratch)
-        g_esp += 0x50;
+    if (guard==XBOX_SEH_MAX_FRAMES)
+        fprintf(stderr,"  RtlUnwind: registration walk limit reached\n");
+    if (target_frame && target_frame!=XBOX_SEH_END_OF_CHAIN && reg!=target_frame)
+        fprintf(stderr,"  RtlUnwind: requested target was not reached\n");
+    /* Never manufacture a target after an invalid/incomplete walk. The SEH
+     * head reflects only frames actually traversed. Normal call cleanup only;
+     * target-IP transfer and collided-unwind dispositions remain unsupported. */
+    g_esp=entry_sp;
 }
-
 
 /* Which open file handles were asked for asynchronously.
  *
@@ -6228,15 +6225,12 @@ static void bridge_MmFreeSystemMemory(void)
  * guest heap here: create returns base+size, delete frees the base (arg 1). */
 static void bridge_MmCreateKernelStack(void)
 {
-    uint32_t size = STACK_ARG(0);
-    uint32_t base_va = xbox_HeapAlloc(size, 16);
-
-    g_eax = base_va ? base_va + size : 0;
+    g_eax = xbox_AllocKernelStack(STACK_ARG(0));
 }
 
 static void bridge_MmDeleteKernelStack(void)
 {
-    xbox_HeapFree(STACK_ARG(1));
+    xbox_FreeKernelStack(STACK_ARG(0),STACK_ARG(1));
     g_eax = 0;
 }
 
