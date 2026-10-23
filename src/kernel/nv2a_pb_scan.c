@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel.h"
+#include "nv2a_pb.h"
 #include "xbox_memory_layout.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -42,18 +43,14 @@ static int s_seen_count;
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 static uint32_t s_tot_calls;
-/* Walks that stopped short of PUT, and how many of those had their fence
- * release salvaged. Counted because after eight log lines a stop is silent. */
-static uint32_t s_tot_stops, s_tot_salvaged;
+/* Walks that stopped short of PUT; counted even after log throttling. */
+static uint32_t s_tot_stops;
 /* Segments refused at entry because GET or PUT is outside the window. */
 static uint32_t s_tot_refused;
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
-extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
-extern uint32_t nv2a_pb_exec_semaphore_last_value(void);
-extern uint32_t nv2a_pb_exec_semaphore_releases(void);
 static int s_exec_enabled = -1;
 
 /* Diagnostic timing stays outside the executor: a packet still reaches the
@@ -220,49 +217,11 @@ static int pb_in_window(uint32_t va)
     return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;
 }
 
-/* The words from a stop to PUT are never executed, and they may hold the
- * semaphore release the title's next fence wait spins on. Run the last such
- * release in [from, to): releasing it marks the earlier ones done too, and
- * none beyond PUT.
- *
- * The XDK writes a fence as (BACK_END_WRITE_SEMAPHORE_RELEASE, count 1,
- * subchannel 0) and its value, but that pair can also be data (index buffer
- * words). A value taken from data could push the fence far ahead, so a
- * candidate counts only if it looks like the next fence: odd, as the XDK's
- * fence values are, after the last release, and at most 128 past it. Returns
- * how the fence was handled, for the log. A span that wraps or can't be read
- * is left to the fence mirror. */
-static const char *pb_stop_salvage(const uint8_t *mem, uint32_t from, uint32_t to,
-                                   uint32_t *value)
-{
-    uint32_t va, last, rel;
-    int found = 0, seen = 0;
+static NV2A_PB_STOP_HANDLER s_stop_handler;
 
-    if (!s_exec_enabled)
-        return "not executing";
-    if (from >= to || !pb_in_window(from) || !pb_in_window(to - 4))
-        return "span wraps or is unreadable; fence left to the mirror";
-    last = nv2a_pb_exec_semaphore_last_value();
-    for (va = from; va + 4 < to; va += 4) {
-        if (*(const uint32_t *)(mem + va) == 0x00041D70u) {
-            uint32_t v = *(const uint32_t *)(mem + va + 4);
-            seen++;
-            if ((v & 1u) && (int32_t)(v - last) > 0 && v - last <= 128u) {
-                last = v;
-                found = 1;
-            }
-        }
-    }
-    if (!found)
-        return seen ? "release(s) in the rest but none plausible"
-                    : "no fence release in the rest";
-    rel = nv2a_pb_exec_semaphore_releases();
-    nv2a_pb_exec_method(0, 0x1D70u, last);
-    *value = last;
-    if (nv2a_pb_exec_semaphore_releases() == rel)
-        return "fence release found but refused by the executor";
-    s_tot_salvaged++;
-    return "fence release salvaged";
+void nv2a_pb_set_stop_handler(NV2A_PB_STOP_HANDLER handler)
+{
+    s_stop_handler = handler;
 }
 
 void nv2a_pb_scan_report(void)
@@ -272,8 +231,7 @@ void nv2a_pb_scan_report(void)
     if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
-        fprintf(stderr, "[PB] %u walks stopped short of PUT (%u with a fence"
-                        " release salvaged)\n", s_tot_stops, s_tot_salvaged);
+        fprintf(stderr, "[PB] %u walks stopped short of PUT\n", s_tot_stops);
         if (s_tot_refused)
             fprintf(stderr, "[PB] %u segments refused: GET or PUT outside the"
                             " contiguous window\n", s_tot_refused);
@@ -674,19 +632,17 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va,
         }
     }
     if (0) {
-stop:   /* Out of step: drop the method in progress and the call, run the
-         * fence release the rest may hold, and resume at PUT. Logged once
-         * per stop, the first eight times. */
+stop:   /* Discard malformed work. Recovery is explicit caller policy. */
         {
             static unsigned said;
-            uint32_t v = 0;
-            const char *fence = pb_stop_salvage(mem, at, end_va, &v);
+            if (s_exec_enabled && s_stop_handler)
+                s_stop_handler(at, end_va, why);
             s_packet.active = 0; in_call = 0;
             s_tot_stops++;
             if (said++ < 8)
                 fprintf(stderr, "[PB] walk stopped at 0x%08X (word 0x%08X) after %u"
-                        " words, PUT 0x%08X (%s); %s 0x%08X\n",
-                        at, word, words, end_va, why, fence, v);
+                        " words, PUT 0x%08X (%s)\n",
+                        at, word, words, end_va, why);
             va = end_va;
         }
     }
