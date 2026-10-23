@@ -632,12 +632,12 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
 
-    if (!s) return NULL;
+    if (!s) { xbox_FreeThreadStack(stack_top); return NULL; }
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
     s->context_count=context_count;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
-    if (!th) free(s);
+    if (!th) { free(s); xbox_FreeThreadStack(stack_top); }
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
      * spawn workers too, but never read it back. See kernel_thread.c. */
@@ -721,14 +721,12 @@ static void bridge_PsCreateSystemThreadEx(void)
                     return;
                 }
 
-                stack_top = xbox_AllocThreadStack();
+                stack_top = xbox_AllocThreadStackSized(STACK_ARG(2));
 
                 if (!stack_top) {
-                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
-                            "thread stacks, running worker 0x%08X inline\n",
-                            start_routine);
-                    fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2, 2);
+                    if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr)=0;
+                    g_eax=0xC0000017u; /* STATUS_NO_MEMORY */
+                    return;
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top, 2);
@@ -736,6 +734,11 @@ static void bridge_PsCreateSystemThreadEx(void)
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
                     fflush(stderr);
+                    if (!th) {
+                        if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr)=0;
+                        g_eax=0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
+                        return;
+                    }
                     if (xbox_handle_ptr && th) {
                         bridge_write_handle(xbox_handle_ptr, th);
                     }
@@ -9168,10 +9171,17 @@ static void bridge_PsCreateSystemThread(void)
                 }
                 stack_top = xbox_AllocThreadStack();
                 if (!stack_top) {
-                    bridge_run_thread_inline(fn, start_context1, start_context2, 1);
+                    if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr)=0;
+                    g_eax=0xC0000017u; /* STATUS_NO_MEMORY */
+                    return;
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top, 1);
+                    if (!th) {
+                        if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr)=0;
+                        g_eax=0xC000009Au; /* STATUS_INSUFFICIENT_RESOURCES */
+                        return;
+                    }
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }

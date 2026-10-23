@@ -161,12 +161,14 @@ static void test_start_io_callback(void)
 static DWORD thread_id;
 static uint32_t thread_context[2], thread_stack, thread_tib;
 static unsigned thread_context_count;
+static uint32_t thread_stack_probe;
 static void test_thread_callback(void)
 {
     thread_id = GetCurrentThreadId();
     thread_context[0] = *(uint32_t *)(g_guest_mem + g_esp + 4);
     thread_context[1] = thread_context_count==2 ? *(uint32_t *)(g_guest_mem + g_esp + 8) : 0;
     thread_stack = g_esp;
+    thread_stack_probe=xbox_HeapBlockSize(g_esp-1024*1024);
     thread_tib = g_fs_base;
     g_ebx = 0xBAD;
     g_esp += 4 + 4*thread_context_count; /* translated stdcall return */
@@ -408,6 +410,9 @@ int main(int argc, char **argv)
 
     if (argc == 2 && !strncmp(argv[1],"thread-",7)) {
         int inline_mode = strstr(argv[1],"inline") != NULL;
+        int no_stack=strstr(argv[1],"no-stack") != NULL;
+        int bad_stack=strstr(argv[1],"bad-stack") != NULL;
+        int large_stack=strstr(argv[1],"large-stack") != NULL;
         uint32_t ordinal = strstr(argv[1],"255") ? 255 : 254;
         uint32_t args[10] = {0};
         DWORD caller_id = GetCurrentThreadId();
@@ -421,18 +426,34 @@ int main(int argc, char **argv)
         args[0] = 0x42000;
         thread_context_count=ordinal==255 ? 2 : 1;
         args[ordinal == 255 ? 5 : 3] = 0x12345678;
-        if (ordinal==255) args[6] = 0x87654321;
+        if (ordinal==255) {
+            args[6] = 0x87654321;
+            if (large_stack) args[2]=2*1024*1024+1;
+            if (bad_stack) args[2]=UINT32_MAX;
+        }
         args[ordinal == 255 ? 9 : 2] = TEST_THREAD_VA;
         *(uint32_t *)(mem+SCRATCH_SP+24)=0xDEAD1000u;
         *(uint32_t *)(mem+SCRATCH_SP+28)=0; /* poison old seven-argument decoding */
+        if (no_stack) {
+            while (xbox_HeapAlloc(1024*1024,4096)) {}
+            while (xbox_HeapAlloc(4096,4)) {}
+            while (xbox_HeapAlloc(4,4)) {}
+        }
         g_ebx = 0x555;
         uint32_t status = call_slot(mem,THUNK_VA,ordinal == 255 ? 10 : 5,args);
         check(g_esp==SCRATCH_SP+4+(ordinal==255?40:20),
               "thread-create uses exact stdcall cleanup after translated return",NULL);
+        if (no_stack || bad_stack) {
+            check(status==0xC0000017u,"stack failure reports STATUS_NO_MEMORY",NULL);
+            check(!*(uint32_t *)(mem+0x42000),"failed creation clears handle output",NULL);
+            check(!thread_id && !xbox_thread_debug_handle(),"failed creation never executes inline or spawns",NULL);
+            xbox_kernel_shutdown(); xbox_MemoryLayoutShutdown(); return failures?1:0;
+        }
         HANDLE worker = (HANDLE)xbox_thread_debug_handle();
         if (!inline_mode && worker)
             check(WaitForSingleObject(worker,5000) == WAIT_OBJECT_0,"spawned guest thread finishes",NULL);
         check(status == 0,"thread-create returns success",NULL);
+        if (large_stack) check(thread_stack_probe>1024*1024,"Ex honors its requested multi-megabyte guest stack",NULL);
         check(inline_mode ? thread_id == caller_id : thread_id && thread_id != caller_id,
               "first thread follows explicit inline or default spawned mode",NULL);
         check(thread_context[0] == 0x12345678 && thread_context[1] == (ordinal==255?0x87654321u:0u),
