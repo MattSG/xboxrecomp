@@ -7,11 +7,7 @@
  * decode the faulting instruction, service it against the device model, and
  * step over it.
  *
- * That decoder existed twice before this file -- once in nv2a_mmio_hook.c and
- * once in apu_mmio_hook.c -- as the same opcode table written out against two
- * different pairs of accessors. This is the same logic with the accessors
- * passed in, so a third device does not need a third copy. The two originals
- * still carry their own and can move onto this whenever they are next touched.
+ * Accessors are passed by the device-specific fault handler.
  *
  * Header-only and static inline: one function, one caller per device, and a
  * library for it would be more build wiring than code.
@@ -27,6 +23,7 @@
 #define MMIO_DECODE_H
 
 #include <stdint.h>
+#include <string.h>
 
 #if defined(_WIN32) || defined(__x86_64__)
 #include "xbox_winnt.h"
@@ -58,7 +55,10 @@ static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
     int len = 1;
 
     if (mod == 3) return 1;
-    if ((rm & 7) == 4) len += 1;                    /* SIB    */
+    if ((rm & 7) == 4) {
+        len += 1;                                  /* SIB */
+        if (mod == 0 && (ip[1] & 7) == 5) len += 4; /* no base: disp32 */
+    }
     if (mod == 0 && (rm & 7) == 5) len += 4;        /* disp32 */
     else if (mod == 1) len += 1;
     else if (mod == 2) len += 4;
@@ -106,7 +106,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     rex_b = has_rex && (rex & 0x01);
 
     op   = ip + prefix;
-    size = has66 ? 2 : (rex_w ? 8 : 4);
+    size = rex_w ? 8 : (has66 ? 2 : 4);
 
     switch (op[0]) {
     case 0x88: case 0x89:                            /* MOV r/m, r   (write) */
@@ -117,13 +117,27 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
         ctx->Rip += prefix + 1 + mlen;
         return 1;
 
-    case 0xC7:                                       /* MOV r/m, imm32       */
+    case 0xC7: {                                     /* MOV r/m, imm16|32 */
+        uint64_t value;
+        int immediate_size = size == 2 ? 2 : 4;
+        if ((op[1] & 0x38) || (op[1] & 0xC0) == 0xC0) return 0;
         mlen = mmio_modrm_len(op + 1, rex_b);
-        wr(dev, off, *(const uint32_t *)(op + 1 + mlen), size);
-        ctx->Rip += prefix + 1 + mlen + 4;
+        if (size == 2) {
+            uint16_t immediate;
+            memcpy(&immediate, op + 1 + mlen, sizeof(immediate));
+            value = immediate;
+        } else {
+            uint32_t immediate;
+            memcpy(&immediate, op + 1 + mlen, sizeof(immediate));
+            value = size == 8 ? (uint64_t)(int64_t)(int32_t)immediate : immediate;
+        }
+        wr(dev, off, value, size);
+        ctx->Rip += prefix + 1 + mlen + immediate_size;
         return 1;
+    }
 
     case 0xC6:                                       /* MOV r/m8, imm8       */
+        if ((op[1] & 0x38) || (op[1] & 0xC0) == 0xC0) return 0;
         mlen = mmio_modrm_len(op + 1, rex_b);
         wr(dev, off, op[1 + mlen], 1);
         ctx->Rip += prefix + 1 + mlen + 1;
