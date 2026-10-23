@@ -427,8 +427,10 @@ void xbox_kernel_init(void)
             xbox_kernel_thunk_table[i] = ptr;
             resolved++;
         } else {
-            /* Point unresolved thunks to our error handler */
-            xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
+            /* The optional native IDE object is data, never executable code.
+             * Leave an unavailable object NULL rather than exposing the error
+             * handler's instruction bytes as an IDE channel structure. */
+            xbox_kernel_thunk_table[i] = ordinal==357 ? 0 : (ULONG_PTR)xbox_unresolved_thunk;
             unresolved++;
         }
     }
