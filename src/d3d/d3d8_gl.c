@@ -1,26 +1,9 @@
 /*
- * d3d8_gl.c - OpenGL 3.3 backend for the D3D8 compat layer (Linux)
- *
- * The Windows build keeps using D3D11 (d3d8_device.c / d3d8_resources.c /
- * d3d8_states.c / d3d8_combiners.c / d3d8_vsh.c / d3d8_shaders.c). The
- * CMake split picks this file on POSIX.
- *
- * This is the FIRST cut of the real OpenGL backend:
- *   - SDL3 window + GL 3.3 core context
- *   - All Xbox D3D8 COM interfaces wired up (every vtable slot has a body)
- *   - Real Clear, Present, BeginScene/EndScene, viewport, scissor
- *   - Render-state caching with a small "apply" path for depth/blend/cull/etc.
- *   - CreateTexture / CreateVertexBuffer / CreateIndexBuffer with shadow
- *     memory + a GL handle ready for upload
- *   - DrawPrimitive(UP) / DrawIndexedPrimitive(UP) with a fixed GLSL program
- *     supporting position + diffuse + UV (the FVF set the recompiled RW
- *     driver actually emits at this point)
- *
- * Next iterations: real texture-format mapping, FVF-driven input layouts
- * beyond pos/diffuse/UV, Xbox VSH bytecode → GLSL, register-combiner
- * pixel programs → GLSL fragment.
+ * OpenGL backend for the D3D8 object interface, selected on POSIX builds.
+ * Uses an SDL3 window/context and host resource/state translation.
+ * Supported behavior is bounded by the implementation and focused tests;
+ * vtable entries alone do not establish complete interface conformance.
  */
-
 #include "d3d8_xbox.h"
 #include "d3d8_fvf.h"
 
