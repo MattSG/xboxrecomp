@@ -59,17 +59,10 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
-/* Physical addresses, resolved the way every other bus master here does it
- * (dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c).
- *
- * DirectSound builds its voice, SGE and notifier structures in
- * MmAllocateContiguousMemory and hands the APU their physical addresses.
- * Physical P and the contiguous window's 0x80000000 + P are the same bytes on
- * hardware; here the window is separate storage. Reading every address as low
- * RAM meant the voice processor walked zeroes and wrote each "voice done"
- * notification into ordinary RAM, where DirectSound never looked -- so a
- * buffer never reported that it had stopped, and Burnout 3's frontend waits
- * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
+/* Resolve bus addresses through runtime physical mappings, contiguous
+ * allocations, loaded image storage, reservations and ordinary heap pages.
+ * The contiguous window has separate host storage: guest physical P must
+ * reach the same bytes as its 0x80000000 + P alias. */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 /* An address that is none of the mappings below. Wrapping it into low RAM
@@ -158,8 +151,7 @@ static void update_irq(MCPXAPUState *d)
 
 /* ---- delivering it ---------------------------------------------------- */
 
-/* HalGetInterruptVector(5) -- the APU's IRQ -- is what DirectSound connects
- * its service routine to (0x002F8E81 in Burnout 3). */
+/* DirectSound connects its APU service routine through interrupt vector 5. */
 #define APU_VECTOR 5
 
 typedef void (*apu_guest_fn)(void);
@@ -282,19 +274,10 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
         qatomic_set(&d->regs[addr], (uint32_t)val);
-        /* Starting the APU has to start the frame thread.
-         *
-         * The thread idles on pause_requested, which init sets and only the
-         * test tone ever cleared -- so a title that enabled the APU through
-         * these registers got an APU that stayed asleep. Nothing then advanced
-         * the front end, and a title waiting on a notify completion (the
-         * FEMEMDATA magic write, which is how completion reaches guest memory)
-         * waited forever. Wreckless hangs exactly there during DirectSound
-         * init, and because it initialises its whole engine behind a
-         * successful DirectSound create, that hang is not confined to audio.
-         *
-         * Resume whenever the write is not switching the block off; the thread
-         * re-checks FECTL itself and idles again if it is halted or trapped. */
+        /* Register startup must resume the frame thread; initialization leaves
+         * pause_requested set. Resume when neither SECTL nor FECTL turns the
+         * block off. The frame thread rechecks FECTL and idles when halted
+         * or trapped; FEMEMDATA publishes notify completion to guest memory. */
         {
             uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
             uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -722,16 +705,9 @@ static void *mcpx_apu_frame_thread(void *arg)
         }
         apu_deliver_irq(d);
 
-        /* Let the guest in once per frame.
-         *
-         * The thread holds d->lock for its whole loop and only drops it inside
-         * throttle()'s wait. Once voices really play, processing can run
-         * behind real time, throttle never waits, and the lock is never
-         * released -- while every VOICE_ON/OFF/RELEASE the title writes needs
-         * it (voice_lock). A critical section is not fair, so the title's
-         * thread starved there indefinitely: Burnout 3 froze on its vehicle
-         * select, blocked in voice_lock at raised IRQL, which in turn held
-         * off every USB interrupt. */
+        /* Release the APU lock once per frame so guest voice methods can run
+         * even when processing is behind real time and throttle never waits.
+         * Critical-section scheduling does not guarantee fairness. */
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
