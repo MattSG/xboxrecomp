@@ -38,9 +38,16 @@ void video_close(void);
  * guest carries on running while the video plays. */
 int  xbox_VideoPlayFile(const char *host_path);
 int  xbox_VideoIsPlaying(void);
+/* Optional pump presentation notification, 1-based and reset for each playback.
+ * Register/clear only while playback is stopped and callers are quiesced.
+ * Called on the playback thread after Present returns; it does not prove the
+ * presentation succeeded or that a new frame decoded. May inspect/dump the
+ * current decoded frame; must not run guest code, restart playback or shut down
+ * the decoder. */
+void xbox_VideoSetPresentHandler(void (*handler)(unsigned frame));
 
-/* Write the current decoded frame to a 24-bit BMP -- evidence that real
- * pixels reached the renderer, which a log line cannot give. */
+/* Write the current decoded CPU frame to a 24-bit BMP.
+ * This is not a readback of the rendered window or proof of presentation. */
 int  video_dump_frame_bmp(const char *path);
 
 /* Show the guest framebuffer in its own window (RECOMP_FB_WINDOW). Whatever
