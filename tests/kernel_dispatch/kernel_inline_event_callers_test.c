@@ -328,7 +328,7 @@ int main(int argc, char **argv)
 {
     CHECK(argc == 2);
     _putenv_s("RECOMP_TITLE_KEVENTS", "0"); _putenv_s("RECOMP_ASYNC_WAIT_TRACE", "0");
-    _putenv_s("MM3_BUILDING_TRACE", "0"); _putenv_s("RECOMP_KERNEL_LOG_BUDGET", "0");
+    _putenv_s("RECOMP_KERNEL_LOG_BUDGET", "0");
     _putenv_s("RECOMP_GUEST_LOCK", "0");
     memory = VirtualAlloc(NULL, 0x100000, MEM_RESERVE, PAGE_NOACCESS);
     CHECK(memory && VirtualAlloc(memory, 0x40000, MEM_COMMIT, PAGE_READWRITE) == memory);
