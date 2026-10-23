@@ -88,6 +88,13 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  * simultaneously, so another thread must not replace that call's reason. */
 static XBOX_THREAD_LOCAL uint32_t g_xbox_last_file_error;
 
+/* Startup configuration; immutable while file operations are running. */
+static int s_share_read_only;
+void xbox_SetReadOnlyFileSharing(BOOLEAN enabled)
+{
+    s_share_read_only = enabled != FALSE;
+}
+
 static void (*s_file_open_observer)(const xbox_host_char *);
 void xbox_SetFileOpenObserver(void (*observer)(const xbox_host_char *path))
 {
@@ -473,12 +480,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
-    /* The Xbox has one process, so a title's exclusive share mode only ever
-     * meant "not within this title". On the host a second copy of the game
-     * (system-link testing) reads the same disc files: read-only opens share
-     * reads, or the first copy locks the second out of D:. */
+    /* Application opt-in may broaden read sharing for read-only host files. */
     DWORD share = xbox_share_to_win32(ShareAccess);
-    if (!(xbox_access_to_win32(DesiredAccess) & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA |
+    if (s_share_read_only && !(xbox_access_to_win32(DesiredAccess) & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA |
           FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | DELETE)))
         share |= FILE_SHARE_READ;
 
@@ -1313,12 +1317,10 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         if (slash && slash != host_path)
             *slash = 0;
     }
-    /* Win32 share rules, as in the Win32 backend: the caller's ShareAccess, and
-     * read sharing for read-only opens (system-link testing shares read-only
-     * disc files between two copies of the game). */
+    /* Preserve caller sharing unless the application opts into shared reads. */
     win_access = posix_access_to_win32(DesiredAccess);
     share = posix_share_to_win32(ShareAccess);
-    if (!(win_access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA |
+    if (s_share_read_only && !(win_access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA |
           FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | DELETE)))
         share |= FILE_SHARE_READ;
 

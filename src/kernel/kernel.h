@@ -690,6 +690,11 @@ NTSTATUS __stdcall xbox_NtQueryVirtualMemory(PVOID BaseAddress, PVOID MemoryInfo
  * File I/O (kernel_file.c)
  * ============================================================================ */
 
+/* Configure before file operations/worker startup. Default FALSE preserves
+ * caller ShareAccess. TRUE additionally shares read-only host opens for read;
+ * write-capable opens and existing incompatible handles remain exclusive. */
+void xbox_SetReadOnlyFileSharing(BOOLEAN enabled);
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
