@@ -76,44 +76,12 @@ extern "C" {
 /** Shader cache size (hashed microcode -> compiled shader). */
 #define NV2A_VS_CACHE_SIZE          64
 
-/* ================================================================
- * NV2A VS Instruction Encoding (128 bits = 4 DWORDs)
- *
- * Each instruction is composed of 4 x 32-bit words:
- *
- * Word 0 (ILU/misc):
- *   [31:29] - Reserved / type
- *   [28:25] - ILU opcode (4 bits)
- *   [24:21] - MAC opcode (4 bits)
- *   [20:13] - Const index (8 bits) - constant register selector
- *   [12:9]  - Input reg (v#) (4 bits) - which v0-v15 register
- *   [8]     - Source A negate
- *   [7:4]   - Source A register type + index (mux field A)
- *   [3:0]   - Source A swizzle X component (2 bits in combined field)
- *
- * Word 1 (Source A/B):
- *   [31:24] - Source A swizzle (Y, Z, W components) + remaining bits
- *   [23:16] - Source B register select + negate + type
- *   [15:0]  - Source B swizzle + remaining fields
- *
- * Word 2 (Source C / MAC dest):
- *   [31:16] - Source C register select + negate + swizzle
- *   [15:12] - MAC dest temp register index
- *   [11:8]  - MAC dest write mask (xyzw)
- *   [7:3]   - MAC dest output register mux
- *   [2:0]   - Remaining source C bits
- *
- * Word 3 (ILU dest / final):
- *   [31:28] - ILU dest temp register index
- *   [27:24] - ILU dest write mask (xyzw)
- *   [23:19] - ILU dest output register mux
- *   [18:1]  - Reserved / other fields
- *   [0]     - Final instruction flag (1 = last instruction in program)
- *
- * NOTE: The exact bit layout follows the xemu/envytools conventions.
- * The fields below are extracted using shift-and-mask operations
- * matching the NV2A hardware encoding.
- * ================================================================ */
+/* NV2A wire encoding: DWORD 0 is unused. DWORD 1 contains opcodes,
+ * constant/input indices and A swizzle/negate. DWORD 2 contains A/B muxes,
+ * B/C swizzles and temporary indices. DWORD 3 carries C mux/index remainder,
+ * independent MAC/ILU temporary masks, shared output selection/mask, relative
+ * addressing and final. See d3d8_vsh_parse and its pinned field reference.
+ * IR register-bank enum values below are not wire mux values. */
 
 /* ================================================================
  * Opcode Enumerations
@@ -171,7 +139,8 @@ typedef enum NV2AVshRegType {
     NV2A_VSH_REG_TEMP   = 0,  /* R0-R11 (R12 = oPos alias) */
     NV2A_VSH_REG_INPUT  = 1,  /* v0-v15 */
     NV2A_VSH_REG_CONST  = 2,  /* c0-c191 (may be indexed via a0) */
-    NV2A_VSH_REG_COUNT  = 3,
+    NV2A_VSH_REG_UNKNOWN = 3,
+    NV2A_VSH_REG_COUNT  = 4,
 } NV2AVshRegType;
 
 /**
@@ -228,7 +197,9 @@ typedef struct NV2AVshSrcOperand {
 typedef struct NV2AVshDstOperand {
     int               temp_reg;    /* Temp register index (0-12), or -1 if none */
     NV2AVshOutputReg  output_reg;  /* Output register, or NV2A_VSH_OUT_NONE */
-    uint8_t           write_mask;  /* Bitmask: bit3=x, bit2=y, bit1=z, bit0=w */
+    uint8_t           write_mask;  /* Temporary mask: x=8,y=4,z=2,w=1 */
+    uint8_t           output_mask; /* Independent shared-output mask */
+    int               constant_reg; /* Constant-output address, or -1 */
 } NV2AVshDstOperand;
 
 /**
@@ -265,6 +236,8 @@ typedef struct NV2AVshInstruction {
 typedef struct NV2AVshProgram {
     NV2AVshInstruction  insns[NV2A_VS_MAX_INSTRUCTIONS];
     int                 length;     /* Number of instructions */
+
+    int                 unsupported; /* Unsupported encoding or state write */
 
     /* Bitmask of input registers read (v0-v15). Bit N = vN is used.
      * Used to determine the required input layout. */
@@ -327,7 +300,8 @@ void d3d8_vsh_shutdown(void);
  * @param microcode   Pointer to the 128-bit instruction array (4 DWORDs each)
  * @param num_insns   Number of instructions
  * @param out_handle  Receives the shader handle (>= 0x10000 to distinguish from FVF)
- * @return S_OK on success
+ * @return S_OK on success; E_NOTIMPL for unsupported draw/state encodings.
+ * The output handle is unchanged on failure.
  */
 HRESULT d3d8_vsh_create_shader(const DWORD *microcode, int num_insns,
                                 DWORD *out_handle);
