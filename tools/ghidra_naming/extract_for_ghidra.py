@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""
-Prepare a an Xbox XBE for Ghidra headless raw-binary import.
+"""Prepare an XBE for headless raw-binary import.
 
-Ghidra 12.0.3 has no built-in XBE loader, so we use the project's existing
-xbe_parser to read the section table and build ONE flat raw image that spans
-from the XBE base address (0x00010000) to the end of the highest loadable
-section. Each section's raw bytes are placed at (virtual_addr - base_address),
-with gaps zero-filled.
+Read the caller's XBE section table and build one flat image, starting at its
+header base_address. Place each section at virtual_addr - base_address and
+zero-fill gaps/virtual tails. Outputs in --out-dir are xbe_flat.bin and
+sections.json; the importer must use that metadata's base_address rather than
+assuming a reference image's layout. This is a partial image preparation tool,
+not a full XBE loader or malformed-input validator.
 
-Because the image starts at the XBE base, a Ghidra import with image base
-0x00010000 yields virtual addresses that match the recompiler's
-functions.json `start` values exactly (Xbox VAs).
-
-Outputs (into --out-dir, default tools/ghidra_naming/work):
-  xbe_flat.bin   - flat image, load at image base 0x00010000
-  sections.json       - section metadata + chosen image base/size
-
-Usage:
-  py -3 tools/ghidra_naming/extract_for_ghidra.py /path/to/default.xbe
+Usage: python extract_for_ghidra.py path/to/input.xbe --out-dir build/ghidra
 """
 import argparse
 import json
