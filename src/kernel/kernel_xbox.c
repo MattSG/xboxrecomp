@@ -55,13 +55,8 @@ UCHAR xbox_AlternateSignatureKeys[16][16] = {{0}};
 /* Public-key bytes; zero until supplied by the port. */
 UCHAR xbox_XePublicKeyData[284] = {0};
 
-/* Image filename - the XBE path as seen by the kernel */
-static char g_image_filename[] = "\\Device\\CdRom0\\default.xbe";
-XBOX_ANSI_STRING xbox_XeImageFileName = {
-    .Length        = sizeof(g_image_filename) - 1,
-    .MaximumLength = sizeof(g_image_filename),
-    .Buffer        = g_image_filename
-};
+/* Caller-owned counted image path; zero means unconfigured. */
+XBOX_ANSI_STRING xbox_XeImageFileName = {0};
 
 /* Optional port-owned boot input. Native consumers use this host pointer;
  * bridge initialization copies its complete 4096-byte guest layout. */

@@ -95,6 +95,21 @@ explicitly changed, while the selected runtime address retires at shutdown.
 The page's export payloads remain partial kernel implementations, not a full
 hardware identity or firmware image.
 
+## Counted export strings
+
+The port supplies `xbox_XeImageFileName`, `xbox_HalDiskModelNumber`,
+`xbox_HalDiskSerialNumber` and `xbox_HalDiskCachePartitionCount`. Defaults are
+unconfigured zero values. Native STRING buffers must back `Length` bytes and
+remain alive while native consumers use them. Bridge initialization copies
+exactly `Length` bytes into owned guest heap capacity `MaximumLength`, writing
+two 16-bit counts and a 32-bit guest buffer VA. No terminator is assumed or
+added outside that capacity. Unused capacity is zeroed. Invalid counts/NULL
+nonempty input or allocation failure leave an empty descriptor.
+
+These are boot copies retained until memory-layout shutdown, like optional
+launch input. Change input only while quiesced; this is not a live synchronization
+API. Label text, image path and cache-partition topology belong to the port.
+
 ## Optional launch input
 
 `xbox_LaunchDataPage` defaults to NULL. A port may supply a complete

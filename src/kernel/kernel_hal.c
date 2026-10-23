@@ -1072,27 +1072,15 @@ NTSTATUS __stdcall xbox_HalWriteSMBusValue(
  * of real storage -- pointing these at a function is what produced garbage
  * disk metadata before.
  *
- * The strings are counted (Length/MaximumLength), not NUL-terminated, matching
- * the kernel's STRING type. Values describe the virtual disk we present; no
- * real hardware is queried.
+ * The strings are counted (Length/MaximumLength); no terminator is required,
+ * matching the kernel's STRING type. Values come from the port; zero defaults do not
+ * invent a disk model, serial number or cache-partition topology.
  * ============================================================================ */
 
-ULONG xbox_HalDiskCachePartitionCount = 3;
-
-static char g_disk_model[]  = "XBOXRECOMP VIRTUAL HDD";
-static char g_disk_serial[] = "XR0000000000";
-
-XBOX_ANSI_STRING xbox_HalDiskModelNumber = {
-    sizeof(g_disk_model) - 1,
-    sizeof(g_disk_model) - 1,
-    g_disk_model
-};
-
-XBOX_ANSI_STRING xbox_HalDiskSerialNumber = {
-    sizeof(g_disk_serial) - 1,
-    sizeof(g_disk_serial) - 1,
-    g_disk_serial
-};
+/* Port supplies disk topology and counted identity strings before init. */
+ULONG xbox_HalDiskCachePartitionCount = 0;
+XBOX_ANSI_STRING xbox_HalDiskModelNumber = {0};
+XBOX_ANSI_STRING xbox_HalDiskSerialNumber = {0};
 
 /*
  * Video mode the SMC reported at boot. 0 lets title code fall back to querying

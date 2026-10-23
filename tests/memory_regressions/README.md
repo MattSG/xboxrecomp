@@ -137,3 +137,8 @@ exports between native resolution and the guest page. Every byte of hardware,
 version, three keys, alternate keys and public-key storage is checked; the
 runtime must ignore credential environment variables. This does not prove any
 hardware identity or cryptographic/kernel behavior.
+
+Counted-string cases cover port strings/topology, embedded NULs, nonterminated
+input, long paths, all 65535 counted bytes, absent/empty input, invalid counts or
+NULL data, and exhausted guest heap. Guest STRING descriptors use 32-bit VAs;
+Length/MaximumLength and bounded owned capacity match the valid native input.
