@@ -34,9 +34,8 @@ PVOID xbox_IoFileObjectType       = &g_file_object_type_data;
 /* ============================================================================
  * Device Management
  *
- * IoCreateDevice/IoDeleteDevice create kernel device objects. Since we
- * don't have real kernel drivers, we allocate dummy objects that satisfy
- * the interface without actual device functionality.
+ * Native-pointer device creation is unsupported. Guest device objects and
+ * dispatch are implemented by the fixed-width guest bridge.
  * ============================================================================ */
 
 NTSTATUS __stdcall xbox_IoCreateDevice(
@@ -82,7 +81,8 @@ int xbox_IoInitializeIrpGuest(uint32_t guest_va, PVOID Irp, USHORT PacketSize, C
     if (!irp || StackSize <= 0)
         return 0;
     required = XBOX_IRP_SIZE + (uint32_t)(uint8_t)StackSize * XBOX_IO_STACK_LOCATION_SIZE;
-    if (PacketSize < required || guest_va > UINT32_MAX - required)
+    if (PacketSize < required || guest_va > UINT32_MAX - required ||
+        (uint64_t)guest_va + PacketSize > UINT64_C(0x100000000))
         return 0;
 
     memset(irp, 0, PacketSize);

@@ -58,3 +58,5 @@ foreach(mode object-reference-default bridge-override)
     add_test(NAME kernel_${mode} COMMAND kernel_bridge_test ${mode})
     set_tests_properties(kernel_${mode} PROPERTIES TIMEOUT 10)
 endforeach()
+
+add_test(NAME kernel_irp_packet_boundary COMMAND kernel_bridge_test irp-packet-boundary)

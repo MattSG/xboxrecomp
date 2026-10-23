@@ -337,6 +337,20 @@ static void firmware_observer(ULONG routine)
 }
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "irp-packet-boundary")) {
+        extern int xbox_IoInitializeIrpGuest(uint32_t, PVOID, USHORT, CCHAR);
+        unsigned char packet[512], original[512];
+        memset(packet, 0xa5, sizeof(packet));
+        memcpy(original, packet, sizeof(packet));
+        check(!xbox_IoInitializeIrpGuest(UINT32_MAX - 255u, packet, 512, 1),
+              "full packet crossing guest address end is rejected", NULL);
+        check(!memcmp(packet, original, sizeof(packet)),
+              "rejected packet remains unchanged", NULL);
+        check(xbox_IoInitializeIrpGuest(UINT32_MAX - 511u, packet, 512, 1),
+              "packet ending at guest address end is accepted", NULL);
+        return failures ? 1 : 0;
+    }
+
     /* This fixture owns fixed raw scratch addresses below the export page. */
     if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
 
