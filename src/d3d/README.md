@@ -34,7 +34,7 @@ conversion/backend and relevant tests for a particular format or shader path.
 
 The standalone tests/d3d8_smoke CMake project uses production sources. On
 Windows it includes CPU format/layout checks and D3D11 checks for gamma,
-bound states, alpha sampling and vertex-program handling. Some use D3D11's
+bound states, alpha/palette sampling and vertex-program handling. Some use D3D11's
 software device. The POSIX test needs a working GL context/display.
 
 Run from the toolkit checkout:
