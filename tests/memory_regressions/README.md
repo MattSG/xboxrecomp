@@ -17,7 +17,7 @@ One test per mode, one process each, because the switches are read once and cach
 |---|---|
 | `memory_regressions_default` | No switch set. Freed heap blocks are split on reuse, contiguous memory is reused, and an explicit high base is not honoured. |
 | `memory_regressions_car_churn` | No switch set. Reuses an unaligned free tail for a page-aligned request, coalesces its fragments, and runs 200 model-sized temporary allocations interspersed with small persistent objects without exhausting the heap or corrupting those objects. |
-| `memory_regressions_scene_churn` | `RECOMP_HEAP_RECLAIM=1` on a 128 MB map. Repeats 24 whole-roster scene loads using commit-only flags and synthetic non-page-aligned block sizes, releasing through the NT bridge; addresses stabilize, reused bytes are zero, and live neighbours remain intact. |
+| `memory_regressions_scene_churn` | `RECOMP_HEAP_RECLAIM=1` on a 128 MB map. Repeats 24 whole-roster scene loads using a title's commit-only flags and observed model sizes, releasing through the NT bridge; addresses stabilize, reused bytes are zero, and live neighbours remain intact. |
 | `memory_regressions_heap_reclaim` | `RECOMP_HEAP_RECLAIM=1`. The first table below. |
 | `memory_regressions_ext_vma` | `RECOMP_EXT_VMA=1`. The second table. |
 | `memory_regressions_ext_vma_128` | `RECOMP_EXT_VMA=1` on a 128 MB map. The tracker stays off. |

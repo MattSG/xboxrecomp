@@ -1,4 +1,4 @@
-/* Real event bridges with synthetic caller PCs and request sentinels.
+/* Real event bridges with a title's XPP pending-request/wait/cancel contract.
  * No game assets or guest event opt-in are needed. */
 #include "../../src/kernel/kernel_bridge.c"
 #include "../kernel_test_host.h"

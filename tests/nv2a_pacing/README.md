@@ -1,6 +1,6 @@
 # NV2A display pacing regressions
 
-Build from the XboxRecomp checkout with a Visual Studio developer shell:
+Build with a Windows MSVC environment (`python scripts/devenv.py --shell` in a title checkout provides one):
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force

@@ -129,13 +129,7 @@ The state snapshots are zero-initialized, read-only diagnostic structures from
 four mirrors, each with 27 metadata words and a `0x2200`-byte raw device block.
 The header carries the version and total byte size. Validity flags and
 `device_bytes` distinguish unavailable data from a real zero. Registered device
-pointers supply the roots; the helper does not hardcode an image global.
-Configure `xbox_Nv2aCaptureLayout` before guest execution to decode the port's
-channel, PFIFO pointer and inclusive ring bounds. With no layout, these fields
-remain unavailable; raw device and hardware state capture still works. Version 2
-adds `ring_first`, `ring_last` and `ring_valid` to each mirror. The JSON contains
-these generic fields; device-layout-specific cursor/fence decoding belongs in
-the port's diagnostic tools. Old version-1 readers must reject the new size/version.
+pointers supply the roots; the helper does not hardcode a title's image global.
 The snapshots and ring copies do not suspend the producer and are not atomic;
 the fetched-word ledger is the evidence of what execution actually read.
 
@@ -148,7 +142,7 @@ only its own artifacts.
 
 Timer lifecycle cases cover signal publication before callbacks, rearming,
 retired timer storage, periodic cancellation, and absolute/relative deadlines.
-The `audio_deadline` case checks a future-deadline rearm loop: one action
+The `audio_deadline` case mirrors a title's future-deadline rearm loop: one action
 must require one callback, rather than running again on every polling tick.
 DPC cancellation cases exercise wrapped FIFO order, duplicate rejection, and
 1,000 insert/cancel cycles without losing queue capacity.
@@ -173,7 +167,7 @@ The log snapshots 12 raw dwords at each of ESI and EBX with guarded reads;
 request packet from its return PC.
 
 The inline-event caller cases exercise the public startup-only
-`xbox_kernel_set_inline_event_callers` API with synthetic setter and
+`xbox_kernel_set_inline_event_callers` API with a title's verified XPP setter and
 wait return PCs. The global `RECOMP_TITLE_KEVENTS` option stays disabled.
 Real native completion workers pass through the kernel dispatch bridge,
 including completion before the first wait and completion while it blocks.

@@ -4123,8 +4123,8 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
 }
 
 /* The last flipped frame shown again, paced like a flip: for a title that
- * has nothing new to draw between world updates. Asked from the title's
- * thread, done on this one, which owns the
+ * has nothing new to draw this frame (a console-rate title mod between world
+ * updates). Asked from the title's thread, done on this one, which owns the
  * device; the asker waits for it as it would for a flip. */
 static volatile LONG s_repeat;
 

@@ -389,11 +389,12 @@ int main(int argc, char **argv)
     }
     printf("mode: %s\n", mode);
     if (scene_churn) {
-        /* Synthetic non-page-aligned blocks exercise the NT release bridge.
-         * Keeping the whole group live catches a release no-op even when
-         * individual allocation/free pairs appear stable. */
-        const uint32_t sizes[] = {0x250030u, 0x2B0030u, 0x190030u, 0x1A0030u,
-                                 0x130030u, 0x160030u, 0x180030u, 0x140030u};
+        /* Sizes from a title's race -> menu -> car-change OOM report. Unlike
+         * car-churn, these blocks return through the NT bridge, not HeapFree.
+         * Keeping the whole roster live for each scene catches a release
+         * no-op even when individual car changes appear stable. */
+        const uint32_t sizes[] = {2441264u, 2818096u, 1638448u, 1720368u,
+                                 1261616u, 1458224u, 1635472u, 1342608u};
         uint32_t blocks[8], first[8] = {0};
         uint32_t guard = xbox_HeapAlloc(4096, 16);
         unsigned completed = 0;
@@ -403,9 +404,9 @@ int main(int argc, char **argv)
             unsigned loaded = 0;
             for (; loaded < 8; ++loaded) {
                 uint32_t size = sizes[loaded], base = 0;
-                /* Commit-only requests choose their base; alternate the Xbox
-                 * MEM_NOZERO flag while checking the existing zeroing and
-                 * ownership contract of the NT release path. */
+                /* A title's large CRT allocation requests commit at base zero,
+                 * optionally with MEM_NOZERO. It returns base + 0x30 to the
+                 * file loader and subtracts that header before release. */
                 uint32_t st = nt_alloc_at(&base, &size, loaded & 1 ? 0x801000 : 0x1000);
                 blocks[loaded] = base;
                 if (st || !blocks[loaded]) break;
