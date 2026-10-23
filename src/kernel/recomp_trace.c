@@ -264,6 +264,10 @@ void recomp_trace_esp(const char *name, const char *tag)
  * is happening, and during bring-up that is the most valuable output there is.
  * ------------------------------------------------------------------------- */
 
+/* Defined in xbox_memory_layout.c; declared extern per consumer, as
+ * kernel_bridge.c already does. */
+extern ptrdiff_t g_xbox_mem_offset;
+
 void recomp_debug_service(uint32_t service, uint32_t arg_va)
 {
     uint8_t header[8];
