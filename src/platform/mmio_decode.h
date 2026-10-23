@@ -47,6 +47,27 @@ static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
     }
 }
 
+static inline uint64_t mmio_width_mask(int size)
+{
+    return size == 8 ? UINT64_MAX : (1ULL << (size * 8)) - 1;
+}
+
+static inline uint64_t mmio_read_reg(PCONTEXT ctx, int reg, int size, int rex)
+{
+    int high_byte = size == 1 && !rex && reg >= 4 && reg < 8;
+    return (*mmio_ctx_reg(ctx, high_byte ? reg - 4 : reg) >> (high_byte ? 8 : 0)) &
+           mmio_width_mask(size);
+}
+
+static inline void mmio_write_reg(PCONTEXT ctx, int reg, int size, int rex, uint64_t value)
+{
+    int high_byte = size == 1 && !rex && reg >= 4 && reg < 8;
+    int shift = high_byte ? 8 : 0;
+    uint64_t mask = mmio_width_mask(size), *dst = mmio_ctx_reg(ctx, high_byte ? reg - 4 : reg);
+    if (size >= 4) *dst = value & mask; /* DWORD writes clear the upper half. */
+    else *dst = (*dst & ~(mask << shift)) | ((value & mask) << shift);
+}
+
 static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
 {
     uint8_t modrm = *ip;
@@ -65,21 +86,20 @@ static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
     return len;
 }
 
-/* Flags after a compare-shaped operation, so a poll loop branches correctly.
- * ZF, SF and CF only: those are what jz/jnz, js and jb/jae read, and inventing
- * an overflow flag nothing here sets is worse than leaving it alone. */
+/* Defined status flags; auxiliary carry is set separately for subtraction. */
 static inline void mmio_set_flags(PCONTEXT ctx, uint64_t result, int size,
-                                  int carry)
+                                  int carry, int overflow)
 {
-    ctx->EFlags &= ~(0x0001u | 0x0040u | 0x0080u | 0x0800u);
-    if (size < 8)
-        result &= (1ULL << (size * 8)) - 1;
-    if (result == 0)
-        ctx->EFlags |= 0x0040u;                                   /* ZF */
-    if (result & (1ULL << (size * 8 - 1)))
-        ctx->EFlags |= 0x0080u;                                   /* SF */
-    if (carry)
-        ctx->EFlags |= 0x0001u;                                   /* CF */
+    unsigned parity;
+    ctx->EFlags &= ~(0x0001u | 0x0004u | 0x0040u | 0x0080u | 0x0800u);
+    result &= mmio_width_mask(size);
+    if (result == 0) ctx->EFlags |= 0x0040u;
+    if (result & (1ULL << (size * 8 - 1))) ctx->EFlags |= 0x0080u;
+    if (carry) ctx->EFlags |= 0x0001u;
+    if (overflow) ctx->EFlags |= 0x0800u;
+    parity = (unsigned)result & 0xFFu;
+    parity ^= parity >> 4; parity ^= parity >> 2; parity ^= parity >> 1;
+    if (!(parity & 1)) ctx->EFlags |= 0x0004u;
 }
 
 /* 1 if the instruction at ctx->Rip was serviced and Rip advanced past it. */
@@ -113,7 +133,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
         if (op[0] == 0x88) size = 1;
         mlen = mmio_modrm_len(op + 1, rex_b);
         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        wr(dev, off, *mmio_ctx_reg(ctx, reg), size);
+        wr(dev, off, mmio_read_reg(ctx, reg, size, has_rex), size);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
 
@@ -144,16 +164,12 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
         return 1;
 
     case 0x8A: case 0x8B: {                          /* MOV r, r/m   (read)  */
-        uint64_t v, *dst;
+        uint64_t v;
         if (op[0] == 0x8A) size = 1;
         mlen = mmio_modrm_len(op + 1, rex_b);
         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
         v    = rd(dev, off, size);
-        dst  = mmio_ctx_reg(ctx, reg);
-        if (size == 1)      *dst = (*dst & ~0xFFULL)   | (v & 0xFF);
-        else if (size == 2) *dst = (*dst & ~0xFFFFULL) | (v & 0xFFFF);
-        else if (size == 4) *dst = v & 0xFFFFFFFFULL;  /* 32-bit clears high */
-        else                *dst = v;
+        mmio_write_reg(ctx, reg, size, has_rex, v);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
     }
@@ -164,8 +180,8 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
         mlen = mmio_modrm_len(op + 1, rex_b);
         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
         m    = rd(dev, off, size);
-        r    = *mmio_ctx_reg(ctx, reg);
-        mmio_set_flags(ctx, m & r, size, 0);
+        r    = mmio_read_reg(ctx, reg, size, has_rex);
+        mmio_set_flags(ctx, m & r, size, 0, 0);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
     }
@@ -176,36 +192,38 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
         mlen = mmio_modrm_len(op + 1, rex_b);
         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
         m    = rd(dev, off, size);
-        r    = *mmio_ctx_reg(ctx, reg);
+        r    = mmio_read_reg(ctx, reg, size, has_rex);
         mask = (size < 8) ? ((1ULL << (size * 8)) - 1) : ~0ULL;
         m &= mask; r &= mask;
-        mmio_set_flags(ctx, m - r, size, m < r);
+        uint64_t result = m - r;
+        int overflow = ((m ^ r) & (m ^ result) & (1ULL << (size * 8 - 1))) != 0;
+        mmio_set_flags(ctx, result, size, m < r, overflow);
+        ctx->EFlags = (ctx->EFlags & ~0x10u) | (unsigned)((m ^ r ^ result) & 0x10u);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
     }
 
-    case 0x08: case 0x09:                            /* OR  r/m, r           */
-        if (op[0] == 0x08) size = 1;
+    case 0x08: case 0x09:                            /* OR r/m, r */
+    case 0x20: case 0x21: {                          /* AND r/m, r */
+        uint64_t value, operand;
+        if (!(op[0] & 1)) size = 1;
         mlen = mmio_modrm_len(op + 1, rex_b);
-        reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        wr(dev, off, rd(dev, off, size) | *mmio_ctx_reg(ctx, reg), size);
+        reg = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
+        value = rd(dev, off, size);
+        operand = mmio_read_reg(ctx, reg, size, has_rex);
+        value = (op[0] < 0x20 ? value | operand : value & operand) & mmio_width_mask(size);
+        wr(dev, off, value, size);
+        mmio_set_flags(ctx, value, size, 0, 0);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
-
-    case 0x20: case 0x21:                            /* AND r/m, r           */
-        if (op[0] == 0x20) size = 1;
-        mlen = mmio_modrm_len(op + 1, rex_b);
-        reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        wr(dev, off, rd(dev, off, size) & *mmio_ctx_reg(ctx, reg), size);
-        ctx->Rip += prefix + 1 + mlen;
-        return 1;
+    }
 
     case 0x0F:
         if (op[1] == 0xB6 || op[1] == 0xB7) {        /* MOVZX r32, r/m8|16   */
             int s = (op[1] == 0xB6) ? 1 : 2;
             mlen  = mmio_modrm_len(op + 2, rex_b);
             reg   = ((op[2] >> 3) & 7) | (rex_r ? 8 : 0);
-            *mmio_ctx_reg(ctx, reg) = rd(dev, off, s) & ((1ULL << (s * 8)) - 1);
+            mmio_write_reg(ctx, reg, size, has_rex, rd(dev, off, s) & mmio_width_mask(s));
             ctx->Rip += prefix + 2 + mlen;
             return 1;
         }
