@@ -137,7 +137,8 @@ py -3 -m tools.func_id game_files/default.xbe -v
 | Flag | Description |
 |------|-------------|
 | `-v` / `--verbose` | Show identification details |
-| `--output-dir DIR` | Output directory (default: `tools/func_id/output/`) |
+| `--output DIR` | Output directory (default: `tools/func_id/output/`) |
+| `--game-keywords FILE` | Caller-owned keyword policy JSON (default: disabled) |
 
 **Classification strategies:**
 
@@ -148,19 +149,18 @@ py -3 -m tools.func_id game_files/default.xbe -v
 | **Immediate scanner** | Functions that reference known constants (vtable addresses, magic numbers) |
 | **Vtable scanner** | Virtual method tables (arrays of function pointers) |
 | **Stub classifier** | Empty/trivial functions (ret, xor eax,eax; ret) |
-| **Clustering** | Groups similar functions by instruction patterns |
+| **Clustering** | Propagates labels through call graph and address proximity |
 
-**Output:** Annotated function database with categories:
+**Output:** `identified_functions.json` records categories, confidence and
+identification methods alongside input function addresses. These are heuristic
+labels, not proof of function identity or ABI compatibility.
 
-```
-0x00011000  CRT     _mainCRTStartup
-0x00011240  GAME    resource_loader
-0x000636D0  GAME    physics_force_apply
-0x001DD910  RW      RwCameraBeginUpdate
-0x0034D530  RW      renderware_main_render (79KB!)
-```
-
-**Why this matters:** Knowing which functions are CRT vs RenderWare vs game code helps you prioritize. CRT functions usually "just work" in recompiled form. RenderWare functions may need manual overrides. Game functions need the most attention.
+Application keyword classification is disabled by default. Supply a JSON object
+mapping category names to lists of nonempty lowercase strings with
+`--game-keywords path/to/keywords.json`. For example, `{"space": ["orbit"]}`
+can label a matching referenced string as `game_space`. The Python `run` and
+`propagate_labels` APIs accept the same mapping as `game_keywords`; no policy
+persists between calls.
 
 ---
 

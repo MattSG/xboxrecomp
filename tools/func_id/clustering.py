@@ -16,7 +16,7 @@ from . import config
 
 
 def propagate_labels(functions, rw_results, crt_results, imm_refs, strings,
-                     verbose=False, sections=None):
+                     verbose=False, sections=None, game_keywords=None):
     """
     Propagate category labels through the call graph and by proximity.
 
@@ -29,6 +29,8 @@ def propagate_labels(functions, rw_results, crt_results, imm_refs, strings,
         verbose: Print progress info.
         sections: XBE section list from _parse_xbe_sections, for XDK-caller
             classification. Without it that pass is skipped.
+        game_keywords: Optional category -> lowercase keyword list, supplied by
+            the caller. None/empty disables application keyword classification.
 
     Returns:
         dict: func_addr (int) -> {
@@ -39,6 +41,13 @@ def propagate_labels(functions, rw_results, crt_results, imm_refs, strings,
         }
         This includes new classifications found by propagation only.
     """
+    if game_keywords is not None and (
+        not isinstance(game_keywords, dict) or any(
+            not isinstance(cat, str) or not cat or not isinstance(words, list) or
+            any(not isinstance(word, str) or not word or word != word.lower()
+                for word in words)
+            for cat, words in game_keywords.items())):
+        raise ValueError("game_keywords must map nonempty categories to lists of nonempty lowercase strings")
     # Build lookup structures
     func_by_addr = {}
     for f in functions:
@@ -167,7 +176,7 @@ def propagate_labels(functions, rw_results, crt_results, imm_refs, strings,
 
     # Game sub-classification via string references
     game_sub_count = _classify_game_subcategories(
-        sorted_addrs, labels, propagated, string_refs
+        sorted_addrs, labels, propagated, string_refs, game_keywords or {}
     )
     if verbose:
         print(f"  Game sub-classification: {game_sub_count} functions categorized")
@@ -411,7 +420,8 @@ def _build_string_ref_map(imm_refs, strings):
     return func_strings
 
 
-def _classify_game_subcategories(sorted_addrs, labels, propagated, string_refs):
+def _classify_game_subcategories(sorted_addrs, labels, propagated, string_refs,
+                                  game_keywords):
     """
     For unlabeled functions, try to sub-classify as game categories
     based on referenced string content.
@@ -429,7 +439,7 @@ def _classify_game_subcategories(sorted_addrs, labels, propagated, string_refs):
         best_score = 0
         combined_text = " ".join(refs)
 
-        for cat, keywords in config.GAME_SUBCATEGORIES.items():
+        for cat, keywords in game_keywords.items():
             score = sum(1 for kw in keywords if kw in combined_text)
             if score > best_score:
                 best_score = score
