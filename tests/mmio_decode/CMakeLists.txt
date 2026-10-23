@@ -6,3 +6,7 @@ target_include_directories(mmio-decode-test PRIVATE ../../src ../../src/platform
 target_link_libraries(mmio-decode-test PRIVATE platform)
 enable_testing()
 add_test(NAME mmio-decode COMMAND mmio-decode-test)
+add_executable(nv2a-mmio-adapter-test nv2a_adapter_test.c)
+target_include_directories(nv2a-mmio-adapter-test PRIVATE ../../src ../../src/nv2a)
+target_link_libraries(nv2a-mmio-adapter-test PRIVATE platform)
+add_test(NAME nv2a-mmio-adapter COMMAND nv2a-mmio-adapter-test)

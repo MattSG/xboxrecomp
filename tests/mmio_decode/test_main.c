@@ -123,7 +123,7 @@ static void check_snapshot_bounds(void)
 static void check_invalid_forms(void)
 {
     const uint8_t codes[][3] = {{0x88,0xC0}, {0x89,0xC0}, {0x8A,0xC0},
-        {0x8B,0xC0}, {0x84,0xC0}, {0x85,0xC0}, {0x38,0xC0}, {0x39,0xC0},
+        {0x8B,0xC0}, {0x84,0xC0}, {0x85,0xC0}, {0x38,0xC0}, {0x39,0xC0}, {0x3A,0xC0}, {0x3B,0xC0},
         {0x08,0xC0}, {0x09,0xC0}, {0x20,0xC0}, {0x21,0xC0}, {0x0F,0xB6,0xC0}};
     CONTEXT ctx = {0};
     for (unsigned i = 0; i < sizeof codes / sizeof codes[0]; i++) {
@@ -152,11 +152,15 @@ static void check_compare_widths(void)
         const uint64_t right[] = {1, 1, mask, 0, 1};
         const unsigned expected[] = {w ? 0x814 : 0x810, 0x95,
                                      w ? 0x885 : 0x881, 0x44, 0x14};
+        for (unsigned reverse = 0; reverse < 2; reverse++)
         for (unsigned i = 0; i < 5; i++) {
             CONTEXT ctx = {0};
+            uint8_t instruction[3];
+            memcpy(instruction, code[w], sizeof instruction);
+            if (reverse) instruction[(w == 1 || w == 3) ? 1 : 0] += 2;
             memset(&dev, 0, sizeof dev);
-            ctx.Rcx = right[i]; ctx.EFlags = 0x400;
-            ctx.Rip = (uintptr_t)code[w]; dev.next_read = left[i];
+            ctx.Rcx = reverse ? left[i] : right[i]; ctx.EFlags = 0x400;
+            ctx.Rip = (uintptr_t)instruction; dev.next_read = reverse ? right[i] : left[i];
             CHECK("CMP width handled", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
             CHECK_U64("CMP width status flags", ctx.EFlags & 0xCD5, expected[i] | 0x400);
             CHECK("CMP read-only", dev.reads == 1 && dev.writes == 0);
