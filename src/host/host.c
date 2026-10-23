@@ -128,6 +128,7 @@ int xbox_HostGraphicsInit(const char *window_title)
     DWORD old_protect;
     (void)window_title;
     nv2a_hook_init(g_xbox_mem_offset);
+    if (!nv2a_get_state()) return 0;
     if (!VirtualProtect((void *)((uintptr_t)g_xbox_mem_offset + PVIDEO_PAGE),
                         0x1000, PAGE_NOACCESS, &old_protect)) {
         fprintf(stderr, "[NV2A] could not trap PVIDEO page\n");
@@ -192,6 +193,7 @@ int xbox_HostGraphicsInit(const char *window_title)
     fprintf(stderr, "graphics: D3D8/D3D11 device initialized\n");
 
     nv2a_hook_init(g_xbox_mem_offset);
+    if (!nv2a_get_state()) return 0;
     /* PVIDEO accesses must execute register semantics, including STOP. */
     if (!VirtualProtect((void *)((uintptr_t)g_xbox_mem_offset + PVIDEO_PAGE),
                         0x1000, PAGE_NOACCESS, &old_protect)) {

@@ -21,7 +21,9 @@
 /*
  * Initialize the NV2A GPU subsystem.
  * Call this during startup before the game code runs.
- * Allocates VRAM, RAMIN, and initializes register state.
+ * Allocates VRAM/RAMIN once if no state exists. Failed initialization releases
+ * new backing. Existing caller-owned state is reused. Startup must be quiesced;
+ * the process-wide device has no teardown API. The offset is legacy/unused.
  */
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset);
 
@@ -44,15 +46,5 @@ void nv2a_hook_pvideo_consume(unsigned bank);
  */
 bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                            uint32_t fault_xbox_va, int is_write);
-
-/*
- * Handle a GPU framebuffer/push buffer access.
- *
- * Legacy writable host-page allocation. These pages are not aliases of the
- * modeled NV2A VRAM; this helper does not establish framebuffer/DMA ownership.
- *
- * Returns true if handled.
- */
-bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va);
 
 #endif /* XBOXRECOMP_NV2A_MMIO_HOOK_H */

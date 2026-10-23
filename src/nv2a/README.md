@@ -16,18 +16,18 @@ subsequent initialization returns the existing state. There is no teardown API.
 aperture, not absolute guest virtual addresses. Register definitions live in
 [nv2a_regs.h](nv2a_regs.h).
 
-For host fault handling, `nv2a_hook_init` allocates separate VRAM/RAMIN storage
-and initializes that state. Use this path instead of initializing separate
-caller-owned buffers. It does not register a host exception handler: the host
+For host fault handling, `nv2a_hook_init` creates VRAM/RAMIN storage only when
+no standalone state exists. It reuses existing state and releases new storage
+if state initialization fails. Initialization is quiesced and process-wide;
+its legacy offset argument is unused. It does not register a host exception handler: the host
 must validate the fault address and route supported GPU faults to
 `nv2a_hook_handle_mmio`. A false result leaves the fault unhandled; the host
 chooses its error policy. Instruction decoding is host-specific and partial.
 The non-x86-64/non-Windows branch supplies unsupported stubs.
 
-`nv2a_hook_handle_vram` allocates writable host pages; it does not alias them
-to the standalone device's VRAM buffer. PVIDEO snapshot/consume helpers
-coordinate with the hook's PVIDEO access lock. Direct register calls do not
-acquire that lock.
+VRAM aliasing belongs to the memory-layout/mapping layer; this hook handles
+register accesses only. PVIDEO snapshot/consume helpers coordinate with the
+hook's PVIDEO access lock. Direct register calls do not acquire that lock.
 
 ## Boundaries
 
