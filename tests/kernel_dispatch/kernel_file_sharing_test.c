@@ -105,9 +105,9 @@ static int malformed_name_contract(guest_fn open_guest, uint8_t *memory)
     return ok;
 }
 
-/* System-link instances may share guest read-only opens, including a guest
- * ShareAccess of zero. That exception must never give writers shared access. */
-static int shared_read_contract(XBOX_OBJECT_ATTRIBUTES *oa)
+/* Default/cleared policy preserves exclusive reads; opt-in broadens only
+ * read-only opens and must never give writers shared access. */
+static int shared_read_contract(XBOX_OBJECT_ATTRIBUTES *oa, int shared)
 {
     HANDLE first = NULL, second = NULL, writer = NULL;
     XBOX_IO_STATUS_BLOCK ios = {0};
@@ -118,6 +118,10 @@ static int shared_read_contract(XBOX_OBJECT_ATTRIBUTES *oa)
     if (status != STATUS_SUCCESS || !first) goto done;
     status = xbox_NtCreateFile(&second, XBOX_GENERIC_READ, oa, &ios,
         NULL, 0x80, 0, XBOX_FILE_OPEN, XBOX_FILE_NON_DIRECTORY_FILE);
+    if (!shared) {
+        ok = status == STATUS_SHARING_VIOLATION && ios.Status == status && !second;
+        goto done;
+    }
     if (status != STATUS_SUCCESS || !second) goto done;
     status = xbox_NtCreateFile(&writer, XBOX_GENERIC_WRITE, oa, &ios,
         NULL, 0x80, 1, XBOX_FILE_OPEN, XBOX_FILE_NON_DIRECTORY_FILE);
@@ -286,11 +290,16 @@ int main(int argc,char **argv)
         }
     }
     xbox_NtClose(opened); opened = NULL;
-    if (!shared_read_contract(&oa)) goto done;
+    if (!shared_read_contract(&oa, 0)) goto done;
+    xbox_SetReadOnlyFileSharing(TRUE);
+    if (!shared_read_contract(&oa, 1)) goto done;
+    xbox_SetReadOnlyFileSharing(FALSE);
+    if (!shared_read_contract(&oa, 0)) goto done;
     puts("PASS: system-link reads share; writes and host locks stay exclusive; concurrent errors, absence and EOF retain native statuses");
     result = 0;
 
 done:
+    xbox_SetReadOnlyFileSharing(FALSE);
     xbox_SetFileOpenObserver(NULL);
     if (worker) {
         SetEvent(missing.release);
