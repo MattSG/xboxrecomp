@@ -1,25 +1,11 @@
-/*
- * kernel_ob.c - Object Manager
- *
- * Implements object reference counting and handle-to-object resolution.
- *
- * The Xbox kernel uses a simplified NT object manager. Objects have reference
- * counts and can be looked up by handle or name. Since we use Win32 HANDLEs
- * directly, most of these are thin wrappers.
- *
- * ObfReferenceObject/ObfDereferenceObject use __fastcall on Xbox (parameter
- * in ECX register).
- */
+/* Native object/handle adapters. These do not implement a guest object
+ * namespace, typed validation or guest reference-counted lifetime.
+ * Guest ABI bridges need their own supported object representation. */
 
 #include "kernel.h"
 
-/* ============================================================================
- * Type Object Pointers
- *
- * Xbox kernel exports type objects for common types. Game code uses these
- * with ObReferenceObjectByHandle to validate handle types.
- * We provide dummy non-NULL pointers so type checks pass.
- * ============================================================================ */
+/* Opaque native type identity markers. These are not guest type-object
+ * layouts; ObReferenceObjectByHandle below does not validate types. */
 
 static ULONG g_thread_object_type_data = 0x54485244; /* 'THRD' */
 static ULONG g_event_object_type_data  = 0x45564E54; /* 'EVNT' */
@@ -27,35 +13,19 @@ static ULONG g_event_object_type_data  = 0x45564E54; /* 'EVNT' */
 PVOID xbox_PsThreadObjectType = &g_thread_object_type_data;
 PVOID xbox_ExEventObjectType  = &g_event_object_type_data;
 
-/* ============================================================================
- * Reference Counting
- *
- * On Xbox, kernel objects have embedded reference counts. On Windows,
- * HANDLEs manage their own lifetime, so we track references loosely.
- *
- * ObfDereferenceObject: Decrements ref count. If it reaches zero on Xbox,
- * the object is freed. We approximate by closing the handle on deref.
- * However, since game code may hold multiple references, we only close
- * when explicitly told via NtClose. These become approximate no-ops.
- * ============================================================================ */
+/* Reference operations are no-ops in this native adapter. Explicit handle
+ * closure owns lifetime; this is not Xbox object reference counting. */
 
 VOID __fastcall xbox_ObfReferenceObject(PVOID Object)
 {
-    /*
-     * Increment reference count. With Win32 handles, the OS manages
-     * the underlying reference count via DuplicateHandle/CloseHandle.
-     * We don't need to track this separately for correctness.
-     */
+    /* No native reference-count state is maintained here. */
     (void)Object;
     XBOX_TRACE(XBOX_LOG_OB, "ObfReferenceObject: %p", Object);
 }
 
 VOID __fastcall xbox_ObfDereferenceObject(PVOID Object)
 {
-    /*
-     * Decrement reference count. We don't close the handle here because
-     * game code may still use it. The handle is closed via NtClose.
-     */
+    /* Keep explicit handle closure separate from this no-op adapter. */
     (void)Object;
     XBOX_TRACE(XBOX_LOG_OB, "ObfDereferenceObject: %p", Object);
 }
