@@ -138,3 +138,8 @@ add_executable(guest-vmem-prefix-test guest_vmem_prefix_test.c)
 target_include_directories(guest-vmem-prefix-test PRIVATE ../../src ../../src/kernel)
 target_link_libraries(guest-vmem-prefix-test PRIVATE platform)
 add_test(NAME guest-vmem-prefix COMMAND guest-vmem-prefix-test)
+
+add_executable(ram-statistics-test ram_statistics_test.c)
+target_include_directories(ram-statistics-test PRIVATE ../../src/kernel)
+target_link_libraries(ram-statistics-test PRIVATE xboxrecomp)
+add_test(NAME kernel-ram-statistics COMMAND ram-statistics-test)
