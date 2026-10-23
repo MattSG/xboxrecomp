@@ -1092,7 +1092,7 @@ static void ff_vs_prepare_draw(DWORD fvf)
     }
 }
 
-void d3d8_shaders_prepare_draw(DWORD handle)
+HRESULT d3d8_shaders_prepare_draw(DWORD handle)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     ID3D11PixelShader *ps;
@@ -1100,14 +1100,17 @@ void d3d8_shaders_prepare_draw(DWORD handle)
     const DWORD *rs;
     HRESULT hr;
 
-    if (!ctx) return;
-    if (!d3d8_vsh_prepare_draw(handle))
+    if (!ctx) return E_FAIL;
+    if (d3d8_vsh_is_programmable(handle)) {
+        if (!d3d8_vsh_prepare_draw(handle)) return E_FAIL;
+    } else {
         ff_vs_prepare_draw(handle);
+    }
 
     /* Pixel state is independent of whether the vertex shader is programmable. */
-    if (!g_ps_cb) return;
+    if (!g_ps_cb) return E_FAIL;
     ps = ff_ps_get_shader(ff_ps_compute_signature());
-    if (!ps) return;
+    if (!ps) return E_FAIL;
     ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
     rs = d3d8_GetRenderStates();
 
@@ -1189,5 +1192,7 @@ void d3d8_shaders_prepare_draw(DWORD handle)
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_ps_cb, 0);
     }
 
+    if (FAILED(hr)) return hr;
     ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_ps_cb);
+    return S_OK;
 }
