@@ -123,7 +123,7 @@ hrtf_filter_set_target_params(HrtfFilter *f, float hrir_coeff[2][HRTF_NUM_TAPS],
         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
             s += fabsf(coeff[k]);
         }
-        if (s == 0.0f || s == 1.0f) break;
+        if (s == 0.0f || s == 1.0f) continue;
         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
             coeff[k] /= s;
         }
@@ -209,13 +209,7 @@ static inline int adpcm_decode_block(int16_t *outbuf, const uint8_t *inbuf,
 
     for (int ch = 0; ch < channels; ch++) {
         *outbuf++ = pcmdata[ch] = (int16_t)(inbuf[0] | (inbuf[1] << 8));
-        /* The fourth header byte is RESERVED, not validated: the MCPX does not
-         * refuse a block over it, and titles ship blocks where it is non-zero
-         * (Jet Set Radio Future ends every ADPCM buffer in a 0x08 pad, and
-         * 3.5-4.4% of its blocks were silenced by this test). The step index
-         * is clamped for the same reason -- and it must be clamped, not
-         * trusted, because step_table has 89 entries. Refusing either returned
-         * 0 AFTER the first sample of each channel had been written. */
+        /* Ignore the reserved header byte and clamp the step-table index. */
         index[ch] = (int8_t)inbuf[2];
         ADPCM_CLIP(index[ch], 0, 88);
         inbufsize -= 4;
@@ -387,14 +381,9 @@ struct MCPXAPUState {
 
     uint32_t regs[0x20000];
 
-    /* The GP/EP run on their own thread (apu_core.c, mcpx_apu_dsp_thread),
-     * through the frames the frame thread queues as it mixes their voices --
-     * up to one output group of 8, which it waits for before consuming the
-     * group's output. dsp_lock guards the GP/EP, their registers and the PCM
-     * they publish (monitor.ep_pcm_*, frame_buf); whoever needs it and lock
-     * takes lock first. The queue has its own lock, never held while a frame
-     * runs: posting behind a running frame's dsp_lock stalled the frame thread
-     * (a critical section is not fair) and made the thread a net loss. */
+    /* GP/EP frames are queued in output groups of up to eight. dsp_lock guards
+     * the cores, registers and published PCM. Acquire lock before dsp_lock
+     * when both are needed. The separate queue lock is not held during a frame. */
     QemuThread dsp_thread;
     QemuMutex dsp_lock, dsp_queue_lock;
     QemuCond dsp_job_cond, dsp_done_cond;

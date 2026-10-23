@@ -62,8 +62,25 @@ static void input(float data[HRTF_SAMPLES_PER_FRAME][2], unsigned kind)
         for (int ch = 0; ch < 2; ++ch)
             data[n][ch] = kind == 0 ? 0.0f : kind == 1 ? (n == 0 ? 1.0f : 0.0f) : value();
 }
+static void check_stereo_targets(void)
+{
+    for (int left = 0; left <= 2; left++) {
+        HrtfFilter filter;
+        float coefficients[2][HRTF_NUM_TAPS] = {{0}};
+        hrtf_filter_init(&filter);
+        filter.ch[1].hrir_coeff_tar[0] = -3.0f;
+        coefficients[0][0] = (float)left;
+        coefficients[1][0] = coefficients[1][1] = 2.0f;
+        hrtf_filter_set_target_params(&filter, coefficients, 0);
+        CHECK(filter.ch[0].hrir_coeff_tar[0] == (left ? 1.0f : 0.0f));
+        CHECK(filter.ch[1].hrir_coeff_tar[0] == 0.5f);
+        CHECK(filter.ch[1].hrir_coeff_tar[1] == 0.5f);
+    }
+}
+
 int main(void)
 {
+    check_stereo_targets();
     const float delays[] = {-42, -41.999f, -41.5f, -20.75f, -1.5f, -1, -0.5f,
                             -0.0f, 0, 0.25f, 1, 1.5f, 20.5f, 41.5f, 41.999f, 42};
     unsigned frames = 0;
