@@ -28,9 +28,7 @@ if(MSVC)
         /wd4244  # conversion warnings (float/double/int)
         /wd4146  # unary minus on unsigned
         /wd4267  # size_t to int conversion
-        # RelWithDebInfo's default /Ob1 keeps the DSP56300 interpreter's small
-        # helpers out of line: a recorded GP frame took 400 us at /Ob1 and
-        # 330 us at /Ob2, of a 667 us real-time budget.
+        # Inline the interpreter's small helpers in RelWithDebInfo as well.
         $<$<CONFIG:RelWithDebInfo>:/Ob2>
     )
     target_compile_definitions(xbox_apu PRIVATE

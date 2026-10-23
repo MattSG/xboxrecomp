@@ -3,6 +3,7 @@
  * device is paused after each init, so the queue only changes when the test
  * changes it. */
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,8 @@ static void test_invalid_input(void)
     CHECK(xa2_submit_samples(NULL, SUB_SAMPLES) == -1);
     CHECK(xa2_submit_samples(sub, 0) == -1);
     CHECK(xa2_submit_samples(sub, -1) == -1);
+    CHECK(xa2_submit_samples(sub, INT_MIN) == -1);
+    CHECK(xa2_submit_samples(sub, INT_MAX) == -1);
     CHECK(xa2_submit_samples(sub, XA2_BUF_SAMPLES + 1) == -1);
     CHECK(SDL_GetAudioStreamQueued(g_stream) == before);
 }
