@@ -342,6 +342,20 @@ extern ptrdiff_t g_xbox_mem_offset;
 extern RECOMP_TLS uint32_t g_esp;
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
 
+/* Diagnostic reads must not fault or wrap back into low guest memory. */
+static int xbox_rtl_read_word(uint64_t va, uint32_t *word)
+{
+    SIZE_T copied = 0;
+    DWORD error = GetLastError();
+    BOOL ok;
+    if (!va || va > UINT32_MAX - 3u) return 0;
+    ok = ReadProcessMemory(GetCurrentProcess(),
+        (const void *)((uintptr_t)g_xbox_mem_offset + (uintptr_t)va),
+        word, sizeof(*word), &copied);
+    SetLastError(error);
+    return ok && copied == sizeof(*word);
+}
+
 /* A guest backtrace, printed where the guest is standing.
  *
  * This runs on the guest thread -- g_esp is thread-local and therefore real
@@ -360,8 +374,8 @@ static void xbox_guest_backtrace(int depth)
     if (!sp || !g_xbox_code_hi)
         return;
     for (i = 0; i < 256 && shown < depth; i++) {
-        uint32_t word = *(const uint32_t *)((uintptr_t)(sp + i * 4)
-                                            + g_xbox_mem_offset);
+        uint32_t word;
+        if (!xbox_rtl_read_word((uint64_t)sp + (unsigned)i * 4u, &word)) break;
         if (word >= g_xbox_code_lo && word < g_xbox_code_hi) {
             fprintf(stderr, "  [CS]     guest 0x%08X\n", word);
             shown++;
@@ -395,8 +409,9 @@ static int xbox_crt_lock_index(uint32_t guest_va)
     if (!g_crt_lock_table)
         return -1;
     for (i = 0; i < g_crt_lock_count; i++) {
-        uint32_t slot = *(const uint32_t *)((uintptr_t)(g_crt_lock_table + i * 8)
-                                            + g_xbox_mem_offset);
+        uint32_t slot;
+        if (!xbox_rtl_read_word((uint64_t)g_crt_lock_table + (uint64_t)i * 8u,
+                                &slot)) break;
         if (slot == guest_va)
             return (int)i;
     }

@@ -145,3 +145,5 @@ target_link_libraries(ram-statistics-test PRIVATE xboxrecomp)
 add_test(NAME kernel-ram-statistics COMMAND ram-statistics-test)
 
 add_test(NAME contig-bounded-ownership COMMAND contig-heap-ownership-test bounded)
+
+add_test(NAME kernel-cs-diagnostics COMMAND kernel-cs-test diagnostics)
