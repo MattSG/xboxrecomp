@@ -538,6 +538,14 @@ int xbox_kernel_set_bridge_override(ULONG ordinal, void (*callback)(void));
  * opt-in; titles registering nothing retain the original behavior. */
 int xbox_kernel_set_inline_event_callers(const uint32_t *callers, unsigned count);
 
+/* Answers SCSI pass-through requests on the DVD device (IOCTLs whose input is
+ * a SCSI_PASS_THROUGH_DIRECT block). Return 1 after filling the request in guest
+ * memory and storing the IOSB Information value in *information; return 0 for
+ * the default answer, STATUS_SUCCESS with a zeroed output buffer. Startup-only. */
+typedef int (*xbox_dvd_scsi_hook_fn)(uint32_t scsi_va, uint32_t scsi_len,
+                                     uint32_t *information);
+void xbox_kernel_set_dvd_scsi_hook(xbox_dvd_scsi_hook_fn hook);
+
 /* Optional port-supplied source-to-canonical ordinal policy. Configure before
  * both xbox_kernel_init and xbox_kernel_bridge_init, while execution is
  * quiesced. The borrowed table must stay alive and unchanged until replaced

@@ -4204,6 +4204,13 @@ static void bridge_IoCreateFile(void)
         file_attrs, share, disposition, options, NULL);
 }
 
+static xbox_dvd_scsi_hook_fn g_dvd_scsi_hook;
+
+void xbox_kernel_set_dvd_scsi_hook(xbox_dvd_scsi_hook_fn hook)
+{
+    g_dvd_scsi_hook = hook;
+}
+
 /* -- NtDeviceIoControlFile (ordinal 196, 10 args = 40 bytes) ----
  *
  * NTSTATUS NtDeviceIoControlFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
@@ -4252,56 +4259,16 @@ static void bridge_NtDeviceIoControlFile(void)
         uint32_t in_va  = STACK_ARG(6);
         uint32_t in_len = STACK_ARG(7);
 
-        /* The media check arrives as a SCSI pass-through, so the answer the
-         * title reads is not the IOCTL's output buffer -- that is NULL here,
-         * with length zero -- but the DataBuffer the request points at.
-         * Returning STATUS_SUCCESS alone leaves that buffer as the title
-         * zeroed it, which it reads as a failed check; DDS9 retries five
-         * times and then exits through HalReturnToFirmware.
-         *
-         * SCSI_PASS_THROUGH_DIRECT, 32-bit layout, 44 bytes:
-         *   0 Length(USHORT)  2 ScsiStatus  3 PathId  4 TargetId  5 Lun
-         *   6 CdbLength  7 SenseInfoLength  8 DataIn
-         *   12 DataTransferLength  16 TimeOutValue  20 DataBuffer
-         *   24 SenseInfoOffset  28 Cdb[16] */
-        if (in_va && in_len >= 44 && BRIDGE_MEM8(in_va + 28) == 0x5A) {
-            uint32_t data_va  = BRIDGE_MEM32(in_va + 20);
-            uint32_t data_len = BRIDGE_MEM32(in_va + 12);
-            uint32_t page     = BRIDGE_MEM8(in_va + 30) & 0x3F;
-
-            if (KERNEL_LOG_ON())
-                fprintf(stderr, "  [FILE] DVD MODE SENSE(10) page 0x%02X, "
-                                "%u bytes -> authentication page\n", page, data_len);
-
-            if (data_va && data_len) {
-                uint32_t i;
-                for (i = 0; i < data_len; i++)
-                    BRIDGE_MEM8(data_va + i) = 0;
-
-                /* An 8-byte MODE SENSE(10) parameter header, then the page.
-                 * The three bytes that matter are the ones the title's own
-                 * validation reads: byte 11 must be exactly 1, and bytes 10
-                 * and 12 must both be non-zero. Anything else is read as "not
-                 * the expected disc". */
-                if (data_len >= 2) {
-                    BRIDGE_MEM8(data_va + 0) = 0;
-                    BRIDGE_MEM8(data_va + 1) = 26;   /* mode data length */
-                }
-                if (data_len >= 10) {
-                    BRIDGE_MEM8(data_va + 8) = 0x3E; /* page code */
-                    BRIDGE_MEM8(data_va + 9) = 18;   /* page length */
-                }
-                if (data_len >= 13) {
-                    BRIDGE_MEM8(data_va + 10) = 1;   /* non-zero */
-                    BRIDGE_MEM8(data_va + 11) = 1;   /* exactly 1 */
-                    BRIDGE_MEM8(data_va + 12) = 1;   /* non-zero */
-                }
+        /* A title that runs a media check answers its SCSI pass-through
+         * requests through the hook; anything it leaves unanswered gets the
+         * default answer below. */
+        if (g_dvd_scsi_hook && in_va && in_len) {
+            uint32_t information = 0;
+            if (g_dvd_scsi_hook(in_va, in_len, &information)) {
+                bridge_write_iostatus(ios_va, 0, information);
+                g_eax = 0;
+                return;
             }
-
-            BRIDGE_MEM8(in_va + 2) = 0;              /* ScsiStatus = GOOD */
-            bridge_write_iostatus(ios_va, 0, in_len);
-            g_eax = 0;
-            return;
         }
 
         if (KERNEL_LOG_ON())
