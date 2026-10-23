@@ -289,3 +289,17 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va)
     }
     free(text);
 }
+
+/* Opt-in stop for an unresolved call target. The generated stub would
+ * otherwise pop its arguments and return as if the missing body had run.
+ * Report the return address at the top of the guest stack, then abort.
+ * Select it with -DRECOMP_UNRESOLVED_STUB_OBSERVE=recomp_unresolved_stub_stop. */
+void recomp_unresolved_stub_stop(uint32_t va)
+{
+    uint32_t caller = 0;
+    int have = trace_read(g_esp, &caller, sizeof caller);
+    fprintf(stderr, "[STUB] unresolved 0x%08X reached from 0x%08X (esp=0x%08X); stopping\n",
+            va, have ? caller : 0, g_esp);
+    fflush(stderr);
+    abort();
+}
