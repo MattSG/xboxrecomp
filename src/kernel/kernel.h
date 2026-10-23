@@ -853,6 +853,10 @@ extern UCHAR                   xbox_LANKey[16];
 extern UCHAR                   xbox_AlternateSignatureKeys[16][16];
 extern XBOX_ANSI_STRING        xbox_XeImageFileName;
 extern UCHAR                   xbox_XePublicKeyData[284];
+/* Optional boot input, NULL for no launch page. Set before initialization,
+ * keep alive while native exports can use it, and change only while quiesced.
+ * Bridge initialization copies the full page into owned guest heap storage.
+ * Port supplies all fields and payload; runtime does not read environment. */
 extern XBOX_LAUNCH_DATA_PAGE*  xbox_LaunchDataPage;
 
 NTSTATUS __stdcall xbox_XeLoadSection(PXBE_SECTION_HEADER Section);

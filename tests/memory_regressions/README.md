@@ -117,3 +117,7 @@ resolution and verify bridge function cleanup or guest data-export addresses.
 A second mapping at the target ID catches accidental double translation;
 zero/missing/out-of-range entries and disabled/negative-count maps keep identity.
 These cases cover implemented exports, not all native/bridge export coverage.
+
+Launch-page cases verify all 4096 bytes of caller-supplied boot input, native
+pointer identity, guest alignment/copy independence and absent-page behavior.
+Setting RECOMP_CMDLINE alone must not create generic runtime launch data.

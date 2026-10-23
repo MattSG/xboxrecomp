@@ -79,10 +79,9 @@ XBOX_ANSI_STRING xbox_XeImageFileName = {
     .Buffer        = g_image_filename
 };
 
-/* Launch data page - used for title-to-title launches (e.g., Xbox Dashboard → game).
- * Allocated dynamically and zeroed for normal game boot. */
-static XBOX_LAUNCH_DATA_PAGE g_launch_data_page = {0};
-XBOX_LAUNCH_DATA_PAGE* xbox_LaunchDataPage = &g_launch_data_page;
+/* Optional port-owned boot input. Native consumers use this host pointer;
+ * bridge initialization copies its complete 4096-byte guest layout. */
+XBOX_LAUNCH_DATA_PAGE* xbox_LaunchDataPage = NULL;
 
 /* ============================================================================
  * Section Loading
