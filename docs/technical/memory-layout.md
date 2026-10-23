@@ -78,6 +78,17 @@ image. A port may populate compatibility data before guest execution; it must
 not free the view or retain it after memory shutdown. Fabricated header fields
 used to steer an application's feature probing belong to that port.
 
+## Optional launch input
+
+`xbox_LaunchDataPage` defaults to NULL. A port may supply a complete
+`XBOX_LAUNCH_DATA_PAGE` before initialization and retain its storage while native
+exports use it. Bridge initialization copies all 4096 bytes into aligned guest
+heap storage; a NULL input or failed allocation leaves the guest export NULL.
+Change the host pointer only while execution is quiesced. It remains caller
+policy until explicitly replaced or cleared; guest memory retires at shutdown.
+Environment names, launch types, title IDs and payload interpretation belong to
+the port. The runtime does not manufacture command-line launch data.
+
 ## Devices, diagnostics and shutdown
 
 Use the shared host/MMIO initialization and hardware handlers. Zero-filling a

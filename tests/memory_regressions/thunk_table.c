@@ -58,6 +58,32 @@ int main(int argc, char **argv)
     }
     if (!loaded) goto done;
     CHECK(actual_base == (expected ? table_va : 0) && actual_count == expected);
+    if (!strcmp(mode,"launch-page") || !strcmp(mode,"no-launch-page")) {
+        XBOX_LAUNCH_DATA_PAGE page;
+        int supplied = !strcmp(mode,"launch-page");
+        CHECK(sizeof(page) == 4096);
+        memset(&page,0xA5,sizeof(page));
+        page.LaunchDataType=7; page.TitleId=0x12345678;
+        xbox_LaunchDataPage = supplied ? &page : NULL;
+#if defined(_WIN32)
+        _putenv_s("RECOMP_CMDLINE","ignored generic runtime policy");
+#else
+        setenv("RECOMP_CMDLINE","ignored generic runtime policy",1);
+#endif
+        xbox_kernel_init();
+        CHECK(*(XBOX_LAUNCH_DATA_PAGE **)xbox_resolve_ordinal(164) == xbox_LaunchDataPage);
+        xbox_kernel_bridge_init();
+        uint32_t guest_page = *word(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+        CHECK((guest_page != 0) == supplied);
+        if (supplied && guest_page) {
+            CHECK(!(guest_page & 4095));
+            CHECK(!memcmp(word(guest_page),&page,sizeof(page)));
+            memset(&page,0,sizeof(page));
+            CHECK(*word(guest_page) == 7 && *word(guest_page+4) == 0x12345678);
+        }
+        xbox_LaunchDataPage=NULL;
+        xbox_kernel_shutdown();
+    }
     if (!strcmp(mode,"sparse")) {
         /* A port may explicitly select a bounded span containing NULL gaps. */
         xbox_kernel_set_thunk_address(table_va,3);
