@@ -1,6 +1,7 @@
 /* Test alpha/palette sampling and transformed-vertex interpolation on D3D11 WARP.
  * No game data, window, or hardware adapter is needed. */
 #include "d3d8_internal.h"
+#include "d3d8_combiners.h"
 #include <d3dcompiler.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +15,13 @@ static IDirect3DBaseTexture8 *textures[4];
 static DWORD states[512], stages[4][64], palette_entries[256];
 static const D3DMATRIX identity = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
 
-ID3D11Device *d3d8_GetD3D11Device(void) { return device; }
+static int fail_pixel_shader;
+static HRESULT STDMETHODCALLTYPE fail_create_ps(ID3D11Device *self, const void *code,
+    SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11PixelShader **out)
+{ (void)self; (void)code; (void)bytes; (void)linkage; *out = NULL; return E_OUTOFMEMORY; }
+static const ID3D11DeviceVtbl failing_vtable = { .CreatePixelShader = fail_create_ps };
+static ID3D11Device failing_device = { &failing_vtable };
+ID3D11Device *d3d8_GetD3D11Device(void) { return fail_pixel_shader ? &failing_device : device; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return context; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return NULL; }
 IDirect3DDevice8 *xbox_GetD3DDevice(void) { return NULL; }
@@ -118,6 +125,50 @@ static int check_rhw(ID3D11Texture2D *target, ID3D11Texture2D *readback,
     ID3D11SamplerState_Release(sampler);
     printf("d3d8_rhw: %d failures (4 draws)\n", failures);
     return failures;
+}
+
+/* A failed replacement must retain every cached shader and its ownership. */
+static int check_cache_failure(void)
+{
+    NV2ACombinerState state = {0};
+    ID3D11PixelShader *held[128];
+    ULONG refs[128];
+    unsigned i;
+    d3d8_combiners_shutdown();
+    REQUIRE(d3d8_combiners_init());
+    state.num_stages = 1;
+    for (i = 0; i < 4; i++) state.tex_mode[i] = NV2A_TEXMODE_NONE;
+    for (i = 0; i < 128; i++) {
+        state.c0[0] = i;
+        held[i] = d3d8_combiners_get_shader(&state);
+        if (!held[i]) return 1;
+        ID3D11PixelShader_AddRef(held[i]);
+    }
+    for (i = 0; i < 128; i++) {
+        refs[i] = ID3D11PixelShader_AddRef(held[i]);
+        ID3D11PixelShader_Release(held[i]);
+    }
+    state.c0[0] = 128;
+    fail_pixel_shader = 1;
+    ID3D11PixelShader *failed = d3d8_combiners_get_shader(&state);
+    fail_pixel_shader = 0;
+    if (failed) return 1;
+    for (i = 0; i < 128; i++) {
+        ULONG count = ID3D11PixelShader_AddRef(held[i]);
+        ID3D11PixelShader_Release(held[i]);
+        if (count != refs[i]) {
+            fprintf(stderr, "FAIL: failed eviction changed shader ownership\n");
+            return 1; /* Held references keep the old failure path observable. */
+        }
+    }
+    for (i = 0; i < 128; i++) {
+        state.c0[0] = i;
+        if (d3d8_combiners_get_shader(&state) != held[i]) return 1;
+    }
+    state.c0[0] = 128;
+    if (!d3d8_combiners_get_shader(&state)) return 1; /* Retry can replace. */
+    for (i = 0; i < 128; i++) ID3D11PixelShader_Release(held[i]);
+    return 0;
 }
 
 int main(void)
@@ -289,6 +340,7 @@ int main(void)
         }
     }
     ID3D11DeviceContext_ClearState(context);
+    if (check_cache_failure()) return 1;
     d3d8_combiners_shutdown();
     d3d8_shaders_shutdown();
     ID3D11RasterizerState_Release(rasterizer);
