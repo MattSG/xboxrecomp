@@ -21,7 +21,7 @@ From the game repository with its portable toolchain loaded:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
-. ./scripts/enter-env.ps1
+python scripts/devenv.py --shell
 cmake -S tools/xboxrecomp/tests/nv2a_graphics_quality -B conformance_tmp/graphics-quality-test -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build conformance_tmp/graphics-quality-test
 ctest --test-dir conformance_tmp/graphics-quality-test --output-on-failure

@@ -15,7 +15,7 @@ Microsoft documents EVENT completion as `S_OK` plus a true BOOL, and
 - [GetData](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-getdata)
 - [D3D11_ASYNC_GETDATA_DONOTFLUSH](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_async_getdata_flag)
 
-Build after entering the game repository's `scripts/enter-env.ps1`:
+Build after entering the game repository's `python scripts/devenv.py --shell`:
 
 ```powershell
 cmake -S tools/xboxrecomp/tests/nv2a_readback -B conformance_tmp/stutter-readback-test -G Ninja -DCMAKE_BUILD_TYPE=Release

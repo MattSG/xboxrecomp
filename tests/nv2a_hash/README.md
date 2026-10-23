@@ -23,7 +23,7 @@ of the original scalar implementation:
 The exact and page cases cover 566,882 inputs. On a supported CPU each compares
 both the dispatcher and native helper against the original scalar result.
 
-From the game repository after loading `scripts/enter-env.ps1`:
+From the game repository after loading `python scripts/devenv.py --shell`:
 
 ```powershell
 cmake -S tools/xboxrecomp/tests/nv2a_hash -B conformance_tmp/stutter-hash-shipping-test -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo

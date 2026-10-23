@@ -4,7 +4,7 @@ Build from the parent MM3 checkout with its Windows MSVC environment:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
-. ./scripts/enter-env.ps1
+python scripts/devenv.py --shell
 cmake -S tools/xboxrecomp/tests/nv2a_pacing -B conformance_tmp/pacing-test -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build conformance_tmp/pacing-test
 ctest --test-dir conformance_tmp/pacing-test --output-on-failure

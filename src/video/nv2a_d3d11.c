@@ -26,6 +26,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "platform/frame_limit.h"
 #include <string.h>
 
 #include "nv2a_d3d11.h"
@@ -4109,8 +4110,7 @@ static void pace_vblank(void)
         next = 0;                        /* and start a new cadence after */
     }
     if (limit < 0) {
-        const char *e = getenv("RECOMP_FPS_LIMIT");
-        limit = e ? atoi(e) : 60;
+        limit = recomp_frame_limit_from_env();
         QueryPerformanceFrequency(&freq);
         timer = nv_pacing_create_timer();
     }

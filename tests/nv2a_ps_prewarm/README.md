@@ -7,7 +7,7 @@ existing constant buffer. It shares the validated bytecode cache directory and
 uses a separate `.psm` sidecar. Schema, field layout, source, shader target,
 entry-point/variant family and compiler flags determine its namespace.
 
-Build from the game repository after entering `scripts/enter-env.ps1`:
+Build from the game repository after entering `python scripts/devenv.py --shell`:
 
 ```powershell
 cmake -S tools/xboxrecomp/tests/nv2a_ps_prewarm -B conformance_tmp/stutter-ps-prewarm-test -G Ninja -DCMAKE_BUILD_TYPE=Release
