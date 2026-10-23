@@ -31,9 +31,7 @@ void nv2a_rc_unpack(uint32_t c, float o[4])
     o[3] = (float)( c >> 24        ) / 255.0f;
 }
 
-/* D3DCOLOR to floats, memoised: a program's constants are the same for
- * every pixel of a batch, and unpacking them per pixel was a measurable
- * share of the executor. */
+/* Per-thread memoization of repeated D3DCOLOR constants. */
 static const float *unpack_cached(uint32_t c)
 {
     static NV_RC_TLS uint32_t key[16];

@@ -1,12 +1,8 @@
 /**
  * NV2A vertex program interpreter, for the software pushbuffer executor.
  *
- * The executor (nv2a_pb_exec.c) could only draw vertices that arrive already
- * in screen space. A title running vertex programs -- every 3D scene on the
- * Xbox -- sends model-space positions and lets the GPU transform them, so
- * those batches were counted and skipped. This runs the uploaded program on
- * the CPU, one vertex at a time, and hands back the outputs the rasteriser
- * needs.
+ * Executes uploaded instructions on caller-supplied vertex attributes and
+ * returns program output values for the software rasteriser.
  *
  * Programs and constants arrive through the pushbuffer exactly as the GPU
  * would take them (SET_TRANSFORM_PROGRAM_LOAD / _PROGRAM, _CONSTANT_LOAD /
@@ -27,10 +23,8 @@
 #define NV2A_VSH_CONSTANTS  192     /* c[0..191]; D3D's c0 is c[96]          */
 #define NV2A_VSH_INPUTS     16      /* v0..v15                                */
 
-/* What one vertex comes out as. Position is whatever the program wrote to
- * oPos: on Xbox D3D that is already screen space -- x, y in pixels, z in the
- * depth buffer's range -- because the runtime appends the viewport transform
- * and the divide by w to every shader, with w left as the clip-space w. */
+/* Raw output registers, including the program's oPos value. Coordinate-space
+ * interpretation belongs to the caller and uploaded program. */
 typedef struct {
     float pos[4];
     float d0[4], d1[4];
@@ -48,7 +42,7 @@ void nv2a_vsh_state_save(void *out);
 void nv2a_vsh_state_restore(const void *in);
 void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
 
-/* Run the program from the start slot on one vertex. Inputs are the ten
+/* Run the program from the start slot on one vertex. Inputs are the sixteen
  * attribute values as floats. Returns 0 if there is no program to run (no
  * FINAL flag within program memory), which the caller treats as "cannot
  * transform this batch" rather than drawing garbage. */
