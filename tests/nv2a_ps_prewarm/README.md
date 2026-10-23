@@ -7,8 +7,7 @@ existing constant buffer. It shares the validated bytecode cache directory and
 uses a separate `.psm` sidecar. Schema, field layout, source, shader target,
 entry-point/variant family and compiler flags determine its namespace.
 
-Build from the toolkit root. On Windows use native CMake/CTest and an
-MSVC/Windows SDK build environment:
+Build from the game repository after entering `python scripts/devenv.py --shell`:
 
 ```sh
 cmake -S tests/nv2a_ps_prewarm -B build/ps-prewarm

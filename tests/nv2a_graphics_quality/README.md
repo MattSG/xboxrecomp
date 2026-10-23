@@ -20,9 +20,11 @@ It compiles the actual HLSL; no renderer or GPU results are simulated.
 From the toolkit root with CMake and a C compiler available:
 
 ```powershell
-cmake -S tests/nv2a_graphics_quality -B build/graphics-quality -DCMAKE_BUILD_TYPE=Release
-cmake --build build/graphics-quality --config Release
-ctest --test-dir build/graphics-quality -C Release --output-on-failure
+Set-ExecutionPolicy -Scope Process Bypass -Force
+python scripts/devenv.py --shell
+cmake -S tools/xboxrecomp/tests/nv2a_graphics_quality -B conformance_tmp/graphics-quality-test -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build conformance_tmp/graphics-quality-test
+ctest --test-dir conformance_tmp/graphics-quality-test --output-on-failure
 ```
 
 The cubic comparison allows 0.004 per float channel for hardware bilinear weight

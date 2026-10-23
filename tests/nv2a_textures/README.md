@@ -2,10 +2,12 @@
 
 From the XboxRecomp checkout:
 
-```sh
-cmake -S tests/nv2a_textures -B build/textures
-cmake --build build/textures --config Release
-ctest --test-dir build/textures -C Release --output-on-failure
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
+python scripts/devenv.py --shell
+cmake -S tools/xboxrecomp/tests/nv2a_textures -B conformance_tmp/texture-tests -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build conformance_tmp/texture-tests
+ctest --test-dir conformance_tmp/texture-tests --output-on-failure
 ```
 
 The suite checks CPU decoding and mip reduction, resource/view retries,
