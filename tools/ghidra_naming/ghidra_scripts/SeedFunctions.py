@@ -2,10 +2,8 @@
 #
 # The flat raw image has no symbol table, so Ghidra's auto-analysis only finds
 # functions reachable from the entry point / references / prologue patterns.
-# The project's own disassembler already identified 22,178 function starts in
-# tools/disasm/output/functions.json. Seeding those exact addresses as functions
-# lets Function ID + the decompiler operate on properly-bounded bodies at the
-# addresses the recompiler keys on, maximizing name-transfer overlap.
+# Seed the supplied disassembler function entries so Function ID and the
+# decompiler can analyze the same addresses used by the recompiler.
 #
 # Run as a -preScript (BEFORE auto-analysis). Jython.
 #

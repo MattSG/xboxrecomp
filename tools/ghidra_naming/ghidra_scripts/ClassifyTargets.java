@@ -9,8 +9,6 @@
  * hundreds of them. Ghidra can be wrong too -- check the bytes when it says
  * DATA for an address a title calls.
  *
- *   CT 0022e280 block=.text func=- INSN:MOV EAX,[0x005bb930]
- *   CT 00194890 block=.text func=FUN_00194890@00194890(ENTRY) INSN:PUSH -0x1
  *
  * @category XboxRecomp
  */
