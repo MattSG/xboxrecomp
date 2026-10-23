@@ -14,8 +14,8 @@
  *   x = ...x2 x1 x0   y = ...y2 y1 y0
  *   morton = ...y2 x2 y1 x1 y0 x0
  *
- * Non-square textures are handled by masking: the larger dimension uses
- * all bits, the smaller dimension wraps within a square region.
+ * Non-square power-of-two dimensions stop contributing coordinate bits
+ * independently; the larger dimension continues after the smaller ends.
  *
  * DXT/BC compressed formats are NOT swizzled (they use 4x4 block layout).
  * Only uncompressed formats (A8R8G8B8, R5G6B5, A8, L8, etc.) are swizzled.
@@ -109,14 +109,6 @@ static inline void xbox_swizzle_masks(uint32_t width, uint32_t height,
  * For non-square textures the larger dimension keeps taking bits after the
  * smaller one is exhausted, so the masks are not a simple alternation and the
  * deposit has to be general.
- *
- * This previously spread both coordinates and masked: `(spread(x) & mask_x) |
- * (spread(y) & mask_y)`. Spreading puts a coordinate's bits on even positions
- * only, while mask_y selects odd ones, so the Y term was almost always zero --
- * for 512x512, offset(0,1) came back the same as offset(0,0) and 261,632 of
- * the 262,144 coordinates collided. Nothing called this until a texture
- * sampler did, and then it sampled a column of the image for every row and
- * drew vertical stripes.
  *
  * The masks come from xbox_swizzle_masks, the same generator the row-walking
  * unswizzle uses, so the two cannot disagree about where a texel lives.
@@ -326,18 +318,6 @@ static inline uint32_t d3d8_format_dxt_block_bytes(uint32_t fmt)
  * Check if an Xbox D3D8 format is swizzled (vs linear/compressed).
  * Xbox formats with "LIN_" prefix are linear; DXT formats are block-compressed.
  * All other uncompressed formats are swizzled by default.
- */
-/* Decode one texel out of a DXT1/DXT3/DXT5 image.
- *
- * These are the only formats here that are neither linear nor swizzled: texels
- * live in 4x4 blocks, so there is no offset to compute and read -- the block
- * has to be decoded to get at one texel.
- *
- * ponytail: decodes the whole 4x4 block for every texel, so a filled triangle
- * decodes each block up to sixteen times. It is ~20 arithmetic ops on 16 bytes
- * that are already in L1 from the neighbouring texel, and the menu draws at
- * 640x480. Cache the last block by index if a textured 3D scene ever runs
- * through here.
  */
 /* Decode one compressed block, sharing its colour and alpha palettes across
  * all sixteen texels. The sampler caches these results by address and bytes. */
