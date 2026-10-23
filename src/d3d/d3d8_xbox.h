@@ -1157,7 +1157,7 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
 /**
  * Present frame and pump window messages.
- * Called from recompiled game code (replaces RW driver Present path).
+ * Called from recompiled game code (replaces the game's own Present path).
  */
 void d3d8_PresentFrame(void);
 

@@ -647,7 +647,7 @@ static HRESULT __stdcall dev_SetIndices(IDirect3DDevice8 *s, IDirect3DIndexBuffe
 static HRESULT __stdcall dev_GetIndices(IDirect3DDevice8 *s, IDirect3DIndexBuffer8 **pp, UINT *pb)
 { (void)s; if(pp) *pp=g.ib; if(pb) *pb=g.ib_base; return D3D_OK; }
 
-/* Vertex layout setup for the FVF the recompiled RW driver actually emits at
+/* Vertex layout setup for the FVF the recompiled game's D3D path actually emits at
  * this point: XYZ (or XYZRHW) + DIFFUSE + optional TEX1. */
 static void setup_fvf_attribs(DWORD fvf, UINT stride)
 {
@@ -1086,6 +1086,3 @@ IDirect3DDevice8 *d3d8_GetDevice(void)
     return &g_device;
 }
 
-/* Used by nv2a_pb_replay to skip Present when it owns the frame. The
- * Windows backend defines this in d3d8_device.c; we mirror it here. */
-volatile int g_suppress_present = 0;
