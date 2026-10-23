@@ -78,6 +78,8 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
 
     # Filter false positives
     vtables = _filter_vtables(raw_vtables)
+    for i, vt in enumerate(vtables):
+        vt["class_id"] = f"cls_{i:03d}"
 
     if verbose:
         total_entries = sum(len(vt["entries"]) for vt in vtables)
@@ -106,9 +108,8 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
 
     # Build classification results
     results = {}
-    for i, vt in enumerate(vtables):
-        cls_id = f"cls_{i:03d}"
-        vt["class_id"] = cls_id
+    for vt in vtables:
+        cls_id = vt["class_id"]
 
         for idx, entry_addr in enumerate(vt["entries"]):
             if entry_addr not in results:
