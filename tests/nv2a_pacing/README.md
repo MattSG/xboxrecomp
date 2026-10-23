@@ -1,6 +1,6 @@
 # NV2A display pacing regressions
 
-Build from the parent MM3 checkout with its Windows MSVC environment:
+Build with a Windows MSVC environment (`python scripts/devenv.py --shell` in a title checkout provides one):
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force

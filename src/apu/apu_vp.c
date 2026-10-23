@@ -1298,7 +1298,7 @@ static void voice_process(MCPXAPUState *d,
             float bg = attenuate(d, vol[b]) / hr;
             if (bg > g) g = bg;
         }
-        /* The GP's mix sits ~10 dB below this one (MM3 race, RMS -20.7 vs
+        /* The GP's mix sits ~10 dB below this one (a racing title, RMS -20.7 vs
          * -10.7 dBFS, 0.4% clipped): match it so the DSP switch keeps volume. */
         g *= ea_value * 0.316f;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {

@@ -3564,7 +3564,7 @@ uint32_t nv2a_pb_exec_semaphore_last_value(void) { return s_semaphore_last; }
 uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_semaphore_releases; }
 /* ---- Frames between a title's own: interpolation ----------------------
  *
- * A title whose world updates at a fixed rate (MM3's console-rate mod) draws
+ * A title whose world updates at a fixed rate (a console-rate title mod) draws
  * only when it updates. Between updates, the last frame is drawn again from
  * what the GPU was told: every method of each finished frame is recorded,
  * and replayed with every vertex-program constant (the matrices, among them)

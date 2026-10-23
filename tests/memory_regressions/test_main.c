@@ -237,7 +237,7 @@ int main(int argc, char **argv)
     }
     printf("mode: %s\n", mode);
     if (scene_churn) {
-        /* Sizes from MM3's race -> menu -> car-change OOM report. Unlike
+        /* Sizes from a title's race -> menu -> car-change OOM report. Unlike
          * car-churn, these blocks return through the NT bridge, not HeapFree.
          * Keeping the whole roster live for each scene catches a release
          * no-op even when individual car changes appear stable. */
@@ -252,7 +252,7 @@ int main(int argc, char **argv)
             unsigned loaded = 0;
             for (; loaded < 8; ++loaded) {
                 uint32_t size = sizes[loaded], base = 0;
-                /* MM3's large CRT allocation requests commit at base zero,
+                /* A title's large CRT allocation requests commit at base zero,
                  * optionally with MEM_NOZERO. It returns base + 0x30 to the
                  * file loader and subtracts that header before release. */
                 uint32_t st = nt_alloc_at(&base, &size, loaded & 1 ? 0x801000 : 0x1000);

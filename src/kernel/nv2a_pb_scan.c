@@ -214,7 +214,7 @@ static const char *nv097_name(uint32_t m)
  * wrapped address and corrupt GPU state quietly; the walk stops there
  * instead, as PFIFO does at its DMA limit (xemu's pfifo.c raises a protection
  * error; it never wraps). apexJCL's walker (blinx2-v0.4.0) made this choice;
- * MM3 never leaves the window on either. */
+ * The title never leaves the window on either. */
 static int pb_in_window(uint32_t va)
 {
     return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;

@@ -1,6 +1,6 @@
 /* mcpx_apu_phys from the real apu_core.c: each mapping resolves to its own
  * storage, an ordinary heap address inside the guest RAM map resolves to
- * itself (MM3 streams voices from heap pages), and an address past the map is
+ * itself (a title streams voices from heap pages), and an address past the map is
  * refused rather than wrapped into low guest RAM (the old a & 0x03FFFFFF
  * fallback). */
 #include "../../src/apu/apu_core.c"
@@ -73,7 +73,7 @@ int main(void)
     contig_begin = 0x1000; contig_end = 0x3000;
     reserve_begin = 0x06000000u; reserve_end = 0x07000000u;
     g_xbox_image_lo = 0x10000; g_xbox_image_hi = 0x20000;
-    g_xbox_total_ram = 0x04000000u; g_xbox_map_size = 0x08000000u; /* MM3: 128 MB map */
+    g_xbox_total_ram = 0x04000000u; g_xbox_map_size = 0x08000000u; /* 128 MB map */
 
     /* Mapped addresses: pointers only, since the window and reservations
      * are not backed by this buffer. */
@@ -82,7 +82,7 @@ int main(void)
     CHECK(mcpx_apu_phys(0x10040) == ram + 0x10040);
     CHECK(mcpx_apu_phys(0x06000010u) == ram + 0x06000010u);
 
-    /* Heap pages inside the map are identity-mapped: an MM3 voice buffer at
+    /* Heap pages inside the map are identity-mapped: a title voice buffer at
      * 0x01191EA0 and one above 64 MB both resolve to themselves. */
     CHECK(mcpx_apu_phys(0x01191EA0u) == ram + 0x01191EA0u);
     CHECK(mcpx_apu_phys(0x05000040u) == ram + 0x05000040u);
