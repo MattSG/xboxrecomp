@@ -16,10 +16,12 @@ static uint32_t *word(uint32_t va)
 int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "high-retail";
+    int kdata_config = !strcmp(mode,"kernel-data-config");
+    int kdata_invalid = !strcmp(mode,"kernel-data-header") || !strcmp(mode,"kernel-data-overlap") || !strcmp(mode,"kernel-data-unbacked");
     int high = !strcmp(mode, "high-retail") || !strcmp(mode, "high-debug");
-    int invalid = !strcmp(mode,"partial") || !strcmp(mode,"unterminated") ||
+    int invalid = kdata_invalid || !strcmp(mode,"partial") || !strcmp(mode,"unterminated") ||
                   !strcmp(mode,"bad-ordinal") || !strcmp(mode,"bad-marker");
-    uint32_t data_va = high ? 0x04010000u : 0x30000u;
+    uint32_t data_va = !strcmp(mode,"kernel-data-auto") ? 0x740000u : high ? 0x04010000u : 0x30000u;
     uint32_t table_va = data_va + 64, actual_base, actual_count;
     uint32_t expected = 2;
     uint8_t *xbe = calloc(1, 0x3000);
@@ -31,6 +33,7 @@ int main(int argc, char **argv)
     put(xbe,0x20c,0x1000); put(xbe,0x210,4096);
     put(xbe,0x238,2); put(xbe,0x23c,data_va); put(xbe,0x240,4096);
     put(xbe,0x244,0x2000); put(xbe,0x248,4096);
+    if (!strcmp(mode,"kernel-data-auto")) put(xbe,0x2000,0xA5A5A5A5u);
     put(xbe,0x203c,0x80000067); /* data outside the selected table */
     put(xbe,0x2040,0x80000067); put(xbe,0x2044,0x80000097);
     if (!strcmp(mode,"empty")) { put(xbe,0x2040,0); expected=0; }
@@ -47,6 +50,19 @@ int main(int argc, char **argv)
     put(xbe,0x158,!strcmp(mode,"none") ? 0 : table_va ^
         (!strcmp(mode,"high-debug") ? 0xEFB1F152u : 0x5B6D40B6u));
     if (!strcmp(mode,"encoded-none")) put(xbe,0x158,0x5B6D40B6u);
+    if (kdata_config || kdata_invalid) {
+        uint32_t selected = kdata_config ? 0x500000u :
+                            !strcmp(mode,"kernel-data-overlap") ? 0x20000u :
+                            !strcmp(mode,"kernel-data-header") ? 0x10000u : 0x8000000u;
+        CHECK(xbox_ConfigureKernelData(selected));
+        CHECK(!xbox_ConfigureKernelData(0x500001u));
+        CHECK(!xbox_ConfigureKernelData(0x1000u));
+        CHECK(!xbox_ConfigureKernelData(0xFFFFF000u));
+        CHECK(XBOX_KERNEL_DATA_BASE == selected);
+    }
+    if (!strcmp(mode,"kernel-data-empty")) {
+        put(xbe,0x11c,0); put(xbe,0x158,0); expected=0;
+    }
     xbox_SetTotalRam(XBOX_DEVKIT_RAM);
     xbox_kernel_set_thunk_address(0x60000,3); /* previous image metadata */
     BOOL loaded = xbox_MemoryLayoutInit(xbe,0x3000);
@@ -54,10 +70,27 @@ int main(int argc, char **argv)
     xbox_kernel_get_thunk_address(&actual_base,&actual_count);
     if (invalid) {
         CHECK(!xbox_GetMemoryBase() && !actual_base && !actual_count);
+        CHECK(!XBOX_KERNEL_DATA_BASE);
         goto done;
     }
     if (!loaded) goto done;
     CHECK(actual_base == (expected ? table_va : 0) && actual_count == expected);
+    if (!strcmp(mode,"kernel-data-empty")) CHECK(XBOX_KERNEL_DATA_BASE == 0x11000u);
+    if (!strcmp(mode,"kernel-data-auto") || kdata_config) {
+        uint32_t original = *word(data_va);
+        CHECK(!xbox_ConfigureKernelData(0));
+        if (kdata_config) CHECK(XBOX_KERNEL_DATA_BASE == 0x500000u);
+        *word(table_va) = 0x80000010u; /* relocated ExEventObjectType */
+        xbox_kernel_init();
+        xbox_kernel_bridge_init();
+        CHECK(XBOX_KERNEL_DATA_BASE >= g_xbox_image_hi);
+        CHECK(!(XBOX_KERNEL_DATA_BASE & 4095));
+        CHECK(*word(table_va) == XBOX_KERNEL_DATA_BASE + KDATA_EVENT_OBJ_TYPE);
+        CHECK(*word(data_va) == original);
+        CHECK(XBOX_STACK_BASE >= XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE);
+        CHECK(xbox_HeapAlloc(4096,4096) >= XBOX_WORKER_STACK_END);
+        xbox_kernel_shutdown();
+    }
     if (!strcmp(mode,"launch-page") || !strcmp(mode,"no-launch-page")) {
         XBOX_LAUNCH_DATA_PAGE page;
         int supplied = !strcmp(mode,"launch-page");
@@ -132,6 +165,20 @@ int main(int argc, char **argv)
         xbox_kernel_shutdown();
     }
     xbox_MemoryLayoutShutdown();
+    CHECK(!XBOX_KERNEL_DATA_BASE);
+    if (kdata_config) {
+        CHECK(!xbox_MemoryLayoutInit(xbe,4));
+        CHECK(!XBOX_KERNEL_DATA_BASE);
+        CHECK(xbox_MemoryLayoutInit(xbe,0x3000));
+        CHECK(XBOX_KERNEL_DATA_BASE == 0x500000u);
+        xbox_MemoryLayoutShutdown();
+        CHECK(xbox_ConfigureKernelData(0));
+        CHECK(xbox_MemoryLayoutInit(xbe,0x3000));
+        CHECK(XBOX_KERNEL_DATA_BASE == 0x31000u);
+        CHECK(*word(XBOX_KERNEL_DATA_BASE) == 0);
+        xbox_MemoryLayoutShutdown();
+        CHECK(!XBOX_KERNEL_DATA_BASE);
+    }
     xbox_kernel_get_thunk_address(&actual_base,&actual_count);
     CHECK(!actual_base && !actual_count);
     CHECK(xbox_MemoryLayoutInit(xbe,0x3000));

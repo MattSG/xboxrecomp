@@ -286,6 +286,9 @@ static void firmware_observer(ULONG routine)
 }
 int main(int argc, char **argv)
 {
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     if (argc == 2 && !strncmp(argv[1],"firmware-",9)) {
         if (strcmp(argv[1],"firmware-default")) xbox_SetFirmwareReturnHook(firmware_observer);
         if (!strcmp(argv[1],"firmware-clear")) xbox_SetFirmwareReturnHook(NULL);

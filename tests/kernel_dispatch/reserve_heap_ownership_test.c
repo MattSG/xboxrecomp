@@ -91,6 +91,9 @@ static DWORD WINAPI allocation_worker(void *context)
 
 int main(void)
 {
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     uint8_t *arena = VirtualAlloc(NULL, MAP_END, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     uint32_t reservation, heap, second, next;
     HANDLE workers[THREADS];

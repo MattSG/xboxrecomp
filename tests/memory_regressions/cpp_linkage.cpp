@@ -7,6 +7,7 @@ extern "C" void *recomp_lookup_manual(ULONG) { std::abort(); }
 
 int main()
 {
+    auto volatile kernel_data = &xbox_ConfigureKernelData;
     auto volatile configure = &xbox_ConfigureMainStack;
     auto volatile stack = &xbox_AllocThreadStack;
     auto volatile tib = &xbox_AllocThreadTib;
@@ -17,6 +18,6 @@ int main()
     auto volatile set_thread = &xbox_set_game_thread;
     auto volatile get_thread = &xbox_thread_debug_handle;
     auto volatile mode = &xbox_SetThreadMode;
-    return !(configure && stack && tib && release && reset && acquire && recycle &&
+    return !(kernel_data && configure && stack && tib && release && reset && acquire && recycle &&
              set_thread && get_thread && mode);
 }

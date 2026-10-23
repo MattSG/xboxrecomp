@@ -184,6 +184,9 @@ static void set_env(const char *name, const char *value)
 
 int main(int argc, char **argv)
 {
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     const char *mode = argc > 1 ? argv[1] : "default";
     const char *path = argc > 2 ? argv[2] : "tools/conformance/test.xbe";
     int scene_churn = !strcmp(mode, "scene-churn") || !strcmp(mode, "scene-churn-baseline");

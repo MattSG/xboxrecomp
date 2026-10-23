@@ -279,6 +279,9 @@ static void table_edges(void)
 
 int main(void)
 {
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     HANDLE root, threads[WORKERS];
     DWORD count, live_count = 0;
     unsigned i, round;

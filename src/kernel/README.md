@@ -124,19 +124,11 @@ xbox_kernel_bridge_init();  // Write thunk entries into Xbox memory, set up kern
 
 ### Kernel Data Exports
 
-Some kernel ordinals are data exports (not functions). We allocate a kernel data area:
-
-```c
-#define XBOX_KERNEL_DATA_BASE  0x00740000
-
-// Offsets within the data area
-#define KDATA_HARDWARE_INFO     0x000  // XBOX_HARDWARE_INFO struct
-#define KDATA_KRNL_VERSION      0x010  // XBOX_KRNL_VERSION struct
-#define KDATA_TICK_COUNT        0x020  // KeTickCount (updated by timer)
-#define KDATA_HD_KEY            0x030  // XboxHDKey (16 bytes)
-#define KDATA_EEPROM_KEY        0x050  // XboxEEPROMKey (16 bytes)
-// ... more at documented offsets
-```
+Data exports use an owned page after the loaded image by default.
+`XBOX_KERNEL_DATA_BASE` is a runtime address. Ports needing a fixed address
+must call `xbox_ConfigureKernelData` before initialization; overlapping or
+unbacked placement is rejected. Standalone bridge hosts must explicitly select
+and map their page. Use `xbox_memory_layout.h` for the current offsets.
 
 ## File I/O
 

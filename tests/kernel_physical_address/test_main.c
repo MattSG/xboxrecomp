@@ -12,6 +12,9 @@ extern ptrdiff_t g_xbox_mem_offset;
 void *recomp_lookup(ULONG address) { (void)address; abort(); }
 void *recomp_lookup_manual(ULONG address) { (void)address; abort(); }
 int main(void) {
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     if (xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)0x80001000u) != 0) {
         fputs("FAIL uninitialized contiguous VA must be unsupported\n", stderr);
         return 12;

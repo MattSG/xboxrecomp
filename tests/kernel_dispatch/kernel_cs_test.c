@@ -125,6 +125,9 @@ static int try_from_other_thread(int expected)
 
 int main(int argc, char **argv)
 {
+    /* This private arena keeps its export/heap floor above raw scratch. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     LARGE_INTEGER freq, begin, end;
     PRTL_CRITICAL_SECTION lock;
     _putenv_s("RECOMP_CS_MODE", "");

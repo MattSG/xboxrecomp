@@ -142,6 +142,9 @@ done:
 
 int main(int argc,char **argv)
 {
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     char dir[MAX_PATH] = {0}, path[MAX_PATH] = {0};
     HANDLE exclusive = INVALID_HANDLE_VALUE, root = INVALID_HANDLE_VALUE, opened = NULL;
     XBOX_ANSI_STRING name;

@@ -174,6 +174,9 @@ static int short_buffer_contract(void) {
     return 1;
 }
 int main(void) {
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     char path[MAX_PATH], child[MAX_PATH];
     if(!xt_make_temp_dir(path,sizeof path)) return 10;
     xt_join(child,sizeof child,path,"SaveSlot"); xt_make_dir(child);
