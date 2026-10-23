@@ -13,6 +13,7 @@
 #include "../../src/d3d/d3d8_vsh.c"
 
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -52,6 +53,17 @@ static int hlsl_for_const(uint32_t const_idx, char *hlsl, int size)
 static void test_consts(void)
 {
     char hlsl[8192];
+    const float values[4] = {1, 2, 3, 4};
+    memset(&g_vsh_constants, 0, sizeof g_vsh_constants);
+    g_vsh_constants_dirty = FALSE;
+    d3d8_vsh_set_constant(191, values, INT_MAX);
+    CHECK(memcmp(g_vsh_constants.c[191], values, sizeof values) == 0);
+    CHECK(g_vsh_constants_dirty);
+    g_vsh_constants_dirty = FALSE;
+    d3d8_vsh_set_constant(INT_MAX, values, 1);
+    d3d8_vsh_set_constant(0, values, INT_MIN);
+    d3d8_vsh_set_constant(0, values, 0);
+    CHECK(!g_vsh_constants_dirty);
 
     CHECK(hlsl_for_const(191, hlsl, sizeof hlsl) > 0);
     CHECK(strstr(hlsl, "c[191]") != NULL);

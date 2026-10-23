@@ -1213,12 +1213,12 @@ void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
 {
     int end_reg;
 
-    if (!data || start_reg < 0)
+    if (!data || start_reg < 0 || start_reg >= NV2A_VS_MAX_CONSTANTS || count <= 0)
         return;
 
+    if (count > NV2A_VS_MAX_CONSTANTS - start_reg)
+        count = NV2A_VS_MAX_CONSTANTS - start_reg;
     end_reg = start_reg + count;
-    if (end_reg > NV2A_VS_MAX_CONSTANTS)
-        end_reg = NV2A_VS_MAX_CONSTANTS;
 
     for (int i = start_reg; i < end_reg; i++) {
         int src_offset = (i - start_reg) * 4;
