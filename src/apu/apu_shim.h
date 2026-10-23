@@ -181,8 +181,8 @@ static inline uint8_t *memory_region_get_ram_ptr(MemoryRegion *mr) {
 /* ============================================================
  * libsamplerate stubs (SRC)
  *
- * The VP uses libsamplerate for pitch-shifted voice resampling.
- * We stub it initially; voices will play at native rate.
+ * These compatibility callbacks do not resample and return no frames.
+ * They are not a native-rate playback fallback.
  * ============================================================ */
 
 typedef void SRC_STATE;
@@ -229,8 +229,8 @@ static inline void src_float_to_short_array(const float *in, int16_t *out,
 /* ============================================================
  * SDL Audio stubs
  *
- * The monitor output uses SDL. We stub it; actual audio output
- * will be connected via WASAPI separately.
+ * These compatibility entrypoints do not open an SDL audio stream.
+ * Native output is provided by apu_xaudio2.c.
  * ============================================================ */
 
 typedef void SDL_AudioStream;
