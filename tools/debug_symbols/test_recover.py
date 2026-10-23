@@ -26,10 +26,10 @@ WITH_H = _compile_pattern(include_headers=True)
 
 def test_extract_path():
     # Plain __FILE__ expansion.
-    assert _extract_path(r"c:\halo\SOURCE\ai\actors.c", CODE) == "c:/halo/SOURCE/ai/actors.c"
+    assert _extract_path(r"c:\sample\SOURCE\ai\actors.c", CODE) == "c:/sample/SOURCE/ai/actors.c"
     # The string scanner glues a previous string's tail onto the front.
-    assert _extract_path(r"-2>c:\halo\SOURCE\camera\observer.c", CODE) == "c:/halo/SOURCE/camera/observer.c"
-    assert _extract_path(r"@@c:\halo\SOURCE\camera\dead_camera.c", CODE) == "c:/halo/SOURCE/camera/dead_camera.c"
+    assert _extract_path(r"-2>c:\sample\SOURCE\camera\observer.c", CODE) == "c:/sample/SOURCE/camera/observer.c"
+    assert _extract_path(r"@@c:\sample\SOURCE\camera\dead_camera.c", CODE) == "c:/sample/SOURCE/camera/dead_camera.c"
     # Unix-style path, no drive letter.
     assert _extract_path("/src/engine/render.cpp", CODE) == "/src/engine/render.cpp"
 
@@ -48,15 +48,15 @@ def test_extract_path():
 
 def test_strip_common_root():
     rel = _strip_common_root([
-        "c:/halo/SOURCE/ai/actors.c",
-        "c:/halo/SOURCE/physics/physics.c",
+        "c:/sample/SOURCE/ai/actors.c",
+        "c:/sample/SOURCE/physics/physics.c",
     ])
-    assert rel["c:/halo/SOURCE/ai/actors.c"] == "ai/actors.c"
-    assert rel["c:/halo/SOURCE/physics/physics.c"] == "physics/physics.c"
+    assert rel["c:/sample/SOURCE/ai/actors.c"] == "ai/actors.c"
+    assert rel["c:/sample/SOURCE/physics/physics.c"] == "physics/physics.c"
     # One path alone gives the prefix scan nothing to compare against, so it
     # keeps the immediate parent directory rather than stripping to a bare name.
-    solo = _strip_common_root(["c:/halo/SOURCE/ai/actors.c"])
-    assert solo["c:/halo/SOURCE/ai/actors.c"] == "ai/actors.c"
+    solo = _strip_common_root(["c:/sample/SOURCE/ai/actors.c"])
+    assert solo["c:/sample/SOURCE/ai/actors.c"] == "ai/actors.c"
     # Same when many files share a single directory.
     same_dir = _strip_common_root(["c:/g/SOURCE/ai/a.c", "c:/g/SOURCE/ai/b.c"])
     assert same_dir["c:/g/SOURCE/ai/a.c"] == "ai/a.c"
@@ -65,9 +65,9 @@ def test_strip_common_root():
 
 def test_module_name_is_a_valid_c_identifier():
     assert _module_name("ai/actor_combat.c") == "actor_combat"
-    # Halo ships bungie_net/common/64bit_math.c -- a leading digit does not
+    # Synthetic shared/common/64bit_math.c has a leading digit that does not
     # compile, and the generated header is where it shows up.
-    assert _module_name("bungie_net/common/64bit_math.c") == "_64bit_math"
+    assert _module_name("shared/common/64bit_math.c") == "_64bit_math"
     # Anything else non-identifier gets folded to underscores.
     assert _module_name("saved games/game-state.c") == "game_state"
     assert _module_name("a/b c+d.cpp") == "b_c_d"
