@@ -44,10 +44,11 @@ class XmmIntegerBitwiseTest(unittest.TestCase):
                 self.assertIn(helper, out)
                 self.assertEqual(lifter.unimplemented, {})
 
-    def test_pcmpgtd_on_xmm_is_recorded_not_dropped(self):
+    def test_pcmpgtd_on_xmm_is_the_signed_compare_helper(self):
         lifter, out = _lift("pcmpgtd", "xmm0, xmm1", [_xmm("xmm0"), _xmm("xmm1")])
-        self.assertIn('RECOMP_UNIMPL("pcmpgtd xmm0, xmm1"', out)
-        self.assertIn("pcmpgtd", lifter.unimplemented)
+        self.assertIn("XMM_PCMPGTD(", out)
+        self.assertNotIn("RECOMP_UNIMPL", out)
+        self.assertEqual(lifter.unimplemented, {})
 
 
 class MovqXmmTest(unittest.TestCase):
@@ -73,6 +74,16 @@ class MovqXmmTest(unittest.TestCase):
 
 
 class X87FallthroughTest(unittest.TestCase):
+
+    def test_exception_clear_and_nop_are_explicit_no_ops(self):
+        # The model keeps no x87 exception flags, so these change nothing. They
+        # must not be counted as missing, or a reached one stops the title.
+        for mnem in ("fnclex", "fnop"):
+            with self.subTest(mnemonic=mnem):
+                lifter, out = _lift(mnem)
+                self.assertNotIn("RECOMP_UNIMPL", out)
+                self.assertIn("not modelled", out)
+                self.assertEqual(lifter.unimplemented, {})
 
     def test_unhandled_fpu_form_is_recorded(self):
         # fcmovb is a real conditional move with no translation here. It must
