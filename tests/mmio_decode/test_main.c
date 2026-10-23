@@ -65,26 +65,80 @@ static int run(const uint8_t *code, size_t len, CONTEXT *ctx)
     return r;
 }
 
-/* run() with the device answering `next_read` to the read. */
-static int run_rd(const uint8_t *code, size_t len, CONTEXT *ctx,
-                  uint64_t next_read)
+static void check_compare_widths(void)
 {
-    int r;
-    memset(&dev, 0, sizeof dev);
-    dev.next_read = next_read;
-    ctx->Rip = (DWORD64)(uintptr_t)code;
-    r = mmio_emulate(ctx, 0x54, NULL, t_read, t_write);
-    if (r && ctx->Rip - (DWORD64)(uintptr_t)code != len) {
-        printf("FAIL: Rip advanced %llu, instruction is %llu bytes\n",
-               (unsigned long long)(ctx->Rip - (DWORD64)(uintptr_t)code),
-               (unsigned long long)len);
-        failures++;
+    const uint8_t code[4][3] = {{0x38, 0x08}, {0x66, 0x39, 0x08},
+                                {0x39, 0x08}, {0x48, 0x39, 0x08}};
+    const int widths[4] = {1, 2, 4, 8};
+    for (unsigned w = 0; w < 4; w++) {
+        uint64_t sign = 1ull << (widths[w] * 8 - 1);
+        uint64_t mask = widths[w] == 8 ? UINT64_MAX : (sign * 2 - 1);
+        const uint64_t left[] = {sign, 0, sign - 1, 0, 0x10};
+        const uint64_t right[] = {1, 1, mask, 0, 1};
+        const unsigned expected[] = {w ? 0x814 : 0x810, 0x95,
+                                     w ? 0x885 : 0x881, 0x44, 0x14};
+        for (unsigned i = 0; i < 5; i++) {
+            CONTEXT ctx = {0};
+            memset(&dev, 0, sizeof dev);
+            ctx.Rcx = right[i]; ctx.EFlags = 0x400;
+            ctx.Rip = (uintptr_t)code[w]; dev.next_read = left[i];
+            CHECK("CMP width handled", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+            CHECK_U64("CMP width status flags", ctx.EFlags & 0xCD5, expected[i] | 0x400);
+            CHECK("CMP read-only", dev.reads == 1 && dev.writes == 0);
+        }
     }
-    return r;
+}
+
+static void check_registers_and_flags(void)
+{
+    CONTEXT ctx = {0};
+    { const uint8_t c[] = {0x88, 0x20}; /* MOV [rax], AH */
+      ctx.Rax = 0x1234ABCD; ctx.Rsp = 0x55;
+      CHECK("MOV AH handled", run(c, sizeof c, &ctx));
+      CHECK_U64("MOV AH value", dev.val, 0xAB); }
+    { const uint8_t c[] = {0x8A, 0x20}; /* MOV AH, [rax] */
+      ctx.Rax = 0xFFEEDDCC; ctx.Rsp = 0xAAAA55;
+      memset(&dev, 0, sizeof dev); dev.next_read = 0x12;
+      ctx.Rip = (uintptr_t)c;
+      CHECK("read AH handled", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+      CHECK_U64("read AH preserves other bits", ctx.Rax, 0xFFEE12CC);
+      CHECK_U64("read AH preserves RSP", ctx.Rsp, 0xAAAA55); }
+    { const uint8_t c[] = {0x40, 0x8A, 0x20}; /* MOV SPL, [rax] */
+      memset(&dev, 0, sizeof dev); dev.next_read = 0x12; ctx.Rip = (uintptr_t)c;
+      CHECK("REX byte handled", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+      CHECK_U64("REX selects SPL", ctx.Rsp, 0xAAAA12); }
+    { const uint8_t c[] = {0x66, 0x0F, 0xB6, 0x00};
+      ctx.Rax = 0x123456789ABCFFFFull;
+      memset(&dev, 0, sizeof dev); dev.next_read = 0xAB; ctx.Rip = (uintptr_t)c;
+      CHECK("MOVZX AX handled", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+      CHECK_U64("MOVZX AX preserves upper", ctx.Rax, 0x123456789ABC00ABull); }
+    { const uint8_t c[] = {0x09, 0x08};
+      ctx.Rcx = 2; ctx.EFlags = 0xCC5;
+      memset(&dev, 0, sizeof dev); dev.next_read = 1; ctx.Rip = (uintptr_t)c;
+      CHECK("OR flags handled", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+      CHECK_U64("OR result", dev.val, 3);
+      CHECK_U64("OR parity and preserved DF", ctx.EFlags & 0xCC5, 0x404); }
+    { const uint8_t c[] = {0x21, 0x08};
+      ctx.Rcx = 0x0F; ctx.EFlags = 0xCC5;
+      memset(&dev, 0, sizeof dev); dev.next_read = 0xF0; ctx.Rip = (uintptr_t)c;
+      CHECK("AND flags handled", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+      CHECK_U64("AND zero/even parity", ctx.EFlags & 0xCC5, 0x444); }
+    { const uint8_t c[] = {0x84, 0x20}; /* TEST [rax], AH */
+      ctx.Rax = 0x8000; ctx.Rsp = 0; ctx.EFlags = 0xCC5;
+      memset(&dev, 0, sizeof dev); dev.next_read = 0x80; ctx.Rip = (uintptr_t)c;
+      CHECK("TEST AH handled", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+      CHECK_U64("TEST AH sign/odd parity", ctx.EFlags & 0xCC5, 0x480); }
+    { const uint8_t c[] = {0x38, 0x08};
+      ctx.Rcx = 1; ctx.EFlags = 0x400;
+      memset(&dev, 0, sizeof dev); dev.next_read = 0x80; ctx.Rip = (uintptr_t)c;
+      CHECK("CMP overflow handled", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+      CHECK_U64("CMP signed overflow and auxiliary carry", ctx.EFlags & 0xCD5, 0xC10); }
 }
 
 int main(void)
 {
+    check_registers_and_flags();
+    check_compare_widths();
     CONTEXT ctx;
     printf("mmio_decode: running\n");
     memset(&ctx, 0, sizeof ctx);

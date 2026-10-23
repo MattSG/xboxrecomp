@@ -49,6 +49,27 @@ static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
     }
 }
 
+static inline uint64_t mmio_width_mask(int size)
+{
+    return size == 8 ? UINT64_MAX : (1ULL << (size * 8)) - 1;
+}
+
+static inline uint64_t mmio_read_reg(PCONTEXT ctx, int reg, int size, int rex)
+{
+    int high_byte = size == 1 && !rex && reg >= 4 && reg < 8;
+    return (*mmio_ctx_reg(ctx, high_byte ? reg - 4 : reg) >> (high_byte ? 8 : 0)) &
+           mmio_width_mask(size);
+}
+
+static inline void mmio_write_reg(PCONTEXT ctx, int reg, int size, int rex, uint64_t value)
+{
+    int high_byte = size == 1 && !rex && reg >= 4 && reg < 8;
+    int shift = high_byte ? 8 : 0;
+    uint64_t mask = mmio_width_mask(size), *dst = mmio_ctx_reg(ctx, high_byte ? reg - 4 : reg);
+    if (size >= 4) *dst = value & mask; /* DWORD writes clear the upper half. */
+    else *dst = (*dst & ~(mask << shift)) | ((value & mask) << shift);
+}
+
 static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
 {
     uint8_t modrm = *ip;
@@ -67,14 +88,20 @@ static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
     return len;
 }
 
-/* The ALU operations, numbered as the reg field of group 1 (80/81/83) and as
- * bits 5:3 of the classic two-operand opcodes. TEST has no slot of its own. */
-enum { MMIO_ALU_ADD = 0, MMIO_ALU_OR = 1, MMIO_ALU_AND = 4, MMIO_ALU_SUB = 5,
-       MMIO_ALU_XOR = 6, MMIO_ALU_CMP = 7, MMIO_ALU_TEST = 8 };
-
-static inline uint64_t mmio_size_mask(int size)
+/* Defined status flags; auxiliary carry is set separately for subtraction. */
+static inline void mmio_set_flags(PCONTEXT ctx, uint64_t result, int size,
+                                  int carry, int overflow)
 {
-    return size >= 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
+    unsigned parity;
+    ctx->EFlags &= ~(0x0001u | 0x0004u | 0x0040u | 0x0080u | 0x0800u);
+    result &= mmio_width_mask(size);
+    if (result == 0) ctx->EFlags |= 0x0040u;
+    if (result & (1ULL << (size * 8 - 1))) ctx->EFlags |= 0x0080u;
+    if (carry) ctx->EFlags |= 0x0001u;
+    if (overflow) ctx->EFlags |= 0x0800u;
+    parity = (unsigned)result & 0xFFu;
+    parity ^= parity >> 4; parity ^= parity >> 2; parity ^= parity >> 1;
+    if (!(parity & 1)) ctx->EFlags |= 0x0004u;
 }
 
 /* a OP b at the given width, with the flags a following jcc reads: ZF, SF, CF
@@ -190,7 +217,7 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
         if (op[0] == 0x88) size = 1;
         mlen = mmio_modrm_len(op + 1, rex_b);
         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        wr(dev, off, mmio_get_reg(ctx, reg, size, has_rex), size);
+        wr(dev, off, mmio_read_reg(ctx, reg, size, has_rex), size);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
 
@@ -221,11 +248,12 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
         return 1;
 
     case 0x8A: case 0x8B: {                          /* MOV r, r/m   (read)  */
-        uint64_t v, *dst;
+        uint64_t v;
         if (op[0] == 0x8A) size = 1;
         mlen = mmio_modrm_len(op + 1, rex_b);
         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        mmio_set_reg(ctx, reg, rd(dev, off, size), size, has_rex);
+        v    = rd(dev, off, size);
+        mmio_write_reg(ctx, reg, size, has_rex, v);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
 
@@ -233,46 +261,51 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
         if (op[0] == 0x84) size = 1;
         mlen = mmio_modrm_len(op + 1, rex_b);
         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        mmio_alu(ctx, MMIO_ALU_TEST, rd(dev, off, size),
-                 mmio_get_reg(ctx, reg, size, has_rex), size);
+        m    = rd(dev, off, size);
+        r    = mmio_read_reg(ctx, reg, size, has_rex);
+        mmio_set_flags(ctx, m & r, size, 0, 0);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
+    }
 
-    case 0x80: case 0x81: case 0x83:                 /* group 1 r/m, imm     */
-        alu = (op[1] >> 3) & 7;
-        if (alu == 2 || alu == 3)                    /* ADC, SBB             */
-            return 0;
-        if (op[0] == 0x80) size = 1;
+    case 0x38: case 0x39: {                          /* CMP r/m, r           */
+        uint64_t m, r, mask;
+        if (op[0] == 0x38) size = 1;
         mlen = mmio_modrm_len(op + 1, rex_b);
-        if (op[0] == 0x83) {                         /* imm8, sign-extended  */
-            imm  = (uint64_t)(int64_t)(int8_t)op[1 + mlen];
-            ilen = 1;
-        } else {
-            imm = mmio_imm(op + 1 + mlen, size, &ilen);
-        }
-        v = mmio_alu(ctx, alu, rd(dev, off, size), imm, size);
-        if (alu != MMIO_ALU_CMP)
-            wr(dev, off, v, size);
-        ctx->Rip += prefix + 1 + mlen + ilen;
+        reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
+        m    = rd(dev, off, size);
+        r    = mmio_read_reg(ctx, reg, size, has_rex);
+        mask = (size < 8) ? ((1ULL << (size * 8)) - 1) : ~0ULL;
+        m &= mask; r &= mask;
+        uint64_t result = m - r;
+        int overflow = ((m ^ r) & (m ^ result) & (1ULL << (size * 8 - 1))) != 0;
+        mmio_set_flags(ctx, result, size, m < r, overflow);
+        ctx->EFlags = (ctx->EFlags & ~0x10u) | (unsigned)((m ^ r ^ result) & 0x10u);
+        ctx->Rip += prefix + 1 + mlen;
         return 1;
+    }
 
-    case 0xF6: case 0xF7:                            /* TEST r/m, imm        */
-        if (((op[1] >> 3) & 7) > 1)                  /* /1 aliases /0        */
-            return 0;
-        if (op[0] == 0xF6) size = 1;
+    case 0x08: case 0x09:                            /* OR r/m, r */
+    case 0x20: case 0x21: {                          /* AND r/m, r */
+        uint64_t value, operand;
+        if (!(op[0] & 1)) size = 1;
         mlen = mmio_modrm_len(op + 1, rex_b);
-        imm  = mmio_imm(op + 1 + mlen, size, &ilen);
-        mmio_alu(ctx, MMIO_ALU_TEST, rd(dev, off, size), imm, size);
-        ctx->Rip += prefix + 1 + mlen + ilen;
+        reg = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
+        value = rd(dev, off, size);
+        operand = mmio_read_reg(ctx, reg, size, has_rex);
+        value = (op[0] < 0x20 ? value | operand : value & operand) & mmio_width_mask(size);
+        wr(dev, off, value, size);
+        mmio_set_flags(ctx, value, size, 0, 0);
+        ctx->Rip += prefix + 1 + mlen;
         return 1;
+    }
 
     case 0x0F:
         if (op[1] == 0xB6 || op[1] == 0xB7) {        /* MOVZX r, r/m8|16     */
             int s = (op[1] == 0xB6) ? 1 : 2;
             mlen  = mmio_modrm_len(op + 2, rex_b);
             reg   = ((op[2] >> 3) & 7) | (rex_r ? 8 : 0);
-            mmio_set_reg(ctx, reg, rd(dev, off, s) & mmio_size_mask(s),
-                         rex_w ? 8 : (has66 ? 2 : 4), 1);
+            mmio_write_reg(ctx, reg, size, has_rex, rd(dev, off, s) & mmio_width_mask(s));
             ctx->Rip += prefix + 2 + mlen;
             return 1;
         }
