@@ -131,3 +131,9 @@ section/header overlap, unbacked storage, an empty-section image, zeroed fresh
 storage, shutdown clearing and restoration of automatic placement. A C++
 consumer links the configuration API. These are storage-ownership checks, not
 full kernel-data export fidelity checks.
+
+Identity cases compare configured and unconfigured hardware/version/credential
+exports between native resolution and the guest page. Every byte of hardware,
+version, three keys, alternate keys and public-key storage is checked; the
+runtime must ignore credential environment variables. This does not prove any
+hardware identity or cryptographic/kernel behavior.

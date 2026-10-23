@@ -4,9 +4,8 @@
  * Provides Xbox-specific exported data (hardware info, kernel version,
  * keys, image filename) and section loading stubs.
  *
- * Most Xbox-specific hardware data is stubbed with plausible retail
- * values. Crypto keys are zeroed since we don't need Xbox Live or
- * EEPROM-based encryption on PC.
+ * Ports own reported identity and credential policy. Unconfigured exports
+ * are zero; section handling and other exports remain partial implementations.
  */
 
 #include "kernel.h"
@@ -31,27 +30,13 @@
  * Game code accesses them directly via the thunk table.
  * ============================================================================ */
 
-/* Hardware info - default report is a standard retail Xbox.
- * A target may override via xbox_kernel_set_version() or by patching the
- * global directly; no title-specific values are baked in. */
-XBOX_HARDWARE_INFO xbox_HardwareInfo = {
-    .Flags       = 0x00000020,  /* Retail Xbox */
-    .GpuRevision = 0xD2,       /* NV2A D2 revision */
-    .McpRevision = 0xD4,       /* MCPX D4 revision */
-    .Reserved    = {0, 0}
-};
+/* Unconfigured identity exports are zero. Ports choose any compatibility
+ * values explicitly before native/bridge initialization. These values do not
+ * certify hardware emulation or an SDK-specific kernel ABI. */
+XBOX_HARDWARE_INFO xbox_HardwareInfo = {0};
+XBOX_KRNL_VERSION xbox_KrnlVersion = {0};
 
-/* Kernel version - default is a stock retail value. Titles built against a
- * different XDK can report their own through xbox_kernel_set_version(). */
-XBOX_KRNL_VERSION xbox_KrnlVersion = {
-    .Major = 1,
-    .Minor = 0,
-    .Build = 5849,
-    .Qfe   = 1
-};
-
-/* Override the kernel version reported to game code (ordinal 324).
- * Match the XDK revision the target title was built with if it checks it. */
+/* Set caller-selected reported version; bridge initialization copies it. */
 void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qfe)
 {
     xbox_KrnlVersion.Major = major;
@@ -60,15 +45,14 @@ void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qf
     xbox_KrnlVersion.Qfe   = qfe;
 }
 
-/* Crypto keys - zeroed, not needed for PC operation.
- * These are unique per-console on real hardware. */
+/* Console credentials; zero until supplied by the port. */
 UCHAR xbox_EEPROMKey[16]              = {0};
 UCHAR xbox_HDKey[16]                  = {0};
 UCHAR xbox_SignatureKey[16]           = {0};
 UCHAR xbox_LANKey[16]                 = {0};
 UCHAR xbox_AlternateSignatureKeys[16][16] = {{0}};
 
-/* Public key data for Xbox Live signature verification - not needed */
+/* Public-key bytes; zero until supplied by the port. */
 UCHAR xbox_XePublicKeyData[284] = {0};
 
 /* Image filename - the XBE path as seen by the kernel */
