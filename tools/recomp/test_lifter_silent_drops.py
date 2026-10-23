@@ -1,0 +1,92 @@
+"""SSE and x87 forms that used to lift to a comment and vanish at runtime.
+
+Each of these was a `/* ... */` comment, which the C compiler reads as nothing.
+The integer bitwise ops on xmm and movq on xmm now lift to the same helpers the
+float forms use. Everything else in these two lifters that is not translated
+goes through `_unimplemented`, so it is counted and marked at runtime.
+"""
+import unittest
+
+from .disasm import Instruction, Operand
+from .lifter import Lifter
+
+
+def _lift(mnemonic, op_str="", operands=()):
+    lifter = Lifter()
+    insn = Instruction(0x00012340, 3, mnemonic, op_str, "",
+                       operands=list(operands))
+    return lifter, " ".join(lifter.lift_instruction(insn))
+
+
+def _xmm(name):
+    return Operand(type="reg", reg=name)
+
+
+def _mem(size):
+    return Operand(type="mem", mem_base="eax", mem_index=None, mem_scale=1,
+                   mem_disp=0, mem_size=size)
+
+
+class XmmIntegerBitwiseTest(unittest.TestCase):
+
+    def test_pxor_on_xmm_is_the_xor_helper(self):
+        lifter, out = _lift("pxor", "xmm0, xmm1", [_xmm("xmm0"), _xmm("xmm1")])
+        self.assertIn("XMM_XOR(", out)
+        self.assertNotIn("RECOMP_UNIMPL", out)
+        self.assertEqual(lifter.unimplemented, {})
+
+    def test_pand_pandn_por_map_to_their_helpers(self):
+        for mnem, helper in (("pand", "XMM_AND("), ("pandn", "XMM_ANDN("),
+                             ("por", "XMM_OR(")):
+            with self.subTest(mnemonic=mnem):
+                lifter, out = _lift(mnem, "xmm2, xmm3",
+                                    [_xmm("xmm2"), _xmm("xmm3")])
+                self.assertIn(helper, out)
+                self.assertEqual(lifter.unimplemented, {})
+
+    def test_pcmpgtd_on_xmm_is_recorded_not_dropped(self):
+        lifter, out = _lift("pcmpgtd", "xmm0, xmm1", [_xmm("xmm0"), _xmm("xmm1")])
+        self.assertIn('RECOMP_UNIMPL("pcmpgtd xmm0, xmm1"', out)
+        self.assertIn("pcmpgtd", lifter.unimplemented)
+
+
+class MovqXmmTest(unittest.TestCase):
+
+    def test_load_low_qword_zeroes_the_high_qword(self):
+        lifter, out = _lift("movq", "xmm0, qword ptr [eax]",
+                            [_xmm("xmm0"), _mem(8)])
+        self.assertIn("XMM_LOAD_LOW(xmm0,", out)
+        self.assertIn("xmm0.u[2] = xmm0.u[3] = 0", out)
+        self.assertEqual(lifter.unimplemented, {})
+
+    def test_store_low_qword(self):
+        lifter, out = _lift("movq", "qword ptr [eax], xmm1",
+                            [_mem(8), _xmm("xmm1")])
+        self.assertIn("XMM_STORE_LOW(", out)
+        self.assertEqual(lifter.unimplemented, {})
+
+    def test_register_to_register_copies_low_and_zeroes_high(self):
+        lifter, out = _lift("movq", "xmm0, xmm1", [_xmm("xmm0"), _xmm("xmm1")])
+        self.assertIn("xmm0.u[0] = xmm1.u[0]", out)
+        self.assertIn("xmm0.u[2] = xmm0.u[3] = 0", out)
+        self.assertEqual(lifter.unimplemented, {})
+
+
+class X87FallthroughTest(unittest.TestCase):
+
+    def test_unhandled_fpu_form_is_recorded(self):
+        # fcmovb is a real conditional move with no translation here. It must
+        # be counted and marked, not left as a comment.
+        lifter, out = _lift("fcmovb", "st, st(1)")
+        self.assertIn('RECOMP_UNIMPL("fcmovb st, st(1)"', out)
+        self.assertIn("fcmovb", lifter.unimplemented)
+
+    def test_fstp_tbyte_store_is_recorded(self):
+        # No fp80 store helper exists yet, so a 10-byte fstp is a counted site.
+        lifter, out = _lift("fstp", "tbyte ptr [eax]", [_mem(10)])
+        self.assertIn("RECOMP_UNIMPL", out)
+        self.assertIn("fstp", lifter.unimplemented)
+
+
+if __name__ == "__main__":
+    unittest.main()
