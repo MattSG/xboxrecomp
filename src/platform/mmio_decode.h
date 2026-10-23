@@ -22,11 +22,15 @@
 #ifndef MMIO_DECODE_H
 #define MMIO_DECODE_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #if defined(_WIN32) || defined(__x86_64__)
 #include "xbox_winnt.h"
+#if !defined(_WIN32)
+#include "win32_compat.h"
+#endif
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
@@ -102,22 +106,22 @@ static inline void mmio_set_flags(PCONTEXT ctx, uint64_t result, int size,
     if (!(parity & 1)) ctx->EFlags |= 0x0004u;
 }
 
-/* 1 if the instruction at ctx->Rip was serviced and Rip advanced past it. */
-static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
-                               mmio_read_fn rd, mmio_write_fn wr)
+/* Decode a caller-owned snapshot; no callback/context mutation before validation. */
+static inline int mmio_emulate_bytes(PCONTEXT ctx, uint32_t off, void *dev,
+                                     mmio_read_fn rd, mmio_write_fn wr,
+                                     const uint8_t *ip, size_t length)
 {
-    const uint8_t *ip = (const uint8_t *)ctx->Rip;
     int prefix = 0, has66 = 0, rex = 0, has_rex = 0;
     const uint8_t *op;
     int size, rex_w, rex_r, rex_b, mlen, reg;
 
-    if (!rd || !wr)
-        return 0;
-
+    if (!ctx || !ip || !rd || !wr) return 0;
+    if (length > 15) length = 15;
     for (;;) {
+        if ((size_t)prefix >= length) return 0;
         uint8_t b = ip[prefix];
-        if (b == 0x66)                   { has66 = 1; prefix++; }
-        else if (b == 0xF2 || b == 0xF3) { prefix++; }
+        if (b == 0x66) { has66 = 1; has_rex = 0; rex = 0; prefix++; }
+        else if (b == 0xF2 || b == 0xF3) { has_rex = 0; rex = 0; prefix++; }
         else if (b >= 0x40 && b <= 0x4F) { rex = b; has_rex = 1; prefix++; }
         else break;
     }
@@ -127,6 +131,29 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
 
     op   = ip + prefix;
     size = rex_w ? 8 : (has66 ? 2 : 4);
+
+    /* Validate the complete supported memory encoding before touching a device. */
+    {
+        size_t opcode_bytes = 1, modrm, total, immediate = 0;
+        switch (op[0]) {
+        case 0x0F:
+            if ((size_t)prefix + 1 >= length || (op[1] != 0xB6 && op[1] != 0xB7)) return 0;
+            opcode_bytes = 2;
+            break;
+        case 0xC7: immediate = size == 2 ? 2 : 4; break;
+        case 0xC6: immediate = 1; break;
+        case 0x88: case 0x89: case 0x8A: case 0x8B:
+        case 0x84: case 0x85: case 0x38: case 0x39:
+        case 0x08: case 0x09: case 0x20: case 0x21: break;
+        default: return 0;
+        }
+        modrm = (size_t)prefix + opcode_bytes;
+        if (modrm >= length || (ip[modrm] & 0xC0) == 0xC0) return 0;
+        if ((op[0] == 0xC6 || op[0] == 0xC7) && (ip[modrm] & 0x38)) return 0;
+        if ((ip[modrm] & 7) == 4 && modrm + 1 >= length) return 0;
+        total = modrm + mmio_modrm_len(ip + modrm, rex_b) + immediate;
+        if (total > length) return 0;
+    }
 
     switch (op[0]) {
     case 0x88: case 0x89:                            /* MOV r/m, r   (write) */
@@ -140,7 +167,6 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     case 0xC7: {                                     /* MOV r/m, imm16|32 */
         uint64_t value;
         int immediate_size = size == 2 ? 2 : 4;
-        if ((op[1] & 0x38) || (op[1] & 0xC0) == 0xC0) return 0;
         mlen = mmio_modrm_len(op + 1, rex_b);
         if (size == 2) {
             uint16_t immediate;
@@ -157,7 +183,6 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 
     case 0xC6:                                       /* MOV r/m8, imm8       */
-        if ((op[1] & 0x38) || (op[1] & 0xC0) == 0xC0) return 0;
         mlen = mmio_modrm_len(op + 1, rex_b);
         wr(dev, off, op[1 + mlen], 1);
         ctx->Rip += prefix + 1 + mlen + 1;
@@ -232,6 +257,32 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     default:
         return 0;
     }
+}
+
+/* Snapshot at most one architectural instruction without faulting on its page
+ * boundary. Usually one host read; byte reads recover a readable short prefix
+ * when the host refuses a cross-page bulk read. Preserve caller LastError. */
+static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+                               mmio_read_fn rd, mmio_write_fn wr)
+{
+    uint8_t code[15];
+    SIZE_T copied = 0;
+    DWORD error;
+    uintptr_t address;
+    if (!ctx || !rd || !wr) return 0;
+    error = GetLastError();
+    address = (uintptr_t)ctx->Rip;
+    ReadProcessMemory(GetCurrentProcess(), (const void *)address, code, sizeof(code), &copied);
+    if (!copied) {
+        while (copied < sizeof(code) && address <= UINTPTR_MAX - copied) {
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), (const void *)(address + copied),
+                                   code + copied, 1, &got) || got != 1) break;
+            copied++;
+        }
+    }
+    SetLastError(error);
+    return mmio_emulate_bytes(ctx, off, dev, rd, wr, code, copied);
 }
 
 #endif /* _WIN32 || __x86_64__ */

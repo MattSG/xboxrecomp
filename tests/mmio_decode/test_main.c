@@ -15,6 +15,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 #include "platform/xbox_winnt.h"
 
 #include "mmio_decode.h"
@@ -63,6 +66,78 @@ static int run(const uint8_t *code, size_t len, CONTEXT *ctx)
         }
     }
     return r;
+}
+
+static void check_snapshot_bounds(void)
+{
+    const uint8_t code[][8] = {{0x89,0x0C,0x25,0,0x10,0,0},
+        {0x66,0xC7,0,0x34,0x12}, {0x48,0xC7,0,0,0,0,0x80}, {0x0F,0xB6,0}};
+    const unsigned lengths[] = {7, 5, 7, 3};
+    for (unsigned i = 0; i < 4; i++) {
+        for (unsigned available = 0; available < lengths[i]; available++) {
+            CONTEXT ctx, before;
+            memset(&ctx, 0, sizeof ctx); ctx.Rip = (uintptr_t)code[i];
+            memcpy(&before, &ctx, sizeof ctx); memset(&dev, 0, sizeof dev);
+            CHECK("truncated snapshot refused", !mmio_emulate_bytes(&ctx, 0x54, NULL,
+                  t_read, t_write, code[i], available));
+            CHECK("truncation preserves context", !memcmp(&ctx, &before, sizeof ctx));
+            CHECK("truncation has no callback", dev.reads == 0 && dev.writes == 0);
+        }
+    }
+    CONTEXT ctx = {0};
+    const uint8_t legacy_after_rex[] = {0x48,0x66,0xC7,0,0x34,0x12};
+    CHECK("legacy after REX handled", run(legacy_after_rex, sizeof legacy_after_rex, &ctx));
+    CHECK_U64("legacy after REX ignores REX.W", dev.size, 2);
+    CHECK_U64("legacy after REX immediate", dev.val, 0x1234);
+    uint8_t maximum[15];
+    memset(maximum, 0x66, 13); maximum[13] = 0x89; maximum[14] = 0;
+    CHECK("maximum instruction length", run(maximum, sizeof maximum, &ctx));
+
+    size_t page;
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si); page = si.dwPageSize;
+#else
+    page = (size_t)sysconf(_SC_PAGESIZE);
+#endif
+    uint8_t *memory = VirtualAlloc(NULL, page * 2, MEM_RESERVE, PAGE_NOACCESS);
+    CHECK("instruction page reserve", memory != NULL);
+    if (!memory) return;
+    CHECK("instruction page commit", VirtualAlloc(memory, page, MEM_COMMIT, PAGE_READWRITE) != NULL);
+    memory[page - 2] = 0x89; memory[page - 1] = 0x08;
+    ctx.Rip = (uintptr_t)(memory + page - 2); ctx.Rcx = 0x1234;
+    memset(&dev, 0, sizeof dev); SetLastError(123);
+    CHECK("short instruction at page end", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+    CHECK_U64("instruction snapshot preserves LastError", GetLastError(), 123);
+    CHECK_U64("page end instruction value", dev.val, 0x1234);
+    CHECK_U64("page end instruction RIP", ctx.Rip, (uintptr_t)(memory + page));
+    memory[page - 2] = 0xC7; memory[page - 1] = 0;
+    ctx.Rip = (uintptr_t)(memory + page - 2); memset(&dev, 0, sizeof dev);
+    CHECK("page end truncation refused", !mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+    CHECK("page end truncation has no callback", dev.reads == 0 && dev.writes == 0);
+    ctx.Rip = (uintptr_t)(memory + page);
+    CHECK("unreadable instruction refused", !mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+    CHECK("instruction pages freed", VirtualFree(memory, 0, MEM_RELEASE));
+}
+
+static void check_invalid_forms(void)
+{
+    const uint8_t codes[][3] = {{0x88,0xC0}, {0x89,0xC0}, {0x8A,0xC0},
+        {0x8B,0xC0}, {0x84,0xC0}, {0x85,0xC0}, {0x38,0xC0}, {0x39,0xC0},
+        {0x08,0xC0}, {0x09,0xC0}, {0x20,0xC0}, {0x21,0xC0}, {0x0F,0xB6,0xC0}};
+    CONTEXT ctx = {0};
+    for (unsigned i = 0; i < sizeof codes / sizeof codes[0]; i++) {
+        memset(&dev, 0, sizeof dev); ctx.Rip = (uintptr_t)codes[i];
+        CHECK("register-only instruction refused", !mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+        CHECK("register-only form has no callback", dev.reads == 0 && dev.writes == 0);
+        CHECK_U64("register-only form preserves RIP", ctx.Rip, (uintptr_t)codes[i]);
+    }
+    uint8_t overlong[17];
+    memset(overlong, 0x66, 15); overlong[15] = 0x89; overlong[16] = 0;
+    ctx.Rip = (uintptr_t)overlong; memset(&dev, 0, sizeof dev);
+    CHECK("overlong encoding refused", !mmio_emulate(&ctx, 0x54, NULL, t_read, t_write));
+    CHECK("overlong encoding has no callback", dev.reads == 0 && dev.writes == 0);
+    CHECK_U64("overlong encoding preserves RIP", ctx.Rip, (uintptr_t)overlong);
 }
 
 static void check_compare_widths(void)
@@ -137,6 +212,8 @@ static void check_registers_and_flags(void)
 
 int main(void)
 {
+    check_snapshot_bounds();
+    check_invalid_forms();
     check_registers_and_flags();
     check_compare_widths();
     CONTEXT ctx;

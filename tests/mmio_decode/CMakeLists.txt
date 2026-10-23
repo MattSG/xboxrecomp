@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(mmio_decode_test C)
+add_subdirectory(../../src/platform platform)
 add_executable(mmio-decode-test test_main.c)
 target_include_directories(mmio-decode-test PRIVATE ../../src ../../src/platform)
+target_link_libraries(mmio-decode-test PRIVATE platform)
 enable_testing()
 add_test(NAME mmio-decode COMMAND mmio-decode-test)
