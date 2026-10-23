@@ -295,7 +295,7 @@ static struct {
      * sequence came out as 12 black BMPs. */
     uint32_t drawn_offset;
     /* ...and the shape of that surface. A title also draws into small
-     * render targets (Burnout 3: 128x128 shadow/reflection maps, pitch 512),
+     * render targets (a title: 128x128 shadow/reflection maps, pitch 512),
      * often after the main scene, so "last surface drawn" alone picked one of
      * those and read it with the framebuffer's pitch: horizontal noise. The
      * biggest surface drawn since the last flip is the one being presented. */
@@ -620,7 +620,7 @@ static uint32_t surface_bpp(void)
 {
     /* The surface format says it outright (NV097_SET_SURFACE_FORMAT_COLOR).
      * Deriving it from pitch / clip width -- the only way before -- is right
-     * only while the clip spans the whole surface: Burnout 3 narrows the clip
+     * only while the clip spans the whole surface: A title narrows the clip
      * to a 250-pixel window to draw its option values, 2560 / 250 came out as
      * 10 bytes a pixel, and every such text quad was refused. */
     switch (s_gpu.format & 0xF) {
@@ -1055,7 +1055,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
         *argb = ((const uint32_t *)p)[u] | 0xFF000000u;
         return 1;
 
-    /* 8-bit palette index, swizzled. Burnout 3 draws its logo and frontend
+    /* 8-bit palette index, swizzled. A title draws its logo and frontend
      * header art this way; without a case every such quad came out as the
      * unsupported-format fill, a white box where the logo should be. */
     case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
@@ -1308,7 +1308,7 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb,
     /* Blending, with the GL factor set and equations the NV2A takes.
      *
      * Only SRC_ALPHA / ONE_MINUS_SRC_ALPHA used to be honoured and every other
-     * pair was written opaque. Menus never noticed; a race does: Burnout 3
+     * pair was written opaque. Menus never noticed; a race does: a title
      * finishes its 3D frame with screen-space passes that modulate or add
      * over the scene, and written opaque they paint the whole view over. */
     if (s_gpu.blend_enable
@@ -2153,7 +2153,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 
 /* Worker threads for big triangles.
  *
- * The rasteriser is a software GPU, and a Burnout 3 frame is dominated by a
+ * The rasteriser is a software GPU, and a title's frame is dominated by a
  * handful of full-screen passes -- composites, blurs, the menu backdrops --
  * each two triangles of 300,000 pixels through the register combiners. Those
  * split cleanly by row: every pixel reads only its own depth and colour, so
@@ -3363,7 +3363,7 @@ static void imm_emit_vertex(void)
  * Each sets an attribute's current value; completing attribute 0 -- the
  * position -- emits a vertex carrying every attribute as it stands. This used
  * to keep position, diffuse and texcoord 0 only, which dropped any quad with
- * a second texture coordinate: Burnout 3 composites its whole 3D scene into
+ * a second texture coordinate: A title composites its whole 3D scene into
  * the frame with exactly such a quad, and the frame never got the scene. */
 static int imm_vertex_method(uint32_t method, uint32_t param)
 {
@@ -4072,8 +4072,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* The GPU's answer to a visibility test: 16 bytes at the report
          * DMA offset -- a timestamp, the pixel count, and 0 for "done".
          * Never written, a title polling it (D3D's GetVisibilityTestResult
-         * starts the slot at 0xFFFFFFFF) sees every test incomplete. Burnout
-         * 3 culls its world with these, so the race's main view drew only
+         * starts the slot at 0xFFFFFFFF) sees every test incomplete. A title
+         * culls its world with these, so the race's main view drew only
          * the sky while the cube-map passes, which do not test, drew it all.
          * The report DMA object starts at physical 0 here, as D3D sets it. */
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
