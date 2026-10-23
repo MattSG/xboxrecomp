@@ -21,6 +21,9 @@
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 
+/* ponytail: one diagnostic-state lock; shard only if trace contention matters. */
+static SRWLOCK g_trace_lock = SRWLOCK_INIT;
+
 /* A run that recurses produces trace lines without limit, and the useful
  * window is rarely the first few thousand. The budget stops a diagnostic from
  * filling a disk, and is deliberately generous: a budget that runs out before
@@ -60,7 +63,7 @@ static const char *g_prof_name[PROF_SLOTS];
 static int g_prof_used, g_prof_full;
 static unsigned long long g_prof_calls;
 
-static void prof_report(void)
+static void prof_report_locked(void)
 {
     int taken[40], ntaken = 0;
     int i, j, shown;
@@ -90,6 +93,13 @@ static void prof_report(void)
                 g_prof[best].va);
     }
     fflush(stderr);
+}
+
+static void prof_report(void)
+{
+    AcquireSRWLockExclusive(&g_trace_lock);
+    prof_report_locked();
+    ReleaseSRWLockExclusive(&g_trace_lock);
 }
 
 /* RECOMP_TRACE_PROFILE=1 profiles; a larger number is also how often to
@@ -127,7 +137,7 @@ static void prof_count(const char *name, uint32_t va)
      * killed rather than exited, and a kill does not reach atexit. Report as
      * it goes, so there is always a recent one. */
     if (++g_prof_calls % prof_interval() == 0)
-        prof_report();
+        prof_report_locked();
 
     for (n = 0; n < PROF_SLOTS; n++) {
         unsigned k = (i + n) & (PROF_SLOTS - 1);
@@ -135,12 +145,31 @@ static void prof_count(const char *name, uint32_t va)
         if (!g_prof[k].hits) {
             g_prof[k].va = va;
             g_prof[k].hits = 1;
-            g_prof_name[k] = name;
+            /* Own the name until process exit, like the profile table itself. */
+            if (name) {
+                size_t bytes = strlen(name) + 1;
+                char *copy = malloc(bytes);
+                if (copy) memcpy(copy, name, bytes);
+                g_prof_name[k] = copy;
+            }
             g_prof_used++;
             return;
         }
     }
     g_prof_full = 1;
+}
+
+static int trace_should_log(const char *name, uint32_t va, int entry)
+{
+    int log = 0;
+    AcquireSRWLockExclusive(&g_trace_lock);
+    if (prof_enabled()) {
+        if (entry) prof_count(name, va);
+    } else {
+        log = trace_budget() != 0;
+    }
+    ReleaseSRWLockExclusive(&g_trace_lock);
+    return log;
 }
 
 /* Diagnostics must not fault on the guest memory they are diagnosing. */
@@ -172,8 +201,7 @@ static void trace_dump(const char *label, uint32_t va, int count)
 
 void recomp_trace_enter(const char *name, uint32_t va)
 {
-    if (prof_enabled()) { prof_count(name, va); return; }
-    if (!trace_budget()) return;
+    if (!trace_should_log(name, va, 1)) return;
     uint32_t from = 0, args[32];
     int readable = trace_read(g_esp, &from, sizeof(from));
     fprintf(stderr, "[TRACE] -> %s (0x%08X)  from=%08X%s esp=%08X eax=%08X "
@@ -206,8 +234,7 @@ void recomp_trace_enter(const char *name, uint32_t va)
  * comes back wrong. */
 void recomp_trace_exit(const char *name, uint32_t va)
 {
-    if (prof_enabled()) return;     /* entries alone carry the count */
-    if (!trace_budget()) return;
+    if (!trace_should_log(name, va, 0)) return;
     fprintf(stderr, "[TRACE] <- %s (0x%08X)  esp=%08X eax=%08X ecx=%08X "
             "esi=%08X edi=%08X ebx=%08X\n",
             name, va, g_esp, g_eax, g_ecx, g_esi, g_edi, g_ebx);
@@ -219,8 +246,7 @@ void recomp_trace_exit(const char *name, uint32_t va)
  * bytes per call is only visible from a sample taken before it. */
 void recomp_trace_esp(const char *name, const char *tag)
 {
-    if (prof_enabled()) return;
-    if (!trace_budget()) return;
+    if (!trace_should_log(name, 0, 0)) return;
     fprintf(stderr, "[ESP] %s @%s  esp=%08X esi=%08X edi=%08X\n",
             name, tag, g_esp, g_esi, g_edi);
     fflush(stderr);
