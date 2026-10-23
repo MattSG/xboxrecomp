@@ -1286,10 +1286,9 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     if (g_vsh_constants_dirty) {
         hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vsh_cb,
                                      0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (SUCCEEDED(hr)) {
-            memcpy(mapped.pData, &g_vsh_constants, sizeof(g_vsh_constants));
-            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_cb, 0);
-        }
+        if (FAILED(hr)) return FALSE;
+        memcpy(mapped.pData, &g_vsh_constants, sizeof(g_vsh_constants));
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_cb, 0);
         g_vsh_constants_dirty = FALSE;
     }
 
