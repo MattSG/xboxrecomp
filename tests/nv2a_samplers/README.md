@@ -22,7 +22,7 @@ The four CTests cover:
   complete render-target mip-chain and reduction aliases. Pipeline checks read
   back the sampler and shader-resource slots from the real D3D11 context.
 
-Build and run from the game repository after loading `scripts/enter-env.ps1`:
+Build and run from the game repository after loading `python scripts/devenv.py --shell`:
 
 ```powershell
 cmake -S tools/xboxrecomp/tests/nv2a_samplers -B conformance_tmp/stutter-samplers-test -G Ninja -DCMAKE_BUILD_TYPE=Release

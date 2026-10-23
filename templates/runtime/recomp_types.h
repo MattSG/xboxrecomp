@@ -351,6 +351,30 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
 #define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
 
+/* Opt-in (define RECOMP_GUEST_MEMCPY before this header). Translated rep movs
+ * calls memcpy, and the CRT memcpy may use AVX-512 moves that the Xbox hardware
+ * window's trap handlers (APU, NV2A, ...) cannot decode. Copies touching
+ * 0xFE000000 and up use scalar volatile moves they decode; the rest stay memcpy. */
+#ifdef RECOMP_GUEST_MEMCPY
+static __inline void *recomp_guest_memcpy(void *dst, const void *src, size_t n)
+{
+    uintptr_t lo = (uintptr_t)g_xbox_mem_offset + 0xFE000000u;
+    uintptr_t hi = (uintptr_t)g_xbox_mem_offset + 0x100000000ull;
+    uintptr_t d = (uintptr_t)dst, s = (uintptr_t)src;
+    if ((d < hi && d + n > lo) || (s < hi && s + n > lo)) {
+        size_t i = 0;
+        if (!((d | s | n) & 3))
+            for (; i < n; i += 4)
+                *(volatile uint32_t *)(d + i) = *(const volatile uint32_t *)(s + i);
+        for (; i < n; i++)
+            *(volatile uint8_t *)(d + i) = *(const volatile uint8_t *)(s + i);
+        return dst;
+    }
+    return memcpy(dst, src, n);
+}
+#define memcpy recomp_guest_memcpy
+#endif
+
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
@@ -913,10 +937,15 @@ extern volatile uint64_t g_icall_guard_misses;
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
+
+/* Calls a resolved target. A kernel thunk (0xFE000000 and up) is host code that
+ * may clobber the guest's callee-saved registers; the guest's ebx/esi/edi must
+ * survive the call, so restore them after thunks. */
+#define RECOMP_ICALL_INVOKE(va, fn) do {     uint32_t _kebx = g_ebx, _kesi = g_esi, _kedi = g_edi;     RECOMP_ABI_CALL((va), (fn));     if ((va) >= 0xFE000000u) { g_ebx = _kebx; g_esi = _kesi; g_edi = _kedi; } } while (0)
 
 /**
  * RECOMP_ICALL_SAFE - Stack-safe indirect call.
@@ -939,7 +968,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
@@ -959,7 +988,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
@@ -986,7 +1015,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
@@ -1007,7 +1036,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
@@ -1025,7 +1054,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
@@ -1328,6 +1357,8 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
  * RECOMP_UNIMPL_TRAP=1 stops at the first reported site. Generated comments
  * also enumerate untranslated sites that have not executed. */
 void recomp_unimpl(const char *text, uint32_t va);
+#ifndef RECOMP_UNIMPL
 #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
+#endif
 
 #endif /* RECOMP_TYPES_H */
