@@ -22,10 +22,7 @@
  * an ILU op, the ILU's temp write goes to R1 whatever the temp field says,
  * and both units read their sources before either writes.
  *
- * The layout is checked against real programs rather than taken on trust:
- * RECOMP_VSH_DUMP disassembles each program the title uploads, and an Xbox
- * D3D program is recognisable -- DP4s against the matrix constants, ending in
- * the runtime's screen-space epilogue (RCC of R12.w, then a MAD into oPos).
+ * Uploaded programs can be disassembled with RECOMP_VSH_DUMP for diagnosis.
  */
 #include "nv2a_vsh_interp.h"
 
@@ -357,8 +354,8 @@ void nv2a_vsh_debug_dump(void)
 {
     uint32_t c;
     dump_program(s_start_slot);
-    for (c = 96; c < 112; ++c)
-        fprintf(stderr, "[VSH_MATRIX] c%u %g %g %g %g\n", c,
+    for (c = 0; c < NV2A_VSH_CONSTANTS; ++c)
+        fprintf(stderr, "[VSH_CONST] c%u %g %g %g %g\n", c,
                 s_const[c][0], s_const[c][1], s_const[c][2], s_const[c][3]);
 }
 
@@ -424,11 +421,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             if (d) write_masked(d, &mres, mac_mask);
         }
         if (ilu && ilu_mask) {
-            /* Paired with any MAC op, the ILU can only write R1 -- even when
-             * the MAC half writes no temp at all. The D3D epilogue is exactly
-             * that: `mul o[0].xyz` beside `rcc R1.x`, then `mad` with R1.x.
-             * Sending the rcc to the temp field (R7 there) left R1.x at 0 and
-             * put every vertex of every 3D batch at c[59]. */
+            /* With any MAC op, the ILU temp destination is R1, even if
+             * the MAC half has no temp destination. */
             uint32_t it = mac ? 1u : tdst;
             float *d = it == 12 ? opos.v : (it < 12 ? temp[it].v : NULL);
             if (d) write_masked(d, &ires, ilu_mask);
@@ -438,8 +432,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         if (omask && (field(ins, 3, 2, 1) ? ilu : mac)) {
             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
                     write_masked(s_const[oaddr], src, omask);
+                    s_const_version++;
+                }
             } else if (oaddr == 0) {
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {
