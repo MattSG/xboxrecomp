@@ -1,137 +1,54 @@
-# xbox_input — Xbox Gamepad to XInput
+# Host gamepad and keyboard integration
 
-Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGetState` with a slightly different structure layout than the XInput API on Windows. This layer translates between them.
+[xinput_device.c](xinput_device.c) converts host input into the types declared
+in [xinput_xbox.h](xinput_xbox.h). Windows uses XInput; other hosts use SDL3
+gamepads. Xbox digital flags, eight analog-button bytes and signed stick axes
+remain separate. This host facade does not replace the guest XAPI or USB device
+model used by a port.
 
-## Files
+## Host API
 
-| File | LOC | Purpose |
-|------|-----|---------|
-| `xinput_xbox.h` | 189 | Public header — types, button constants, function prototypes |
-| `xinput_device.c` | 23 | Implementation (maps Xbox calls to Windows XInput) |
+Call `xbox_InputInit` before polling. `xbox_InputGetState` accepts ports 0-3 and
+returns zero on success. Check that result before reading the output.
+`xbox_InputSetState` sends motor values to the host backend;
+`xbox_InputGetCapabilities` exposes the implemented subset of capabilities.
+`xbox_InputIsConnected` reports cached connection state rather than polling the
+host. Backend behavior and capabilities are partial, not hardware parity.
 
-## Quick Start
+By default, face buttons become 0/255 pressure values, right shoulder is Black,
+left shoulder is White, and trigger axes remain analog. `RECOMP_PADMAP` accepts
+`NAME:SOURCE,...` assignments such as `BLACK:RB,WHITE:LB`. Input names are A, B,
+X, Y, BLACK, WHITE, START, BACK, LS, RS, UP, DOWN, LEFT, RIGHT, LT and RT;
+source names use LB/RB for the shoulders. Unspecified bindings retain defaults.
 
-```c
-#include "xinput_xbox.h"
+## Keyboard and menu callbacks
 
-// Initialize input system
-xbox_InputInit();
+`RECOMP_KEYBOARD=1` enables an optional keyboard pad on port 0, merged with a
+physical pad when present. `RECOMP_KEYMAP` accepts `NAME:VK,...` bindings with
+hexadecimal virtual-key values; zero disables a binding. For example,
+`START:0,A:57` disables keyboard Start and binds A to W. Defaults and supported
+axis names are defined alongside the parser in the implementation.
 
-// Poll controller state (port 0-3)
-XBOX_INPUT_STATE state;
-if (xbox_InputGetState(0, &state) == 0) {
-    // Digital buttons
-    if (state.Gamepad.wButtons & XBOX_GAMEPAD_START)
-        pause_game();
+`RECOMP_MENU_KEYS=1` adds navigation/confirm/back keys while the registered menu
+probe returns nonzero; without a probe it applies continuously. Ports register
+context with `xbox_InputSetMenuProbe`, contextual keyboard behavior with
+`xbox_InputSetKeyboardHook`, and optional click consumption with
+`xbox_InputSetMenuClickHandler`. NULL clears each callback. Configure before
+input starts. Keep captured menu state, application actions and guest-thread
+handoff in the port.
 
-    // Analog buttons (0-255 pressure)
-    uint8_t trigger_r = state.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER];
-    if (trigger_r > XBOX_ANALOG_BUTTON_THRESHOLD)
-        accelerate(trigger_r / 255.0f);
+The keyboard hook receives the keyboard state after default mapping and before
+physical-pad merging. Menu click consumption can be invoked from framebuffer
+mouse dispatch as well as polling; callbacks must be safe for their calling
+threads and queue guest work when needed. Returning nonzero consumes a click;
+otherwise menu input can use the bounded mouse-to-A fallback. Host input capture
+neutralizes polling output and advances packet state.
 
-    // Stick axes (-32768 to +32767)
-    float steer = state.Gamepad.sThumbLX / 32768.0f;
-}
+## Verification and limits
 
-// Vibration feedback
-XBOX_VIBRATION vib = { .wLeftMotorSpeed = 32000, .wRightMotorSpeed = 16000 };
-xbox_InputSetState(0, &vib);
-```
-
-## API
-
-```c
-// Initialize (call once at startup)
-void xbox_InputInit(void);
-
-// Poll controller state (returns 0 on success, non-zero if disconnected)
-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
-
-// Set vibration motors
-DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
-
-// Check if controller is connected
-BOOL xbox_InputIsConnected(DWORD dwPort);
-
-// Query controller capabilities
-DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
-```
-
-## Types
-
-```c
-typedef struct {
-    WORD  wButtons;                     // Digital button bitmask
-    BYTE  bAnalogButtons[8];            // Analog button pressure (0-255)
-    SHORT sThumbLX, sThumbLY;           // Left stick (-32768 to +32767)
-    SHORT sThumbRX, sThumbRY;           // Right stick
-} XBOX_GAMEPAD;
-
-typedef struct {
-    DWORD dwPacketNumber;               // Increments on state change
-    XBOX_GAMEPAD Gamepad;
-} XBOX_INPUT_STATE;
-
-typedef struct {
-    WORD wLeftMotorSpeed;               // 0-65535
-    WORD wRightMotorSpeed;              // 0-65535
-} XBOX_VIBRATION;
-```
-
-## Button Constants
-
-### Digital Buttons (wButtons bitmask)
-
-```c
-XBOX_GAMEPAD_DPAD_UP         0x0001
-XBOX_GAMEPAD_DPAD_DOWN       0x0002
-XBOX_GAMEPAD_DPAD_LEFT       0x0004
-XBOX_GAMEPAD_DPAD_RIGHT      0x0008
-XBOX_GAMEPAD_START            0x0010
-XBOX_GAMEPAD_BACK             0x0020
-XBOX_GAMEPAD_LEFT_THUMB       0x0040    // Left stick click
-XBOX_GAMEPAD_RIGHT_THUMB      0x0080    // Right stick click
-```
-
-### Analog Buttons (bAnalogButtons[] indices)
-
-The original Xbox had pressure-sensitive face buttons (0-255):
-
-```c
-XBOX_BUTTON_A          0    // Also used for "boost" in racing games
-XBOX_BUTTON_B          1
-XBOX_BUTTON_X          2
-XBOX_BUTTON_Y          3
-XBOX_BUTTON_BLACK      4    // No equivalent on modern controllers
-XBOX_BUTTON_WHITE      5    // No equivalent on modern controllers
-XBOX_BUTTON_LTRIGGER   6    // Left trigger
-XBOX_BUTTON_RTRIGGER   7    // Right trigger
-
-XBOX_ANALOG_BUTTON_THRESHOLD  30   // Recommended press threshold
-```
-
-### Xbox → Modern Controller Mapping
-
-| Xbox Button | XInput Equivalent | Notes |
-|-------------|------------------|-------|
-| A | A | Green button |
-| B | B | Red button |
-| X | X | Blue button |
-| Y | Y | Yellow button |
-| Black | Right Bumper | Mapped to RB |
-| White | Left Bumper | Mapped to LB |
-| L Trigger | Left Trigger | Analog 0-255 |
-| R Trigger | Right Trigger | Analog 0-255 |
-| Start | Start/Menu | |
-| Back | Back/View | |
-| D-pad | D-pad | Digital only |
-| L Stick | L Stick | Click = L3 |
-| R Stick | R Stick | Click = R3 |
-
-## Ports
-
-```c
-#define XBOX_MAX_CONTROLLERS  4   // Ports 0-3
-```
-
-The Xbox supports 4 controllers. Each port can have a controller with optional memory units and other accessories. This layer only handles the gamepad; memory unit emulation is not needed for recompiled games.
+[Keymap checks](../../tests/keymap/CMakeLists.txt) exercise remapping, contextual
+hooks, click consumption/fallback and default shoulder mapping; the SDL fixture
+also checks consecutive discovery of two virtual pads. These focused checks do
+not establish all hotplug, concurrency, capture, vibration or device semantics.
+Environment mappings are cached by the implementation; treat configuration as
+startup policy. Memory units and accessories require their own implementation.
