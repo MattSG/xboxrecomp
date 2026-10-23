@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+#if !defined(_WIN32)
+#include "platform/win32_compat.h"
+#endif
 
 #include "xbox_memory_layout.h"
 
@@ -139,61 +143,60 @@ static void prof_count(const char *name, uint32_t va)
     g_prof_full = 1;
 }
 
+/* Diagnostics must not fault on the guest memory they are diagnosing. */
+static int trace_read(uint64_t va, void *out, size_t bytes)
+{
+    SIZE_T copied = 0;
+    DWORD error = GetLastError();
+    BOOL ok;
+    if (!va || va > UINT32_MAX || bytes > 0x100000000ull - va) return 0;
+    ok = ReadProcessMemory(GetCurrentProcess(),
+        (const void *)((uintptr_t)xbox_GetMemoryOffset() + (uintptr_t)va),
+        out, bytes, &copied);
+    SetLastError(error);
+    return ok && copied == bytes;
+}
+
+static void trace_dump(const char *label, uint32_t va, int count)
+{
+    uint32_t words[24];
+    int i;
+    fprintf(stderr, "         %s -> [%08X]:", label, va);
+    if (!trace_read(va, words, (size_t)count * sizeof(words[0]))) {
+        fprintf(stderr, " <unreadable>\n");
+        return;
+    }
+    for (i = 0; i < count; i++) fprintf(stderr, " %08X", words[i]);
+    fprintf(stderr, "\n");
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
     if (prof_enabled()) { prof_count(name, va); return; }
     if (!trace_budget()) return;
-    /* The return address as well as the registers: at entry it is still at
-     * [esp], and it names the call site, which is the thing a trace of "who
-     * reached this" actually needs. Reading a guest stack dump for it works
-     * only when the frames above are still live. */
-    fprintf(stderr, "[TRACE] -> %s (0x%08X)  from=%08X esp=%08X eax=%08X "
+    uint32_t from = 0, args[32];
+    int readable = trace_read(g_esp, &from, sizeof(from));
+    fprintf(stderr, "[TRACE] -> %s (0x%08X)  from=%08X%s esp=%08X eax=%08X "
             "ecx=%08X esi=%08X edi=%08X ebx=%08X\n",
-            name, va,
-            *(const uint32_t *)((uintptr_t)g_esp + xbox_GetMemoryOffset()),
+            name, va, from, readable ? "" : "<unreadable>",
             g_esp, g_eax, g_ecx, g_esi, g_edi, g_ebx);
-
-    /* The stack arguments too, when asked. Registers alone do not say which
-     * argument arrived null, and for a function with a long argument list,
-     * counting pushes back from the call site is guesswork. */
     if (getenv("RECOMP_TRACE_ARGS")) {
-        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-        int n = atoi(getenv("RECOMP_TRACE_ARGS"));
-        int i;
-
-        if (n <= 0 || n > 32)
-            n = 8;
+        int n = atoi(getenv("RECOMP_TRACE_ARGS")), i;
+        if (n <= 0 || n > 32) n = 8;
+        readable = trace_read((uint64_t)g_esp + 4, args, (size_t)n * sizeof(args[0]));
         fprintf(stderr, "         args:");
-        for (i = 1; i <= n; i++)
-            fprintf(stderr, " %d=%08X", i,
-                    *(const uint32_t *)(mem + g_esp + i * 4));
+        if (!readable) fprintf(stderr, " <unreadable>");
+        else for (i = 0; i < n; i++) fprintf(stderr, " %d=%08X", i + 1, args[i]);
         fprintf(stderr, "\n");
-        /* And the object eax points at. A matrix of NaNs says the maths went
-         * wrong; whether its inputs were already zero says whether the maths
-         * is at fault or the data behind it was never built. */
-        /* Follow the pointer arguments one level. A matrix that arrives as
-         * NaN was copied from somewhere, and the object it came from is what
-         * needs looking at -- the value alone says only that it is wrong. */
-        if (getenv("RECOMP_TRACE_DEREF")) {
-            for (i = 1; i <= n; i++) {
-                uint32_t a = *(const uint32_t *)(mem + g_esp + i * 4);
-                int k;
-                if (a < 0x00010000u || a >= 0x04000000u)
-                    continue;
-                fprintf(stderr, "         arg%d -> [%08X]:", i, a);
-                for (k = 0; k < 12; k++)
-                    fprintf(stderr, " %08X",
-                            *(const uint32_t *)(mem + a + k * 4));
-                fprintf(stderr, "\n");
+        if (readable && getenv("RECOMP_TRACE_DEREF")) {
+            for (i = 0; i < n; i++) {
+                char label[16];
+                if (!args[i]) continue;
+                snprintf(label, sizeof(label), "arg%d", i + 1);
+                trace_dump(label, args[i], 12);
             }
         }
-        if (g_eax > 0x00010000u && g_eax < 0x04000000u) {
-            fprintf(stderr, "         [eax=%08X]:", g_eax);
-            for (i = 0; i < 24; i++)
-                fprintf(stderr, " %08X",
-                        *(const uint32_t *)(mem + g_eax + i * 4));
-            fprintf(stderr, "\n");
-        }
+        if (g_eax) trace_dump("eax", g_eax, 24);
     }
     fflush(stderr);
 }
@@ -235,33 +238,28 @@ void recomp_trace_esp(const char *name, const char *tag)
  * is happening, and during bring-up that is the most valuable output there is.
  * ------------------------------------------------------------------------- */
 
-/* Defined in xbox_memory_layout.c; declared extern per consumer, as
- * kernel_bridge.c and nv2a_pb_replay.c already do. */
-extern ptrdiff_t g_xbox_mem_offset;
-
 void recomp_debug_service(uint32_t service, uint32_t arg_va)
 {
-    const uint8_t *mem = (const uint8_t *)g_xbox_mem_offset;
+    uint8_t header[8];
     uint16_t length;
     uint32_t buffer_va;
-
+    char *text;
     if (service != 1) {
         fprintf(stderr, "[GUEST] DebugService %u (arg 0x%08X), ignored\n",
                 (unsigned)service, arg_va);
         fflush(stderr);
         return;
     }
-
-    /* ANSI_STRING { USHORT Length; USHORT MaximumLength; PCHAR Buffer; } */
-    if (!arg_va)
-        return;
-    length    = *(const uint16_t *)(mem + arg_va);
-    buffer_va = *(const uint32_t *)(mem + arg_va + 4);
-    if (!buffer_va || !length)
-        return;
-
-    fprintf(stderr, "[GUEST] %.*s", (int)length, (const char *)(mem + buffer_va));
-    if (length && ((const char *)(mem + buffer_va))[length - 1] != '\n')
-        fputc('\n', stderr);
-    fflush(stderr);
+    if (!trace_read(arg_va, header, sizeof(header))) return;
+    memcpy(&length, header, sizeof(length));
+    memcpy(&buffer_va, header + 4, sizeof(buffer_va));
+    if (!buffer_va || !length) return;
+    text = malloc(length);
+    if (!text) return;
+    if (trace_read(buffer_va, text, length)) {
+        fprintf(stderr, "[GUEST] %.*s", (int)length, text);
+        if (text[length - 1] != '\n') fputc('\n', stderr);
+        fflush(stderr);
+    }
+    free(text);
 }
