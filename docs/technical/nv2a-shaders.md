@@ -4,7 +4,7 @@ Xbox games do not ship HLSL. They configure the NV2A's fixed-function combiner
 pipeline, or upload raw vertex-shader microcode. Both have to become something
 D3D11 or OpenGL will accept, and both are translated at runtime and cached.
 
-This document covers the two translators. For what is and is not implemented,
+This document covers the two translators. For support-claim evidence boundaries,
 see [gap-analysis.md](gap-analysis.md); for the wider D3D8 layer, see
 [d3d-translation.md](d3d-translation.md).
 
