@@ -2035,7 +2035,7 @@ static ID3D11ShaderResourceView *texture_get(const NvD3DTexture *t)
 typedef struct { uint64_t key; void *obj; } StateSlot;
 #define STATE_SLOTS 512
 static StateSlot s_blend_cache[STATE_SLOTS], s_ds_cache[STATE_SLOTS],
-                 s_rs_cache[STATE_SLOTS], s_samp_cache[STATE_SLOTS];
+                 s_samp_cache[STATE_SLOTS];
 
 static void **state_slot(StateSlot *tab, uint64_t key)
 {
@@ -2173,16 +2173,44 @@ static ID3D11DepthStencilState *ds_state(int zt, uint32_t zf, int zw, int st,
     return (ID3D11DepthStencilState *)*slot;
 }
 
+/* A raster state is keyed on every field that changes it. Each slot keeps those
+ * fields and compares them in full, so distinct states never share an object. */
+typedef struct {
+    int cull, front_ccw, bias;
+    uint32_t slope_bits;
+    void *obj;
+} RasterSlot;
+static RasterSlot s_rs_cache[STATE_SLOTS];
+
 static ID3D11RasterizerState *rs_state(int cull, int front_ccw, int bias, float slope)
 {
-    uint32_t sb;
-    uint64_t key;
-    void **slot;
+    uint32_t sb, h;
+    int n;
+    RasterSlot *slot = NULL;
     memcpy(&sb, &slope, 4);
-    key = (uint64_t)(cull & 3) | ((uint64_t)(front_ccw != 0) << 2) |
-          ((uint64_t)(uint32_t)bias << 3) ^ ((uint64_t)sb << 30);
-    slot = state_slot(s_rs_cache, key);
-    if (!*slot) {
+    front_ccw = front_ccw != 0;
+    h = (uint32_t)cull * 0x9E3779B1u ^ (uint32_t)front_ccw * 0x85EBCA77u
+      ^ (uint32_t)bias * 0xC2B2AE3Du ^ sb * 0x27D4EB2Fu;
+    for (n = 0; n < STATE_SLOTS; n++) {
+        RasterSlot *c = &s_rs_cache[(h + n) & (STATE_SLOTS - 1)];
+        if (!c->obj) {
+            slot = c;
+            break;
+        }
+        if (c->cull == cull && c->front_ccw == front_ccw && c->bias == bias &&
+            c->slope_bits == sb)
+            return (ID3D11RasterizerState *)c->obj;
+    }
+    if (!slot) {
+        slot = &s_rs_cache[h & (STATE_SLOTS - 1)];
+        IUnknown_Release((IUnknown *)slot->obj);
+        slot->obj = NULL;
+    }
+    slot->cull = cull;
+    slot->front_ccw = front_ccw;
+    slot->bias = bias;
+    slot->slope_bits = sb;
+    {
         D3D11_RASTERIZER_DESC d;
         memset(&d, 0, sizeof d);
         d.FillMode = D3D11_FILL_SOLID;
@@ -2192,9 +2220,9 @@ static ID3D11RasterizerState *rs_state(int cull, int front_ccw, int bias, float 
         d.SlopeScaledDepthBias = slope;
         d.DepthClipEnable = FALSE;
         d.ScissorEnable = TRUE;
-        ID3D11Device_CreateRasterizerState(s_dev, &d, (ID3D11RasterizerState **)slot);
+        ID3D11Device_CreateRasterizerState(s_dev, &d, (ID3D11RasterizerState **)&slot->obj);
     }
-    return (ID3D11RasterizerState *)*slot;
+    return (ID3D11RasterizerState *)slot->obj;
 }
 
 static D3D11_TEXTURE_ADDRESS_MODE addr_mode(uint32_t m)
