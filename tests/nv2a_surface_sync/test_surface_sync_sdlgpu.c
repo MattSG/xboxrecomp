@@ -278,6 +278,33 @@ static void test_common(void)
     printf("PASS: shared layout, texel and draw helpers (nv2a_render_common.h)\n");
 }
 
+static void test_depth_view(int shifted)
+{
+    NvD3DState st={0};
+    st.color_addr=0x20000; st.zeta_addr=0x40000;
+    st.color_pitch=st.zeta_pitch=128; st.surface_format=0x128;
+    st.clip_w=st.clip_h=32;
+    nv2a_d3d_clear(&st,1,0,0x40000000,0,0,31,31);
+    nv2a_d3d_clear(&st,1,0,0xC0000000,16,0,31,31);
+    Depth *d=depth_find(phys(st.zeta_addr));
+    CHECK(d && d->iw==64 && d->w==32);
+    SDL_GPUTexture *view=depth_y16(d); CHECK(view);
+    SDL_GPUTransferBufferCreateInfo ci={0};
+    ci.usage=SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD; ci.size=8;
+    SDL_GPUTransferBuffer *tb=SDL_CreateGPUTransferBuffer(s_dev,&ci); CHECK(tb);
+    CHECK(copy_begin());
+    SDL_GPUTextureRegion source={0}; source.texture=view; source.x=64; source.y=1;
+    source.w=source.h=source.d=1;
+    SDL_GPUTextureTransferInfo dest={0}; dest.transfer_buffer=tb;
+    SDL_DownloadFromGPUTexture(s_copy,&source,&dest); copy_end();
+    SDL_GPUFence *fence=NULL; submit(&fence); CHECK(fence);
+    CHECK(SDL_WaitForGPUFences(s_dev,true,&fence,1)); SDL_ReleaseGPUFence(s_dev,fence);
+    uint16_t *pixel=SDL_MapGPUTransferBuffer(s_dev,tb,false); CHECK(pixel);
+    CHECK(pixel[0]==65535 && pixel[1]==(shifted?0x4040:0xC0C0) && pixel[2]==0);
+    SDL_UnmapGPUTransferBuffer(s_dev,tb); SDL_ReleaseGPUTransferBuffer(s_dev,tb);
+    printf("PASS: depth view %s alignment actual SDL GPU pixels\n",shifted?"caller-shifted":"unshifted");
+}
+
 int main(int argc, char **argv)
 {
     const char *test;
@@ -291,11 +318,12 @@ int main(int argc, char **argv)
     concurrent = !strncmp(test, "concurrent_", 11);
     bpp16 = !strcmp(test, "padded16");
     swizzled = !strcmp(test, "swizzled");
-    test_setenv("RECOMP_RENDER_SCALE", "1");
+    test_setenv("RECOMP_RENDER_SCALE", !strncmp(test,"depth_view",10)?"2":"1");
     test_setenv("RECOMP_ASPECT", "4:3");
     test_setenv("RECOMP_FPS_LIMIT", "0");
     ram[0] = 0;
     CHECK(nv2a_d3d_init());
+    if (!strncmp(test,"depth_view",10)) { test_depth_view(!strcmp(test,"depth_view_shifted")); return 0; }
     if (!strcmp(test, "multiple_surfaces")) { test_multiple_surfaces(); return 0; }
     if (!strcmp(test, "idle_scanout")) { test_idle_scanout(); return 0; }
     s = surface_get(0x20000, bpp16 ? 80 : 128, bpp16 ? 3 : 8, 32, 32, swizzled);

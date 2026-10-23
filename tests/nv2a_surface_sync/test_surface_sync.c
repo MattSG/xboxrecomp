@@ -265,6 +265,30 @@ static void test_idle_scanout(void)
     printf("PASS: idle CPU scanout, same-epoch animation, unchanged/active skips, pending-readback deferral and present retry; %ux MSAA\n", s_msaa);
 }
 
+static void test_depth_view(int shifted)
+{
+    NvD3DState st={0};
+    st.color_addr=0x20000; st.zeta_addr=0x40000;
+    st.color_pitch=st.zeta_pitch=128; st.surface_format=0x128;
+    st.clip_w=st.clip_h=32;
+    nv2a_d3d_clear(&st,1,0,0x40000000,0,0,31,31);
+    nv2a_d3d_clear(&st,1,0,0xC0000000,16,0,31,31);
+    Depth *d=depth_find(phys(st.zeta_addr));
+    CHECK(d && d->iw==64 && d->w==32 && depth_y16(d));
+    D3D11_TEXTURE2D_DESC desc; ID3D11Texture2D *stage=NULL;
+    ID3D11Texture2D_GetDesc(d->y16,&desc);
+    desc.Usage=D3D11_USAGE_STAGING; desc.BindFlags=0;
+    desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ; desc.MiscFlags=0;
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev,&desc,NULL,&stage)));
+    ID3D11DeviceContext_CopyResource(s_ctx,(ID3D11Resource *)stage,(ID3D11Resource *)d->y16);
+    D3D11_MAPPED_SUBRESOURCE map;
+    CHECK(SUCCEEDED(ID3D11DeviceContext_Map(s_ctx,(ID3D11Resource *)stage,0,D3D11_MAP_READ,0,&map)));
+    uint16_t *pixel=(uint16_t *)((uint8_t *)map.pData+map.RowPitch+64*8);
+    CHECK(pixel[0]==65535 && pixel[1]==(shifted?0x4040:0xC0C0) && pixel[2]==0);
+    ID3D11DeviceContext_Unmap(s_ctx,(ID3D11Resource *)stage,0); ID3D11Texture2D_Release(stage);
+    printf("PASS: depth view %s alignment, %ux MSAA actual GPU pixels\n",shifted?"caller-shifted":"unshifted",s_msaa);
+}
+
 int main(int argc, char **argv)
 {
     const char *test;
@@ -275,10 +299,11 @@ int main(int argc, char **argv)
     initial = !strncmp(test, "initial_", 8) || !strcmp(test, "concurrent_initial");
     concurrent = !strncmp(test, "concurrent_", 11);
     bpp16 = !strcmp(test, "padded16"); swizzled = !strcmp(test, "swizzled");
-    _putenv_s("RECOMP_MSAA", argv[2]); _putenv_s("RECOMP_RENDER_SCALE", "1");
+    _putenv_s("RECOMP_MSAA", argv[2]); _putenv_s("RECOMP_RENDER_SCALE", !strncmp(test,"depth_view",10)?"2":"1");
     _putenv_s("RECOMP_PS_SPEC", "0"); _putenv_s("RECOMP_FPS_LIMIT", "0");
     CHECK(nv2a_d3d_init());
     present_buffer = (ID3D11Resource *)s_cb_present;
+    if (!strncmp(test,"depth_view",10)) { test_depth_view(!strcmp(test,"depth_view_shifted")); return 0; }
     if (!strcmp(test, "multiple_surfaces")) { test_multiple_surfaces(); return 0; }
     if (!strcmp(test, "idle_scanout")) { test_idle_scanout(); return 0; }
     s = surface_get(0x20000, bpp16 ? 80 : 128, bpp16 ? 3 : 8, 32, 32, swizzled);

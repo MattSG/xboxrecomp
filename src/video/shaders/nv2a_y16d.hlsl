@@ -4,9 +4,6 @@
  * rounding splits between the two (moire in the fog). Both texels hold
  * z[23:8]. ponytail: the low word (z[7:0]:stencil) is not readable this way;
  * keep it for even texels if a title ever reads stencil through Y16.
- * A high-word tap sits a quarter guest pixel to the right of the shaded
- * pixel. Shift the depth read left by ccol.z host pixels so a building's
- * edge does not accidentally use sky depth and acquire a bright haze rim.
  * Host depth is z / 0xFFFFFF (see map[2]). */
 #ifdef Y16_MS
 Texture2DMS<float> Y16Z : register(t0);
@@ -18,7 +15,7 @@ PS_SAMP(Y16ZS, 0);
 #endif
 float4 y16d_ps(float4 p : SV_Position) : SV_Target {
   uint2 q = uint2(p.xy);
-  int zx = max(0, (int)floor((q.x + 0.5) * 0.5 - ccol.z));
+  int zx = (int)(q.x >> 1);
 #ifdef Y16_MS
   float d = Y16Z.Load(int2(zx, q.y), 0);
 #else
