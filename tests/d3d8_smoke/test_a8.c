@@ -32,9 +32,10 @@ UINT d3d8_GetNumLights(void) { return 0; }
 
 /* Model successful programmable-VS preparation without Xbox microcode.
  * Bind real D3D11 vertex state so pixel preparation must preserve it. */
+BOOL d3d8_vsh_is_programmable(DWORD handle) { return (handle & 1u) != 0; }
 BOOL d3d8_vsh_prepare_draw(DWORD handle)
 {
-    if (handle != 0x10000) return FALSE;
+    if (handle != 0x10001) return FALSE;
     ID3D11DeviceContext_VSSetShader(context, vs, NULL, 0);
     ID3D11DeviceContext_IASetInputLayout(context, NULL);
     ID3D11DeviceContext_VSSetConstantBuffers(context, 1, 1, &programmable_constants);
@@ -250,7 +251,7 @@ int main(void)
                         textures[stage] = (IDirect3DBaseTexture8 *)&previous;
                         d3d8_shaders_prepare_draw(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
                         textures[stage] = tex;
-                        d3d8_shaders_prepare_draw(0x10000);
+                        d3d8_shaders_prepare_draw(0x10001);
                         ID3D11DeviceContext_VSGetShader(context, &bound_vs, NULL, NULL);
                         ID3D11DeviceContext_VSGetConstantBuffers(context, 1, 1, &bound_cb);
                         ID3D11DeviceContext_IAGetInputLayout(context, &bound_layout);

@@ -289,7 +289,7 @@ HRESULT d3d8_shaders_init(void);
 void    d3d8_shaders_shutdown(void);
 
 /* Select programmable/FVF vertex state and refresh fixed-function pixel state. */
-void    d3d8_shaders_prepare_draw(DWORD handle);
+HRESULT d3d8_shaders_prepare_draw(DWORD handle);
 
 /* ================================================================
  * NV2A Register Combiner pixel shaders (d3d8_combiners.c)
