@@ -43,13 +43,9 @@ def va_to_file_offset(va):
 # Functions calling into these sections get classified accordingly.
 # Populated per-image by configure_from_xbe().
 
-# Section NAME -> category. The VAs must come from the XBE being analysed, not
-# from here: these sections sit at completely different addresses in every
-# title. This table used to carry Burnout 3's VAs, which meant every other
-# title had its own .text misclassified wherever it happened to overlap them --
-# on Half-Life 2 all eight ranges landed inside .text, mislabelling 4,498
-# functions including 2,697 as "game_audio" and 884 as "game_video" in a title
-# that has no video section at all.
+# Classify SDK sections by name; derive every address range from the input.
+# Reference-title ranges can overlap another image's ordinary code and must
+# never supply implicit classification boundaries.
 XDK_SECTION_CATEGORIES = {
     "D3D":     "game_render",
     "D3DX":    "game_render",
