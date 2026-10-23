@@ -3531,8 +3531,8 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         record_tex_reg(method, param);
 }
 
-/* The last semaphore value released and how many, for the walker's
- * stop salvage (nv2a_pb_scan.c). */
+/* Last released semaphore value and release count for diagnostics and
+ * explicit caller recovery; the scanner does not infer missing releases. */
 static uint32_t s_semaphore_last, s_semaphore_releases;
 uint32_t nv2a_pb_exec_semaphore_last_value(void) { return s_semaphore_last; }
 uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_semaphore_releases; }

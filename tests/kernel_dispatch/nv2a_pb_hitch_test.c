@@ -93,6 +93,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #condition); return 1; \
 } } while (0)
 
+static unsigned stop_calls;
+static uint32_t stop_from, stop_put;
+static const char *stop_reason;
+static void test_stop_handler(uint32_t from, uint32_t put, const char *reason)
+{
+    stop_calls++;
+    stop_from = from; stop_put = put; stop_reason = reason;
+    /* Explicit caller work, deliberately unrelated to a guessed fence. */
+    nv2a_pb_exec_method(3, 0x0100, 0xABCDEF);
+}
+
 int main(int argc, char **argv)
 {
     uint32_t *root, *called, *jumped;
@@ -217,7 +228,7 @@ int main(int argc, char **argv)
 
     /* Nothing wraps at 64 MB: a read past the window, or a JUMP/CALL target
      * outside it, stops the walk at PUT instead of executing whatever lies at
-     * the wrapped address (stop-and-salvage, as apexJCL's walker). */
+     * the wrapped address. */
     {
         uint32_t *last = (uint32_t *)(memory + XBOX_CONTIG_SIZE - 4);
         uint32_t *first = (uint32_t *)memory;
@@ -248,20 +259,38 @@ int main(int argc, char **argv)
         nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x90C);
         CHECK(command_count == 0 && s_tot_stops == stops + 3 && !s_fifo.in_call);
 
-        /* After a stop, the next fence release between it and PUT still
-         * runs (odd, after the last, within 128 of it), so the title's
-         * fence wait completes. A release that doesn't look like the next
-         * fence is left alone. */
+        /* Undecoded payload must never become a guessed fence by default. */
         sema_last = 5;
         root[0] = (XBOX_CONTIG_SIZE + 0) | 1;
         root[1] = 0x00041D70; root[2] = 7;
         nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x90C);
-        CHECK(command_count == 1 && commands[0].method == 0x1D70 && commands[0].param == 7);
-        CHECK(s_tot_salvaged == 1);
+        CHECK(command_count == 0 && sema_last == 5 && !stop_calls);
+
+        /* Recovery is opt-in, with exact stop/PUT/reason on this thread. */
+        nv2a_pb_set_stop_handler(test_stop_handler);
+        root[0] = (1u << 18) | 0x1720; root[1] = 42;
+        nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x908);
+        CHECK(stop_calls == 0 && command_count == 1 && commands[0].param == 42);
         command_count = 0;
-        root[2] = 0x9000;                  /* even and far ahead: data */
+        root[0] = (XBOX_CONTIG_SIZE + 0) | 1;
+        root[1] = 0x00041D70; root[2] = 7;
         nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x90C);
-        CHECK(command_count == 0 && s_tot_salvaged == 1);
+        CHECK(stop_calls == 1 && stop_from == XBOX_CONTIG_BASE + 0x900);
+        CHECK(stop_put == XBOX_CONTIG_BASE + 0x90C);
+        CHECK(!strcmp(stop_reason, "jump outside the window"));
+        CHECK(command_count == 1 && commands[0].subch == 3);
+        CHECK(commands[0].method == 0x0100 && commands[0].param == 0xABCDEF);
+        CHECK(sema_last == 5 && !s_fifo.in_call && !s_packet.active);
+
+        /* Survey mode never calls application recovery. */
+        command_count = 0;
+        s_exec_enabled = 0; s_scan = 1;
+        nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x90C);
+        CHECK(stop_calls == 1 && command_count == 0);
+        s_exec_enabled = 1; s_scan = 0;
+        nv2a_pb_set_stop_handler(NULL);
+        nv2a_pb_scan(XBOX_CONTIG_BASE + 0x900, XBOX_CONTIG_BASE + 0x90C);
+        CHECK(stop_calls == 1 && command_count == 0 && sema_last == 5);
     }
 
     /* An explicitly discontinuous scan cannot inherit stale packet state. */
