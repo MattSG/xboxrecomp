@@ -143,3 +143,5 @@ add_executable(ram-statistics-test ram_statistics_test.c)
 target_include_directories(ram-statistics-test PRIVATE ../../src/kernel)
 target_link_libraries(ram-statistics-test PRIVATE xboxrecomp)
 add_test(NAME kernel-ram-statistics COMMAND ram-statistics-test)
+
+add_test(NAME contig-bounded-ownership COMMAND contig-heap-ownership-test bounded)
