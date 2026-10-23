@@ -235,6 +235,29 @@ static void test_program_gpu(void)
     ID3D10Blob_Release(vs_code);ID3D10Blob_Release(ps_code);
 }
 
+static void test_prepare_failure(void)
+{
+    DWORD wire[4], handle;
+    ID3D11Buffer *dynamic, *unmappable;
+    D3D11_BUFFER_DESC desc = {0};
+    REQUIRE_GPU(d3d8_vsh_init());
+    make_const_mov(wire, 0);
+    REQUIRE_GPU(d3d8_vsh_create_shader(wire, 1, &handle));
+    dynamic = g_vsh_cb;
+    desc.ByteWidth = sizeof(NV2AVSConstants);
+    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    REQUIRE_GPU(ID3D11Device_CreateBuffer(device, &desc, NULL, &unmappable));
+    g_vsh_cb = unmappable; /* DEFAULT buffers reject WRITE_DISCARD mapping. */
+    CHECK(!d3d8_vsh_prepare_draw(handle));
+    CHECK(g_vsh_constants_dirty);
+    g_vsh_cb = dynamic;
+    CHECK(d3d8_vsh_prepare_draw(handle));
+    CHECK(!g_vsh_constants_dirty);
+    ID3D11Buffer_Release(unmappable);
+    ID3D11DeviceContext_ClearState(context);
+    d3d8_vsh_shutdown();
+}
+
 static void test_layouts(void)
 {
     static const char src[] =
@@ -298,7 +321,7 @@ int main(int argc, char **argv)
             return 1;
         }
         if (strcmp(which,"layouts")==0 || strcmp(which,"all")==0) test_layouts();
-        if (strcmp(which,"gpu")==0 || strcmp(which,"all")==0) test_program_gpu();
+        if (strcmp(which,"gpu")==0 || strcmp(which,"all")==0) { test_program_gpu(); test_prepare_failure(); }
         ID3D11DeviceContext_Release(context);
         ID3D11Device_Release(device);
     }
