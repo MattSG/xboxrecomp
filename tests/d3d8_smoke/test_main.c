@@ -362,6 +362,22 @@ static void test_convert_linear(void)
     (void)src; (void)dst;
 }
 
+static void test_palette_argb(void)
+{
+    const BYTE indices[] = {1, 7, 128, 255};
+    const BYTE expected[] = {0,0,255,255, 255,0,0,255, 16,32,64,128, 3,2,1,0};
+    BYTE guarded[18];
+    memset(guarded, 0xA5, sizeof(guarded));
+    g_palette[1] = 0xFFFF0000u;
+    g_palette[7] = 0xFF0000FFu;
+    g_palette[128] = 0x80402010u;
+    g_palette[255] = 0x00010203u;
+    CHECK_FMT("P8 host layout", d3d8_to_dxgi_format(D3DFMT_P8), DXGI_FORMAT_B8G8R8A8_UNORM);
+    d3d8_convert_linear_pixels(D3DFMT_P8, 4, 1, indices, guarded + 1, 0);
+    CHECK("P8 ARGB palette to BGRA bytes", memcmp(guarded + 1, expected, sizeof(expected)) == 0);
+    CHECK("P8 conversion boundaries", guarded[0] == 0xA5 && guarded[17] == 0xA5);
+}
+
 static void test_fvf_position(void)
 {
     static const struct { DWORD position; UINT bytes; int transformed; } cases[] = {
@@ -397,6 +413,7 @@ int main(void)
     test_dxt_decode();
     test_convert_linear();
     test_fvf_position();
+    test_palette_argb();
 
     if (failures == 0) {
         printf("d3d8_smoke: ALL PASS\n");

@@ -1,4 +1,4 @@
-/* Test A8 sampling and transformed-vertex interpolation on D3D11 WARP.
+/* Test alpha/palette sampling and transformed-vertex interpolation on D3D11 WARP.
  * No game data, window, or hardware adapter is needed. */
 #include "d3d8_internal.h"
 #include <d3dcompiler.h>
@@ -11,14 +11,14 @@ static ID3D11DeviceContext *context;
 static ID3D11VertexShader *vs;
 static ID3D11Buffer *programmable_constants;
 static IDirect3DBaseTexture8 *textures[4];
-static DWORD states[512], stages[4][64];
+static DWORD states[512], stages[4][64], palette_entries[256];
 static const D3DMATRIX identity = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
 
 ID3D11Device *d3d8_GetD3D11Device(void) { return device; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return context; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return NULL; }
 IDirect3DDevice8 *xbox_GetD3DDevice(void) { return NULL; }
-const DWORD *d3d8_GetPalette(DWORD stage) { (void)stage; return states; }
+const DWORD *d3d8_GetPalette(DWORD stage) { (void)stage; return palette_entries; }
 const DWORD *d3d8_GetRenderStates(void) { return states; }
 const DWORD *d3d8_GetTSS(DWORD stage) { return stages[stage]; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return textures[stage]; }
@@ -128,7 +128,7 @@ int main(void)
         "V main(uint id:SV_VertexID) { V o=(V)0;"
         " o.p=float4(id==2?3:-1,id==1?3:-1,0,1);"
         " o.c=1; o.t0=o.t1=o.t2=o.t3=float3(0.5,0.5,0.5); return o; }";
-    static const D3DFORMAT formats[] = {D3DFMT_A8, D3DFMT_LIN_A8, D3DFMT_LIN_A8R8G8B8};
+    static const D3DFORMAT formats[] = {D3DFMT_A8, D3DFMT_LIN_A8, D3DFMT_LIN_A8R8G8B8, D3DFMT_P8};
     static const BYTE alphas[] = {0, 1, 127, 255};
     ID3D11Texture2D *target, *readback;
     ID3D11RenderTargetView *rtv;
@@ -210,6 +210,10 @@ int main(void)
                 BYTE expected[4] = {255, 255, 255, alphas[a]};
                 UINT face;
                 if (f == 2) {
+                    expected[0] = 95; expected[1] = 63; expected[2] = 31;
+                } else if (f == 3) {
+                    pixel[0] = 1;
+                    palette_entries[1] = ((DWORD)alphas[a] << 24) | 0x005F3F1Fu;
                     expected[0] = 95; expected[1] = 63; expected[2] = 31;
                 } else {
                     pixel[0] = alphas[a];
@@ -295,6 +299,6 @@ int main(void)
     ID3D11Texture2D_Release(readback);
     ID3D11DeviceContext_Release(context);
     ID3D11Device_Release(device);
-    printf("d3d8_a8: %d failures (336 A8 + 4 RHW draws)\n", failures);
+    printf("d3d8_a8: %d failures (448 texture + 4 RHW draws)\n", failures);
     return failures != 0;
 }
