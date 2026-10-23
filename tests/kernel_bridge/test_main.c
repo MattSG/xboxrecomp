@@ -337,6 +337,28 @@ static void firmware_observer(ULONG routine)
 }
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "volume-buffer-boundary")) {
+        union { XBOX_FILE_FS_SIZE_INFORMATION info; unsigned char bytes[64]; } buffer;
+        XBOX_IO_STATUS_BLOCK ios;
+        for (ULONG n = 0; n < sizeof(buffer.info); n++) {
+            memset(&buffer, 0xa5, sizeof(buffer));
+            ios.Status = STATUS_SUCCESS; ios.Information = 99;
+            NTSTATUS result = xbox_NtQueryVolumeInformationFile(NULL, &ios,
+                &buffer, n, XboxFileFsSizeInformation);
+            check(result == (NTSTATUS)0xC0000004 && ios.Status == result && !ios.Information,
+                  "short volume buffer reports length mismatch", NULL);
+            for (unsigned i = 0; i < sizeof(buffer); i++)
+                if (buffer.bytes[i] != 0xa5) { check(0, "short volume buffer is unchanged", NULL); break; }
+        }
+        memset(&buffer, 0xa5, sizeof(buffer));
+        check(xbox_NtQueryVolumeInformationFile(NULL, &ios, &buffer,
+              sizeof(buffer.info), XboxFileFsSizeInformation) == STATUS_SUCCESS &&
+              ios.Information == sizeof(buffer.info), "exact volume buffer succeeds", NULL);
+        for (unsigned i = sizeof(buffer.info); i < sizeof(buffer); i++)
+            if (buffer.bytes[i] != 0xa5) { check(0, "exact volume buffer preserves canary", NULL); break; }
+        return failures ? 1 : 0;
+    }
+
     if (argc > 1 && !strcmp(argv[1], "irp-packet-boundary")) {
         extern int xbox_IoInitializeIrpGuest(uint32_t, PVOID, USHORT, CCHAR);
         unsigned char packet[512], original[512];
