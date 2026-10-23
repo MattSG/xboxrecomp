@@ -2531,7 +2531,8 @@ static ID3D11ShaderResourceView *depth_y16(Depth *d)
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, src);
         {
             float cc[8] = { 0 };
-            cc[2] = d->w ? 0.25f * (float)d->iw / (float)d->w : 0.0f;
+            /* Host texels per guest pixel, for a port-owned conversion shader. */
+            cc[2] = d->w ? (float)d->iw / (float)d->w : 0.0f;
             upload_cb(s_cb_clear, cc, sizeof cc);
             ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_clear);
         }

@@ -1976,7 +1976,8 @@ static SDL_GPUTexture *depth_y16(Depth *d)
     }
     if (d->y16_gen != d->gen) {
         float cc[8] = { 0 };
-        cc[2] = d->w ? 0.25f * (float)d->iw / (float)d->w : 0.0f;
+        /* Host texels per guest pixel, for a port-owned conversion shader. */
+        cc[2] = d->w ? (float)d->iw / (float)d->w : 0.0f;
         y16_draw(d->y16, &d->y16_clear, 2 * d->iw, d->ih, SH_Y16D_PS, d->tex, cc);
         d->y16_gen = d->gen;
     }

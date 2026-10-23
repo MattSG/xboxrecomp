@@ -27,3 +27,15 @@ caller-owned source selection. Configure once normally and once with
 It checks selected/fallback compile-unit paths and the embedded D3D11 source;
 DXC builds the selected shader to SPIR-V and, on Windows, DXIL. These are source
 selection/build checks, not pixel or runtime compatibility tests.
+
+For a depth-conversion fragment, `ccol.z` carries host source texels per guest
+pixel (zero if the guest width is unavailable). It is scale metadata, not an
+implicit sample shift. A replacement owns any alignment correction it applies.
+The current shared depth proxy still lacks complete packed low-word/stencil
+semantics; shader replacement does not establish that missing format support.
+
+The surface-sync fixture also has actual GPU depth-alignment readback cases.
+Its normal `depth_view` case expects unshifted source pixels at a 2x depth
+boundary (D3D11 at 1x/4x MSAA and SDL GPU). With a caller shader that deliberately
+shifts by a quarter guest pixel, invoke `depth_view_shifted` instead. This tests
+alignment only, not packed depth-word parity or stencil preservation.
