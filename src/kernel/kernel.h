@@ -557,6 +557,19 @@ ULONG xbox_kernel_canonical_ordinal(ULONG source_ordinal);
 /* Initialize path translation with base directories */
 void xbox_path_init(const char* game_dir, const char* save_dir);
 
+/* Optional extracted-layout mounts. Configure only while path users are quiesced.
+ * Borrowed table/UTF-8 roots must remain alive and immutable until replaced.
+ * Guest prefixes use backslashes and end in one; longest case-insensitive match
+ * wins. Guest drive links resolve first; bare devices retain image handling.
+ * NULL/0 clears. Invalid input returns FALSE without replacing the table.
+ * Mounts persist across xbox_path_init. Translation does not create host roots. */
+typedef struct XboxPathMount {
+    const char *guest_prefix;
+    const char *host_root;
+} XboxPathMount;
+BOOL xbox_path_set_mounts(const XboxPathMount *mounts, int count);
+
+
 /*
  * Character type of a translated host path. The Win32 file APIs take wide
  * chars; POSIX takes bytes. kernel_path.c and kernel_file.c are split on
