@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int inspect, fail_malloc, fail_realloc, fail_texture, fail_srv, fail_constants;
+static int inspect, fail_malloc, fail_realloc, fail_texture, fail_srv, fail_constants, fail_rtv;
 static unsigned allocations, updates, draws;
 static uint32_t *late_write;
 static ID3D11Resource *present_buffer;
@@ -43,6 +43,12 @@ static HRESULT watched_srv(ID3D11Device *dev, ID3D11Resource *res,
     if (inspect && fail_srv && !--fail_srv) { *out = NULL; return E_OUTOFMEMORY; }
     return dev->lpVtbl->CreateShaderResourceView(dev, res, d, out);
 }
+static HRESULT watched_rtv(ID3D11Device *dev,ID3D11Resource *res,
+                          const D3D11_RENDER_TARGET_VIEW_DESC *desc,ID3D11RenderTargetView **out)
+{
+    if (inspect && fail_rtv && !--fail_rtv) { *out=NULL; return E_OUTOFMEMORY; }
+    return dev->lpVtbl->CreateRenderTargetView(dev,res,desc,out);
+}
 static HRESULT watched_map(ID3D11DeviceContext *ctx, ID3D11Resource *res, UINT sub,
                             D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE *out)
 {
@@ -69,6 +75,8 @@ static void watched_draw(ID3D11DeviceContext *ctx, UINT count, UINT start)
 #define ID3D11Device_CreateTexture2D watched_texture
 #undef ID3D11Device_CreateShaderResourceView
 #define ID3D11Device_CreateShaderResourceView watched_srv
+#undef ID3D11Device_CreateRenderTargetView
+#define ID3D11Device_CreateRenderTargetView watched_rtv
 #undef ID3D11DeviceContext_Map
 #define ID3D11DeviceContext_Map watched_map
 #undef ID3D11DeviceContext_UpdateSubresource
@@ -265,6 +273,20 @@ static void test_idle_scanout(void)
     printf("PASS: idle CPU scanout, same-epoch animation, unchanged/active skips, pending-readback deferral and present retry; %ux MSAA\n", s_msaa);
 }
 
+static void test_colour_view_retry(void)
+{
+    Surface *s=surface_get(0x20000,128,8,32,32,0); CHECK(s);
+    clear_gpu(s);
+    for (unsigned failure=0; failure<3; failure++) {
+        inspect=1; fail_texture=failure==0; fail_srv=failure==1; fail_rtv=failure==2;
+        CHECK(!surface_y16(s));
+        CHECK(!fail_texture && !fail_srv && !fail_rtv && !s->y16 && !s->y16_srv && !s->y16_rtv);
+        inspect=0;
+    }
+    CHECK(surface_y16(s) && s->y16 && s->y16_rtv && s->y16_gen==s->gen);
+    puts("PASS: colour conversion target failures release partial objects and retry");
+}
+
 static void test_depth_view(int shifted)
 {
     NvD3DState st={0};
@@ -274,7 +296,24 @@ static void test_depth_view(int shifted)
     nv2a_d3d_clear(&st,1,0,0x40000000,0,0,31,31);
     nv2a_d3d_clear(&st,1,0,0xC0000000,16,0,31,31);
     Depth *d=depth_find(phys(st.zeta_addr));
-    CHECK(d && d->iw==64 && d->w==32 && depth_y16(d));
+    CHECK(d && d->iw==64 && d->w==32);
+    st.tex_used=1; st.tex[0].addr=st.zeta_addr; st.tex[0].color=0x35;
+    st.tex[0].width=64; st.tex[0].height=32; st.tex[0].pitch=128; st.tex[0].levels=1;
+    Surface *unused; uint32_t gw,gh,zmax;
+#ifndef XBOXRECOMP_DEPTH_VIEW_SHADER
+    CHECK(!shifted && !depth_y16(d) && !d->y16);
+    CHECK(!setup_pipeline(&st,3,&unused,&gw,&gh,&zmax));
+    puts("PASS: absent depth converter reports unsupported without a proxy");
+    return;
+#else
+    for (unsigned failure=0; failure<3; failure++) {
+        inspect=1; fail_texture=failure==0; fail_srv=failure==1; fail_rtv=failure==2;
+        CHECK(!setup_pipeline(&st,3,&unused,&gw,&gh,&zmax));
+        CHECK(!fail_texture && !fail_srv && !fail_rtv && !d->y16 && !d->y16_srv && !d->y16_rtv);
+        inspect=0;
+    }
+    CHECK(setup_pipeline(&st,3,&unused,&gw,&gh,&zmax));
+    CHECK(depth_y16(d));
     D3D11_TEXTURE2D_DESC desc; ID3D11Texture2D *stage=NULL;
     ID3D11Texture2D_GetDesc(d->y16,&desc);
     desc.Usage=D3D11_USAGE_STAGING; desc.BindFlags=0;
@@ -287,6 +326,7 @@ static void test_depth_view(int shifted)
     CHECK(pixel[0]==65535 && pixel[1]==(shifted?0x4040:0xC0C0) && pixel[2]==0);
     ID3D11DeviceContext_Unmap(s_ctx,(ID3D11Resource *)stage,0); ID3D11Texture2D_Release(stage);
     printf("PASS: depth view %s alignment, %ux MSAA actual GPU pixels\n",shifted?"caller-shifted":"unshifted",s_msaa);
+#endif
 }
 
 int main(int argc, char **argv)
@@ -303,6 +343,7 @@ int main(int argc, char **argv)
     _putenv_s("RECOMP_PS_SPEC", "0"); _putenv_s("RECOMP_FPS_LIMIT", "0");
     CHECK(nv2a_d3d_init());
     present_buffer = (ID3D11Resource *)s_cb_present;
+    if (!strcmp(test,"colour_view_retry")) { test_colour_view_retry(); return 0; }
     if (!strncmp(test,"depth_view",10)) { test_depth_view(!strcmp(test,"depth_view_shifted")); return 0; }
     if (!strcmp(test, "multiple_surfaces")) { test_multiple_surfaces(); return 0; }
     if (!strcmp(test, "idle_scanout")) { test_idle_scanout(); return 0; }

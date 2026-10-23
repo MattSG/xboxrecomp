@@ -57,7 +57,9 @@
 #include "sdlgpu/clear_ps.spirv.h"
 #include "sdlgpu/y16_vs.spirv.h"
 #include "sdlgpu/y16_ps.spirv.h"
+#ifdef XBOXRECOMP_DEPTH_VIEW_SHADER
 #include "sdlgpu/y16d_ps.spirv.h"
+#endif
 #if defined(_WIN32)
 #include "sdlgpu/ub_vs.dxil.h"
 #include "sdlgpu/ps_main.dxil.h"
@@ -70,7 +72,9 @@
 #include "sdlgpu/clear_ps.dxil.h"
 #include "sdlgpu/y16_vs.dxil.h"
 #include "sdlgpu/y16_ps.dxil.h"
+#ifdef XBOXRECOMP_DEPTH_VIEW_SHADER
 #include "sdlgpu/y16d_ps.dxil.h"
+#endif
 #define DXIL(name) name##_dxil, sizeof name##_dxil
 #else
 #define DXIL(name) NULL, 0
@@ -276,7 +280,10 @@ static uint32_t phys(uint32_t va)
 
 enum { SH_UB_VS, SH_PS_MAIN, SH_PS_MAIN_FLAT, SH_PS_WDEPTH, SH_PS_WDEPTH_FLAT,
        SH_PRESENT_VS, SH_PRESENT_PS, SH_CLEAR_VS, SH_CLEAR_PS, SH_Y16_VS, SH_Y16_PS,
-       SH_Y16D_PS, SH_COUNT };
+#ifdef XBOXRECOMP_DEPTH_VIEW_SHADER
+       SH_Y16D_PS,
+#endif
+       SH_COUNT };
 
 typedef struct {
     const unsigned char *spirv; size_t spirv_size;
@@ -299,7 +306,9 @@ static const ShaderSource s_shader_src[SH_COUNT] = {
     [SH_CLEAR_PS] = { SPIRV(clear_ps), DXIL(clear_ps), "clear_ps", SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 0, 1 },
     [SH_Y16_VS] = { SPIRV(y16_vs), DXIL(y16_vs), "y16_vs", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, 0 },
     [SH_Y16_PS] = { SPIRV(y16_ps), DXIL(y16_ps), "y16_ps", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 0 },
+#ifdef XBOXRECOMP_DEPTH_VIEW_SHADER
     [SH_Y16D_PS] = { SPIRV(y16d_ps), DXIL(y16d_ps), "y16d_ps", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0, 1 },
+#endif
 };
 static SDL_GPUShader *s_shader[SH_COUNT];
 
@@ -1968,6 +1977,12 @@ static SDL_GPUTexture *surface_y16(Surface *s)
 
 static SDL_GPUTexture *depth_y16(Depth *d)
 {
+#ifndef XBOXRECOMP_DEPTH_VIEW_SHADER
+    static int noted;
+    (void)d;
+    if (!noted) { noted=1; fprintf(stderr,"[NV2A] depth texture conversion unavailable; supply a port shader\n"); }
+    return NULL;
+#else
     if (!d->y16) {
         d->y16 = make_texture(2 * d->iw, d->ih, 1, 0, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM, USAGE_TARGET);
         if (!d->y16) return NULL;
@@ -1982,6 +1997,7 @@ static SDL_GPUTexture *depth_y16(Depth *d)
         d->y16_gen = d->gen;
     }
     return d->y16;
+#endif
 }
 
 typedef struct {
@@ -2054,7 +2070,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         Surface *rt;
         Depth *zt;
         if (t->color != 0x35 || t->cube || !t->addr) continue;
-        if ((zt = depth_find(phys(t->addr))) != NULL) { depth_y16(zt); continue; }
+        if ((zt = depth_find(phys(t->addr))) != NULL) { if (!depth_y16(zt)) return 0; continue; }
         rt = surface_find(phys(t->addr));
         if (rt && rt->bpp == 4) { surface_sync(rt, 0); surface_y16(rt); }
     }

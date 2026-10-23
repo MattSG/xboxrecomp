@@ -28,14 +28,25 @@ It checks selected/fallback compile-unit paths and the embedded D3D11 source;
 DXC builds the selected shader to SPIR-V and, on Windows, DXIL. These are source
 selection/build checks, not pixel or runtime compatibility tests.
 
-For a depth-conversion fragment, `ccol.z` carries host source texels per guest
-pixel (zero if the guest width is unavailable). It is scale metadata, not an
-implicit sample shift. A replacement owns any alignment correction it applies.
-The current shared depth proxy still lacks complete packed low-word/stencil
-semantics; shader replacement does not establish that missing format support.
+## Optional depth conversion
 
-The surface-sync fixture also has actual GPU depth-alignment readback cases.
-Its normal `depth_view` case expects unshifted source pixels at a 2x depth
-boundary (D3D11 at 1x/4x MSAA and SDL GPU). With a caller shader that deliberately
-shifts by a quarter guest pixel, invoke `depth_view_shifted` instead. This tests
-alignment only, not packed depth-word parity or stencil preservation.
+`nv2a_y16d.hlsl` is a caller-owned optional fragment; it has no shipped fallback.
+When present, both shader helpers define `XBOXRECOMP_DEPTH_VIEW_SHADER` for the
+renderer and compile its `y16d_ps` fragment entry. Without it, a draw that reads
+a cached depth surface as Y16 is skipped with a diagnostic. It does not receive
+fabricated high words or silently read a stale RAM copy instead.
+
+The extension provides a depth source at texture slot 0 and a single-sample
+R16G16B16A16_UNORM target twice the source width. It uses the shared binding and
+clear-buffer declarations. `y16d_ps(float4 p : SV_Position)` returns float4
+colour. D3D11 builds single-sample and `Y16_MS=1` variants; SDL GPU uses a sampled
+Texture2D depth source. `ccol.z` carries host source texels per guest pixel (zero
+if the guest width is unavailable). It is scale metadata, not a sample shift.
+The caller owns any packing, reinterpretation and alignment semantics. This
+extension does not implement complete packed depth/stencil reads by itself.
+
+The surface-sync fixture checks absent converters without allocating a proxy or
+issuing an unsupported draw. With a converter, it can read an actual converted
+GPU texel at a 2x depth boundary. `depth_view_shifted` checks the quarter-pixel
+alignment used by a caller shader; this is alignment proof, not packed word or
+stencil-preservation proof.

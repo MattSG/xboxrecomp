@@ -12,8 +12,7 @@ set(NV2A_HLSL_PARTS
     ${NV2A_HLSL_DIR}/nv2a_combiner.hlsl
     ${NV2A_HLSL_DIR}/nv2a_present.hlsl
     ${NV2A_HLSL_DIR}/nv2a_clear.hlsl
-    ${NV2A_HLSL_DIR}/nv2a_y16.hlsl
-    ${NV2A_HLSL_DIR}/nv2a_y16d.hlsl)
+    ${NV2A_HLSL_DIR}/nv2a_y16.hlsl)
 # Optional application-owned replacements, by the shipped fragment filename.
 # Select before adding the toolkit. Unspecified fragments retain shared sources.
 if(XBOXRECOMP_NV2A_SHADER_DIR)
@@ -36,11 +35,20 @@ if(XBOXRECOMP_NV2A_SHADER_DIR)
 else()
     set(_xbr_shader_dependencies)
 endif()
+# Depth conversion is a caller-owned extension, not a shipped approximation.
+set(NV2A_DEPTH_VIEW_SHADER "")
+if(XBOXRECOMP_NV2A_SHADER_DIR AND EXISTS "${XBOXRECOMP_NV2A_SHADER_DIR}/nv2a_y16d.hlsl")
+    set(NV2A_DEPTH_VIEW_SHADER "${XBOXRECOMP_NV2A_SHADER_DIR}/nv2a_y16d.hlsl")
+    list(APPEND NV2A_HLSL_PARTS "${NV2A_DEPTH_VIEW_SHADER}")
+endif()
 set(NV2A_HLSL_DEPENDS ${NV2A_HLSL_PARTS} ${_xbr_shader_dependencies})
 
 set(_XBR_EMBED_TEXT ${_xbr_hlsl_root}/cmake/EmbedText.cmake)
 
 function(xbr_embed_nv2a_hlsl target)
+    if(NV2A_DEPTH_VIEW_SHADER)
+        target_compile_definitions(${target} PRIVATE XBOXRECOMP_DEPTH_VIEW_SHADER=1)
+    endif()
     set(gen ${CMAKE_CURRENT_BINARY_DIR}/${target}_generated)
     string(JOIN "|" parts ${NV2A_HLSL_PARTS})
     add_custom_command(OUTPUT ${gen}/nv2a_hlsl.inc

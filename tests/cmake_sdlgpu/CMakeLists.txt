@@ -11,7 +11,7 @@ option(XBR_TEST_SHADER_OVERRIDE "Compile a caller-owned shader fragment" OFF)
 if(XBR_TEST_SHADER_OVERRIDE)
     set(XBOXRECOMP_NV2A_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/port-shaders")
     file(MAKE_DIRECTORY "${XBOXRECOMP_NV2A_SHADER_DIR}")
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../src/video/shaders/nv2a_y16d.hlsl" _shader)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/port/nv2a_y16d.hlsl" _shader)
     file(CONFIGURE OUTPUT "${XBOXRECOMP_NV2A_SHADER_DIR}/nv2a_y16d.hlsl"
         CONTENT "/* XBR_PORT_SHADER_TEST */\n${_shader}" @ONLY)
 endif()
@@ -29,5 +29,6 @@ enable_testing()
 add_test(NAME selected_shader_sources COMMAND ${CMAKE_COMMAND}
     "-DGEN=${CMAKE_CURRENT_BINARY_DIR}/sdlgpu_helper_test_generated"
     "-DROOT=${CMAKE_CURRENT_SOURCE_DIR}/../.."
-    "-DPORT=${XBOXRECOMP_NV2A_SHADER_DIR}"
+    "-DDEPTH_SOURCE=${NV2A_DEPTH_VIEW_SHADER}"
+    "-DTEST_PORT=${XBR_TEST_SHADER_OVERRIDE}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/verify_shader_sources.cmake")

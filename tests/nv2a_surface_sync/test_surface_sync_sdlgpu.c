@@ -59,7 +59,7 @@ static void *test_realloc(void *old, size_t bytes)
 }
 static SDL_GPUTexture *test_create_texture(SDL_GPUDevice *dev, const SDL_GPUTextureCreateInfo *ci)
 {
-    if (inspect && fail_texture && ci->usage == SDL_GPU_TEXTUREUSAGE_SAMPLER && !--fail_texture)
+    if (inspect && fail_texture && (ci->usage == SDL_GPU_TEXTUREUSAGE_SAMPLER || ci->format == SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM) && !--fail_texture)
         return NULL;
     return real_create_texture(dev, ci);
 }
@@ -288,6 +288,19 @@ static void test_depth_view(int shifted)
     nv2a_d3d_clear(&st,1,0,0xC0000000,16,0,31,31);
     Depth *d=depth_find(phys(st.zeta_addr));
     CHECK(d && d->iw==64 && d->w==32);
+    st.tex_used=1; st.tex[0].addr=st.zeta_addr; st.tex[0].color=0x35;
+    st.tex[0].width=64; st.tex[0].height=32; st.tex[0].pitch=128; st.tex[0].levels=1;
+    Surface *unused; uint32_t gw,gh,zmax;
+#ifndef XBOXRECOMP_DEPTH_VIEW_SHADER
+    CHECK(!shifted && !depth_y16(d) && !d->y16);
+    CHECK(!setup_pipeline(&st,3,&unused,&gw,&gh,&zmax,0));
+    puts("PASS: absent SDL depth converter reports unsupported without a proxy");
+    return;
+#else
+    inspect=1; fail_texture=1;
+    CHECK(!setup_pipeline(&st,3,&unused,&gw,&gh,&zmax,0));
+    CHECK(!fail_texture && !d->y16); inspect=0;
+    CHECK(setup_pipeline(&st,3,&unused,&gw,&gh,&zmax,0));
     SDL_GPUTexture *view=depth_y16(d); CHECK(view);
     SDL_GPUTransferBufferCreateInfo ci={0};
     ci.usage=SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD; ci.size=8;
@@ -303,6 +316,7 @@ static void test_depth_view(int shifted)
     CHECK(pixel[0]==65535 && pixel[1]==(shifted?0x4040:0xC0C0) && pixel[2]==0);
     SDL_UnmapGPUTransferBuffer(s_dev,tb); SDL_ReleaseGPUTransferBuffer(s_dev,tb);
     printf("PASS: depth view %s alignment actual SDL GPU pixels\n",shifted?"caller-shifted":"unshifted");
+#endif
 }
 
 int main(int argc, char **argv)
