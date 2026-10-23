@@ -1,8 +1,6 @@
-/* Fixed-width Xbox kernel I/O layouts. Sized against XboxDev/nxdk master at
- * 14d5ee97e73347c973f1f57b68b79ec08c9e77f2, compiled for its i386-pc-win32
- * target; see build/audit-continuation/reference/xbox-io-layout.md. These are
- * guest memory objects, not
- * host WDM structures: every pointer field is a 32-bit Xbox virtual address. */
+/* Fixed-width guest kernel I/O representations. Every pointer field is a
+ * 32-bit guest virtual address, not a host WDM pointer. Keep marshaling and
+ * supported I/O semantics separate from these layout declarations. */
 #ifndef XBOX_KERNEL_GUEST_IO_H
 #define XBOX_KERNEL_GUEST_IO_H
 
@@ -43,10 +41,9 @@ enum {
     XBOX_MAJOR_INTERNAL_DEVICE_CONTROL = 0x0b
 };
 
-/* Xbox packet layout: a four-byte header followed by the complete 20-byte
- * parameter payload. The regression test records the title-binary byte
- * evidence for the observed parameter offsets; a Cxbx record-layout probe
- * places Parameters at +8 and is not used as the guest-layout authority. */
+/* Xbox packet representation: four header bytes and 20 parameter bytes.
+ * Compile-time assertions check the declared sizes/offsets; they do not
+ * independently establish hardware behavior or supported I/O semantics. */
 typedef struct XBOX_GUEST_IO_STACK_LOCATION {
     uint8_t major_function;
     uint8_t minor_function;
