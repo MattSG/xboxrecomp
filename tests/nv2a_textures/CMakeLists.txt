@@ -19,6 +19,28 @@ foreach(case srv_retry mip_retry palette_identity mip_chain)
     add_test(NAME nv2a_texture_sdlgpu_${case} COMMAND nv2a_textures_sdlgpu ${case})
 endforeach()
 
+# Completion is a selected capability, not an implicit default of the cache.
+foreach(case srv_retry mip_retry palette_identity mip_chain)
+    set_property(TEST nv2a_texture_sdlgpu_${case} APPEND PROPERTY ENVIRONMENT "RECOMP_COMPLETE_MIPS=1")
+endforeach()
+foreach(mode default complete disabled)
+    if(mode STREQUAL "complete")
+        set(policy_env "RECOMP_COMPLETE_MIPS=1")
+        set(expected 6)
+    elseif(mode STREQUAL "disabled")
+        set(policy_env "RECOMP_COMPLETE_MIPS=0")
+        set(expected 2)
+    else()
+        set(policy_env "--unset=RECOMP_COMPLETE_MIPS")
+        set(expected 2)
+    endif()
+    add_test(NAME nv2a_texture_mip_policy_${mode}
+        COMMAND ${CMAKE_COMMAND} -E env ${policy_env} $<TARGET_FILE:nv2a_textures_cpu> mip_policy ${expected})
+endforeach()
+
+add_test(NAME nv2a_texture_sdlgpu_guest_mips
+    COMMAND ${CMAKE_COMMAND} -E env --unset=RECOMP_COMPLETE_MIPS $<TARGET_FILE:nv2a_textures_sdlgpu> guest_mips)
+
 if(NOT WIN32)
     message(STATUS "nv2a_textures: D3D11 GPU cases are Windows only")
     return()
@@ -43,3 +65,19 @@ foreach(case srv_retry mip_retry palette_identity mip_chain)
         PASS_REGULAR_EXPRESSION "\\[TEXTURE_STREAM\\].*event=new_upload")
 endforeach()
 xbr_embed_nv2a_hlsl(nv2a_textures)
+
+if(WIN32)
+    foreach(case srv_retry mip_retry palette_identity palette_bounds refusals scanout_size native_bc mip_chain)
+        set_property(TEST nv2a_texture_${case} APPEND PROPERTY ENVIRONMENT "RECOMP_COMPLETE_MIPS=1")
+    endforeach()
+    foreach(case srv_retry mip_retry palette_identity mip_chain)
+        set_property(TEST nv2a_texture_${case}_trace APPEND PROPERTY ENVIRONMENT "RECOMP_COMPLETE_MIPS=1")
+    endforeach()
+endif()
+
+if(WIN32)
+    foreach(case guest_mips native_bc_default)
+        add_test(NAME nv2a_texture_${case}
+            COMMAND ${CMAKE_COMMAND} -E env --unset=RECOMP_COMPLETE_MIPS $<TARGET_FILE:nv2a_textures> ${case})
+    endforeach()
+endif()

@@ -261,7 +261,7 @@ static int bc_compare(ID3D11ShaderResourceView *compressed, ID3D11ShaderResource
     return 0;
 }
 
-static int test_native_bc(void)
+static int test_native_bc(int complete)
 {
     static const unsigned formats[] = {0x0C, 0x0E, 0x0F};
     static const DXGI_FORMAT host_formats[] = {DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM};
@@ -285,6 +285,7 @@ static int test_native_bc(void)
                 ID3D11ShaderResourceView *array;
                 size_t count = s_tex_count, bytes = s_tex_bytes, expected_bytes = 0;
                 unsigned i, mip, width, height, levels;
+                int native_expected = cases[item].native || (!complete && (item == 5 || item == 6));
                 texture.addr = 0x50000 + sequence++ * 4096 + alignments[alignment];
                 texture.color = formats[format];
                 texture.width = cases[item].width; texture.height = cases[item].height;
@@ -319,7 +320,7 @@ static int test_native_bc(void)
                 memcpy(snapshot, ram + texture.addr, layout.total);
                 nv2a_d3d_kick();
                 /* A failed native view must retry within the same kick. */
-                if (cases[item].native) {
+                if (native_expected) {
                     fail_srv = 1;
                     CHECK(texture_get(&texture) == NULL && fail_srv == 0);
                     CHECK(s_tex_count == count && s_tex_bytes == bytes);
@@ -331,22 +332,22 @@ static int test_native_bc(void)
                 CHECK(array);
                 ID3D11ShaderResourceView_Release(array);
                 ID3D11ShaderResourceView_GetDesc(view, &view_desc);
-                CHECK(texture_desc.Format == (cases[item].native ? host_formats[format] : DXGI_FORMAT_B8G8R8A8_UNORM));
+                CHECK(texture_desc.Format == (native_expected ? host_formats[format] : DXGI_FORMAT_B8G8R8A8_UNORM));
                 CHECK(view_desc.Format == texture_desc.Format);
                 CHECK(view_desc.ViewDimension == (texture.cube ? D3D11_SRV_DIMENSION_TEXTURECUBE : D3D11_SRV_DIMENSION_TEXTURE2D));
                 levels = host_levels(&layout, &texture);
                 CHECK(texture_desc.MipLevels == levels && texture_desc.ArraySize == layout.faces);
                 width = texture.width; height = texture.height;
                 for (mip = 0; mip < levels; mip++) {
-                    expected_bytes += cases[item].native ? (size_t)((width + 3) / 4) * ((height + 3) / 4) * layout.bpp * layout.faces
+                    expected_bytes += native_expected ? (size_t)((width + 3) / 4) * ((height + 3) / 4) * layout.bpp * layout.faces
                                                        : (size_t)width * height * 4 * layout.faces;
                     if (width > 1) width /= 2;
                     if (height > 1) height /= 2;
                 }
                 CHECK(s_tex_count == count + 1 && s_tex_bytes == bytes + expected_bytes);
                 reference = bc_reference(&texture, &layout);
-                CHECK(reference && bc_compare(view, reference, cases[item].native, &texture, &layout, snapshot) == 0);
-                if (cases[item].native) {
+                CHECK(reference && bc_compare(view, reference, native_expected, &texture, &layout, snapshot) == 0);
+                if (native_expected) {
                     for (i = 0; i < layout.total; i++) ram[texture.addr + i] ^= (uint8_t)(0x5B + i * 17);
                     /* Cached draws in this kick retain the old upload. A new
                      * kick must hash all bytes and refresh this same resource. */

@@ -414,16 +414,20 @@ static void halve_bgra(const uint32_t *src, uint32_t w, uint32_t h, uint32_t *ds
         }
 }
 
-/* Mip levels the host texture gets. Titles shipped short chains to save
- * memory (for example, 1024x1024 with 4 levels), so distant surfaces kept sampling
- * a level far finer than their footprint -- grain and shimmer, with a band
- * where the chain runs out. A chain the title started is completed down to
- * 1x1 from its own smallest level; a single level stays single. */
+/* Completing a supplied 2D/cube chain is an explicit host enhancement.
+ * Default: retain guest levels. Set RECOMP_COMPLETE_MIPS=1 before texture
+ * uploads. The renderer caches this setting: changing it cannot invalidate
+ * already-created resources. Single-level and volume textures stay unchanged. */
 static int host_levels(const TexLayout *L, const NvD3DTexture *t)
 {
+    static int complete = -1;
     int n = 1;
     uint32_t m = t->width > t->height ? t->width : t->height;
-    if (tex_volume(t) || L->levels < 2) return L->levels;
+    if (complete < 0) {
+        const char *setting = getenv("RECOMP_COMPLETE_MIPS");
+        complete = setting && strcmp(setting, "1") == 0;
+    }
+    if (!complete || tex_volume(t) || L->levels < 2) return L->levels;
     while (m > 1) { m >>= 1; n++; }
     return n > L->levels ? n : L->levels;
 }
