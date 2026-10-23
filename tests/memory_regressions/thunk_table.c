@@ -13,13 +13,23 @@ static void put(uint8_t *bytes, unsigned offset, uint32_t value)
 { memcpy(bytes + offset, &value, 4); }
 static uint32_t *word(uint32_t va)
 { return (uint32_t *)((uintptr_t)xbox_GetMemoryOffset() + va); }
+struct stack_request { HANDLE ready,release; uint32_t top; };
+static DWORD WINAPI allocate_worker_stack(LPVOID opaque)
+{
+    struct stack_request *request=opaque;
+    request->top=xbox_AllocThreadStackSized(8192);
+    SetEvent(request->ready);
+    WaitForSingleObject(request->release,5000);
+    xbox_FreeThreadStack(request->top);
+    return request->top ? 0 : 1;
+}
 int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "high-retail";
     int kdata_config = !strcmp(mode,"kernel-data-config");
     int kdata_invalid = !strcmp(mode,"kernel-data-header") || !strcmp(mode,"kernel-data-overlap") || !strcmp(mode,"kernel-data-unbacked");
     int high = !strcmp(mode, "high-retail") || !strcmp(mode, "high-debug");
-    int invalid = kdata_invalid || !strcmp(mode,"partial") || !strcmp(mode,"unterminated") ||
+    int invalid = !strcmp(mode,"thread-stack-unbacked") || kdata_invalid || !strcmp(mode,"partial") || !strcmp(mode,"unterminated") ||
                   !strcmp(mode,"bad-ordinal") || !strcmp(mode,"bad-marker");
     uint32_t data_va = !strcmp(mode,"kernel-data-auto") ? 0x740000u : high ? 0x04010000u : 0x30000u;
     uint32_t table_va = data_va + 64, actual_base, actual_count;
@@ -63,6 +73,11 @@ int main(int argc, char **argv)
     if (!strcmp(mode,"kernel-data-empty")) {
         put(xbe,0x11c,0); put(xbe,0x158,0); expected=0;
     }
+    if (!strcmp(mode,"thread-stack-policy")) {
+        CHECK(xbox_ConfigureThreadStack(256*1024));
+        CHECK(!xbox_ConfigureThreadStack(123));
+    }
+    if (!strcmp(mode,"thread-stack-unbacked")) CHECK(xbox_ConfigureThreadStack(0x08001000u));
     xbox_SetTotalRam(XBOX_DEVKIT_RAM);
     xbox_kernel_set_thunk_address(0x60000,3); /* previous image metadata */
     BOOL loaded = xbox_MemoryLayoutInit(xbe,0x3000);
@@ -90,6 +105,61 @@ int main(int argc, char **argv)
         CHECK(XBOX_STACK_BASE >= XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE);
         CHECK(xbox_HeapAlloc(4096,4096) >= XBOX_WORKER_STACK_END);
         xbox_kernel_shutdown();
+    }
+    if (!strcmp(mode,"thread-stack-policy")) {
+        CHECK(!xbox_ConfigureThreadStack(0));
+        uint32_t a=xbox_AllocThreadStackSized(4097), b=xbox_AllocThreadStackSized(1);
+        CHECK(a && b==a+256*1024);
+        CHECK(xbox_HeapBlockSize(a)==16 && xbox_HeapBlockSize(b)==16);
+        xbox_FreeThreadStack(a+4); CHECK(xbox_HeapBlockSize(a)==16);
+        xbox_FreeThreadStack(a); xbox_FreeThreadStack(a); xbox_FreeThreadStack(b);
+        a=xbox_AllocThreadStackSized(1024*1024+1); b=xbox_AllocThreadStackSized(1024*1024+1);
+        CHECK(a && b==a+1024*1024+4096);
+        CHECK(!xbox_AllocThreadStackSized(UINT32_MAX));
+        xbox_FreeThreadStack(a); xbox_FreeThreadStack(b);
+        xbox_MemoryLayoutShutdown();
+        CHECK(!xbox_AllocThreadStack());
+        CHECK(xbox_ConfigureThreadStack(0));
+        CHECK(xbox_MemoryLayoutInit(xbe,0x3000));
+        a=xbox_AllocThreadStack(); b=xbox_AllocThreadStack();
+        CHECK(a && b==a+4096);
+        xbox_FreeThreadStack(a); xbox_FreeThreadStack(b);
+    }
+    if (!strcmp(mode,"thread-stack-parallel")) {
+        struct stack_request requests[12]={0}; HANDLE threads[12]={0};
+        HANDLE release=CreateEventA(NULL,TRUE,FALSE,NULL); CHECK(release!=NULL);
+        for (unsigned i=0;i<12;i++) {
+            requests[i].ready=CreateEventA(NULL,TRUE,FALSE,NULL); requests[i].release=release;
+            threads[i]=CreateThread(NULL,0,allocate_worker_stack,&requests[i],0,NULL);
+            CHECK(threads[i]!=NULL);
+        }
+        for (unsigned i=0;i<12;i++) {
+            CHECK(WaitForSingleObject(requests[i].ready,5000)==WAIT_OBJECT_0);
+            CHECK(requests[i].top!=0);
+            for (unsigned j=0;j<i;j++) CHECK(requests[i].top!=requests[j].top);
+        }
+        SetEvent(release);
+        for (unsigned i=0;i<12;i++) {
+            DWORD status=1;
+            CHECK(WaitForSingleObject(threads[i],5000)==WAIT_OBJECT_0);
+            CHECK(GetExitCodeThread(threads[i],&status) && status==0);
+            CHECK(xbox_HeapBlockSize(requests[i].top)==0);
+            CloseHandle(threads[i]); CloseHandle(requests[i].ready);
+        }
+        CloseHandle(release);
+    }
+    if (!strcmp(mode,"thread-stack-many")) {
+        uint32_t tops[12]={0};
+        for (unsigned i=0;i<12;i++) {
+            tops[i]=xbox_AllocThreadStack(); CHECK(tops[i]!=0);
+            for (unsigned j=0;j<i;j++) CHECK(!tops[i] || tops[i]!=tops[j]);
+        }
+        for (unsigned i=0;i<12;i++) xbox_FreeThreadStack(tops[i]);
+        uint32_t ordinary=xbox_HeapAlloc(512*1024,4096);
+        CHECK(ordinary!=0);
+        xbox_FreeThreadStack(ordinary+512*1024-16);
+        CHECK(xbox_HeapBlockSize(ordinary)>=512*1024);
+        xbox_HeapFree(ordinary);
     }
     if (!strncmp(mode,"kernel-strings",14)) {
         int empty=!strcmp(mode,"kernel-strings-empty"), invalid_strings=!strcmp(mode,"kernel-strings-invalid");

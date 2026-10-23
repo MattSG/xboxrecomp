@@ -142,3 +142,8 @@ Counted-string cases cover port strings/topology, embedded NULs, nonterminated
 input, long paths, all 65535 counted bytes, absent/empty input, invalid counts or
 NULL data, and exhausted guest heap. Guest STRING descriptors use 32-bit VAs;
 Length/MaximumLength and bounded owned capacity match the valid native input.
+
+Worker-stack cases cover more than eight live stacks, twelve simultaneous
+allocations/releases, forged/interior/duplicate tops, minimum policy, explicit
+sizes/page rounding, unbacked policy, overflow and restored image defaults.
+The C++ consumer links both new APIs. Reset/shutdown requires quiesced users.

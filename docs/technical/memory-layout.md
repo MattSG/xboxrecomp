@@ -78,6 +78,29 @@ image. A port may populate compatibility data before guest execution; it must
 not free the view or retain it after memory shutdown. Fabricated header fields
 used to steer an application's feature probing belong to that port.
 
+## Spawned worker stacks
+
+`xbox_AllocThreadStackSized(bytes)` owns a separate guest heap allocation and
+returns its 16-byte-aligned top. Requests are rounded to pages; zero uses the
+image's StackCommit, at least one page. Before initialization a port may select
+a page-aligned lower bound through `xbox_ConfigureThreadStack`. Zero restores
+the image-derived default. Invalid/active changes preserve policy. Oversized
+unbacked default policy fails initialization; individual allocation failure
+returns zero. Capacity follows available heap/metadata rather than eight slots.
+
+`xbox_FreeThreadStack` releases only an exact live top returned by the allocator;
+unowned/interior/duplicate values do nothing. Metadata updates are serialized
+with allocator ownership. Memory reset retires its host metadata only while
+guest users are quiesced. Returned addresses are invalid after shutdown.
+
+Ex passes its KernelStackSize request to the allocator; the simple create API
+uses the default. Failed guest-stack allocation reports STATUS_NO_MEMORY and
+clears handle output, instead of silently running on the caller. Explicit
+inline compatibility/diagnostics remain caller-selected behavior. Host start
+metadata/CreateThread failure releases the selected guest stack and reports
+STATUS_INSUFFICIENT_RESOURCES. This does not implement all thread-object,
+suspension, native-export or teardown semantics.
+
 ## Kernel export storage
 
 Memory initialization places the kernel-data page after copied headers and all

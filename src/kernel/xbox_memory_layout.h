@@ -429,21 +429,23 @@ HANDLE xbox_GetMappingHandle(void);
 
 
 
-/* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
- * stack top, or 0 when the pool is exhausted. */
-uint32_t xbox_AllocThreadStack(void);
+/* Optional page-aligned worker minimum, configured before memory init.
+ * Zero restores the image-derived default. Invalid/active changes preserve
+ * policy. Requests/defaults are page-rounded; backing/heap capacity bounds
+ * allocation, without a fixed thread-count cap. Startup/reset is quiesced. */
+BOOL xbox_ConfigureThreadStack(uint32_t minimum_bytes);
+/* Zero request uses XBE StackCommit (at least one page), enlarged by any port
+ * minimum. Returns an owned guest top, 16-byte aligned, or zero on failure. */
+uint32_t xbox_AllocThreadStackSized(uint32_t requested_bytes);
+uint32_t xbox_AllocThreadStack(void); /* equivalent to a zero-sized request */
 
 /* A TIB and TLS block for a newly spawned guest thread, copied from the
  * template the loader built. Returns the new TIB's Xbox VA, or 0. */
 uint32_t xbox_AllocThreadTib(void);
 
-/**
- * Return a worker's stack when the worker ends. Takes the value
- * xbox_AllocThreadStack returned. Without this the pool counts threads ever
- * created rather than threads alive, and a title that cycles workers exhausts
- * it -- after which PsCreateSystemThreadEx runs them inline, which deadlocks
- * any caller that then waits for the worker it thought it had spawned.
- */
+/* Release the exact top returned by either allocator. Unowned, interior,
+ * duplicate or zero values are ignored; no other heap block is released.
+ * Addresses are invalid after memory shutdown, even if later reused. */
 void xbox_FreeThreadStack(uint32_t stack_top);
 
 /* Guest stack slices for host callbacks: DPCs, interrupts and host-driven

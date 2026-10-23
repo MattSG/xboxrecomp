@@ -49,6 +49,14 @@ static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 uint32_t g_xbox_stack_base, g_xbox_stack_size;
 static uint32_t s_main_stack_base, s_main_stack_size;
+static uint32_t s_thread_stack_minimum, g_thread_stack_default;
+
+BOOL xbox_ConfigureThreadStack(uint32_t minimum_bytes)
+{
+    if (g_memory_base || (minimum_bytes & 4095u)) return FALSE;
+    s_thread_stack_minimum=minimum_bytes;
+    return TRUE;
+}
 uint32_t g_xbox_kernel_data_base;
 static uint32_t s_kernel_data_base;
 
@@ -2384,7 +2392,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
     uint32_t loaded_header_end;
-    if (!g_memory_base) g_xbox_kernel_data_base = 0;
+    if (!g_memory_base) {
+        g_xbox_kernel_data_base=0;
+        g_thread_stack_default=0;
+    }
     if (!xbe || xbe_size < XBE_TLS_ADDR_OFFSET + 4u || memcmp(xbe, "XBEH", 4)) {
         fprintf(stderr, "xbox_MemoryLayoutInit: invalid XBE header\n");
         return FALSE;
@@ -2813,12 +2824,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         if (floor < XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE)
             floor = XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE;
         floor = (floor + 4095u) & ~UINT64_C(4095);
-        if (!bytes) {
-            if (xbe_size >= XBE_STACK_COMMIT_OFFSET + 4)
-                bytes = *(const uint32_t *)(xbe + XBE_STACK_COMMIT_OFFSET);
-            if (!bytes) bytes = 4096;
-            bytes = (bytes + 4095u) & ~UINT64_C(4095);
+        uint64_t image_stack=0, worker_bytes;
+        if (xbe_size>=XBE_STACK_COMMIT_OFFSET+4)
+            image_stack=*(const uint32_t *)(xbe+XBE_STACK_COMMIT_OFFSET);
+        if (!image_stack) image_stack=4096;
+        image_stack=(image_stack+4095u)&~UINT64_C(4095);
+        if (!bytes) bytes=image_stack;
+        worker_bytes=image_stack>s_thread_stack_minimum ? image_stack : s_thread_stack_minimum;
+        if (worker_bytes>g_memory_size || worker_bytes>UINT32_MAX) {
+            fprintf(stderr,"  Worker stack: default cannot fit backed memory\n");
+            xbox_MemoryLayoutShutdown(); return FALSE;
         }
+        g_thread_stack_default=(uint32_t)worker_bytes;
         base = s_main_stack_base ? s_main_stack_base : floor;
         end = base + bytes;
         if (base < floor || end > g_memory_size || end > UINT32_MAX) {
@@ -3438,6 +3455,7 @@ void xbox_MemoryLayoutShutdown(void)
     xbox_worker_stack_reset(0);
     g_xbox_stack_base = g_xbox_stack_size = 0;
     g_xbox_kernel_data_base = 0;
+    g_thread_stack_default=0;
     g_esp = 0;
     xbox_allocators_reset();
     xbox_kernel_set_thunk_address(0, 0);
@@ -3516,10 +3534,11 @@ static int g_heap_block_count = 0;
  * code accesses them through guest MEM macros, like the main stack. */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
-#define XBOX_THREAD_STACK_SIZE  (512 * 1024)
-#define XBOX_MAX_THREAD_STACKS  8
-
-static int g_thread_stacks_used = 0;
+struct owned_thread_stack {
+    uint32_t base, top;
+    struct owned_thread_stack *next;
+};
+static struct owned_thread_stack *g_thread_stacks;
 
 /* A TIB and TLS block for a newly spawned guest thread.
  *
@@ -3587,46 +3606,46 @@ uint32_t xbox_AllocThreadTib(void)
     #undef TIB_VA
 }
 
-uint32_t xbox_AllocThreadStack(void)
+uint32_t xbox_AllocThreadStackSized(uint32_t requested_bytes)
 {
-    uint32_t base;
-
-    if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
-        return 0;
-    }
-
-    /* Allocate a separate owned heap block above the image and permanent
-     * main/callback stack storage; never carve a worker out of a live stack. */
-    base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
-    if (!base)
-        return 0;
-    g_thread_stacks_used++;
-
-    /* Top of the slice, 16-byte aligned, growing down. */
-    return base + XBOX_THREAD_STACK_SIZE - 16;
+    struct owned_thread_stack *stack;
+    uint64_t bytes=requested_bytes ? requested_bytes : g_thread_stack_default;
+    uint32_t base,top;
+    if (!g_memory_base || !g_thread_stack_default) return 0;
+    if (bytes<s_thread_stack_minimum) bytes=s_thread_stack_minimum;
+    bytes=(bytes+4095u)&~UINT64_C(4095);
+    if (!bytes || bytes>UINT32_MAX) return 0;
+    stack=malloc(sizeof(*stack));
+    if (!stack) return 0;
+    base=xbox_HeapAlloc((uint32_t)bytes,4096);
+    if (!base) { free(stack); return 0; }
+    top=base+(uint32_t)bytes-16;
+    stack->base=base; stack->top=top;
+    EnterCriticalSection(&g_allocator_lock);
+    stack->next=g_thread_stacks; g_thread_stacks=stack;
+    LeaveCriticalSection(&g_allocator_lock);
+    return top;
 }
 
-/* Give a worker's stack back when the worker ends.
- *
- * The counter used to only ever go up, so a title that creates and destroys
- * threads ran the pool dry no matter how few were alive at once. The Xbox
- * Dashboard spawns one worker per ambient WAV and terminates it before loading
- * the next; after XBOX_MAX_THREAD_STACKS files the pool was empty and
- * PsCreateSystemThreadEx fell back to running the worker inline. That fallback
- * is a deadlock here rather than a slowdown: the worker ran to completion
- * before the caller reached its wait, so the main thread then waited forever on
- * events whose only signaller had already finished. It looked like an audio
- * hang, three layers away from the cause.
- *
- * Takes the value AllocThreadStack returned, so callers never do the arithmetic.
- */
+uint32_t xbox_AllocThreadStack(void)
+{
+    return xbox_AllocThreadStackSized(0);
+}
+
+/* Only a returned owned top can release a stack. Unknown/interior/duplicate
+ * values must not free an unrelated heap block by guessed size arithmetic. */
 void xbox_FreeThreadStack(uint32_t stack_top)
 {
-    if (!stack_top)
-        return;
-    xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
-    if (g_thread_stacks_used > 0)
-        g_thread_stacks_used--;
+    struct owned_thread_stack **link, *stack=NULL;
+    if (!stack_top || !g_allocator_lock_initialized) return;
+    EnterCriticalSection(&g_allocator_lock);
+    for (link=&g_thread_stacks; *link; link=&(*link)->next) {
+        if ((*link)->top==stack_top) {
+            stack=*link; *link=stack->next; break;
+        }
+    }
+    LeaveCriticalSection(&g_allocator_lock);
+    if (stack) { xbox_HeapFree(stack->base); free(stack); }
 }
 
 /* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
@@ -4318,7 +4337,12 @@ static RECOMP_TLS uint64_t t_allocator_generation;
 static void xbox_allocators_reset(void)
 {
     g_heap_next = XBOX_HEAP_BASE;
-    g_heap_block_count = g_heap_alloc_count = g_thread_stacks_used = 0;
+    g_heap_block_count = g_heap_alloc_count = 0;
+    /* Reset is startup/quiesced, after guest users have stopped. */
+    while (g_thread_stacks) {
+        struct owned_thread_stack *stack=g_thread_stacks;
+        g_thread_stacks=stack->next; free(stack);
+    }
     g_reserve_next = 0;
     g_reserve_alloc_count = 0;
     g_contig_next = XBOX_CONTIG_BASE + 0x1000u;

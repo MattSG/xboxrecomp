@@ -96,5 +96,9 @@ stack and TIB. Poisoned words beyond the five simple-API arguments reject the
 old seven-argument decode. Signatures: [nxdk kernel header](https://github.com/XboxDev/nxdk/blob/master/lib/xboxkrnl/xboxkrnl.h).
 
 These cases do not prove suspended/debugger creation, optional thread-ID output,
-full thread-object/reference semantics or every thread teardown path. Worker
-stack sizing/capacity and allocation-failure fallback policy need separate review.
+full thread-object/reference semantics or every thread teardown path.
+
+Worker resource cases exhaust the guest heap for both create APIs and require
+STATUS_NO_MEMORY, cleared handle output and no inline/spawned execution. Ex
+also tests a multi-megabyte requested stack and an overflowing request. Native
+host allocation/CreateThread failure cleanup is reviewed but not fault-injected.
