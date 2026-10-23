@@ -955,12 +955,14 @@ int nv2a_d3d_init(void)
         ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
                                        ID3D10Blob_GetBufferSize(b), NULL, &s_y16_ps[1]);
         ID3D10Blob_Release(b);
+#ifdef XBOXRECOMP_DEPTH_VIEW_SHADER
         for (v = 0; v < 2; v++) {
             if (!(b = compile_def("y16d_ps", "ps_5_0", v ? ms : NULL))) return 0;
             ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
                                            ID3D10Blob_GetBufferSize(b), NULL, &s_y16d_ps[v]);
             ID3D10Blob_Release(b);
         }
+#endif
     }
 
     {
@@ -2467,14 +2469,28 @@ static ID3D11ShaderResourceView *surface_mips(Surface *s)
 
 /* Bring s's LU_IMAGE_Y16 view up to date (2 x iw by ih); NULL on failure.
  * Unbinds the current targets: call before a draw binds its own. */
+/* Publish a cached conversion target only after all three objects exist. */
+static int make_y16_target(uint32_t w,uint32_t h,ID3D11Texture2D **texture,
+                          ID3D11ShaderResourceView **srv,ID3D11RenderTargetView **rtv)
+{
+    ID3D11Texture2D *t=make_texture(w,h,1,1,DXGI_FORMAT_R16G16B16A16_UNORM,
+        D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE,0);
+    ID3D11ShaderResourceView *v=NULL;
+    ID3D11RenderTargetView *r=NULL;
+    if (t && SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_dev,(ID3D11Resource *)t,NULL,&v)) &&
+        SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_dev,(ID3D11Resource *)t,NULL,&r))) {
+        *texture=t; *srv=v; *rtv=r; return 1;
+    }
+    if (v) ID3D11ShaderResourceView_Release(v);
+    if (r) ID3D11RenderTargetView_Release(r);
+    if (t) ID3D11Texture2D_Release(t);
+    return 0;
+}
+
 static ID3D11ShaderResourceView *surface_y16(Surface *s)
 {
     if (!s->y16) {
-        s->y16 = make_texture(2 * s->iw, s->ih, 1, 1, DXGI_FORMAT_R16G16B16A16_UNORM,
-                              D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0);
-        if (!s->y16) return NULL;
-        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s->y16, NULL, &s->y16_srv);
-        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s->y16, NULL, &s->y16_rtv);
+        if (!make_y16_target(2*s->iw,s->ih,&s->y16,&s->y16_srv,&s->y16_rtv)) return NULL;
         s->y16_gen = s->gen - 1;
     }
     if (s->y16_gen != s->gen) {
@@ -2504,13 +2520,15 @@ static ID3D11ShaderResourceView *surface_y16(Surface *s)
 /* The same for a depth buffer the title reads as LU_IMAGE_Y16 (see y16d_ps). */
 static ID3D11ShaderResourceView *depth_y16(Depth *d)
 {
+#ifndef XBOXRECOMP_DEPTH_VIEW_SHADER
+    static int noted;
+    (void)d;
+    if (!noted) { noted=1; fprintf(stderr,"[NV2A] depth texture conversion unavailable; supply a port shader\n"); }
+    return NULL;
+#else
     if (!d->zsrv) return NULL;
     if (!d->y16) {
-        d->y16 = make_texture(2 * d->iw, d->ih, 1, 1, DXGI_FORMAT_R16G16B16A16_UNORM,
-                              D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0);
-        if (!d->y16) return NULL;
-        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->y16, NULL, &d->y16_srv);
-        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)d->y16, NULL, &d->y16_rtv);
+        if (!make_y16_target(2*d->iw,d->ih,&d->y16,&d->y16_srv,&d->y16_rtv)) return NULL;
         d->y16_gen = d->gen - 1;
     }
     if (d->y16_gen != d->gen) {
@@ -2542,6 +2560,7 @@ static ID3D11ShaderResourceView *depth_y16(Depth *d)
         d->y16_gen = d->gen;
     }
     return d->y16_srv;
+#endif
 }
 
 static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
@@ -2587,7 +2606,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         if (t->color != 0x35 || t->cube || !t->addr) continue;
         /* A depth buffer wins over a colour surface at the same address:
          * titles bind one there for colour-masked stencil passes. */
-        if ((zt = depth_find(phys(t->addr))) != NULL) { depth_y16(zt); continue; }
+        if ((zt = depth_find(phys(t->addr))) != NULL) { if (!depth_y16(zt)) return 0; continue; }
         rt = surface_find(phys(t->addr));
         if (rt && rt->bpp == 4) { surface_sync(rt, 0); surface_y16(rt); }
     }

@@ -31,8 +31,10 @@ function(xbr_sdlgpu_shaders gen out)
         "clear clear_vs vs"
         "clear clear_ps ps"
         "y16 y16_vs vs"
-        "y16 y16_ps ps"
-        "y16d y16d_ps ps")
+        "y16 y16_ps ps")
+    if(NV2A_DEPTH_VIEW_SHADER)
+        list(APPEND _sdl_shaders "y16d y16d_ps ps")
+    endif()
     set(_formats spirv)
     if(WIN32)
         list(APPEND _formats dxil)
@@ -85,6 +87,9 @@ function(xbr_sdlgpu_shaders gen out)
 endfunction()
 
 function(xbr_nv2a_sdlgpu_target target)
+    if(NV2A_DEPTH_VIEW_SHADER)
+        target_compile_definitions(${target} PRIVATE XBOXRECOMP_DEPTH_VIEW_SHADER=1)
+    endif()
     include(${_xbr_sdlgpu_root}/cmake/Dxc.cmake)
     include(${_xbr_sdlgpu_root}/cmake/Sdl3.cmake)
     set(_gen ${CMAKE_CURRENT_BINARY_DIR}/${target}_generated)
