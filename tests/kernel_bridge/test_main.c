@@ -297,6 +297,27 @@ static uint32_t query_link(uint8_t *mem, uint32_t query, uint32_t handle,
     return status;
 }
 
+static volatile LONG native_calls;
+static PVOID native_context;
+static DWORD native_id;
+static volatile LONG native_system_calls;
+static PXBOX_START_ROUTINE native_system_start;
+static PVOID native_system_context;
+static HANDLE native_ready;
+static int native_terminate;
+static VOID __stdcall native_start(PVOID context)
+{
+    native_context=context; native_id=GetCurrentThreadId();
+    InterlockedIncrement(&native_calls);
+    if (native_ready) SetEvent(native_ready);
+    if (native_terminate) xbox_PsTerminateSystemThread((NTSTATUS)0xC0000123u);
+}
+static VOID __stdcall native_system(PXBOX_START_ROUTINE start,PVOID context)
+{
+    native_system_start=start; native_system_context=context;
+    InterlockedIncrement(&native_system_calls);
+    start(context);
+}
 static void firmware_observer(ULONG routine)
 {
     fprintf(stderr,"FIRMWARE_HOOK=%u\n",(unsigned)routine);
@@ -312,6 +333,55 @@ int main(int argc, char **argv)
         xbox_HalReturnToFirmware(37);
         fprintf(stderr,"FIRMWARE_RETURNED\n");
         return 99;
+    }
+    if (argc==2 && !strncmp(argv[1],"native-thread-",14)) {
+        const char *mode=argv[1]; int context=37;
+        HANDLE thread=(HANDLE)(uintptr_t)0xDEAD; ULONG id=123;
+        NTSTATUS status;
+        if (!strcmp(mode,"native-thread-invalid")) {
+            status=xbox_PsCreateSystemThreadEx(&thread,0,0,0,&id,NULL,&context,FALSE,FALSE,NULL);
+            check(status==STATUS_INVALID_PARAMETER && !thread && !id,"invalid native start clears outputs",NULL);
+            check(xbox_PsCreateSystemThread(NULL,&id,native_start,&context,FALSE)==STATUS_INVALID_PARAMETER,
+                  "NULL native output handle is rejected",NULL);
+            return failures?1:0;
+        }
+        if (!strcmp(mode,"native-thread-unsupported")) {
+            for (unsigned i=0;i<3;i++) {
+                thread=(HANDLE)(uintptr_t)0xDEAD; id=123;
+                status=xbox_PsCreateSystemThreadEx(&thread,i==0?1:0,0,i==1?1:0,&id,native_start,&context,FALSE,i==2,NULL);
+                check(status==STATUS_NOT_SUPPORTED && !thread && !id,"unsupported native setup fails without stale outputs",NULL);
+            }
+            check(!native_calls,"unsupported setup never runs native callback",NULL);
+            return failures?1:0;
+        }
+        int suspended=!strcmp(mode,"native-thread-suspended"),custom=!strcmp(mode,"native-thread-system");
+        native_terminate=!strcmp(mode,"native-thread-terminate");
+        native_ready=CreateEventA(NULL,TRUE,FALSE,NULL);
+        if (!strcmp(mode,"native-thread-simple"))
+            status=xbox_PsCreateSystemThread(&thread,&id,native_start,&context,FALSE);
+        else
+            status=xbox_PsCreateSystemThreadEx(&thread,0,0,0,&id,native_start,&context,suspended,FALSE,custom?native_system:NULL);
+        check(status==0 && thread!=NULL,"native callback thread is created",NULL);
+        check(xbox_resolve_ordinal(254)==(ULONG_PTR)xbox_PsCreateSystemThread &&
+              xbox_resolve_ordinal(255)==(ULONG_PTR)xbox_PsCreateSystemThreadEx,
+              "both native thread exports resolve",NULL);
+        if (status==0 && thread) {
+            if (suspended) {
+                check(WaitForSingleObject(native_ready,50)==WAIT_TIMEOUT,"suspended native callback has not executed",NULL);
+                check(ResumeThread(thread)!=UINT32_MAX,"native callback resumes",NULL);
+            }
+            check(WaitForSingleObject(thread,5000)==WAIT_OBJECT_0,"native thread completes",NULL);
+            DWORD exit_code=0;
+            check(GetExitCodeThread(thread,&exit_code) && exit_code==(native_terminate?0xC0000123u:0),
+                  "native completion/termination status is observable",NULL);
+            check(native_calls==1 && native_context==&context && native_id==id && id!=GetCurrentThreadId(),
+                  "native start receives context and matching independent thread ID",NULL);
+            check(custom ? native_system_calls==1 && native_system_start==native_start && native_system_context==&context : !native_system_calls,
+                  "optional system routine receives the start callback and context",NULL);
+            CloseHandle(thread);
+        }
+        CloseHandle(native_ready); native_ready=NULL;
+        return failures?1:0;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
     uint32_t unconfigured_base = 1, unconfigured_count = 1;
@@ -502,6 +572,9 @@ int main(int argc, char **argv)
         int no_stack=strstr(argv[1],"no-stack") != NULL;
         int bad_stack=strstr(argv[1],"bad-stack") != NULL;
         int large_stack=strstr(argv[1],"large-stack") != NULL;
+        int default_system=strstr(argv[1],"default-system") != NULL;
+        int missing_entry=strstr(argv[1],"missing-entry") != NULL;
+        int unknown_entry=strstr(argv[1],"unknown-entry") != NULL;
         uint32_t ordinal = strstr(argv[1],"255") ? 255 : 254;
         uint32_t args[10] = {0};
         DWORD caller_id = GetCurrentThreadId();
@@ -513,7 +586,7 @@ int main(int argc, char **argv)
         xbox_kernel_init();
         xbox_kernel_bridge_init();
         args[0] = 0x42000;
-        thread_context_count=ordinal==255 ? 2 : 1;
+        thread_context_count=ordinal==255 && !default_system ? 2 : 1;
         args[ordinal == 255 ? 5 : 3] = 0x12345678;
         if (ordinal==255) {
             args[6] = 0x87654321;
@@ -521,6 +594,11 @@ int main(int argc, char **argv)
             if (bad_stack) args[2]=UINT32_MAX;
         }
         args[ordinal == 255 ? 9 : 2] = TEST_THREAD_VA;
+        if (default_system) { args[5]=TEST_THREAD_VA; args[6]=0x12345678; args[9]=0; }
+        if (missing_entry || unknown_entry) {
+            if (ordinal==255) { args[5]=unknown_entry?0xDEAD1000u:0; args[9]=0; }
+            else args[2]=unknown_entry?0xDEAD1000u:0;
+        }
         *(uint32_t *)(mem+SCRATCH_SP+24)=0xDEAD1000u;
         *(uint32_t *)(mem+SCRATCH_SP+28)=0; /* poison old seven-argument decoding */
         if (no_stack) {
@@ -532,6 +610,11 @@ int main(int argc, char **argv)
         uint32_t status = call_slot(mem,THUNK_VA,ordinal == 255 ? 10 : 5,args);
         check(g_esp==SCRATCH_SP+4+(ordinal==255?40:20),
               "thread-create uses exact stdcall cleanup after translated return",NULL);
+        if (missing_entry || unknown_entry) {
+            check(status==(uint32_t)(missing_entry?STATUS_INVALID_PARAMETER:STATUS_NOT_SUPPORTED),"unavailable guest entry reports failure",NULL);
+            check(!*(uint32_t *)(mem+0x42000) && !thread_id && !xbox_thread_debug_handle(),"unavailable guest entry neither executes nor returns a fake handle",NULL);
+            xbox_kernel_shutdown(); xbox_MemoryLayoutShutdown(); return failures?1:0;
+        }
         if (no_stack || bad_stack) {
             check(status==0xC0000017u,"stack failure reports STATUS_NO_MEMORY",NULL);
             check(!*(uint32_t *)(mem+0x42000),"failed creation clears handle output",NULL);
@@ -546,7 +629,7 @@ int main(int argc, char **argv)
         if (large_stack) check(thread_stack_probe>1024*1024,"Ex honors its requested multi-megabyte guest stack",NULL);
         check(inline_mode ? thread_id == caller_id : thread_id && thread_id != caller_id,
               "first thread follows explicit inline or default spawned mode",NULL);
-        check(thread_context[0] == 0x12345678 && thread_context[1] == (ordinal==255?0x87654321u:0u),
+        check(thread_context[0] == 0x12345678 && thread_context[1] == (thread_context_count==2?0x87654321u:0u),
               "thread APIs deliver their one/two start-context contracts",NULL);
         check(inline_mode ? g_ebx == 0xBAD : g_ebx == 0x555,
               "spawned thread owns registers; inline mode inherits them",NULL);

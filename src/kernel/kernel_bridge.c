@@ -657,12 +657,21 @@ static void bridge_PsCreateSystemThreadEx(void)
     uint32_t xbox_handle_ptr = STACK_ARG(0);
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
-    uint32_t start_routine   = STACK_ARG(9);
+    uint32_t system_routine  = STACK_ARG(9);
+    uint32_t start_routine   = system_routine ? system_routine : start_context1;
+    uint32_t entry_context1  = system_routine ? start_context1 : start_context2;
+    uint32_t entry_context2  = system_routine ? start_context2 : 0;
+    unsigned context_count  = system_routine ? 2 : 1;
     /* In SPAWN mode there is no privileged "first call": every thread is real,
      * so the entry can return. In INLINE mode the first call runs the game. */
     int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
                         && (g_thread_call_count == 0);
     g_thread_call_count++;
+    if (!start_routine) {
+        if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr)=0;
+        g_eax=STATUS_INVALID_PARAMETER;
+        return;
+    }
 
     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
             g_thread_call_count, start_routine, start_context1, start_context2);
@@ -696,7 +705,7 @@ static void bridge_PsCreateSystemThreadEx(void)
         if (fn) {
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
-                bridge_run_thread_inline(fn, start_context1, start_context2, 2);
+                bridge_run_thread_inline(fn, entry_context1, entry_context2, context_count);
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
                 fflush(stderr);
             } else {
@@ -717,7 +726,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                     fprintf(stderr, "  [KERNEL] RECOMP_WORKERS=inline: running "
                             "worker 0x%08X on this thread\n", start_routine);
                     fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2, 2);
+                    bridge_run_thread_inline(fn, entry_context1, entry_context2, context_count);
                     return;
                 }
 
@@ -728,8 +737,8 @@ static void bridge_PsCreateSystemThreadEx(void)
                     g_eax=0xC0000017u; /* STATUS_NO_MEMORY */
                     return;
                 } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top, 2);
+                    HANDLE th = bridge_spawn_thread(fn, entry_context1,
+                                                    entry_context2, stack_top, context_count);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -747,6 +756,9 @@ static void bridge_PsCreateSystemThreadEx(void)
         } else {
             fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: start routine 0x%08X not found in dispatch!\n",
                     start_routine);
+            if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr)=0;
+            g_eax=STATUS_NOT_SUPPORTED;
+            return;
         }
     }
 
@@ -9142,6 +9154,11 @@ static void bridge_PsCreateSystemThread(void)
                         && (g_thread_call_count == 0);
 
     g_thread_call_count++;
+    if (!start_routine) {
+        if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr)=0;
+        g_eax=STATUS_INVALID_PARAMETER;
+        return;
+    }
 
     /* Fake handle until the worker path can write a real one. */
     if (xbox_handle_ptr)
@@ -9183,6 +9200,9 @@ static void bridge_PsCreateSystemThread(void)
         } else {
             fprintf(stderr, "  [KERNEL] PsCreateSystemThread: start routine 0x%08X not found in dispatch!\n",
                     start_routine);
+            if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr)=0;
+            g_eax=STATUS_NOT_SUPPORTED;
+            return;
         }
     }
     g_eax = 0;  /* STATUS_SUCCESS */

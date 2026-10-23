@@ -280,6 +280,7 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case 251: return (ULONG_PTR)xbox_ObfReferenceObject;
 
     /* ---- Process / thread ---- */
+    case 254: return (ULONG_PTR)xbox_PsCreateSystemThread;
     case 255: return (ULONG_PTR)xbox_PsCreateSystemThreadEx;
     case 258: return (ULONG_PTR)xbox_PsTerminateSystemThread;
     case 259: return (ULONG_PTR)&xbox_PsThreadObjectType;
