@@ -149,6 +149,27 @@ int main(int argc, char **argv)
     xbox_kernel_bridge_init();
     memcpy(imports, memory + 0x600000, sizeof imports);
 
+    if (argc > 1 && !strcmp(argv[1], "diagnostics")) {
+        DWORD old;
+        extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+        _putenv_s("RECOMP_CS_TRACE_CRT", "all");
+        _putenv_s("RECOMP_CS_WATCH", "0x10000");
+        g_xbox_code_lo = 0x10000; g_xbox_code_hi = 0x20000;
+        if (!VirtualProtect(memory + 0x800000, 4096, PAGE_NOACCESS, &old)) return 12;
+        xbox_SetCrtLockTable(0x800000, 2);
+        g_esp = 0x800000;
+        SetLastError(1234);
+        xbox_RtlEnterCriticalSection(guest_lock(0));
+        xbox_RtlLeaveCriticalSection(guest_lock(0));
+        if (GetLastError() != 1234) return 13;
+        xbox_SetCrtLockTable(0xfffffffc, 2);
+        g_esp = 0xfffffffe;
+        xbox_RtlEnterCriticalSection(guest_lock(0));
+        xbox_RtlLeaveCriticalSection(guest_lock(0));
+        puts("PASS: unreadable and overflowing guest lock diagnostics");
+        return 0;
+    }
+
     if (!run_workers(0) || shared_count != THREADS * SHARED_ITERATIONS ||
         !run_workers(1)) return 1;
     for (unsigned i = 0; i < COLLISIONS; i++)
