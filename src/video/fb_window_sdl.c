@@ -144,12 +144,8 @@ static void cursor_tick(void)
     if (c != s_cursor_shown) { SDL_SetCursor(c); s_cursor_shown = c; }
 }
 
-/* Call before SDL's video subsystem starts. On Linux, native Wayland first and
- * X11 second: through XWayland, SDL's X11 backend aborted the process on an X
- * error (BadRROutput from RRGetOutputInfo) when the display layout changed
- * mid-game, and on Wayland the same runs were clean. SDL itself only prefers
- * Wayland when the compositor has fifo-v1/commit-timing. SDL_VIDEO_DRIVER (or
- * a hint set earlier) still decides. */
+/* Set a default Linux driver preference before SDL video initialization.
+ * Caller environment or higher-priority SDL hints can override it. */
 void xbox_FramebufferSdlHints(void)
 {
 #if defined(__linux__)
