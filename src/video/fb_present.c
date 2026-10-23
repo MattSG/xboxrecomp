@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include "fb_window.h"
+#include "../kernel/xbox_memory_layout.h"
 #include "../nv2a/nv2a_regs.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -171,13 +172,12 @@ static void pvideo_poll(void)
         size_t available;
         if (!(regs[NV_PVIDEO_BUFFER / 4] & (1u << (bank * 4u)))) continue;
         if (!bytes) continue;
-        if (physical + bytes > 0x04000000u) {
-            /* Retail Xbox RAM is 64 MB, so this bank cannot be a real scanout.
-             * Skip it, but say so once rather than silently. */
+        if (physical + bytes > g_xbox_total_ram) {
+            /* Installed RAM bounds scanout, independently of extra guest backing. */
             static int range_logged;
             if (!range_logged) {
                 range_logged = 1;
-                fprintf(stderr, "[PVIDEO_RANGE] bank=%u base=%08X offset=%08X pitch=%u height=%u physical=%llX outside 64MB, skipped\n",
+                fprintf(stderr, "[PVIDEO_RANGE] bank=%u base=%08X offset=%08X pitch=%u height=%u physical=%llX outside installed RAM, skipped\n",
                         bank, regs[(NV_PVIDEO_BASE + bank * 4) / 4],
                         regs[(NV_PVIDEO_OFFSET + bank * 4) / 4], pitch, height,
                         (unsigned long long)physical);
