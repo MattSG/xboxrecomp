@@ -230,7 +230,7 @@ void dsp_dma_step(DSPDMAState *s)
 
         size_t transfer_size = (size_t)word_count * item_size;
 
-        /* Per-frame transfers are small; the heap round trip was ~1.5% of the APU thread. */
+        /* Stage small transfers locally; allocate larger transfers on the heap. */
         uint8_t stack_buf[4096];
         uint8_t *scratch_buf = transfer_size <= sizeof(stack_buf) ? stack_buf : malloc(transfer_size);
         if (!scratch_buf) {
