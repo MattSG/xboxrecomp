@@ -1,8 +1,6 @@
-"""A je/jne reached across a label must test the flags its producer set.
+"""fix_flag_joins: rewrites je/jne reads of the never-set `_flags` fallback.
 
-The lifter's fallback `_flags` is never assigned, so the branch used to be
-dead. These cases pin the rewrite: a cmp reaching the branch through a label is
-materialized as `_zf`, and a branch with no producer is left and reported.
+Runs the real pass on a synthetic generated file. No XBE or disassembly is needed.
 """
 import tempfile
 import unittest
@@ -10,31 +8,53 @@ from pathlib import Path
 
 from .flag_joins import fix_flag_joins
 
-JOIN = """void sub_00001000(void)
-{
-    int _flags = 0; /* fallback flag var */
-    _fa = eax; _fb = ecx; /* cmp eax, ecx */
-loc_00001010: ;
+DECL = '    int _flags = 0; /* fallback flag var */'
+
+# sub_00001000: a sub result reaches a je through a fall-through join.
+# sub_00002000: a call (flags undefined afterwards) reaches a jne join.
+# sub_00003000: a je whose target label is not in the function.
+SOURCE = f'''void sub_00001000(void)
+{{
+{DECL}
+    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fas = (int32_t)(_fa); /* sub result */
+    if (_cf) goto loc_00001010;
+
+loc_00001008: ;
     if (_flags /* je: equal / zero */) goto loc_00001020;
-    return;
+    eax = 1;
+loc_00001010: ;
+    eax = 2;
 loc_00001020: ;
     return;
-}
-"""
+}}
 
-ENTRY = """void sub_00002000(void)
-{
-    int _flags = 0; /* fallback flag var */
-    if (_flags /* je: equal / zero */) goto loc_00002010;
+void sub_00002000(void)
+{{
+{DECL}
+    sub_00003000();
+loc_00002008: ;
+    if (_flags /* jne: not equal / not zero */) goto loc_00002020;
+    eax = 3;
+loc_00002020: ;
     return;
-loc_00002010: ;
+}}
+
+void sub_00003000(void)
+{{
+{DECL}
+    _fa = (uint32_t)(eax) & 0xFFFFFFFFu; _fb = (uint32_t)(ecx) & 0xFFFFFFFFu; /* cmp eax, ecx */
+    _fas = (int32_t)(_fa); _fbs = (int32_t)(_fb); /* cmp eax, ecx (32-bit) */
+loc_00003008: ;
+    if (_flags /* je: equal / zero */) goto loc_00003020;
+    if (_flags /* jne: not equal / not zero */) (void)0; /* goto loc_00003999 - dead code, label not in function */
+    eax = 4;
+loc_00003020: ;
     return;
-}
-"""
+}}
+'''
 
 
 class FlagJoinTest(unittest.TestCase):
-
     def run_pass(self, text):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'recomp_0000.c'
@@ -42,21 +62,43 @@ class FlagJoinTest(unittest.TestCase):
             fixed, unfixed = fix_flag_joins(Path(tmp))
             return fixed, unfixed, path.read_text()
 
-    def test_cmp_across_a_label_is_materialized(self):
-        fixed, unfixed, out = self.run_pass(JOIN)
-        self.assertEqual((fixed, unfixed), (1, []))
-        self.assertIn('int _flags = 0; /* fallback flag var */ int _zf = 0;', out)
-        self.assertIn('_fa = eax; _fb = ecx; /* cmp eax, ecx */\n    _zf = (_fa == _fb);', out)
-        self.assertIn('if (_zf) goto loc_00001020;', out)
-        self.assertNotIn('_flags /* je', out)
+    def test_rewrites_fixable_join_and_reports_the_rest(self):
+        fixed, unfixed, out = self.run_pass(SOURCE)
+        # Both fixable joins are materialized: each producer stores ZF and its branch reads it.
+        self.assertEqual(fixed, 2)
+        self.assertIn('    if (_zf) goto loc_00003020;', out)
+        self.assertIn('_fas = (int32_t)(_fa); /* sub result */\n    _zf = (_fa == 0);\n', out)
+        self.assertIn('    if (_zf) goto loc_00001020;', out)
+        self.assertIn(f'{DECL} int _zf = 0;', out)
+        self.assertNotIn('if (_flags /* je: equal / zero */) goto loc_00001020;', out)
 
-    def test_entry_without_a_producer_is_left_and_reported(self):
-        fixed, unfixed, out = self.run_pass(ENTRY)
-        self.assertEqual(fixed, 0)
-        self.assertEqual(len(unfixed), 1)
-        self.assertTrue(unfixed[0][4].startswith('blocked at'), unfixed[0][4])
-        self.assertIn('if (_flags /* je: equal / zero */) goto loc_00002010;', out)
+        # A call before the jne join leaves the flags undefined: the branch stays on _flags.
+        self.assertIn('    if (_flags /* jne: not equal / not zero */) goto loc_00002020;', out)
+        reasons = {(f, label, line): reason for f, _, label, line, reason in unfixed}
+        call_line = SOURCE.splitlines().index('    sub_00003000();') + 1
+        self.assertIn(('recomp_0000.c', 'loc_00002008', call_line + 2), reasons)
+        blocked = reasons[('recomp_0000.c', 'loc_00002008', call_line + 2)]
+        self.assertIn(f'blocked at recomp_0000.c:{call_line}: sub_00003000();', blocked)
+
+        # The jump whose label is outside the function is reported, not silently kept.
+        self.assertTrue(any('outside this function' in r for r in reasons.values()))
+        self.assertEqual(len(unfixed), 2)
+        self.assertEqual(sorted({f for f, *_ in unfixed}), ['recomp_0000.c'])
+
+    def test_reports_function_names(self):
+        _, unfixed, _ = self.run_pass(SOURCE)
+        funcs = sorted({func for _, func, *_ in unfixed})
+        self.assertEqual(funcs, ['sub_00002000', 'sub_00003000'])
+
+    def test_second_run_is_stable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'recomp_0000.c'
+            path.write_text(SOURCE)
+            fix_flag_joins(Path(tmp))
+            once = path.read_text()
+            fix_flag_joins(Path(tmp))
+            self.assertEqual(path.read_text(), once)
 
 
 if __name__ == '__main__':
-    unittest.main()
+    unittest.main(verbosity=2)
