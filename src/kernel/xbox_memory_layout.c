@@ -3730,15 +3730,7 @@ BOOL xbox_GetStackBounds(uint32_t address, uint32_t *low_out, uint32_t *high_out
  * the GPU-instance bridge, so the two do not meet until the window is full.
  * Freed blocks are reused in place. Unissued alignment and heap-skip gaps
  * remain available if the bump reaches the top of the window. */
-/* Starts one page in. Physical page 0 is never handed out by the real
- * kernel, and the XDK's USB stack relies on that: XPP carves its host
- * controller structures from a private 0xFE0-byte arena ending at
- * 0x80001000 (sub_00365454 in Burnout 3), with no allocation call at all.
- * Starting at the base gave that same page to the title's first
- * MmAllocateContiguousMemory -- XAPI's launch data page -- and whichever
- * wrote last won. The symptom was timing-dependent: enumeration worked
- * when logging slowed the title down and otherwise stopped in the root
- * port reset, walking a device whose parent pointer had been overwritten. */
+/* Keep physical page zero outside allocator-issued spans. */
 static uint32_t g_contig_next = XBOX_CONTIG_BASE + 0x1000u;
 
 /* The table is sorted by offset and covers every span ever handed out, in
@@ -3872,10 +3864,15 @@ static uint64_t heap_unowned_start(uint32_t lo, uint32_t size, uint32_t alignmen
     return candidate;
 }
 
-uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+uint32_t xbox_ContiguousAllocRange(uint32_t size, uint32_t alignment,
+                                    uint32_t low, uint32_t high)
 {
     uint32_t result, start;
-    const uint32_t limit = XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT;
+    uint32_t limit = XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT;
+    uint32_t floor = low < 0x1000u ? 0x1000u : low;
+    if (low > high) return 0;
+    if ((uint64_t)high + 1 < limit) limit = high + 1;
+    if (floor >= limit) return 0;
     LONG insertion;
 
     /* The kernel allocates physical pages, not byte-sized fragments. XDK
@@ -3890,20 +3887,16 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     if (alignment < 4096) alignment = 4096;
     if (alignment & (alignment - 1)) return 0;
     EnterCriticalSection(&g_allocator_lock);
-    /* Reuse freed pages first-fit by address, carving from the front of the
-     * lowest free extent that fits; freed neighbours are coalesced on free.
-     * Consecutive requests therefore come out adjacent, as they do from the
-     * kernel's page allocator. Titles can build large vertex
-     * buffers from consecutive 16 KB requests and addresses them as one span.
-     * Best-fit reuse of whole freed blocks scattered those requests, so after
-     * the first load the player car was drawn from 16 KB of mesh followed by
-     * someone else's textures. */
+    /* Reuse the lowest fitting free extent, splitting around the aligned
+     * requested interval. Free coalesces adjacent spans. */
     for (LONG i = 0; i < g_contig_alloc_count; ++i) {
         uint32_t offset = g_contig_allocs[i].offset;
         uint32_t span = g_contig_allocs[i].size;
         uint32_t head, tail;
         if (g_contig_allocs[i].in_use || span < size) continue;
-        if (!contig_heap_gap(offset, offset + span, size, alignment, &start))
+        uint32_t begin = offset > floor ? offset : floor;
+        uint32_t end = offset + span < limit ? offset + span : limit;
+        if (!contig_heap_gap(begin, end, size, alignment, &start))
             continue;
         head = start - offset;
         tail = offset + span - (start + size);
@@ -3932,18 +3925,22 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
      * contiguous storage, breaking audio DMA reads.
      * Keep freed heap addresses reserved too, since HeapAlloc reuses them. */
     insertion = g_contig_alloc_count;
-    if (!contig_heap_gap(g_contig_next - XBOX_CONTIG_BASE, limit,
-                         size, alignment, &start)) {
-        uint32_t lo = 0x1000u;
+    uint32_t next = g_contig_next - XBOX_CONTIG_BASE;
+    if (next < floor) next = floor;
+    if (!contig_heap_gap(next, limit, size, alignment, &start)) {
+        uint32_t lo = floor;
         /* Recover unissued holes without claiming alignment gaps for DMA.
          * Issued spans (even freed ones) keep their permanent backing and are
          * handled by the reuse pass above. */
         for (insertion = 0; insertion <= g_contig_alloc_count; ++insertion) {
             uint32_t hi = insertion < g_contig_alloc_count
                 ? g_contig_allocs[insertion].offset : limit;
+            if (hi > limit) hi = limit;
             if (contig_heap_gap(lo, hi, size, alignment, &start)) break;
-            if (insertion < g_contig_alloc_count)
-                lo = g_contig_allocs[insertion].offset + g_contig_allocs[insertion].size;
+            if (insertion < g_contig_alloc_count) {
+                uint32_t end = g_contig_allocs[insertion].offset + g_contig_allocs[insertion].size;
+                if (end > lo) lo = end;
+            }
         }
     }
     if (insertion > g_contig_alloc_count) {
@@ -3969,6 +3966,11 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
                 g_esp, *(const uint32_t *)((uintptr_t)g_esp + g_memory_offset));
     LeaveCriticalSection(&g_allocator_lock);
     return result;
+}
+
+uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+{
+    return xbox_ContiguousAllocRange(size, alignment, 0, UINT32_MAX);
 }
 
 /* How much of the window has been handed out.

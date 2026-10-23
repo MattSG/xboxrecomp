@@ -866,12 +866,6 @@ static void bridge_MmAllocateSystemMemory(void)
  * PVOID MmAllocateContiguousMemoryEx(SIZE_T size, ULONG_PTR low, ULONG_PTR high,
  *                                     ULONG alignment, ULONG protect)
  */
-/* Contiguous memory is addressed through the physical-memory mirror: physical
- * page P is visible at 0x80000000 + P. Titles that pin buffers at fixed
- * physical addresses check the returned pointer against that, so the address
- * has to be honoured rather than satisfied from the general heap. */
-#define XBOX_PHYSICAL_MIRROR_BASE 0x80000000u
-
 static void bridge_MmAllocateContiguousMemoryEx(void)
 {
     uint32_t size = STACK_ARG(0);
@@ -883,36 +877,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 
     (void)prot;
 
-    /*
-     * A caller that constrains the range to exactly one allocation's worth is
-     * demanding a specific physical address, not expressing a preference.
-     * Halo does this for its two big pools and asserts on the result
-     * (physical_memory_map.c:46) - XPhysicalAlloc passes lowest = the address
-     * it wants and highest = lowest + size - 1, then requires
-     * 0x80000000 | lowest back. Satisfying that from the heap fails the assert
-     * and leaves its whole memory map wrong.
-     */
-    if (low && high >= low && (high - low + 1) <= size + 0x1000) {
-        xbox_va = XBOX_PHYSICAL_MIRROR_BASE + low;
-
-        /* The console hands out zeroed pages here, and titles rely on it:
-         * pool headers and free-list roots are assumed clear, so whatever the
-         * backing view happened to contain shows up later as structures that
-         * are "allocated" but full of garbage. */
-        memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
-
-        if (KERNEL_LOG_ON_HALF()) {
-            fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
-                    "pinned phys 0x%08X -> Xbox VA 0x%08X (zeroed)\n",
-                    size, low, xbox_va);
-            fflush(stderr);
-        }
-        g_eax = xbox_va;
-        return;
-    }
-
-    if (align < 4096) align = 4096;
-    xbox_va = xbox_ContiguousAlloc(size, align);
+    xbox_va = xbox_ContiguousAllocRange(size, align, low, high);
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",

@@ -90,6 +90,10 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+/* Inclusive physical bounds; owns/zeros page-rounded allocation or returns 0.
+ * Same heap exclusion and lifetime as unconstrained allocations. */
+uint32_t xbox_ContiguousAllocRange(uint32_t size, uint32_t alignment,
+                                    uint32_t low, uint32_t high);
 int xbox_ContiguousFree(uint32_t xbox_va);              /* 0: not ours */
 uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va);
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size);

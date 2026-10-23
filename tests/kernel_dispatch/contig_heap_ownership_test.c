@@ -18,6 +18,9 @@ void *recomp_lookup_manual(ULONG address) { (void)address; abort(); }
     fprintf(stderr, "line %d: %s\n", __LINE__, #expr); exit(1); \
 } } while (0)
 
+extern void (*recomp_lookup_kernel(uint32_t address))(void);
+extern ptrdiff_t g_xbox_mem_offset;
+
 static uint8_t *guest_bytes(uint32_t address)
 {
     return (uint8_t *)((uintptr_t)address + g_memory_offset);
@@ -50,7 +53,7 @@ static void check_ownership(void)
         CHECK(!xbox_ContiguousRangeAllocated(g_heap_blocks[i].addr, 1));
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     const size_t reservation = (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
     uint8_t *arena = VirtualAlloc(NULL, reservation, MEM_RESERVE, PAGE_READWRITE);
@@ -71,6 +74,54 @@ int main(void)
     InitializeCriticalSection(&g_allocator_lock);
     g_allocator_lock_initialized = 1;
     SetEnvironmentVariableA("RECOMP_CONTIG_TRACE", NULL);
+
+    if (argc > 1 && !strcmp(argv[1], "bounded")) {
+        uint32_t exact = xbox_ContiguousAllocRange(0x2000, 4096, 0x10000, 0x11FFF);
+        CHECK(exact == XBOX_CONTIG_BASE + 0x10000);
+        CHECK(xbox_ContiguousBlockSize(exact) == 0x2000);
+        CHECK(!xbox_ContiguousAllocRange(0x1000, 4096, 0x10000, 0x11FFF));
+        CHECK(!xbox_ContiguousAllocRange(0x1000, 4096, 0x2000, 0x1000));
+        CHECK(!xbox_ContiguousAllocRange(0x1000, 0x3000, 0, UINT32_MAX));
+        CHECK(!xbox_ContiguousAllocRange(0x1001, 4096, 0x30000, 0x31FFE));
+        CHECK(!xbox_ContiguousAllocRange(0x1000, 4096, UINT32_MAX, UINT32_MAX));
+        uint32_t span = xbox_ContiguousAllocRange(0x10000, 4096, 0x20000, 0x2FFFF);
+        CHECK(span == XBOX_CONTIG_BASE + 0x20000);
+        CHECK(xbox_ContiguousFree(span));
+        memset(guest_bytes(span), 0x5A, 0x10000);
+        uint32_t middle = xbox_ContiguousAllocRange(0x2000, 4096, 0x24000, 0x25FFF);
+        CHECK(middle == span + 0x4000);
+        expect_bytes(middle, 0x2000, 0);
+        expect_bytes(span, 0x4000, 0x5A);
+        expect_bytes(span + 0x6000, 0xA000, 0x5A);
+        heap = xbox_HeapAlloc(0x2000, 4096);
+        CHECK(heap);
+        CHECK(!xbox_ContiguousAllocRange(0x1000, 4096, heap, heap + 0x1FFF));
+        /* Exercise the actual guest bridge, including the former pinned path. */
+        g_xbox_mem_offset = g_memory_offset;
+        CHECK(xbox_ConfigureKernelData(0x740000));
+        uint32_t *imports = (uint32_t *)guest_bytes(XBOX_STACK_BASE + 0x100);
+        imports[0] = 0x80000000u | 166;
+        xbox_kernel_set_thunk_address(XBOX_STACK_BASE + 0x100, 1);
+        xbox_kernel_bridge_init();
+        void (*allocate)(void) = recomp_lookup_kernel(imports[0]);
+        CHECK(allocate);
+        g_esp = XBOX_STACK_BASE + 0x200;
+        uint32_t *args = (uint32_t *)guest_bytes(g_esp);
+        args[0] = 0; args[1] = 0x2000; args[2] = 0x10000;
+        args[3] = 0x11FFF; args[4] = 4096; args[5] = PAGE_READWRITE;
+        allocate();
+        CHECK(g_eax == 0); /* Already-owned exact range cannot be issued twice. */
+        g_esp = XBOX_STACK_BASE + 0x200;
+        args[2] = 0x40000; args[3] = 0x41FFF;
+        allocate();
+        CHECK(g_eax == XBOX_CONTIG_BASE + 0x40000);
+        CHECK(xbox_ContiguousBlockSize(g_eax) == 0x2000);
+        check_ownership();
+        puts("bounded contiguous ownership passed");
+        DeleteCriticalSection(&g_allocator_lock);
+        CHECK(VirtualFree(arena, 0, MEM_RELEASE));
+        return 0;
+    }
 
     heap = xbox_HeapAlloc(0x2000, 4096);
     CHECK(heap == XBOX_HEAP_BASE);
