@@ -540,6 +540,8 @@ RECOMP_XMM_BITWISE(XMM_ANDN, (~a.u[i]) & b.u[i])
 RECOMP_XMM_BITWISE(XMM_CMP_EQ,  (a.f[i] == b.f[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_LT,  (a.f[i] <  b.f[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_LE,  (a.f[i] <= b.f[i]) ? 0xFFFFFFFFu : 0u)
+/* PCMPGTD: signed dword greater-than, dst = (dst > src). */
+RECOMP_XMM_BITWISE(XMM_PCMPGTD, ((int32_t)a.u[i] > (int32_t)b.u[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_NEQ, (a.f[i] == b.f[i]) ? 0u : 0xFFFFFFFFu)
 
 /* The full SSE compare predicate set, by CMPPS/CMPSS immediate:

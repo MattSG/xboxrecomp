@@ -3448,6 +3448,10 @@ class Lifter:
                     return lifted
             return self._unimplemented(insn, m)
         if m == "pcmpgtd":
+            if nops >= 2 and _is_xmm(ops[0]):
+                lifted = _packed_binary("XMM_PCMPGTD")
+                if lifted is not None:
+                    return lifted
             return self._unimplemented(insn, m)
 
         # ── Shuffle/unpack ──
@@ -3511,6 +3515,10 @@ class Lifter:
 
     def _lift_fpu(self, insn, m, ops):
         """Basic FPU instruction translation using double locals."""
+        # x87 exception flags are not modelled, so clearing them and the
+        # no-op form change nothing here. Everything else falls through.
+        if m in ("fnclex", "fclex", "fnop"):
+            return [f"/* {m}: x87 exception flags are not modelled */"]
         # FPU is complex. We translate common patterns to double operations.
         # Full accuracy would require an x87 stack emulator.
 
