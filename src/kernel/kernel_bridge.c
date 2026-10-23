@@ -4495,40 +4495,13 @@ static void bridge_IoCreateSymbolicLink(void)
 /* ── ObReferenceObjectByHandle (ordinal 246) ─────────────── */
 static void bridge_ObReferenceObjectByHandle(void)
 {
-    /* Xbox: NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, PVOID ObjectType, PVOID* Object)
-     * 3 args (not 6 like Windows NT) */
-    static uint32_t thread_object;
-    uint32_t handle = STACK_ARG(0);
-    uint32_t obj_type = STACK_ARG(1);
-    uint32_t object_ptr = STACK_ARG(2);
-
-    if (!object_ptr) {
-        g_eax = 0xC000000Du;                 /* STATUS_INVALID_PARAMETER */
-    } else if (!handle || handle == UINT32_MAX) {
-        BRIDGE_MEM32(object_ptr) = 0;
-        g_eax = 0xC0000008u;                 /* STATUS_INVALID_HANDLE */
-    } else if (obj_type == XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE) {
-        /* A thread handle is a host token, not a guest KTHREAD, and titles
-         * read the object: a worker's ExitStatus can be polled
-         * (+0x120) until it leaves STATUS_PENDING. Hand out one zeroed guest
-         * thread object, signalled (+4) and finished (ExitStatus 0).
-         * ponytail: every thread reads as exited; track per-handle objects
-         * if a title polls a thread that is still meant to be running. */
-        if (!thread_object) {
-            thread_object = xbox_HeapAlloc(0x124u, 16u);
-            if (thread_object) {
-                memset(XBOX_TO_NATIVE(thread_object), 0, 0x124u);
-                BRIDGE_MEM32(thread_object + 4u) = 1;
-            }
-        }
-        BRIDGE_MEM32(object_ptr) = thread_object;
-        g_eax = thread_object ? 0 : 0xC0000017u;    /* STATUS_NO_MEMORY */
-    } else {
-        /* Other objects: the guest token itself, which is what the bridge's
-         * object calls take. NULL turned success into a null dereference. */
-        BRIDGE_MEM32(object_ptr) = handle;
-        g_eax = 0;                           /* STATUS_SUCCESS */
+    uint32_t handle=STACK_ARG(0), output=STACK_ARG(2);
+    if (!bridge_buf_ok(output,4,1,"ObReferenceObjectByHandle.Object")) {
+        g_eax=STATUS_INVALID_PARAMETER;
+        return;
     }
+    BRIDGE_MEM32(output)=0;
+    g_eax=(!handle || handle==UINT32_MAX)?STATUS_INVALID_HANDLE:STATUS_NOT_SUPPORTED;
 }
 
 /* ── RtlRaiseException (ordinal 302) ─────────────────────
@@ -10675,6 +10648,17 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     }
 }
 
+/* Startup policy, retained until explicitly changed while execution is quiesced. */
+static bridge_func_t g_bridge_overrides[XBOX_KERNEL_THUNK_TABLE_SIZE];
+int xbox_kernel_set_bridge_override(ULONG ordinal, void (*callback)(void))
+{
+    if (!ordinal || ordinal>=XBOX_KERNEL_THUNK_TABLE_SIZE ||
+        !bridge_for_ordinal(ordinal)) return -1;
+    g_bridge_overrides[ordinal]=callback;
+    return 0;
+}
+
+
 /* ── Per-slot bridge functions (resolved at init) ────────── */
 
 static bridge_func_t g_slot_bridges[XBOX_KERNEL_THUNK_TABLE_SIZE];
@@ -11046,7 +11030,8 @@ void xbox_kernel_bridge_init(void)
             }
 
             /* FUNCTION export: use synthetic VA for dispatch */
-            g_slot_bridges[i] = bridge_for_ordinal(ordinal);
+            g_slot_bridges[i] = ordinal<XBOX_KERNEL_THUNK_TABLE_SIZE && g_bridge_overrides[ordinal]
+                ? g_bridge_overrides[ordinal] : bridge_for_ordinal(ordinal);
             { int _n = stdcall_args_for_ordinal(ordinal);
               g_slot_arg_unknown[i] = (uint8_t)(_n < 0);
               g_slot_arg_bytes[i] = (_n < 0) ? 0 : _n; }

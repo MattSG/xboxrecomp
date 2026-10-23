@@ -121,3 +121,15 @@ supplied start routine receives one context. Missing or unresolved entries
 report failure with no execution or fake handle. Existing custom-system cases
 retain the two-context contract. Guest suspension/ID and broader object/native
 semantics still need their own work.
+
+
+## Port-supplied function bridges
+
+`bridge-override` exercises canonical selection after one ordinal remap,
+replacement/clearing, rejected invalid/data IDs, unchanged native resolution,
+original stdcall argument cleanup and fastcall register arguments. Callbacks
+receive ESP after the dispatcher consumes the guest return-address slot.
+`object-reference-default` checks that unsupported object references report an
+error with a cleared output, reject invalid handles and validate the output span.
+No shared guest KTHREAD is fabricated. Live object identity/type/lifetime and
+per-handle thread state still require a real implementation or port policy.

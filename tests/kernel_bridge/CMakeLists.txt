@@ -53,3 +53,8 @@ foreach(mode missing-entry unknown-entry)
     add_test(NAME kernel_thread_254_${mode} COMMAND kernel_bridge_test thread-254-${mode})
     set_tests_properties(kernel_thread_254_${mode} PROPERTIES TIMEOUT 10)
 endforeach()
+
+foreach(mode object-reference-default bridge-override)
+    add_test(NAME kernel_${mode} COMMAND kernel_bridge_test ${mode})
+    set_tests_properties(kernel_${mode} PROPERTIES TIMEOUT 10)
+endforeach()
