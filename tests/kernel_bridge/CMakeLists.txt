@@ -60,3 +60,5 @@ foreach(mode object-reference-default bridge-override)
 endforeach()
 
 add_test(NAME kernel_irp_packet_boundary COMMAND kernel_bridge_test irp-packet-boundary)
+
+add_test(NAME kernel_volume_buffer_boundary COMMAND kernel_bridge_test volume-buffer-boundary)

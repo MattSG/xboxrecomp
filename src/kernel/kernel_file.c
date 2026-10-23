@@ -70,17 +70,9 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return ObjectAttributes->ObjectName->Buffer;
 }
 
-/* Xbox volume geometry.
- *
- * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
- * not cosmetic. A title's CRT startup asks for FileFsSizeInformation and
- * multiplies SectorsPerAllocationUnit by BytesPerSector, then *requires* the
- * product to equal the cluster size it was built for. Half-Life 2 checks for
- * 0x4000 and returns STATUS_DEVICE_NOT_READY (0xC000014F) otherwise, which
- * aborts CRT init before main ever runs -- the process then exits cleanly,
- * which reads as a title that did nothing rather than one that failed.
- *
- * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
+/* Default emulated volume geometry: 512-byte sectors and 16 KB clusters.
+ * Host capacity is expressed in these allocation units; this is not a claim
+ * that every Xbox device or FATX volume has the same geometry. */
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
@@ -848,12 +840,17 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)FileHandle;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
         case XboxFileFsSizeInformation: {
+            if (Length < sizeof(XBOX_FILE_FS_SIZE_INFORMATION)) {
+                IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+                IoStatusBlock->Information = 0;
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
@@ -1599,12 +1596,17 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)Length;
+
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
         case XboxFileFsSizeInformation: {
+            if (Length < sizeof(XBOX_FILE_FS_SIZE_INFORMATION)) {
+                IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+                IoStatusBlock->Information = 0;
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
