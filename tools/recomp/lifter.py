@@ -1772,7 +1772,7 @@ class Lifter:
     # ── MOV family ──
 
     def _lift_mov(self, insn, ops):
-        if nops := len(ops) < 2:
+        if len(ops) < 2:
             return [f"/* mov: bad operands */"]
         src = _fmt_operand_read(ops[1])
         out = [_fmt_operand_write(ops[0], src)]

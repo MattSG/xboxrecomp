@@ -5,9 +5,9 @@ Usage:
     py -3 -m tools.disasm <path_to_xbe> [options]
 
 Examples:
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" --text-only --stats-only -v
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" --text-only
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" -o output/
+    py -3 -m tools.disasm "game_files/default.xbe" --text-only --stats-only -v
+    py -3 -m tools.disasm "game_files/default.xbe" --text-only
+    py -3 -m tools.disasm "game_files/default.xbe" -o output/
 """
 
 import argparse
@@ -42,7 +42,7 @@ def main():
     parser.add_argument(
         "--text-only",
         action="store_true",
-        help="Only disassemble the .text section (faster, ~2.73 MB)",
+        help="Only disassemble the .text section (faster)",
     )
     parser.add_argument(
         "--stats-only",
