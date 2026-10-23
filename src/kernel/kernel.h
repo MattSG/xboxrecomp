@@ -844,7 +844,10 @@ extern volatile ULONG xbox_KeTickCount;
 extern XBOX_HARDWARE_INFO      xbox_HardwareInfo;
 extern XBOX_KRNL_VERSION       xbox_KrnlVersion;
 
-/* Override the reported kernel version (ordinal 324). */
+/* Port-owned identity/credential exports. Configure before initialization,
+ * while quiesced; bridge initialization copies the current values to guest
+ * storage. Zero defaults mean unconfigured, not a verified console identity.
+ * Reported version does not change canonical ordinal numbering or emulation. */
 void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qfe);
 extern UCHAR                   xbox_EEPROMKey[16];
 extern UCHAR                   xbox_HDKey[16];

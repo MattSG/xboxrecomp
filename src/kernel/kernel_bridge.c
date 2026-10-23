@@ -278,25 +278,12 @@ static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
  */
 static void kernel_data_init(void)
 {
-    /* XboxHardwareInfo (ordinal 322) - XBOX_HARDWARE_INFO
-     *   +0: ULONG Flags (0 = retail, 0x20 = devkit)
-     *   +4: UCHAR GpuRevision
-     *   +5: UCHAR McpRevision
-     */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 0) = 0;   /* Retail */
-    BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 4) = 0xA1; /* NV2A A1 */
-    BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 5) = 0xB1; /* MCPX B1 */
-
-    /* XboxKrnlVersion (ordinal 324) - XBOX_KRNL_VERSION
-     *   +0: USHORT Major (1)
-     *   +2: USHORT Minor (0)
-     *   +4: USHORT Build (5849 = XDK version)
-     *   +6: USHORT Qfe (0)
-     */
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 0) = 1;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 2) = 0;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) = 5849;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 0;
+    /* Native and guest exports share port-owned identity policy. Neither the
+     * bridge nor the runtime guesses an SDK/console identity from the title. */
+    memcpy(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO),
+           &xbox_HardwareInfo, sizeof(xbox_HardwareInfo));
+    memcpy(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION),
+           &xbox_KrnlVersion, sizeof(xbox_KrnlVersion));
 
     /* KeTickCount (ordinal 156) - initialized to current tick count.
      * A background thread in main.c updates this every ~1ms. */
@@ -359,31 +346,17 @@ static void kernel_data_init(void)
     /* IoDeviceObjectType (ordinal 71) - type object (stub: 0) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE) = 0;
 
-    /* XboxHDKey (323), XboxSignatureKey (325), XboxLANKey (326, 355): zeros,
-     * or a console's own from RECOMP_XBOX_HDKEY / _SIGKEY / _LANKEY (32 hex
-     * digits each). A real kernel decrypts them from the EEPROM; Xbox Live
-     * accounts are bound to the HD key, so an account made on another
-     * console (or xemu) signs in only with that console's key. */
-    {
-        static const struct { uint32_t off; const char *env; } k[] = {
-            { KDATA_HD_KEY, "RECOMP_XBOX_HDKEY" },
-            { KDATA_SIGNATURE_KEY, "RECOMP_XBOX_SIGKEY" },
-            { KDATA_LAN_KEY, "RECOMP_XBOX_LANKEY" },
-        };
-        for (int i = 0; i < 3; i++) {
-            uint8_t *p = (uint8_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + k[i].off) + g_xbox_mem_offset);
-            const char *v = getenv(k[i].env);
-            memset(p, 0, 16);
-            for (int b = 0; v && b < 16 && sscanf(v + 2 * b, "%2hhx", &p[b]) == 1; b++)
-                ;
-        }
-    }
-
-    /* XboxAlternateSignatureKeys (ordinals 327, 356) - 256 bytes of zeros */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), 0, 256);
-
-    /* XePublicKeyData (ordinal 357) - 284 bytes of zeros */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY) + g_xbox_mem_offset), 0, 284);
+    /* Credentials are caller-supplied export bytes, not environment policy. */
+    memcpy(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY),
+           xbox_HDKey, sizeof(xbox_HDKey));
+    memcpy(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY),
+           xbox_SignatureKey, sizeof(xbox_SignatureKey));
+    memcpy(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY),
+           xbox_LANKey, sizeof(xbox_LANKey));
+    memcpy(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS),
+           xbox_AlternateSignatureKeys, sizeof(xbox_AlternateSignatureKeys));
+    memcpy(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY),
+           xbox_XePublicKeyData, sizeof(xbox_XePublicKeyData));
 
     /* HAL disk identity strings (ordinals 41/42). The exported symbol is an
      * XBOX_ANSI_STRING whose Buffer must be an Xbox VA the title can deref --

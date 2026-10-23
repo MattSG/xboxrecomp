@@ -91,6 +91,52 @@ int main(int argc, char **argv)
         CHECK(xbox_HeapAlloc(4096,4096) >= XBOX_WORKER_STACK_END);
         xbox_kernel_shutdown();
     }
+    if (!strcmp(mode,"kernel-identity") || !strcmp(mode,"kernel-identity-default")) {
+        int defaults=!strcmp(mode,"kernel-identity-default");
+        CHECK(sizeof(xbox_HardwareInfo)==8 && sizeof(xbox_KrnlVersion)==8);
+        if (defaults) {
+            XBOX_HARDWARE_INFO empty_hardware={0}; XBOX_KRNL_VERSION empty_version={0};
+            uint8_t zero[284]={0};
+            CHECK(!memcmp(&xbox_HardwareInfo,&empty_hardware,8));
+            CHECK(!memcmp(&xbox_KrnlVersion,&empty_version,8));
+            CHECK(!memcmp(xbox_HDKey,zero,16) && !memcmp(xbox_SignatureKey,zero,16) && !memcmp(xbox_LANKey,zero,16));
+            CHECK(!memcmp(xbox_AlternateSignatureKeys,zero,256) && !memcmp(xbox_XePublicKeyData,zero,284));
+        } else {
+        memset(&xbox_HardwareInfo,0xA5,sizeof(xbox_HardwareInfo));
+        xbox_kernel_set_version(9,8,765,4);
+        for (unsigned i=0;i<16;i++) {
+            xbox_HDKey[i]=(UCHAR)(i+1);
+            xbox_SignatureKey[i]=(UCHAR)(i+33);
+            xbox_LANKey[i]=(UCHAR)(i+65);
+        }
+        memset(xbox_AlternateSignatureKeys,0xC3,sizeof(xbox_AlternateSignatureKeys));
+        memset(xbox_XePublicKeyData,0xD4,sizeof(xbox_XePublicKeyData));
+        }
+#if defined(_WIN32)
+        _putenv_s("RECOMP_XBOX_HDKEY","ffffffffffffffffffffffffffffffff");
+#else
+        setenv("RECOMP_XBOX_HDKEY","ffffffffffffffffffffffffffffffff",1);
+#endif
+        *word(table_va)=0x80000142u; /* XboxHardwareInfo ordinal322 */
+        xbox_kernel_init();
+        CHECK(xbox_resolve_ordinal(322)==(ULONG_PTR)&xbox_HardwareInfo);
+        CHECK(xbox_resolve_ordinal(324)==(ULONG_PTR)&xbox_KrnlVersion);
+        CHECK(xbox_resolve_ordinal(323)==(ULONG_PTR)xbox_HDKey);
+        CHECK(xbox_resolve_ordinal(325)==(ULONG_PTR)xbox_SignatureKey);
+        CHECK(xbox_resolve_ordinal(353)==(ULONG_PTR)xbox_LANKey);
+        CHECK(xbox_resolve_ordinal(354)==(ULONG_PTR)xbox_AlternateSignatureKeys);
+        CHECK(xbox_resolve_ordinal(355)==(ULONG_PTR)xbox_XePublicKeyData);
+        xbox_kernel_bridge_init();
+        CHECK(*word(table_va)==XBOX_KERNEL_DATA_BASE+KDATA_HARDWARE_INFO);
+        CHECK(!memcmp(word(XBOX_KERNEL_DATA_BASE+KDATA_HARDWARE_INFO),&xbox_HardwareInfo,8));
+        CHECK(!memcmp(word(XBOX_KERNEL_DATA_BASE+KDATA_KRNL_VERSION),&xbox_KrnlVersion,8));
+        CHECK(!memcmp(word(XBOX_KERNEL_DATA_BASE+KDATA_HD_KEY),xbox_HDKey,16));
+        CHECK(!memcmp(word(XBOX_KERNEL_DATA_BASE+KDATA_SIGNATURE_KEY),xbox_SignatureKey,16));
+        CHECK(!memcmp(word(XBOX_KERNEL_DATA_BASE+KDATA_LAN_KEY),xbox_LANKey,16));
+        CHECK(!memcmp(word(XBOX_KERNEL_DATA_BASE+KDATA_ALT_SIGNATURE_KEYS),xbox_AlternateSignatureKeys,256));
+        CHECK(!memcmp(word(XBOX_KERNEL_DATA_BASE+KDATA_XE_PUBLIC_KEY),xbox_XePublicKeyData,284));
+        xbox_kernel_shutdown();
+    }
     if (!strcmp(mode,"launch-page") || !strcmp(mode,"no-launch-page")) {
         XBOX_LAUNCH_DATA_PAGE page;
         int supplied = !strcmp(mode,"launch-page");
