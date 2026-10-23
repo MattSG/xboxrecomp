@@ -997,6 +997,8 @@ extern ULONG            xbox_HalDiskCachePartitionCount;
 extern XBOX_ANSI_STRING xbox_HalDiskModelNumber;
 extern XBOX_ANSI_STRING xbox_HalDiskSerialNumber;
 extern ULONG            xbox_HalBootSMCVideoMode;
+/* Native host-owned channel, NULL until supplied. No native IDE implementation
+ * or host-to-guest object marshaling is implied; guest bridge storage is separate. */
 extern PVOID            xbox_IdexChannelObject;
 
 /* EEPROM / Non-Volatile Settings */

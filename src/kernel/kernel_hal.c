@@ -1088,12 +1088,11 @@ XBOX_ANSI_STRING xbox_HalDiskSerialNumber = {0};
  */
 ULONG xbox_HalBootSMCVideoMode = 0;
 
-/*
- * IDE channel object. Real kernels export a device object for the ATA channel;
- * drivers only ever pass it back to us, so identity is all that is required.
- */
-static ULONG g_idex_channel_data = 0x49444558; /* 'IDEX' */
-PVOID xbox_IdexChannelObject = &g_idex_channel_data;
+/* Native embeddings may supply an IDE channel object before kernel init.
+ * No native IDE channel implementation exists here; a non-NULL scalar marker
+ * cannot stand in for the structure. Guest exports use separate fixed-width
+ * storage initialized by kernel_data_init, not this host pointer. */
+PVOID xbox_IdexChannelObject = NULL;
 
 /* ============================================================================
  * Shutdown Notification
