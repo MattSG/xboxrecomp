@@ -318,6 +318,19 @@ static VOID __stdcall native_system(PXBOX_START_ROUTINE start,PVOID context)
     InterlockedIncrement(&native_system_calls);
     start(context);
 }
+static unsigned override_calls;
+static void test_bridge_override(void)
+{
+    uint32_t *sp=(uint32_t *)(g_guest_mem+g_esp);
+    override_calls++;
+    *(uint32_t *)(g_guest_mem+sp[2])=sp[0]^sp[1];
+    g_eax=0x1234;
+}
+static void test_bridge_override_replacement(void)
+{
+    test_bridge_override(); g_eax=0x5678;
+}
+static void test_fast_bridge_override(void) { g_eax=g_ecx^g_edx; }
 static void firmware_observer(ULONG routine)
 {
     fprintf(stderr,"FIRMWARE_HOOK=%u\n",(unsigned)routine);
@@ -489,6 +502,60 @@ int main(int argc, char **argv)
     if (!mem) {
         printf("\n%d failure(s); the rest needs guest memory.\n", failures);
         return 1;
+    }
+
+    if (argc==2 && !strcmp(argv[1],"bridge-override")) {
+        static unsigned short map[512]; map[511]=246; map[246]=173;
+        xbox_kernel_set_ordinal_remap(map,512);
+        uint32_t args[3]={37,0x13579BDF,0x42000};
+        check(xbox_kernel_set_bridge_override(246,test_bridge_override)==0,"register canonical function override",NULL);
+        for (unsigned round=0;round<3;round++) {
+            if (round==1) check(xbox_kernel_set_bridge_override(246,test_bridge_override_replacement)==0,"replace override",NULL);
+            if (round==2) check(xbox_kernel_set_bridge_override(246,NULL)==0,"clear override",NULL);
+            check(xbox_kernel_set_bridge_override(0,test_bridge_override)==-1 &&
+                  xbox_kernel_set_bridge_override(16,test_bridge_override)==-1 &&
+                  xbox_kernel_set_bridge_override(XBOX_KERNEL_THUNK_TABLE_SIZE,test_bridge_override)==-1 &&
+                  xbox_kernel_set_bridge_override(UINT32_MAX,test_bridge_override)==-1,
+                  "invalid/data ordinals reject without replacing valid policy",NULL);
+            *(uint32_t *)(mem+THUNK_VA)=0x80000000u|511;
+            xbox_kernel_set_thunk_address(THUNK_VA,1); xbox_kernel_init(); xbox_kernel_bridge_init();
+            uint32_t result=call_slot(mem,THUNK_VA,3,args);
+            check(g_esp==SCRATCH_SP+16,"override uses original argument cleanup exactly once",NULL);
+            check(result==(round==0?0x1234u:round==1?0x5678u:(uint32_t)STATUS_NOT_SUPPORTED),"canonical remap selects replacement or restored default",NULL);
+            check(*(uint32_t *)(mem+args[2])==(round<2?(args[0]^args[1]):0),"callback receives original guest arguments",NULL);
+            check(xbox_resolve_ordinal(246)==(ULONG_PTR)xbox_ObReferenceObjectByHandle,"guest override leaves native lookup unchanged",NULL);
+            xbox_kernel_shutdown();
+        }
+        check(override_calls==2,"only installed callbacks execute",NULL);
+        check(xbox_kernel_set_bridge_override(160,test_fast_bridge_override)==0,"register fastcall bridge override",NULL);
+        *(uint32_t *)(mem+THUNK_VA)=0x80000000u|160;
+        xbox_kernel_set_thunk_address(THUNK_VA,1); xbox_kernel_init(); xbox_kernel_bridge_init();
+        check(call_fast_slot(mem,THUNK_VA,0x11223344,0x55667788)==0x444444CC &&
+              g_esp==SCRATCH_SP,"fastcall override receives register args with no stack cleanup",NULL);
+        xbox_kernel_set_bridge_override(160,NULL); xbox_kernel_shutdown();
+        xbox_kernel_set_ordinal_remap(NULL,0); xbox_MemoryLayoutShutdown(); return failures?1:0;
+    }
+
+    if (argc==2 && !strcmp(argv[1],"object-reference-default")) {
+        *(uint32_t *)(mem+THUNK_VA)=0x80000000u|246;
+        xbox_kernel_set_thunk_address(THUNK_VA,1); xbox_kernel_init(); xbox_kernel_bridge_init();
+        uint32_t args[3]={37,XBOX_KERNEL_DATA_BASE+KDATA_THREAD_OBJ_TYPE,0x42000};
+        *(uint32_t *)(mem+args[2])=0xDEADBEEF;
+        uint32_t status=call_slot(mem,THUNK_VA,3,args);
+        check(status==STATUS_NOT_SUPPORTED && !*(uint32_t *)(mem+args[2]),
+              "shared default never fabricates an exited thread object",NULL);
+        check(g_esp==SCRATCH_SP+16,"object reference keeps guest stdcall cleanup",NULL);
+        args[0]=0;
+        check(call_slot(mem,THUNK_VA,3,args)==(uint32_t)STATUS_INVALID_HANDLE && !*(uint32_t *)(mem+args[2]),
+              "invalid reference handle clears output",NULL);
+        args[0]=37; args[1]=0;
+        check(call_slot(mem,THUNK_VA,3,args)==(uint32_t)STATUS_NOT_SUPPORTED && !*(uint32_t *)(mem+args[2]),
+              "untyped references do not fabricate object pointers",NULL);
+        args[2]=(uint32_t)xbox_GetMappedSize()-2;
+        check(call_slot(mem,THUNK_VA,3,args)==(uint32_t)STATUS_INVALID_PARAMETER,
+              "truncated reference output is rejected before host write",NULL);
+
+        xbox_kernel_shutdown(); xbox_MemoryLayoutShutdown(); return failures?1:0;
     }
 
     if (argc==2 && !strncmp(argv[1],"unwind-",7)) {

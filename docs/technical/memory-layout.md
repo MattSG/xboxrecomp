@@ -182,3 +182,23 @@ loading and moving gameplay. Mapping success alone does not establish fidelity.
 See [runtime setup](../pipeline/05-runtime.md) and
 [D3D8LTCG investigation](d3d8ltcg-device-context.md) for the adjacent integration
 and state-recovery workflows.
+
+
+## Port-supplied kernel function bridges
+
+`xbox_kernel_set_bridge_override(canonical_ordinal, callback)` installs an
+optional host callback for a supported function route at the next bridge
+initialization. Invalid, data and unrouted IDs fail without changing policy.
+NULL restores the shared route. Configure while guest execution is quiesced;
+policy persists until changed, independently of the current memory generation.
+Ordinal remapping is applied once before selection. Native resolution and data
+exports are unaffected.
+
+A callback uses the shared thread-local guest register declarations. ESP points
+to argument 0 after consumption of the return-address slot; fastcall arguments
+remain in guest registers. Validate guest buffers and leave ESP at callback
+entry value on normal return. The dispatcher applies the export's existing
+argument cleanup. This replaces semantics, not the ABI. Any port-owned guest
+object/cache must be reset with its memory generation. The default guest
+ObReferenceObjectByHandle reports unsupported references rather than returning
+fabricated live objects; typed object identity and references remain incomplete.

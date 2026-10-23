@@ -518,6 +518,18 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
+/* Optional port replacement for a supported canonical function bridge.
+ * Configure before bridge initialization while guest execution is quiesced.
+ * Returns 0, or -1 for invalid/data/unrouted ordinals without changing policy.
+ * NULL restores the shared route on the next initialization. Policy persists
+ * across memory generations until changed. Native resolution is unaffected.
+ * The host callback reads/writes shared guest registers/memory; it owns pointer
+ * validation and semantics. ESP points to argument 0 (return slot already
+ * consumed), or register arguments retain their fastcall locations. Leave ESP
+ * at callback entry value on normal return: the
+ * dispatcher applies the original export's ABI cleanup exactly once. */
+int xbox_kernel_set_bridge_override(ULONG ordinal, void (*callback)(void));
+
 
 /* Authorize inline Type 0/1, Size 4 KEVENT handling only at these guest kernel
  * return PCs. Register both setter and wait sites before starting guest code;
