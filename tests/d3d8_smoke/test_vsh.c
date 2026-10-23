@@ -53,6 +53,8 @@ static int hlsl_for_const(uint32_t const_idx, char *hlsl, int size)
 static void test_consts(void)
 {
     char hlsl[8192];
+    for (unsigned dimensions = 0; dimensions < 65536; dimensions++)
+        CHECK(!d3d8_vsh_is_programmable(D3DFVF_XYZ | D3DFVF_TEX4 | (dimensions << 16)));
     const float values[4] = {1, 2, 3, 4};
     memset(&g_vsh_constants, 0, sizeof g_vsh_constants);
     g_vsh_constants_dirty = FALSE;
@@ -149,6 +151,14 @@ static void test_wire(void)
     CHECK(d3d8_vsh_create_shader(wire,1,&handle)==E_NOTIMPL && handle==0xBAADu);
     make_const_mov(wire,191);
     CHECK(d3d8_vsh_create_shader(wire,1,&handle)==S_OK && handle>=0x10000u);
+    CHECK(d3d8_vsh_is_programmable(handle));
+    DWORD second=0;
+    CHECK(d3d8_vsh_create_shader(wire,1,&second)==S_OK && second!=handle);
+    CHECK(d3d8_vsh_is_programmable(second));
+    CHECK(d3d8_vsh_delete_shader(D3DFVF_XYZ | D3DFVF_TEX1 | D3DFVF_TEXCOORDSIZE1)==E_INVALIDARG);
+    CHECK(d3d8_vsh_delete_shader(1)==E_INVALIDARG);
+    CHECK(d3d8_vsh_delete_shader(0xFFFFFFFFu)==E_INVALIDARG);
+    CHECK(d3d8_vsh_delete_shader(second)==S_OK);
     CHECK(d3d8_vsh_delete_shader(handle)==S_OK);
 }
 

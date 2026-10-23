@@ -299,7 +299,7 @@ void d3d8_vsh_shutdown(void);
  *
  * @param microcode   Pointer to the 128-bit instruction array (4 DWORDs each)
  * @param num_insns   Number of instructions
- * @param out_handle  Receives the shader handle (>= 0x10000 to distinguish from FVF)
+ * @param out_handle  Receives an opaque host shader handle (bit 0 tagged)
  * @return S_OK on success; E_NOTIMPL for unsupported draw/state encodings.
  * The output handle is unchanged on failure.
  */
@@ -327,7 +327,8 @@ void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
  * Check if a shader handle refers to a programmable vertex shader
  * (as opposed to an FVF code).
  *
- * On Xbox, handles > 0xFFFF are shader handles.
+ * Host handles use reserved FVF bit 0; upper FVF bits encode texcoord sizes.
+ * This does not classify guest Xbox shader handles.
  */
 BOOL d3d8_vsh_is_programmable(DWORD handle);
 

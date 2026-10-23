@@ -1180,9 +1180,9 @@ HRESULT d3d8_vsh_create_shader(const DWORD *microcode, int num_insns,
     g_vsh_slots[slot].in_use = 1;
     g_vsh_slot_count++;
 
-    /* Generate handle: slot index + 0x10000 to distinguish from FVF codes.
-     * Xbox D3D8 uses handles with the high bit set (> 0xFFFF). */
-    *out_handle = (DWORD)(slot + 0x10000);
+    /* Host handles use bit 0, which is reserved in fixed-function FVFs.
+     * These opaque values are not guest Xbox shader handles. */
+    *out_handle = 0x10001u + 2u * (DWORD)slot;
 
     fprintf(stderr, "D3D8 VSH: Created shader handle 0x%lX (%d instructions)\n",
             *out_handle, num_insns);
@@ -1197,7 +1197,7 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle)
     if (!d3d8_vsh_is_programmable(handle))
         return E_INVALIDARG;
 
-    slot = (int)(handle - 0x10000);
+    slot = (int)((handle - 0x10001u) / 2u);
     if (slot < 0 || slot >= NV2A_VS_MAX_SLOTS)
         return E_INVALIDARG;
 
@@ -1233,7 +1233,7 @@ void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
 
 BOOL d3d8_vsh_is_programmable(DWORD handle)
 {
-    return (handle >= 0x10000) ? TRUE : FALSE;
+    return (handle & 1u) ? TRUE : FALSE;
 }
 
 BOOL d3d8_vsh_prepare_draw(DWORD handle)
@@ -1254,7 +1254,7 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     if (!ctx) return FALSE;
 
     /* Resolve handle to shader slot */
-    slot = (int)(handle - 0x10000);
+    slot = (int)((handle - 0x10001u) / 2u);
     if (slot < 0 || slot >= NV2A_VS_MAX_SLOTS)
         return FALSE;
 
