@@ -1,19 +1,15 @@
-"""Port RenderWare function names from a PE .exe donor (with matching MAP) onto
-a target XBE by byte-matching the statically-linked RenderWare library code.
+"""Match RenderWare public names from a PE/MAP donor onto an XBE.
 
-Unlike XDK libraries (own sections: D3D, DSOUND...), RenderWare is linked into
-.text mixed with game code, so we match within .text and keep only names that
-land on a detected function start in the target. Donor is the .exe because
-Xyanide's XBE is a different build from its MAP; the .exe matches the MAP and
-its .text bytes are what imagebld would copy into an XBE.
+Usage: python -m tools.symbols.rw_port donor.exe donor.map target.xbe
+       target_analysis.json target_functions.json names.json
 
-IMPORTANT -- the donor and target must use the SAME RenderWare version.
-Microsoft's XDK libraries are byte-stable across versions, so map_names.py port
-works across XDK versions; RenderWare is NOT. Tried against Burnout 3 (RW36,
-release), Xyanide (an earlier RW) matched 1 of 908 -- the versions diverge too
-far for a byte signature. Check the embedded "//RenderWare/RWxxActive/" tag in
-both binaries and only port between matching xx. Burnout 3 is RW36; we have no
-RW36 symbol-bearing donor, so this could not name it.
+The donor PE and MAP must describe the same build. Targets are supplied by
+caller analysis; only unique opening-byte matches at detected function starts
+are retained. Rw/Rp/Rt public names are selected by prefix.
+
+This is a heuristic naming aid. Matching a short prefix does not establish
+function equivalence, and different library versions or compiler settings can
+invalidate it. Validate proposed names against the target's code and ABI.
 """
 import json
 import re
