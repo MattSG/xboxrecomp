@@ -3534,11 +3534,12 @@ static int g_heap_block_count = 0;
  * code accesses them through guest MEM macros, like the main stack. */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
-struct owned_thread_stack {
-    uint32_t base, top;
-    struct owned_thread_stack *next;
+struct owned_guest_stack {
+    uint32_t base,end;
+    int worker;
+    struct owned_guest_stack *next;
 };
-static struct owned_thread_stack *g_thread_stacks;
+static struct owned_guest_stack *g_guest_stacks;
 
 /* A TIB and TLS block for a newly spawned guest thread.
  *
@@ -3606,25 +3607,34 @@ uint32_t xbox_AllocThreadTib(void)
     #undef TIB_VA
 }
 
+static uint32_t xbox_alloc_guest_stack(uint32_t bytes,uint32_t alignment,int worker)
+{
+    struct owned_guest_stack *stack;
+    uint32_t base,end;
+    if (!g_memory_base || !bytes || bytes>g_memory_size) return 0;
+    stack=malloc(sizeof(*stack));
+    if (!stack) return 0;
+    base=xbox_HeapAlloc(bytes,alignment);
+    if (!base) { free(stack); return 0; }
+    if ((uint64_t)base+bytes>UINT32_MAX) { xbox_HeapFree(base); free(stack); return 0; }
+    end=base+bytes;
+    stack->base=base; stack->end=end; stack->worker=worker;
+    EnterCriticalSection(&g_allocator_lock);
+    stack->next=g_guest_stacks; g_guest_stacks=stack;
+    LeaveCriticalSection(&g_allocator_lock);
+    return end;
+}
+
 uint32_t xbox_AllocThreadStackSized(uint32_t requested_bytes)
 {
-    struct owned_thread_stack *stack;
     uint64_t bytes=requested_bytes ? requested_bytes : g_thread_stack_default;
-    uint32_t base,top;
-    if (!g_memory_base || !g_thread_stack_default) return 0;
+    uint32_t end;
+    if (!g_thread_stack_default) return 0;
     if (bytes<s_thread_stack_minimum) bytes=s_thread_stack_minimum;
     bytes=(bytes+4095u)&~UINT64_C(4095);
     if (!bytes || bytes>UINT32_MAX) return 0;
-    stack=malloc(sizeof(*stack));
-    if (!stack) return 0;
-    base=xbox_HeapAlloc((uint32_t)bytes,4096);
-    if (!base) { free(stack); return 0; }
-    top=base+(uint32_t)bytes-16;
-    stack->base=base; stack->top=top;
-    EnterCriticalSection(&g_allocator_lock);
-    stack->next=g_thread_stacks; g_thread_stacks=stack;
-    LeaveCriticalSection(&g_allocator_lock);
-    return top;
+    end=xbox_alloc_guest_stack((uint32_t)bytes,4096,1);
+    return end ? end-16 : 0;
 }
 
 uint32_t xbox_AllocThreadStack(void)
@@ -3632,20 +3642,59 @@ uint32_t xbox_AllocThreadStack(void)
     return xbox_AllocThreadStackSized(0);
 }
 
-/* Only a returned owned top can release a stack. Unknown/interior/duplicate
- * values must not free an unrelated heap block by guessed size arithmetic. */
-void xbox_FreeThreadStack(uint32_t stack_top)
+static void xbox_free_guest_stack(uint32_t high,uint32_t low,int worker)
 {
-    struct owned_thread_stack **link, *stack=NULL;
-    if (!stack_top || !g_allocator_lock_initialized) return;
+    struct owned_guest_stack **link,*stack=NULL;
+    if (!high || !g_allocator_lock_initialized) return;
     EnterCriticalSection(&g_allocator_lock);
-    for (link=&g_thread_stacks; *link; link=&(*link)->next) {
-        if ((*link)->top==stack_top) {
+    for (link=&g_guest_stacks;*link;link=&(*link)->next) {
+        if ((*link)->end==high && (*link)->worker==worker && (!low || (*link)->base==low)) {
             stack=*link; *link=stack->next; break;
         }
     }
     LeaveCriticalSection(&g_allocator_lock);
     if (stack) { xbox_HeapFree(stack->base); free(stack); }
+}
+
+void xbox_FreeThreadStack(uint32_t stack_top)
+{
+    if (stack_top && stack_top<=UINT32_MAX-16) xbox_free_guest_stack(stack_top+16,0,1);
+}
+
+/* Preserve the bridge's exact-size, high-address convention. Guard pages and
+ * debugger placement are not emulated by this owned guest allocation. */
+uint32_t xbox_AllocKernelStack(uint32_t bytes)
+{
+    return xbox_alloc_guest_stack(bytes,16,0);
+}
+void xbox_FreeKernelStack(uint32_t high,uint32_t low)
+{
+    if (low && high>low) xbox_free_guest_stack(high,low,0);
+}
+
+/* Callback ownership lives with the lease allocator, not a second bitset. */
+BOOL xbox_worker_stack_bounds(uint32_t address, uint32_t *low, uint32_t *high);
+BOOL xbox_GetStackBounds(uint32_t address, uint32_t *low_out, uint32_t *high_out)
+{
+    uint32_t low=0,high=0;
+    if (low_out) *low_out=0;
+    if (high_out) *high_out=0;
+    if (g_xbox_stack_size && address>=g_xbox_stack_base &&
+        (uint64_t)address<(uint64_t)g_xbox_stack_base+g_xbox_stack_size) {
+        low=g_xbox_stack_base; high=low+g_xbox_stack_size;
+    } else if (!xbox_worker_stack_bounds(address,&low,&high) && g_allocator_lock_initialized) {
+        EnterCriticalSection(&g_allocator_lock);
+        for (struct owned_guest_stack *stack=g_guest_stacks;stack;stack=stack->next) {
+            if (address>=stack->base && address<stack->end) {
+                low=stack->base; high=stack->end; break;
+            }
+        }
+        LeaveCriticalSection(&g_allocator_lock);
+    }
+    if (!high) return FALSE;
+    if (low_out) *low_out=low;
+    if (high_out) *high_out=high;
+    return TRUE;
 }
 
 /* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
@@ -4339,9 +4388,9 @@ static void xbox_allocators_reset(void)
     g_heap_next = XBOX_HEAP_BASE;
     g_heap_block_count = g_heap_alloc_count = 0;
     /* Reset is startup/quiesced, after guest users have stopped. */
-    while (g_thread_stacks) {
-        struct owned_thread_stack *stack=g_thread_stacks;
-        g_thread_stacks=stack->next; free(stack);
+    while (g_guest_stacks) {
+        struct owned_guest_stack *stack=g_guest_stacks;
+        g_guest_stacks=stack->next; free(stack);
     }
     g_reserve_next = 0;
     g_reserve_alloc_count = 0;

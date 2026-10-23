@@ -447,6 +447,18 @@ uint32_t xbox_AllocThreadTib(void);
  * duplicate or zero values are ignored; no other heap block is released.
  * Addresses are invalid after memory shutdown, even if later reused. */
 void xbox_FreeThreadStack(uint32_t stack_top);
+/* Exact-size guest kernel stack, returning the exclusive high address.
+ * Delete requires its matching high/low pair; ordinary heaps/worker stacks
+ * cannot be released through this API. Zero size fails. No guard/debugger
+ * placement semantics are supplied. Memory teardown remains quiesced. */
+uint32_t xbox_AllocKernelStack(uint32_t bytes);
+void xbox_FreeKernelStack(uint32_t high,uint32_t low);
+/* Allocation containing a guest SP: main, owned worker/kernel or retained
+ * callback lease. Bounds are [low, high); unknown/freed addresses return FALSE
+ * and zero optional outputs. Retain stack/lease lifetime while using bounds;
+ * this is an ownership lookup, not a host-thread identity or backing probe. */
+BOOL xbox_GetStackBounds(uint32_t address, uint32_t *low, uint32_t *high);
+
 
 /* Guest stack slices for host callbacks: DPCs, interrupts and host-driven
  * guest calls. See XBOX_WORKER_STACK_* and docs/runtime/README.md. */

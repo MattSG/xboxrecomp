@@ -157,11 +157,22 @@ static void test_start_io_callback(void)
     g_esp += 12;
 }
 
+#define TEST_UNWIND_VA 0x45098u
+static unsigned unwind_calls;
+static uint32_t unwind_frame,unwind_flags;
+static void test_unwind_callback(void)
+{
+    uint32_t *sp=(uint32_t *)(g_guest_mem+g_esp);
+    unwind_calls++; unwind_frame=sp[2];
+    unwind_flags=*(uint32_t *)(g_guest_mem+sp[1]+4);
+    g_esp+=4; /* cdecl return; caller owns the four arguments */
+}
 #define TEST_THREAD_VA 0x45088u
 static DWORD thread_id;
 static uint32_t thread_context[2], thread_stack, thread_tib;
 static unsigned thread_context_count;
 static uint32_t thread_stack_probe;
+static int thread_has_bounds;
 static void test_thread_callback(void)
 {
     thread_id = GetCurrentThreadId();
@@ -169,6 +180,7 @@ static void test_thread_callback(void)
     thread_context[1] = thread_context_count==2 ? *(uint32_t *)(g_guest_mem + g_esp + 8) : 0;
     thread_stack = g_esp;
     thread_stack_probe=xbox_HeapBlockSize(g_esp-1024*1024);
+    thread_has_bounds=xbox_GetStackBounds(g_esp,NULL,NULL);
     thread_tib = g_fs_base;
     g_ebx = 0xBAD;
     g_esp += 4 + 4*thread_context_count; /* translated stdcall return */
@@ -177,6 +189,7 @@ static void test_thread_callback(void)
 recomp_func_t recomp_lookup(uint32_t xbox_va);
 recomp_func_t recomp_lookup(uint32_t xbox_va)
 {
+    if (xbox_va == TEST_UNWIND_VA) return test_unwind_callback;
     if (xbox_va == TEST_THREAD_VA) return test_thread_callback;
     if (xbox_va == TEST_DISPATCH_VA) return test_dispatch_callback;
     if (xbox_va == TEST_STARTIO_VA) return test_start_io_callback;
@@ -408,6 +421,82 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (argc==2 && !strncmp(argv[1],"unwind-",7)) {
+        const char *mode=argv[1];
+        uint32_t top=XBOX_STACK_TOP,owned=0,other=0,low=0,end=0,record=0,kernel_high=0;
+        int lease=-1;
+        int cross_target=!strcmp(mode,"unwind-cross-target"),cross_chain=!strcmp(mode,"unwind-cross-chain");
+        int last=!strcmp(mode,"unwind-last-frame"),truncated=!strcmp(mode,"unwind-truncated");
+        int low_space=!strcmp(mode,"unwind-low-space"),unowned=!strcmp(mode,"unwind-unowned");
+        int cycle=!strcmp(mode,"unwind-cycle"),unknown=!strcmp(mode,"unwind-unknown");
+        int truncated_args=!strcmp(mode,"unwind-truncated-arguments"),unreachable=!strcmp(mode,"unwind-unreachable-target");
+        int provided=!strcmp(mode,"unwind-record") || !strcmp(mode,"unwind-record-low");
+        int exit_walk=!strcmp(mode,"unwind-exit") || last;
+        *(uint32_t *)(mem+THUNK_VA)=0x80000000u|169;
+        *(uint32_t *)(mem+THUNK_VA+4)=0x80000000u|170;
+        *(uint32_t *)(mem+THUNK_VA+8)=0x80000000u|312;
+        xbox_kernel_set_thunk_address(THUNK_VA,3); xbox_kernel_init(); xbox_kernel_bridge_init();
+        if (!strcmp(mode,"unwind-kernel")) {
+            uint32_t create_args[2]={32768,0};
+            kernel_high=call_slot(mem,THUNK_VA,2,create_args); top=kernel_high-16;
+        }
+        if (!strcmp(mode,"unwind-worker")) top=owned=xbox_AllocThreadStackSized(32768);
+        if (!strcmp(mode,"unwind-callback")) { lease=xbox_worker_stack_alloc(); top=XBOX_WORKER_STACK_TOP(lease); }
+        check(xbox_GetStackBounds(top,&low,&end),"selected unwind stack has owned bounds",NULL);
+        uint32_t sp=end-0x200,first=end-0x100,target=exit_walk?0:end-0xE0;
+        if (low_space || !strcmp(mode,"unwind-record-low")) sp=low+32;
+        if (unowned) sp=SCRATCH_SP;
+        if (truncated_args) sp=end-12;
+        if (last) first=end-8;
+        if (truncated) first=end-4;
+        if (cross_target || cross_chain) other=xbox_AllocThreadStackSized(32768);
+        if (cross_target) target=other+16-0x100;
+        if (!truncated) {
+            *(uint32_t *)(mem+first)=exit_walk?UINT32_MAX:target;
+            *(uint32_t *)(mem+first+4)=unknown?0xDEAD0000u:TEST_UNWIND_VA;
+        }
+        if (cross_chain) *(uint32_t *)(mem+first)=other+16-0x100;
+        if (cycle) *(uint32_t *)(mem+first)=first;
+        if (target && !cross_target) {
+            *(uint32_t *)(mem+target)=UINT32_MAX; *(uint32_t *)(mem+target+4)=TEST_UNWIND_VA;
+        }
+        if (!strcmp(mode,"unwind-exit") || unreachable) {
+            uint32_t second=end-0x80;
+            *(uint32_t *)(mem+first)=second;
+            *(uint32_t *)(mem+second)=UINT32_MAX;
+            *(uint32_t *)(mem+second+4)=TEST_UNWIND_VA;
+        }
+        if (provided) {
+            record=xbox_HeapAlloc(0x50,4); memset(mem+record,0,0x50);
+            *(uint32_t *)(mem+record)=0x11223344; *(uint32_t *)(mem+record+4)=0x100;
+        }
+        uint32_t canary=low_space?low-32:unowned?sp-32:0;
+        if (canary) *(uint32_t *)(mem+canary)=0x13579BDFu;
+        *(uint32_t *)(mem+g_fs_base)=first;
+        uint32_t *args=(uint32_t *)(mem+sp);
+        args[0]=0; args[1]=target; args[2]=0;
+        if (!truncated_args) { args[3]=record; args[4]=0; }
+        g_esp=sp; recomp_lookup_kernel(*(uint32_t *)(mem+THUNK_VA+8))();
+        unsigned expected=(cross_target||truncated||truncated_args||low_space||unowned||unknown)?0:(!strcmp(mode,"unwind-exit")||unreachable)?2:1;
+        uint32_t head=(cross_target||truncated||truncated_args||low_space||unowned||cycle||unknown)?first:
+                      cross_chain?other+16-0x100:(exit_walk||unreachable)?UINT32_MAX:target;
+        check(unwind_calls==expected,"only validated same-stack handlers execute",NULL);
+        if (expected) check(unwind_flags==(provided?0x102u:exit_walk?6u:2u),"handler sees preserved unwind flags",NULL);
+        check(*(uint32_t *)(mem+g_fs_base)==head,"SEH head reflects traversed frames without a fabricated target",NULL);
+        check(g_esp==sp+20,"unwind preserves caller stdcall stack",NULL);
+        if (canary) check(*(uint32_t *)(mem+canary)==0x13579BDFu,"rejected scratch never writes outside calling stack",NULL);
+        if (record) { check(*(uint32_t *)(mem+record)==0x11223344,"provided exception record is preserved",NULL); xbox_HeapFree(record); }
+        if (kernel_high) {
+            uint32_t delete_args[2]={kernel_high,low};
+            call_slot(mem,THUNK_VA+4,2,delete_args);
+            check(!xbox_GetStackBounds(top,NULL,NULL),"MmDelete retires its registered stack",NULL);
+        }
+        if (owned) xbox_FreeThreadStack(owned);
+        if (other) xbox_FreeThreadStack(other);
+        if (lease>=0) xbox_worker_stack_free(lease);
+        xbox_kernel_shutdown(); xbox_MemoryLayoutShutdown(); return failures?1:0;
+    }
+
     if (argc == 2 && !strncmp(argv[1],"thread-",7)) {
         int inline_mode = strstr(argv[1],"inline") != NULL;
         int no_stack=strstr(argv[1],"no-stack") != NULL;
@@ -453,6 +542,7 @@ int main(int argc, char **argv)
         if (!inline_mode && worker)
             check(WaitForSingleObject(worker,5000) == WAIT_OBJECT_0,"spawned guest thread finishes",NULL);
         check(status == 0,"thread-create returns success",NULL);
+        check(inline_mode ? !thread_has_bounds : thread_has_bounds,"real spawned callback can query its stack ownership",NULL);
         if (large_stack) check(thread_stack_probe>1024*1024,"Ex honors its requested multi-megabyte guest stack",NULL);
         check(inline_mode ? thread_id == caller_id : thread_id && thread_id != caller_id,
               "first thread follows explicit inline or default spawned mode",NULL);

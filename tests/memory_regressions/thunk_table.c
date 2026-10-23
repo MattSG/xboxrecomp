@@ -73,7 +73,7 @@ int main(int argc, char **argv)
     if (!strcmp(mode,"kernel-data-empty")) {
         put(xbe,0x11c,0); put(xbe,0x158,0); expected=0;
     }
-    if (!strcmp(mode,"thread-stack-policy")) {
+    if (!strcmp(mode,"thread-stack-policy") || !strcmp(mode,"kernel-stacks")) {
         CHECK(xbox_ConfigureThreadStack(256*1024));
         CHECK(!xbox_ConfigureThreadStack(123));
     }
@@ -105,6 +105,49 @@ int main(int argc, char **argv)
         CHECK(XBOX_STACK_BASE >= XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE);
         CHECK(xbox_HeapAlloc(4096,4096) >= XBOX_WORKER_STACK_END);
         xbox_kernel_shutdown();
+    }
+    if (!strcmp(mode,"kernel-stacks")) {
+        uint32_t high=xbox_AllocKernelStack(801),low=0,end=0;
+        CHECK(high && xbox_GetStackBounds(high-1,&low,&end));
+        CHECK(end==high && high-low==801);
+        CHECK(!xbox_GetStackBounds(high,NULL,NULL));
+        xbox_FreeThreadStack(high-16); CHECK(xbox_GetStackBounds(high-1,NULL,NULL));
+        xbox_FreeKernelStack(high,low+16); CHECK(xbox_GetStackBounds(high-1,NULL,NULL));
+        xbox_FreeKernelStack(high,low); CHECK(!xbox_GetStackBounds(high-1,NULL,NULL));
+        xbox_FreeKernelStack(high,low);
+        uint32_t worker=xbox_AllocThreadStack();
+        CHECK(xbox_GetStackBounds(worker,&low,&end));
+        xbox_FreeKernelStack(end,low); CHECK(xbox_GetStackBounds(worker,NULL,NULL));
+        xbox_FreeThreadStack(worker);
+        uint32_t ordinary=xbox_HeapAlloc(801,16);
+        xbox_FreeKernelStack(ordinary+801,ordinary); CHECK(xbox_HeapBlockSize(ordinary)>=801);
+        xbox_HeapFree(ordinary);
+        CHECK(!xbox_AllocKernelStack(0) && !xbox_AllocKernelStack(UINT32_MAX));
+    }
+    if (!strcmp(mode,"stack-bounds")) {
+        uint32_t low=1,high=1,top=xbox_AllocThreadStackSized(8192);
+        CHECK(xbox_GetStackBounds(XBOX_STACK_TOP,&low,&high));
+        CHECK(low==XBOX_STACK_BASE && high==XBOX_STACK_BASE+XBOX_STACK_SIZE);
+        CHECK(xbox_GetStackBounds(top,&low,&high) && high-low==8192 && high==top+16);
+        CHECK(xbox_GetStackBounds(low,NULL,NULL));
+        uint32_t worker_low=low,worker_high=high;
+        CHECK(!xbox_GetStackBounds(high,NULL,NULL));
+        xbox_FreeThreadStack(top);
+        CHECK(!xbox_GetStackBounds(worker_low,&low,&high) && !low && !high);
+        int lease=xbox_worker_stack_alloc(); CHECK(lease>=0);
+        uint32_t callback_top=XBOX_WORKER_STACK_TOP(lease);
+        CHECK(xbox_GetStackBounds(callback_top,&low,&high));
+        CHECK(high-low==XBOX_WORKER_STACK_SIZE && high==callback_top+16);
+        xbox_worker_stack_free(lease);
+        CHECK(!xbox_GetStackBounds(callback_top,&low,&high) && !low && !high);
+        uint32_t ordinary=xbox_HeapAlloc(8192,4096);
+        CHECK(!xbox_GetStackBounds(ordinary,NULL,NULL));
+        xbox_HeapFree(ordinary);
+        CHECK(!xbox_GetStackBounds(0,&low,&high) && !low && !high);
+        CHECK(!xbox_GetStackBounds(UINT32_MAX,NULL,NULL));
+        xbox_MemoryLayoutShutdown();
+        CHECK(!xbox_GetStackBounds(worker_high-1,&low,&high) && !low && !high);
+        CHECK(xbox_MemoryLayoutInit(xbe,0x3000));
     }
     if (!strcmp(mode,"thread-stack-policy")) {
         CHECK(!xbox_ConfigureThreadStack(0));

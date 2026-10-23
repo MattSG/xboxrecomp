@@ -147,3 +147,9 @@ Worker-stack cases cover more than eight live stacks, twelve simultaneous
 allocations/releases, forged/interior/duplicate tops, minimum policy, explicit
 sizes/page rounding, unbacked policy, overflow and restored image defaults.
 The C++ consumer links both new APIs. Reset/shutdown requires quiesced users.
+
+Bounds/kernel-stack cases check exact intervals, optional/zeroed outputs,
+released workers/callback leases, shutdown, ordinary-heap exclusion and strict
+kernel/worker allocation kinds. Kernel-stack size remains independent of worker
+minimum policy; deletion requires the matching pair and cannot free an ordinary
+heap block. C++ linkage covers the bounds and kernel-stack helper APIs.
