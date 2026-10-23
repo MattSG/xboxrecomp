@@ -160,14 +160,16 @@ static void test_start_io_callback(void)
 #define TEST_THREAD_VA 0x45088u
 static DWORD thread_id;
 static uint32_t thread_context[2], thread_stack, thread_tib;
+static unsigned thread_context_count;
 static void test_thread_callback(void)
 {
     thread_id = GetCurrentThreadId();
     thread_context[0] = *(uint32_t *)(g_guest_mem + g_esp + 4);
-    thread_context[1] = *(uint32_t *)(g_guest_mem + g_esp + 8);
+    thread_context[1] = thread_context_count==2 ? *(uint32_t *)(g_guest_mem + g_esp + 8) : 0;
     thread_stack = g_esp;
     thread_tib = g_fs_base;
     g_ebx = 0xBAD;
+    g_esp += 4 + 4*thread_context_count; /* translated stdcall return */
 }
 
 recomp_func_t recomp_lookup(uint32_t xbox_va);
@@ -417,19 +419,24 @@ int main(int argc, char **argv)
         xbox_kernel_init();
         xbox_kernel_bridge_init();
         args[0] = 0x42000;
-        args[ordinal == 255 ? 5 : 4] = 0x12345678;
-        args[ordinal == 255 ? 6 : 5] = 0x87654321;
-        args[ordinal == 255 ? 9 : 6] = TEST_THREAD_VA;
+        thread_context_count=ordinal==255 ? 2 : 1;
+        args[ordinal == 255 ? 5 : 3] = 0x12345678;
+        if (ordinal==255) args[6] = 0x87654321;
+        args[ordinal == 255 ? 9 : 2] = TEST_THREAD_VA;
+        *(uint32_t *)(mem+SCRATCH_SP+24)=0xDEAD1000u;
+        *(uint32_t *)(mem+SCRATCH_SP+28)=0; /* poison old seven-argument decoding */
         g_ebx = 0x555;
-        uint32_t status = call_slot(mem,THUNK_VA,ordinal == 255 ? 10 : 7,args);
+        uint32_t status = call_slot(mem,THUNK_VA,ordinal == 255 ? 10 : 5,args);
+        check(g_esp==SCRATCH_SP+4+(ordinal==255?40:20),
+              "thread-create uses exact stdcall cleanup after translated return",NULL);
         HANDLE worker = (HANDLE)xbox_thread_debug_handle();
         if (!inline_mode && worker)
             check(WaitForSingleObject(worker,5000) == WAIT_OBJECT_0,"spawned guest thread finishes",NULL);
         check(status == 0,"thread-create returns success",NULL);
         check(inline_mode ? thread_id == caller_id : thread_id && thread_id != caller_id,
               "first thread follows explicit inline or default spawned mode",NULL);
-        check(thread_context[0] == 0x12345678 && thread_context[1] == 0x87654321,
-              "both thread-create APIs deliver start contexts",NULL);
+        check(thread_context[0] == 0x12345678 && thread_context[1] == (ordinal==255?0x87654321u:0u),
+              "thread APIs deliver their one/two start-context contracts",NULL);
         check(inline_mode ? g_ebx == 0xBAD : g_ebx == 0x555,
               "spawned thread owns registers; inline mode inherits them",NULL);
         check(inline_mode ? thread_tib == caller_tib : thread_tib && thread_tib != caller_tib,
