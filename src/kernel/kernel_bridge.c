@@ -541,11 +541,11 @@ RECOMP_TLS uint32_t g_xbox_kernel_caller;
  *   ULONG KernelStackSize,     // arg2: value
  *   ULONG TlsDataSize,         // arg3: value
  *   PULONG ThreadId,           // arg4: Xbox VA → pointer (can be NULL)
- *   PVOID StartContext1,       // arg5: Xbox VA → opaque
- *   PVOID StartContext2,       // arg6: Xbox VA → opaque
+ *   PKSTART_ROUTINE StartRoutine, // arg5: guest start routine passed to system routine
+ *   PVOID StartContext,        // arg6: context passed to system routine
  *   BOOLEAN CreateSuspended,   // arg7: value
  *   BOOLEAN DebugStack,        // arg8: value
- *   PXBOX_SYSTEM_ROUTINE StartRoutine  // arg9: Xbox function pointer
+ *   PXBOX_SYSTEM_ROUTINE SystemRoutine // arg9: Xbox function pointer
  * )
  *
  * Guest thread creation normally starts an independent host thread with
@@ -583,7 +583,8 @@ static int bridge_run_io_apcs(uint32_t alertable, uint32_t wait_mode);
 
 struct bridge_thread_start {
     recomp_func_t fn;
-    uint32_t ctx1, ctx2, stack_top, obj_va, tls_size;
+    uint32_t ctx1, ctx2, stack_top;
+    unsigned context_count;
 };
 
 /* Lay out a thread's TLS the way the Xbox kernel does.
@@ -801,20 +802,15 @@ static uint32_t thobj_current(void)
 }
 
 static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
-                                     uint32_t ctx2)
+                                     uint32_t ctx2, unsigned context_count)
 {
-    /* The worker's code is guest code on a guest thread: it holds the guest
-     * CPU, which the creating call let go of (kernel_thunk_dispatch). On
-     * the spawned path bridge_thread_main joins instead. */
-    int took = xbox_GuestCpuEnterCallback();
-
-    g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx2;
+    uint32_t caller_sp=g_esp;
+    if (context_count==2) { g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx2; }
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     g_seh_ebp = g_esp;
     fn();
-    g_esp += 12;
-    xbox_GuestCpuLeaveCallback(took);
+    g_esp=caller_sp; /* translated return already consumed its own frame */
 }
 
 void guest_cpu_join(void);
@@ -825,6 +821,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+    unsigned context_count=s->context_count;
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
@@ -861,7 +858,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     xbox_DpcMarkGuestThread();
     xbox_GuestThreadPin("guest-worker");
     guest_cpu_join();
-    bridge_run_thread_inline(fn, ctx1, ctx2);
+    bridge_run_thread_inline(fn, ctx1, ctx2, context_count);
     guest_cpu_part();
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
@@ -878,16 +875,14 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 }
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top,
-                                  uint32_t obj_va, uint32_t tls_size)
+                                  uint32_t ctx2, uint32_t stack_top, unsigned context_count)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
-    s->obj_va = obj_va;
-    s->tls_size = tls_size;
+    s->context_count=context_count;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) free(s);
@@ -950,49 +945,11 @@ static void bridge_PsCreateSystemThreadEx(void)
         if (fn) {
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
-                /* Its TLS too: the stack is already in use, so the block
-                 * comes from the heap, and the main TIB's fs:[0x28] object
-                 * gets the TlsData pointer (see bridge_layout_tls). */
-                if (tls_size) {
-                    uint32_t blk = xbox_HeapAlloc((tls_size + 0xFu) & ~0xFu, 16);
-                    uint32_t fs4 = blk ? bridge_layout_tls(
-                        BRIDGE_MEM32(g_fs_base + 0x28),
-                        blk + ((tls_size + 0xFu) & ~0xFu), tls_size) : 0;
-                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: %u-byte"
-                            " TLS at 0x%08X, fs:[4] = 0x%08X\n", tls_size,
-                            fs4 ? fs4 - tls_size : 0, fs4);
-                    fflush(stderr);
-                }
-                xbox_DpcMarkGuestThread();
-                xbox_GuestThreadPin("guest-main");
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                /* The title's main thread runs inside this kernel call, which
-                 * let the guest CPU go (RECOMP_GUEST_LOCK): take it back for
-                 * the thread's whole life, as for any guest code a bridge
-                 * runs, or the main thread runs unlocked against every
-                 * worker, the race the lock is for. */
-                {
-                    int took = xbox_GuestCpuEnterCallback();
-                    fn();
-                    xbox_GuestCpuLeaveCallback(took);
-                }
-                g_esp += 12;
+                bridge_run_thread_inline(fn, start_context1, start_context2, 2);
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
                 fflush(stderr);
             } else {
-                /* Worker thread: a real one.
-                 *
-                 * This used to run the routine synchronously and restore the
-                 * caller's registers afterwards, which is fine only for a
-                 * worker that finishes. Halo's cache/file worker does not -- it
-                 * blocks on an event waiting for requests, so CreateThread
-                 * never returned and startup deadlocked before the main loop.
-                 *
-                 * Now that the register set is thread-local (RECOMP_TLS), a
-                 * spawned thread gets its own, and the caller's is untouched by
-                 * construction rather than by save/restore. */
+                /* Spawned guests own independent registers and stack. */
                 /* RECOMP_WORKERS=inline runs a title's worker routines on
                  * the calling thread instead of spawning one.
                  *
@@ -1009,7 +966,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                     fprintf(stderr, "  [KERNEL] RECOMP_WORKERS=inline: running "
                             "worker 0x%08X on this thread\n", start_routine);
                     fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    bridge_run_thread_inline(fn, start_context1, start_context2, 2);
                     return;
                 }
 
@@ -1020,11 +977,10 @@ static void bridge_PsCreateSystemThreadEx(void)
                             "thread stacks, running worker 0x%08X inline\n",
                             start_routine);
                     fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    bridge_run_thread_inline(fn, start_context1, start_context2, 2);
                 } else {
-                    bridge_spawn_guest_thread(fn, start_context1, start_context2,
-                                              stack_top, xbox_handle_ptr,
-                                              tls_size);
+                    HANDLE th = bridge_spawn_thread(fn, start_context1,
+                                                    start_context2, stack_top, 2);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -10366,21 +10322,15 @@ static void bridge_ObReferenceObjectByPointer(void)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-/* --- PsCreateSystemThread (ordinal 254, 7 args = 28 bytes)
- * NTSTATUS PsCreateSystemThread(PHANDLE ThreadHandle, ULONG KernelStackSize,
- *                               ULONG TlsDataSize, PULONG ThreadId,
- *                               PVOID StartContext1, PVOID StartContext2,
- *                               PXBOX_SYSTEM_ROUTINE StartRoutine);
- * Mirror of PsCreateSystemThreadEx (ordinal 255) with the ThreadExtraSize
- * argument dropped: same first-call-inline / worker-spawn behaviour.
- * Requires bridge_spawn_thread/bridge_run_thread_inline/g_thread_mode from
- * Section A of kernel_bridge.c. */
+/* PsCreateSystemThread (ordinal 254): handle, optional thread ID,
+ * start routine, start context, debugger-thread flag. The start routine takes
+ * one context; Ex's system routine takes two. */
 static void bridge_PsCreateSystemThread(void)
 {
     uint32_t xbox_handle_ptr = STACK_ARG(0);
-    uint32_t start_context1  = STACK_ARG(4);
-    uint32_t start_context2  = STACK_ARG(5);
-    uint32_t start_routine   = STACK_ARG(6);
+    uint32_t start_context1  = STACK_ARG(3);
+    uint32_t start_context2  = 0;
+    uint32_t start_routine   = STACK_ARG(2);
     int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
                         && (g_thread_call_count == 0);
 
@@ -10396,32 +10346,24 @@ static void bridge_PsCreateSystemThread(void)
             fn = recomp_lookup_manual(start_routine);
         if (fn) {
             if (is_first_call) {
-                xbox_DpcMarkGuestThread();
-                xbox_GuestThreadPin("guest-main");
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
-                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                {   /* the main thread holds the guest CPU: see PsCreateSystemThreadEx */
-                    int took = xbox_GuestCpuEnterCallback();
-                    fn();
-                    xbox_GuestCpuLeaveCallback(took);
-                }
-                g_esp += 12;
+                bridge_run_thread_inline(fn, start_context1, 0, 1);
             } else {
                 const char *inline_workers = getenv("RECOMP_WORKERS");
                 uint32_t stack_top;
 
                 if (inline_workers && !strcmp(inline_workers, "inline")) {
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    bridge_run_thread_inline(fn, start_context1, start_context2, 1);
                     g_eax = 0;
                     return;
                 }
                 stack_top = xbox_AllocThreadStack();
                 if (!stack_top) {
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    bridge_run_thread_inline(fn, start_context1, start_context2, 1);
                 } else {
-                    bridge_spawn_guest_thread(fn, start_context1, start_context2,
-                                              stack_top, xbox_handle_ptr, 0);
+                    HANDLE th = bridge_spawn_thread(fn, start_context1,
+                                                    start_context2, stack_top, 1);
+                    if (xbox_handle_ptr && th)
+                        bridge_write_handle(xbox_handle_ptr, th);
                 }
             }
         } else {
@@ -11336,7 +11278,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 248: return  4;  /* ObReferenceObjectByPointer (1) */
 
     /* Ps */
-    case 254: return 28;  /* PsCreateSystemThread (7) */
+    case 254: return 20;  /* PsCreateSystemThread (5) */
     case 256: return  4;  /* PsQueryStatistics (1) */
     case 257: return  8;  /* PsSetCreateThreadNotifyRoutine (2) */
 

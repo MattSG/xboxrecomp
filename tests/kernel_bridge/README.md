@@ -1,7 +1,7 @@
 # Kernel bridge
 
-The dispatch path a title's kernel calls actually take. No game files and no
-mapped guest window are needed -- a plain buffer stands in for guest memory.
+Tests the dispatch path used by guest kernel calls, with a synthetic XBE and
+runtime-owned guest mappings. No game executable or assets are required.
 
 ```
 cmake -S tests/kernel_bridge -B build/kernel-bridge
@@ -22,8 +22,7 @@ both places rather than only one.
 
 ## What it guarantees
 
-Checks on ordinal 173, `MmGetPhysicalAddress`, and ordinal 197,
-`NtDuplicateObject`.
+The ordinal 173 checks exercise `MmGetPhysicalAddress`:
 
 **A thunk entry resolves to a bridge entry point.** Given an import in the
 form an XBE stores it (`0x80000000 | ordinal`), `xbox_kernel_bridge_init()`
@@ -84,3 +83,18 @@ for this one building there.
 title. A regression harness has no title, and a static archive resolves only
 what gets pulled in, so reaching the kernel bridge needs stand-ins. Nothing
 here calls a guest function.
+
+
+## Thread entry contracts
+
+The four thread modes exercise default spawned and explicitly selected inline
+entry for ordinals 254/255. Ordinal 254 uses five API arguments and calls its
+start routine with one context; ordinal 255 calls its supplied system routine
+with two contexts. The fixture simulates a translated stdcall return, checks
+exact caller ESP, correct context delivery and independent spawned registers,
+stack and TIB. Poisoned words beyond the five simple-API arguments reject the
+old seven-argument decode. Signatures: [nxdk kernel header](https://github.com/XboxDev/nxdk/blob/master/lib/xboxkrnl/xboxkrnl.h).
+
+These cases do not prove suspended/debugger creation, optional thread-ID output,
+full thread-object/reference semantics or every thread teardown path. Worker
+stack sizing/capacity and allocation-failure fallback policy need separate review.
