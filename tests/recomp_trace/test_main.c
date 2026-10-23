@@ -8,8 +8,56 @@ RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
 ptrdiff_t g_xbox_mem_offset;
 ptrdiff_t xbox_GetMemoryOffset(void) { return g_xbox_mem_offset; }
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s\n", #x); return 1; } } while (0)
-int main(void)
+static volatile LONG start_workers, budget_admitted;
+static int testing_budget;
+static DWORD WINAPI count_worker(void *unused)
 {
+    (void)unused;
+    while (!InterlockedCompareExchange(&start_workers, 0, 0)) Sleep(0);
+    for (int i = 0; i < 50000; i++) {
+        if (testing_budget) {
+            if (trace_should_log(NULL, 0, 0)) InterlockedIncrement(&budget_admitted);
+        } else recomp_trace_enter("worker", 0x20000);
+    }
+    return 0;
+}
+
+static int check_profile(int budget)
+{
+    HANDLE workers[4];
+    char name[] = "snapshot";
+    unsigned slot = (0x30000u * 2654435761u) & (PROF_SLOTS - 1);
+    testing_budget = budget;
+    if (!budget) recomp_trace_enter(name, 0x30000);
+    name[0] = 'X';
+    for (int i = 0; i < 4; i++) {
+        workers[i] = CreateThread(NULL, 0, count_worker, NULL, 0, NULL);
+        CHECK(workers[i]);
+    }
+    InterlockedExchange(&start_workers, 1);
+    for (int i = 0; i < 4; i++) {
+        CHECK(WaitForSingleObject(workers[i], INFINITE) == WAIT_OBJECT_0);
+        CloseHandle(workers[i]);
+    }
+    if (budget) {
+        CHECK(budget_admitted == 100000);
+        fprintf(stderr, "budget concurrent counts passed\n");
+        return 0;
+    }
+    CHECK(g_prof_calls == 200001);
+    slot = (0x20000u * 2654435761u) & (PROF_SLOTS - 1);
+    while (g_prof[slot].va != 0x20000) slot = (slot + 1) & (PROF_SLOTS - 1);
+    CHECK(g_prof[slot].hits == 200000);
+    slot = (0x30000u * 2654435761u) & (PROF_SLOTS - 1);
+    CHECK(strcmp(g_prof_name[slot], "snapshot") == 0);
+    fprintf(stderr, "profile concurrent counts passed\n");
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "profile") == 0) return check_profile(0);
+    if (argc > 1 && strcmp(argv[1], "budget") == 0) return check_profile(1);
     size_t page;
     uint8_t *memory;
     uint32_t header[2];
