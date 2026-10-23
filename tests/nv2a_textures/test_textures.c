@@ -371,6 +371,30 @@ static int benchmark_decode(void)
     return 0;
 }
 
+static int test_guest_mips(void)
+{
+    NvD3DTexture t = {0};
+    ID3D11ShaderResourceView *view;
+    ID3D11Resource *resource = NULL;
+    ID3D11Texture2D *texture = NULL;
+    D3D11_TEXTURE2D_DESC desc;
+    size_t before = s_tex_bytes;
+    uint32_t i;
+    t.addr=0x30000; t.color=0x06; t.format=0x03320600;
+    t.width=t.height=8; t.levels=2;
+    for(i=0;i<80;i++) ((uint32_t *)(ram+t.addr))[i]=i<64?0xFFFF0000u:0xFF0000FFu;
+    view=texture_get(&t); CHECK(view);
+    ID3D11ShaderResourceView_GetResource(view,&resource);
+    CHECK(SUCCEEDED(ID3D11Resource_QueryInterface(resource,&IID_ID3D11Texture2D,(void **)&texture)));
+    ID3D11Texture2D_GetDesc(texture,&desc);
+    ID3D11Texture2D_Release(texture); ID3D11Resource_Release(resource);
+    CHECK(desc.MipLevels==2 && desc.Format==DXGI_FORMAT_B8G8R8A8_UNORM);
+    CHECK(s_tex_bytes==before+320);
+    CHECK(read_mip(view,0)==0xFFFF0000u && read_mip(view,1)==0xFF0000FFu);
+    puts("PASS: default cache retains exactly two authored mip levels and their GPU pixels");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
@@ -392,7 +416,9 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "scanout_size")) return test_scanout_size();
     if (!strcmp(argv[1], "palette_identity")) return test_palette_identity();
     if (!strcmp(argv[1], "palette_bounds")) return test_palette_bounds();
-    if (!strcmp(argv[1], "native_bc")) return test_native_bc();
+    if (!strcmp(argv[1], "guest_mips")) return test_guest_mips();
+    if (!strcmp(argv[1], "native_bc")) return test_native_bc(1);
+    if (!strcmp(argv[1], "native_bc_default")) return test_native_bc(0);
     if (!strcmp(argv[1], "mip_chain")) return test_mip_chain();
     if (!strcmp(argv[1], "benchmark_mip_upload")) return benchmark_mip_upload();
     if (!strcmp(argv[1], "benchmark_native_bc")) return benchmark_native_bc();

@@ -14,6 +14,8 @@
 /* Failure injection in the renderer's own calls: texture creation and the
  * scratch allocation that holds generated mips. */
 static int fail_create;
+static uint32_t created_levels;
+static SDL_GPUTextureFormat created_format;
 static size_t fail_alloc_size;
 static int fail_alloc;
 
@@ -23,6 +25,7 @@ static SDL_GPUTexture *test_create_texture(SDL_GPUDevice *device, const SDL_GPUT
         fail_create--;
         return NULL;
     }
+    created_levels=info->num_levels; created_format=info->format;
     return (SDL_CreateGPUTexture)(device, info);
 }
 
@@ -229,12 +232,41 @@ static int test_mip_chain(void)
     return 0;
 }
 
+static int test_guest_mips(void)
+{
+    NvD3DTexture t={0};
+    SDL_GPUTexture *view;
+    uint32_t pixels[64], pixel, i;
+    size_t before=s_tex_bytes;
+    t.addr=0x30000; t.color=0x06; t.format=0x03320600;
+    t.width=t.height=8; t.levels=2;
+    for(i=0;i<80;i++) ((uint32_t *)(nv2a_test_ram+t.addr))[i]=i<64?0xFFFF0000u:0xFF0000FFu;
+    view=texture_get_with_levels(&t,NULL); CHECK(view);
+    CHECK(created_levels==2 && created_format==SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM);
+    CHECK(s_tex_bytes==before+320);
+    CHECK(read_texel0(view,8,8,0,&pixel) && pixel==0xFFFF0000u);
+    CHECK(read_texel0(view,4,4,1,&pixel) && pixel==0xFF0000FFu);
+    /* A short BC1 chain remains compressed when completion is not selected. */
+    t.addr=0x40000; t.color=0x0C; t.format=0x00020C00;
+    for(i=0;i<40;i++) nv2a_test_ram[t.addr+i]=(uint8_t)(i*13u);
+    view=texture_get_with_levels(&t,NULL); CHECK(view);
+    CHECK(created_levels==2 && created_format==SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM);
+    CHECK(s_tex_bytes==before+360);
+    CHECK(nv2a_test_read_level(view,8,8,0,0,pixels));
+    CHECK(!memcmp(pixels,nv2a_test_ram+t.addr,32));
+    CHECK(nv2a_test_read_level(view,4,4,1,0,pixels));
+    CHECK(!memcmp(pixels,nv2a_test_ram+t.addr+32,8));
+    puts("PASS: default authored mip pixels, BC1 format and compressed bytes retained");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
     nv2a_test_ram = calloc(1, 0x100000);
     CHECK(nv2a_test_ram);
     CHECK(nv2a_test_init());
+    if (!strcmp(argv[1], "guest_mips")) return test_guest_mips();
     if (!strcmp(argv[1], "srv_retry")) return test_srv_retry();
     if (!strcmp(argv[1], "mip_retry")) return test_mip_retry();
     if (!strcmp(argv[1], "palette_identity")) return test_palette_identity();
