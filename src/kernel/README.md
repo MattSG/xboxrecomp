@@ -171,26 +171,19 @@ save without touching the rest of the save dir.
 
 ## Threading
 
-Xbox threads use `PsCreateSystemThreadEx` with NT-style parameters. We create Win32 threads with a wrapper that sets up the register context:
+Guest thread creation uses `kernel_bridge.c` with guest dispatch, owned guest
+stacks and per-thread CPU/TIB state. Port configuration controls explicit inline
+compatibility; default worker creation is independent and resource failures
+are reported. See [memory/runtime ownership](../../docs/technical/memory-layout.md).
 
-```c
-// The kernel bridge creates a thread that:
-// 1. Looks up the start routine via recomp_lookup()
-// 2. Sets up ESP for the new thread
-// 3. Calls the recompiled function
-NTSTATUS xbox_PsCreateSystemThreadEx(
-    PHANDLE ThreadHandle,
-    ULONG   ThreadExtraSize,
-    ULONG   KernelStackSize,
-    ULONG   TlsDataSize,
-    PULONG  ThreadId,
-    PVOID   StartContext1,
-    PVOID   StartContext2,
-    BOOLEAN CreateSuspended,
-    BOOLEAN DebuggerThread,
-    PVOID   StartRoutine        // Xbox VA → resolved via recomp_lookup()
-);
-```
+The native `xbox_PsCreateSystemThread`/`Ex` facade accepts host callbacks.
+`PXBOX_START_ROUTINE` takes one context; `PXBOX_SYSTEM_ROUTINE` takes the start
+routine and context. Ex uses a supplied system routine or calls the start
+routine directly. It returns host handles/IDs and uses host suspension/stack
+primitives. Native extension/TLS/debugger setup is unsupported and reported;
+it does not accept raw guest function addresses. Callback types/signatures are
+in `kernel.h`, matching the arity described by the
+[nxdk kernel header](https://github.com/XboxDev/nxdk/blob/master/lib/xboxkrnl/xboxkrnl.h).
 
 ## Synchronization
 

@@ -26,109 +26,55 @@
  * ============================================================================ */
 
 typedef struct _XBOX_THREAD_START_INFO {
-    PXBOX_SYSTEM_ROUTINE StartRoutine;
-    PVOID                StartContext;
+    PXBOX_START_ROUTINE StartRoutine;
+    PXBOX_SYSTEM_ROUTINE SystemRoutine;
+    PVOID StartContext;
 } XBOX_THREAD_START_INFO;
 
-static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
+static DWORD WINAPI xbox_thread_wrapper(LPVOID parameter)
 {
-    XBOX_THREAD_START_INFO info = *(XBOX_THREAD_START_INFO*)lpParameter;
-
-    /* Free the start info before calling the routine - the routine may
-     * never return (calling PsTerminateSystemThread instead) */
-    HeapFree(GetProcessHeap(), 0, lpParameter);
-
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u starting at %p",
-        GetCurrentThreadId(), info.StartRoutine);
-
-    info.StartRoutine(info.StartContext);
-
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u returned normally",
-        GetCurrentThreadId());
-
+    XBOX_THREAD_START_INFO info=*(XBOX_THREAD_START_INFO *)parameter;
+    /* Both callbacks may terminate the host thread without returning. */
+    HeapFree(GetProcessHeap(),0,parameter);
+    if (info.SystemRoutine) info.SystemRoutine(info.StartRoutine,info.StartContext);
+    else info.StartRoutine(info.StartContext);
     return 0;
 }
 
-/* ============================================================================
- * PsCreateSystemThreadEx
- *
- * Xbox signature:
- *   PsCreateSystemThreadEx(
- *     OUT PHANDLE ThreadHandle,
- *     IN ULONG ThreadExtraSize,      // extra bytes in thread object (ignored)
- *     IN ULONG KernelStackSize,      // stack size (0 = default)
- *     IN ULONG TlsDataSize,          // TLS data size (Xbox-specific, ignored)
- *     OUT PULONG ThreadId,           // optional thread ID
- *     IN PVOID StartContext1,        // context passed to StartRoutine
- *     IN PVOID StartContext2,        // alternate context (unused by game code)
- *     IN BOOLEAN CreateSuspended,
- *     IN BOOLEAN DebugStack,         // debug stack (ignored)
- *     IN PXBOX_SYSTEM_ROUTINE StartRoutine
- *   )
- *
- * Maps to: CreateThread with a wrapper for calling convention adaptation.
- * ============================================================================ */
-
 NTSTATUS __stdcall xbox_PsCreateSystemThreadEx(
-    PHANDLE ThreadHandle,
-    ULONG ThreadExtraSize,
-    ULONG KernelStackSize,
-    ULONG TlsDataSize,
-    PULONG ThreadId,
-    PVOID StartContext1,
-    PVOID StartContext2,
-    BOOLEAN CreateSuspended,
-    BOOLEAN DebugStack,
-    PXBOX_SYSTEM_ROUTINE StartRoutine)
+    PHANDLE ThreadHandle, ULONG ThreadExtraSize, ULONG KernelStackSize,
+    ULONG TlsDataSize, PULONG ThreadId, PXBOX_START_ROUTINE StartRoutine,
+    PVOID StartContext, BOOLEAN CreateSuspended, BOOLEAN DebuggerThread,
+    PXBOX_SYSTEM_ROUTINE SystemRoutine)
 {
-    XBOX_THREAD_START_INFO* info;
-    HANDLE hThread;
-    DWORD dwThreadId;
-    DWORD dwCreationFlags;
-
-    (void)ThreadExtraSize;
-    (void)TlsDataSize;
-    (void)StartContext2;
-    (void)DebugStack;
-
-    if (!ThreadHandle || !StartRoutine)
-        return STATUS_INVALID_PARAMETER;
-
-    /* Allocate start info - freed by the wrapper thread */
-    info = (XBOX_THREAD_START_INFO*)HeapAlloc(GetProcessHeap(), 0, sizeof(XBOX_THREAD_START_INFO));
-    if (!info)
-        return STATUS_NO_MEMORY;
-
-    info->StartRoutine = StartRoutine;
-    info->StartContext = StartContext1;
-
-    dwCreationFlags = CreateSuspended ? CREATE_SUSPENDED : 0;
-
-    /* Use default stack size if 0 (Xbox default is 64KB) */
-    if (KernelStackSize == 0)
-        KernelStackSize = 65536;
-
-    /* Not pinned to the guest core (xbox_GuestThreadPin): this thunk-table
-     * path is for native-call titles, and the bridge titles that showed the
-     * need go through bridge_PsCreateSystemThreadEx. */
-    hThread = CreateThread(NULL, KernelStackSize, xbox_thread_wrapper, info,
-                           dwCreationFlags, &dwThreadId);
-    if (!hThread) {
-        HeapFree(GetProcessHeap(), 0, info);
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
-            "PsCreateSystemThreadEx: CreateThread failed (error %u)", GetLastError());
+    XBOX_THREAD_START_INFO *info;
+    DWORD id=0;
+    HANDLE thread;
+    if (ThreadHandle) *ThreadHandle=NULL;
+    if (ThreadId) *ThreadId=0;
+    if (!ThreadHandle || !StartRoutine) return STATUS_INVALID_PARAMETER;
+    if (ThreadExtraSize || TlsDataSize || DebuggerThread) return STATUS_NOT_SUPPORTED;
+    info=HeapAlloc(GetProcessHeap(),0,sizeof(*info));
+    if (!info) return STATUS_NO_MEMORY;
+    info->StartRoutine=StartRoutine; info->SystemRoutine=SystemRoutine;
+    info->StartContext=StartContext;
+    thread=CreateThread(NULL,KernelStackSize,xbox_thread_wrapper,info,
+                        CreateSuspended?CREATE_SUSPENDED:0,&id);
+    if (!thread) {
+        HeapFree(GetProcessHeap(),0,info);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-
-    *ThreadHandle = hThread;
-    if (ThreadId)
-        *ThreadId = dwThreadId;
-
-    xbox_log(XBOX_LOG_INFO, XBOX_LOG_THREAD,
-        "PsCreateSystemThreadEx: created thread %u (handle=%p, routine=%p, suspended=%d)",
-        dwThreadId, hThread, StartRoutine, CreateSuspended);
-
+    *ThreadHandle=thread;
+    if (ThreadId) *ThreadId=id;
     return STATUS_SUCCESS;
+}
+
+NTSTATUS __stdcall xbox_PsCreateSystemThread(
+    PHANDLE ThreadHandle, PULONG ThreadId, PXBOX_START_ROUTINE StartRoutine,
+    PVOID StartContext, BOOLEAN DebuggerThread)
+{
+    return xbox_PsCreateSystemThreadEx(ThreadHandle,0,0,0,ThreadId,
+                                     StartRoutine,StartContext,FALSE,DebuggerThread,NULL);
 }
 
 /* ============================================================================
@@ -138,7 +84,7 @@ NTSTATUS __stdcall xbox_PsCreateSystemThreadEx(
  * system threads to exit. Maps directly to ExitThread.
  * ============================================================================ */
 
-NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus)
+VOID __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus)
 {
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD,
         "PsTerminateSystemThread: thread %u exiting with status 0x%08X",
@@ -146,8 +92,6 @@ NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus)
 
     ExitThread((DWORD)ExitStatus);
 
-    /* ExitThread never returns, but the compiler needs this */
-    return STATUS_SUCCESS;
 }
 
 /* ============================================================================

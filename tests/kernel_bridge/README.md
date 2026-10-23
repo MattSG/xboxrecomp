@@ -115,3 +115,17 @@ existing spawned-thread callbacks also query their owned stack bounds.
 These are bounded traversal/ownership checks. They do not establish full SEH,
 context transfer, handler dispositions or validation of caller-provided TIB and
 exception-record mappings.
+
+## Native callbacks and optional guest system entry
+
+Seven native cases execute real host threads with the one-context start and
+two-argument system callbacks, optional default system entry, host suspension,
+thread-ID output, termination status and invalid/unsupported requests. Native
+callbacks are host code; guest CPU/TLS/object extension/debugger setup is not
+provided by this facade. Outputs are cleared on rejected requests.
+
+Guest Ex cases exercise a missing system routine in spawned/inline modes: the
+supplied start routine receives one context. Missing or unresolved entries
+report failure with no execution or fake handle. Existing custom-system cases
+retain the two-context contract. Guest suspension/ID and broader object/native
+semantics still need their own work.

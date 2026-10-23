@@ -38,3 +38,18 @@ foreach(mode main worker callback kernel exit unreachable-target truncated-argum
     add_test(NAME kernel_unwind_${mode} COMMAND kernel_bridge_test unwind-${mode})
     set_tests_properties(kernel_unwind_${mode} PROPERTIES TIMEOUT 10)
 endforeach()
+
+foreach(mode default simple system suspended terminate invalid unsupported)
+    add_test(NAME kernel_native_thread_${mode} COMMAND kernel_bridge_test native-thread-${mode})
+    set_tests_properties(kernel_native_thread_${mode} PROPERTIES TIMEOUT 10)
+endforeach()
+
+foreach(mode default-system inline-default-system missing-entry unknown-entry)
+    add_test(NAME kernel_thread_255_${mode} COMMAND kernel_bridge_test thread-255-${mode})
+    set_tests_properties(kernel_thread_255_${mode} PROPERTIES TIMEOUT 10)
+endforeach()
+
+foreach(mode missing-entry unknown-entry)
+    add_test(NAME kernel_thread_254_${mode} COMMAND kernel_bridge_test thread-254-${mode})
+    set_tests_properties(kernel_thread_254_${mode} PROPERTIES TIMEOUT 10)
+endforeach()
