@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <xaudio2.h>
 #include <stdio.h>
+#include <limits.h>
 #include <string.h>
 
 /* fb_present.c is not linked: never paused. */
@@ -166,6 +167,8 @@ int main(void)
     /* Reject invalid submissions without copying, truncating or advancing. */
     CHECK(xa2_submit_samples(NULL, 256) == -1);
     CHECK(xa2_submit_samples(&samples[0][0], -1) == -1);
+    CHECK(xa2_submit_samples(&samples[0][0], INT_MIN) == -1);
+    CHECK(xa2_submit_samples(&samples[0][0], INT_MAX) == -1);
     CHECK(xa2_submit_samples(&samples[0][0], 0) == -1);
     CHECK(xa2_submit_samples(&samples[0][0], 1025) == -1);
     CHECK(queue_count == 0 && g_xa2_next_buf == 0 && g_xa2_frames_written == 0);

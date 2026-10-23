@@ -323,11 +323,11 @@ int xa2_is_active(void)
 
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
-    const int bytes = num_samples * XA2_CHANNELS * (int)sizeof(int16_t);
     int queued;
 
     if (!samples || num_samples <= 0 || num_samples > XA2_BUF_SAMPLES) return -1;
     if (!g_stream) return -1;
+    const int bytes = num_samples * XA2_CHANNELS * (int)sizeof(int16_t);
     {   /* Paused in the background (fb_present.c): quiet, not a held note. */
         extern int xbox_FramebufferPaused(void);
         int paused = xbox_FramebufferPaused();
