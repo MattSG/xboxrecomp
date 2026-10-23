@@ -118,6 +118,9 @@ static void *map_during_shutdown(void *unused)
 
 int main(int argc, char **argv)
 {
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     FILE *file;
     long length;
     unsigned char *xbe;

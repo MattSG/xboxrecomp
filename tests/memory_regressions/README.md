@@ -121,3 +121,13 @@ These cases cover implemented exports, not all native/bridge export coverage.
 Launch-page cases verify all 4096 bytes of caller-supplied boot input, native
 pointer identity, guest alignment/copy independence and absent-page behavior.
 Setting RECOMP_CMDLINE alone must not create generic runtime launch data.
+
+The kernel-data auto case loads image bytes at the former fixed export page;
+bridge initialization must preserve them, place exports after the image and
+exclude the new page from stack/callback/heap ownership. Older raw-scratch
+fixtures explicitly select their separate export page.
+Explicit kernel-data cases cover accepted overrides, rejected policy changes,
+section/header overlap, unbacked storage, an empty-section image, zeroed fresh
+storage, shutdown clearing and restoration of automatic placement. A C++
+consumer links the configuration API. These are storage-ownership checks, not
+full kernel-data export fidelity checks.

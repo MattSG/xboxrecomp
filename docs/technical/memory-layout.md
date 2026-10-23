@@ -78,6 +78,23 @@ image. A port may populate compatibility data before guest execution; it must
 not free the view or retain it after memory shutdown. Fabricated header fields
 used to steer an application's feature probing belong to that port.
 
+## Kernel export storage
+
+Memory initialization places the kernel-data page after copied headers and all
+loaded sections, then places stacks and heap beyond owned export storage.
+`XBOX_KERNEL_DATA_BASE` is a runtime value. Shutdown or failed initialization
+clears it. `xbox_ConfigureKernelData(base)` selects a page-aligned port override
+before initialization; zero restores automatic placement. Invalid arguments or
+an active layout leave policy unchanged. Explicit placement may occupy an image
+gap, but cannot overlap copied headers, any section or unbacked memory.
+
+Configuration publishes an explicit address for standalone bridge hosts too;
+those hosts own its mapped storage and must select it before bridge init.
+A configured address alone is not proof of mapping. Policy persists until
+explicitly changed, while the selected runtime address retires at shutdown.
+The page's export payloads remain partial kernel implementations, not a full
+hardware identity or firmware image.
+
 ## Optional launch input
 
 `xbox_LaunchDataPage` defaults to NULL. A port may supply a complete

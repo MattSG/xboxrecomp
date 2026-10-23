@@ -49,6 +49,9 @@ static unsigned occurrences(const char *text, const char *needle)
 
 int main(int argc, char **argv)
 {
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     int summary = argc == 2 && strcmp(argv[1], "summary") == 0;
     int budget = argc == 2 && strcmp(argv[1], "budget") == 0;
     FILE *captured;

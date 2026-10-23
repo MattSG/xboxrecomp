@@ -49,6 +49,18 @@ static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 uint32_t g_xbox_stack_base, g_xbox_stack_size;
 static uint32_t s_main_stack_base, s_main_stack_size;
+uint32_t g_xbox_kernel_data_base;
+static uint32_t s_kernel_data_base;
+
+BOOL xbox_ConfigureKernelData(uint32_t base)
+{
+    if (g_memory_base || (base & 4095u) ||
+        (base && base < XBOX_BASE_ADDRESS) ||
+        (uint64_t)base + XBOX_KERNEL_DATA_SIZE > UINT32_MAX)
+        return FALSE;
+    s_kernel_data_base = g_xbox_kernel_data_base = base;
+    return TRUE;
+}
 static void xbox_allocators_reset(void);
 static void xbox_allocator_cache_sync(void);
 static uint32_t heap_runtime_floor(void);
@@ -2371,6 +2383,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
+    uint32_t loaded_header_end;
+    if (!g_memory_base) g_xbox_kernel_data_base = 0;
     if (!xbe || xbe_size < XBE_TLS_ADDR_OFFSET + 4u || memcmp(xbe, "XBEH", 4)) {
         fprintf(stderr, "xbox_MemoryLayoutInit: invalid XBE header\n");
         return FALSE;
@@ -2643,6 +2657,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         if (header_size > xbe_size)
             header_size = (DWORD)xbe_size;
         memcpy(XBOX_VA(XBOX_BASE_ADDRESS), xbe, header_size);
+        loaded_header_end = XBOX_BASE_ADDRESS + header_size;
         fprintf(stderr, "  XBE header: %u bytes at %p (Xbox VA 0x%08X)\n",
                 header_size, XBOX_VA(XBOX_BASE_ADDRESS), XBOX_BASE_ADDRESS);
     }
@@ -2728,6 +2743,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 xbox_MemoryLayoutShutdown();
                 return FALSE;
             }
+            if (s_kernel_data_base && sec_vsize &&
+                (uint64_t)s_kernel_data_base < (uint64_t)sec_va + sec_vsize &&
+                (uint64_t)s_kernel_data_base + XBOX_KERNEL_DATA_SIZE > sec_va) {
+                fprintf(stderr, "  Kernel data: selected page overlaps an image section\n");
+                xbox_MemoryLayoutShutdown();
+                return FALSE;
+            }
             memset(XBOX_VA(sec_va), 0, sec_vsize);
             if (copy_size) memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
 
@@ -2766,6 +2788,22 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
 
+    }
+
+    /* Reserve kernel exports outside copied image bytes before stack,
+     * callback-pool or heap ownership is established. */
+    {
+        uint64_t floor = g_xbox_image_hi > loaded_header_end ? g_xbox_image_hi : loaded_header_end;
+        uint64_t base = s_kernel_data_base ? s_kernel_data_base :
+                        (floor + 4095u) & ~UINT64_C(4095);
+        uint64_t end = base + XBOX_KERNEL_DATA_SIZE;
+        if (base < loaded_header_end || end > g_memory_size || end > UINT32_MAX) {
+            fprintf(stderr, "  Kernel data: invalid range or image overlap\n");
+            xbox_MemoryLayoutShutdown();
+            return FALSE;
+        }
+        g_xbox_kernel_data_base = (uint32_t)base;
+        memset((uint8_t *)g_memory_base + base, 0, XBOX_KERNEL_DATA_SIZE);
     }
 
     /* Establish permanent stack ownership before TLS/heap allocation. */
@@ -3399,6 +3437,7 @@ void xbox_MemoryLayoutShutdown(void)
     }
     xbox_worker_stack_reset(0);
     g_xbox_stack_base = g_xbox_stack_size = 0;
+    g_xbox_kernel_data_base = 0;
     g_esp = 0;
     xbox_allocators_reset();
     xbox_kernel_set_thunk_address(0, 0);

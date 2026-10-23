@@ -97,6 +97,9 @@ static int compare_double(const void *a, const void *b)
 
 int main(void)
 {
+    /* This private arena keeps its export/heap floor above raw scratch. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     const size_t reservation = (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
     uint8_t *arena = VirtualAlloc(NULL, reservation, MEM_RESERVE, PAGE_READWRITE);
     uint32_t a, b, c, heap, fill, after_heap, split, fresh;

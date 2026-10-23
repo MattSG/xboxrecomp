@@ -231,7 +231,15 @@ void xbox_WatchInit(void);
 /** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
  *  These are kernel exports that are DATA, not functions. The game reads
  *  their thunk entries and dereferences them to access the data. */
-#define XBOX_KERNEL_DATA_BASE   0x00740000
+/* Runtime-selected guest VA, zero until selected/initialized and after shutdown.
+ * This is not an integer constant expression. */
+extern uint32_t g_xbox_kernel_data_base;
+#define XBOX_KERNEL_DATA_BASE   g_xbox_kernel_data_base
+/* Before memory init, select a page-aligned override (zero restores automatic
+ * placement after the image). Invalid/active changes leave policy unchanged.
+ * An explicit selection is also published for standalone bridge hosts, which
+ * must map and own that storage. Full init validates backing/image exclusion. */
+BOOL xbox_ConfigureKernelData(uint32_t base);
 #define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
 
 /* Offsets within the kernel data area */

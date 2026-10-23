@@ -12222,6 +12222,10 @@ void xbox_kernel_bridge_init(void)
         fprintf(stderr, "  Kernel thunk bridge: no XBE thunk table configured\n");
         return;
     }
+    if (!XBOX_KERNEL_DATA_BASE) {
+        fprintf(stderr, "  Kernel thunk bridge: no kernel data storage selected\n");
+        return;
+    }
     kernel_log_init();
     /* A new thunk-table initialization accompanies a new guest-memory
      * generation; discard host ownership metadata from the prior mapping. */
