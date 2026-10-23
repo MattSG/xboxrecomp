@@ -867,7 +867,6 @@ class DisasmEngine:
     def get_instructions_in_range(self, start: int, end: int) -> List[Instruction]:
         """Get all instructions in address range [start, end), sorted."""
         self._ensure_sorted_addrs()
-        import bisect
         lo = bisect.bisect_left(self._sorted_addrs, start)
         hi = bisect.bisect_left(self._sorted_addrs, end)
         return [self.instructions[self._sorted_addrs[i]]

@@ -860,7 +860,8 @@ class FunctionDetector:
             # just recovered ends in a call to a stub and nothing is gained.
             # Landing inside a function is the ordinary case -- it is the rest
             # of the loop -- and the alias mechanism already exists for it.
-            if tail is not None and tail not in self._alias_entries                     and tail not in self._candidates and tail not in self.functions:
+            if (tail is not None and tail not in self._alias_entries
+                    and tail not in self._candidates and tail not in self.functions):
                 m = bisect.bisect_right(starts, tail) - 1
                 if m >= 0 and bodies[m][0] < tail < bodies[m][1]:
                     self._alias_entries[tail] = bodies[m][1]
