@@ -1,11 +1,7 @@
 /**
  * Function tracing for recompiled code.
  *
- * recomp_types.h declares these and tools.recomp emits calls to them under
- * --trace-functions, but until now nothing defined them: the definitions lived
- * in one game project, so enabling tracing anywhere else failed at link time
- * with three unresolved symbols and no hint that the fix was to go and copy a
- * file. They belong with the runtime that declares them.
+ * Generic function-entry/exit, stack-pointer and guest debug diagnostics.
  *
  * Output goes to stderr, unbuffered, because the question tracing answers is
  * usually "what was the last thing that happened before it died".
