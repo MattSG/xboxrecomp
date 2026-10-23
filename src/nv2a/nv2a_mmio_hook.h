@@ -39,8 +39,8 @@ void nv2a_hook_pvideo_consume(unsigned bank);
  * through the NV2A register handlers, updates CPU context, and
  * returns true if handled successfully.
  *
- * Returns false if the instruction couldn't be decoded (caller
- * should fall back to allocating a zero page).
+ * Returns false without emulating unsupported instructions. The caller must
+ * leave those faults unhandled rather than fabricate a register value.
  */
 bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                            uint32_t fault_xbox_va, int is_write);
@@ -48,8 +48,8 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 /*
  * Handle a GPU framebuffer/push buffer access.
  *
- * For 0xF0000000-0xFCFFFFFF range. Currently just allocates
- * pages backed by NV2A VRAM where appropriate.
+ * Legacy writable host-page allocation. These pages are not aliases of the
+ * modeled NV2A VRAM; this helper does not establish framebuffer/DMA ownership.
  *
  * Returns true if handled.
  */

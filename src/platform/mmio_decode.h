@@ -143,7 +143,7 @@ static inline int mmio_emulate_bytes(PCONTEXT ctx, uint32_t off, void *dev,
         case 0xC7: immediate = size == 2 ? 2 : 4; break;
         case 0xC6: immediate = 1; break;
         case 0x88: case 0x89: case 0x8A: case 0x8B:
-        case 0x84: case 0x85: case 0x38: case 0x39:
+        case 0x84: case 0x85: case 0x38: case 0x39: case 0x3A: case 0x3B:
         case 0x08: case 0x09: case 0x20: case 0x21: break;
         default: return 0;
         }
@@ -211,15 +211,17 @@ static inline int mmio_emulate_bytes(PCONTEXT ctx, uint32_t off, void *dev,
         return 1;
     }
 
-    case 0x38: case 0x39: {                          /* CMP r/m, r           */
+    case 0x38: case 0x39:                            /* CMP r/m, r */
+    case 0x3A: case 0x3B: {                          /* CMP r, r/m */
         uint64_t m, r, mask;
-        if (op[0] == 0x38) size = 1;
+        if (!(op[0] & 1)) size = 1;
         mlen = mmio_modrm_len(op + 1, rex_b);
         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
         m    = rd(dev, off, size);
         r    = mmio_read_reg(ctx, reg, size, has_rex);
         mask = (size < 8) ? ((1ULL << (size * 8)) - 1) : ~0ULL;
         m &= mask; r &= mask;
+        if (op[0] & 2) { uint64_t swap = m; m = r; r = swap; }
         uint64_t result = m - r;
         int overflow = ((m ^ r) & (m ^ result) & (1ULL << (size * 8 - 1))) != 0;
         mmio_set_flags(ctx, result, size, m < r, overflow);
