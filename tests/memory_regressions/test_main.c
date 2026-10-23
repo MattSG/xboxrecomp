@@ -10,7 +10,7 @@
  *
  *   default       No switch set. Pins what every title gets today, so a change
  *                 that alters the default shows up here.
- *   car-churn     No switch set. Model-sized temporary buffers mixed with
+ *   model-churn     No switch set. Model-sized temporary buffers mixed with
  *                 small retained objects must not consume the entire heap.
  *   heap-reclaim  RECOMP_HEAP_RECLAIM=1 additionally enables NT release and
  *                 decommit. Reuse/splitting and contiguous frees are default.
@@ -194,7 +194,7 @@ int main(int argc, char **argv)
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
     int reserve_heap = !strcmp(mode, "reserve-heap");
-    int car_churn = !strcmp(mode, "car-churn");
+    int model_churn = !strcmp(mode, "model-churn");
     int stack_config = !strcmp(mode, "stack-config");
     int stack_bad_base = !strcmp(mode, "stack-bad-base");
     int stack_bad_size = !strcmp(mode, "stack-bad-size");
@@ -217,7 +217,7 @@ int main(int argc, char **argv)
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !reserve_heap && !car_churn && !scene_churn && !tls_layout && !high_image && !bad_image && !stack_layout && !stack_config && !stack_invalid && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !reserve_heap && !model_churn && !scene_churn && !tls_layout && !high_image && !bad_image && !stack_layout && !stack_config && !stack_invalid && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -434,7 +434,7 @@ int main(int argc, char **argv)
         check(intact, "reused models are zeroed and live neighbours stay intact", NULL);
         goto shutdown;
     }
-    if (car_churn) {
+    if (model_churn) {
         const uint32_t big = 2u * 1024u * 1024u;
         const uint32_t models[] = {0x2B0030u, 0x250030u, 0x190030u, 0x1A0030u};
         uint32_t retained[200] = {0};
