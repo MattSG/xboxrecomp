@@ -52,8 +52,8 @@ One per stage, in the order you run them.
 
 ### Project
 
-- [Lessons Learned](technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
-- [Gap Analysis vs xemu](technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
+- [Integration Checks](technical/lessons-learned.md) — Generic integration review checks
+- [Runtime Support](technical/gap-analysis.md) — Runtime support claims and validation boundaries
 - [Target Evaluation](technical/candidate-games.md) — Executable requirements, runtime gaps and acceptance evidence
 - [Runtime Integration](runtime/README.md) — Generic runtime interfaces and guest thread startup
 - [xemu GDB Debugging](technical/xemu-debugging.md) — xemu's GDB stub as a reference debugger for runtime state

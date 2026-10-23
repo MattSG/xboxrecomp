@@ -333,8 +333,8 @@ xboxrecomp/
 - [D3D8LTCG Device Context](docs/technical/d3d8ltcg-device-context.md) — Per-image state recovery, queue contracts and hook ownership
 - [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping Xbox kernel ordinals to Win32
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
-- [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
-- [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
+- [Integration Checks](docs/technical/lessons-learned.md) — Generic integration review checks
+- [Runtime Support](docs/technical/gap-analysis.md) — Runtime support claims and validation boundaries
 - [Reference Analysis](docs/technical/fusion-analysis.md) — Generic module, package, signature and comparison helpers
 - [Runtime Integration](docs/runtime/README.md) — Generic runtime interfaces and guest thread startup
 
