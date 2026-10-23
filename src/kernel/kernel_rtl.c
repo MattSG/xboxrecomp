@@ -170,13 +170,6 @@ ULONG __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pat
  * main thread now run at the same time on different host threads, and the
  * locks the title takes to keep them apart did nothing.
  *
- * The failure that produced is worth describing, because it looks like
- * anything but a lock. Half-Life 2's level load faulted intermittently -- four
- * runs, three different functions, one clean -- and any attempt to observe it
- * made it disappear, including two plain stores to globals. Registers held
- * fragments of strings where pointers belonged, which is what a half-updated
- * structure looks like from the other thread.
- *
  * The Xbox RTL_CRITICAL_SECTION is 20 bytes of 32-bit layout and a Win32
  * CRITICAL_SECTION is 40 bytes of 64-bit layout, so the guest's own structure
  * cannot back a host lock. Shadow it instead: the guest pointer is the key,
@@ -234,17 +227,9 @@ static RECOMP_TLS XBOX_CS_CACHE_ENTRY t_cs_cache[XBOX_CS_CACHE_SIZE];
 /* RECOMP_CS_MODE=single puts every guest critical section behind one recursive
  * lock.
  *
- * Deadlock-free by construction -- there is only one lock, so there is no order
- * to invert -- and deliberately NOT the default. A title that deadlocks under
- * real locks is telling you its threads are reaching a place the console's
- * would not, and collapsing the hierarchy hides that rather than answering it.
- * What it is good for is deciding whether a lock cycle is the last thing in the
- * way: if the title still does not get further with this on, the cycle was not
- * what was stopping it.
- *
- * Safe only because guest code here never holds a lock while waiting on another
- * guest thread to make progress -- the runtime's own I/O completes
- * synchronously. That would not hold in general.
+ * This diagnostic mode can distinguish lock-order cycles from other stalls.
+ * It does not guarantee progress: waiting for another thread while holding
+ * the shared lock can deadlock. Keep normal per-address locks as the default.
  */
 static CRITICAL_SECTION g_cs_single;
 static INIT_ONCE g_cs_single_once = INIT_ONCE_STATIC_INIT;
@@ -448,12 +433,7 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
     /* "all" logs by address as well as index. Whether a lock's release is
      * missing or merely unrecognised by the index lookup are different bugs,
      * and only the raw address separates them. */
-    /* One lock, both sides, with the guest stack that got there.
-     *
-     * A take at one address and a release 0x78 lower is not a lock protocol
-     * this runtime can reason about from addresses alone -- it needs the two
-     * call sites, because the question is whether the guest computed different
-     * addresses or we did. */
+    /* An explicitly watched guest lock also prints an approximate stack. */
     {
         static int watch = -1;
         static uint32_t watch_va;
