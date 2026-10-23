@@ -11,13 +11,10 @@ Usage (matches the other pipeline tools' style):
         -o build/rtti.json \
         --seeds build/rtti_seeds.json
 
-Run this BEFORE tools.disasm and pass --seeds to its --seed-functions. A vtable
-slot is proof of a function entry point, and methods only ever called virtually
-are invisible to both linear sweep and call-target scanning. On Half-Life 2 that
-is 7,992 functions the sweep never claimed, a 24% increase.
+Optional seeds are candidate function starts for tools.disasm --seed-functions.
+They need validation; recovered records do not prove function boundaries or ABI.
+No supported RTTI is a normal result and produces no class-output files.
 
-Most titles are C, or C++ with RTTI disabled, and produce nothing. That is a
-normal result: the tool reports zero and exits 0.
 """
 
 import argparse
@@ -48,8 +45,8 @@ def main(argv=None):
     methods = methods_by_class(r)
 
     if not r["type_descriptors"]:
-        print("No MSVC RTTI in this image (C title, or RTTI disabled).")
-        print("This is normal; nothing downstream depends on it.")
+        print("No supported MSVC RTTI found in this image.")
+        print("This is normal; no class-output files were written.")
         return 0
 
     classes = {}
