@@ -112,3 +112,22 @@ if __name__ == "__main__":
         test_immediate_code_value_does_not_seed_recovery()
         test_compiled_paths_match_x86()
     print("PASS: taken and untaken overlapping branch streams match x86 EAX/ESP")
+
+
+def test_missing_label_goto_becomes_dead_branch():
+    # A goto to a label that was never emitted is a residual dead branch: it
+    # must report and stop, not fall through. A goto to a defined label stays.
+    from tools.recomp.translator import mark_missing_label_gotos
+
+    lines = [
+        "if (_cf) goto loc_00001010;",
+        "if (_fas < 0) goto loc_00001020;",
+        "loc_00001010: ;",
+        "return;",
+    ]
+    marked = mark_missing_label_gotos(lines)
+    assert marked == 1, lines
+    assert lines[0] == "if (_cf) goto loc_00001010;", lines
+    assert lines[1] == ("if (_fas < 0) RECOMP_DEAD_BRANCH(0x00001020u); "
+                        "/* goto loc_00001020 - label not in function */"), lines
+    assert mark_missing_label_gotos(lines) == 0
