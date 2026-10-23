@@ -253,6 +253,20 @@ static void test_prepare_failure(void)
     g_vsh_cb = dynamic;
     CHECK(d3d8_vsh_prepare_draw(handle));
     CHECK(!g_vsh_constants_dirty);
+    /* Corrupt a cached signature to make real CreateInputLayout fail. */
+    VshCacheEntry *entry = cache_lookup(fnv1a_hash(wire, sizeof wire));
+    ID3DBlob *valid_blob = entry->vs_blob, *invalid_blob;
+    REQUIRE_GPU(D3DCreateBlob(4, &invalid_blob));
+    memset(ID3D10Blob_GetBufferPointer(invalid_blob), 0, 4);
+    entry->vs_blob = invalid_blob;
+    entry->inputs_read = 1;
+    entry->layout_count = 0;
+    CHECK(!d3d8_vsh_prepare_draw(handle));
+    CHECK(entry->layout_count == 0);
+    entry->vs_blob = valid_blob;
+    entry->inputs_read = 0;
+    CHECK(d3d8_vsh_prepare_draw(handle));
+    ID3D10Blob_Release(invalid_blob);
     ID3D11Buffer_Release(unmappable);
     ID3D11DeviceContext_ClearState(context);
     d3d8_vsh_shutdown();

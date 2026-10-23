@@ -1078,6 +1078,7 @@ static ID3D11InputLayout *get_cached_layout(VshCacheEntry *entry, DWORD fvf)
     }
 
     ID3D11InputLayout *layout = create_vsh_input_layout(mask, fvf, entry->vs_blob);
+    if (!layout) return NULL;
     entry->layouts[entry->layout_count]      = layout;
     entry->layout_masks[entry->layout_count] = key;
     entry->layout_count++;
@@ -1274,13 +1275,9 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
             return FALSE;
     }
 
-    /* Bind the vertex shader */
-    ID3D11DeviceContext_VSSetShader(ctx, entry->vs, NULL, 0);
-
-    /* Bind the input layout (sizes texcoords from the bound stream FVF) */
-    layout = get_cached_layout(entry, d3d8_GetCurrentFVF());
-    if (layout)
-        ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+    /* A no-input shader requires no layout; otherwise creation must succeed. */
+    layout = entry->inputs_read ? get_cached_layout(entry, d3d8_GetCurrentFVF()) : NULL;
+    if (entry->inputs_read && !layout) return FALSE;
 
     /* Update constant buffer if dirty */
     if (g_vsh_constants_dirty) {
@@ -1291,6 +1288,9 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_cb, 0);
         g_vsh_constants_dirty = FALSE;
     }
+
+    ID3D11DeviceContext_VSSetShader(ctx, entry->vs, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(ctx, layout);
 
     /* Bind constant buffer to slot b1 */
     ID3D11DeviceContext_VSSetConstantBuffers(ctx, 1, 1, &g_vsh_cb);
