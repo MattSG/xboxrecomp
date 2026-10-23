@@ -51,6 +51,16 @@ function(xbr_sdlgpu_shaders gen out)
             list(GET _spec 4 _define)
             set(_defines -D ${_define})
         endif()
+        # Resolve the same selected fragments as D3D11's embedded source.
+        set(_unit_input "${NV2A_HLSL_DIR}/sdlgpu/${_unit}.hlsl")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_unit_input}")
+        file(READ "${_unit_input}" _unit_text)
+        foreach(_part IN LISTS NV2A_HLSL_PARTS)
+            get_filename_component(_part_name "${_part}" NAME)
+            string(REPLACE "\"../${_part_name}\"" "\"${_part}\"" _unit_text "${_unit_text}")
+        endforeach()
+        set(_unit_source "${gen}/units/${_unit}.hlsl")
+        file(CONFIGURE OUTPUT "${_unit_source}" CONTENT "${_unit_text}" @ONLY)
         string(TOUPPER ${_stage} _STAGE)
         foreach(_format IN LISTS _formats)
             set(_out ${gen}/sdlgpu/${_name}.${_format}.h)
@@ -64,8 +74,8 @@ function(xbr_sdlgpu_shaders gen out)
                 COMMAND ${XBOXRECOMP_DXC} -nologo -HV 2018 -Wno-ignored-attributes
                         -T ${_stage}_6_0 -E ${_entry} -D SDLGPU -D STAGE_${_STAGE} ${_defines}
                         ${_flags} -Fh ${_out} -Vn ${_name}_${_format}
-                        ${NV2A_HLSL_DIR}/sdlgpu/${_unit}.hlsl
-                DEPENDS ${NV2A_HLSL_DIR}/sdlgpu/${_unit}.hlsl ${NV2A_HLSL_PARTS}
+                        ${_unit_source}
+                DEPENDS ${_unit_source} ${_unit_input} ${NV2A_HLSL_DEPENDS}
                 COMMENT "dxc ${_name} (${_format})"
                 VERBATIM)
             list(APPEND _shader_headers ${_out})
