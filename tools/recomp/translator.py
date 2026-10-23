@@ -15,6 +15,7 @@ import bisect
 import json
 import glob
 import os
+import re
 import struct
 import sys
 
@@ -2617,24 +2618,7 @@ class FunctionTranslator:
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
 
-        # Validate: goto targets that reference missing labels (dead code after
-        # unconditional jumps may reference non-existent labels) become
-        # RECOMP_DEAD_BRANCH, which reports and stops a residual reached one.
-        import re
-        defined_labels = set()
-        goto_lines = []
-        for idx, line in enumerate(lines):
-            lbl_match = re.match(r'^(loc_[0-9A-Fa-f]+):', line)
-            if lbl_match:
-                defined_labels.add(lbl_match.group(1))
-            goto_match = re.search(r'goto (loc_[0-9A-Fa-f]+);', line)
-            if goto_match:
-                goto_lines.append((idx, goto_match.group(1)))
-        for idx, target in goto_lines:
-            if target not in defined_labels:
-                lines[idx] = lines[idx].replace(
-                    f"goto {target};",
-                    f"RECOMP_DEAD_BRANCH(0x{int(target[4:], 16):08X}u); /* goto {target} - label not in function */")
+        mark_missing_label_gotos(lines)
 
         # Ensure labels at end of function have a statement after them.
         # In C, a label must be followed by a statement; a comment alone is not
@@ -2699,6 +2683,32 @@ class FunctionTranslator:
                         regs.add(op.reg)
         return regs
 
+
+
+def mark_missing_label_gotos(lines):
+    """Turn each `goto loc_X;` whose label is not defined into RECOMP_DEAD_BRANCH.
+
+    Dead code after an unconditional jump can name labels that were never
+    emitted. A residual reached one reports and stops rather than falling
+    through. Edits `lines` in place and returns how many gotos were marked.
+    """
+    defined_labels = set()
+    goto_lines = []
+    for idx, line in enumerate(lines):
+        lbl_match = re.match(r'^(loc_[0-9A-Fa-f]+):', line)
+        if lbl_match:
+            defined_labels.add(lbl_match.group(1))
+        goto_match = re.search(r'goto (loc_[0-9A-Fa-f]+);', line)
+        if goto_match:
+            goto_lines.append((idx, goto_match.group(1)))
+    marked = 0
+    for idx, target in goto_lines:
+        if target not in defined_labels:
+            lines[idx] = lines[idx].replace(
+                f"goto {target};",
+                f"RECOMP_DEAD_BRANCH(0x{int(target[4:], 16):08X}u); /* goto {target} - label not in function */")
+            marked += 1
+    return marked
 
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""
