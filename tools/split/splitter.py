@@ -53,7 +53,7 @@ def _safe_name(name):
     """A filename that survives every OS and every assembler.
 
     Ghidra and RTTI recovery hand back real C++ names, so this sees `operator<`
-    and `CBaseEntity::~CBaseEntity` as well as `sub_00012664`.
+    and `Widget::~Widget` as well as `sub_00012664`.
     """
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
 
@@ -73,12 +73,9 @@ def write_function(path, func, insns, abi, name_of, read_bytes=None):
 
     read_bytes(va, n) -> bytes is the authority on what the file contains. The
     bytes are NOT reassembled from the instruction stream: a decoded
-    instruction can start inside the function and run past its end -- which
-    happens wherever data was decoded as code -- and rebuilding from those
-    produced files longer than the function they claimed to be, silently, for
-    102 of 2,254 functions on the first binary this was run against. Taking
-    the range straight from the image makes the coverage exact by
-    construction, and leaves the disassembly as pure annotation.
+    instruction can extend past the declared function end when data is
+    interpreted as code. Read and clip the original image range instead;
+    disassembly remains annotation, not the authority on file contents.
     """
     lo, hi = func.start, func.end
     targets = _branch_targets(insns, lo, hi)
@@ -203,7 +200,7 @@ def split(engine, func_detector, out_dir, abi_by_addr=None, sections=None,
 
     entries = []
     for fn in funcs:
-        # Section subdirectories: one flat directory of 41,223 files is
+        # Section subdirectories: one flat directory of thousands of files is
         # miserable in a file browser and slow in a shell.
         sub = _safe_name(fn.section or "unknown").lstrip(".") or "unknown"
         sub_dir = os.path.join(out_dir, "asm", sub)
