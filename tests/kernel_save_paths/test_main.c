@@ -32,6 +32,8 @@ void xbox_log(int level, const char *subsystem, const char *fmt, ...)
 const char *xbox_LookupSymbolicLink(const char *link)
 {
     if (!mounted) return NULL;
+    if (mounted == 2 && strcmp(link, "\\??\\Y:") == 0)
+        return "\\Device\\Custom\\";
     if (strcmp(link, "\\??\\U:") == 0)
         return "\\Device\\Harddisk0\\Partition1\\UDATA\\01234567";
     if (strcmp(link, "\\??\\T:") == 0)
@@ -135,6 +137,57 @@ int main(void)
     mounted = 1;
     check_path("U:\\ABCDEF012345\\profile", save, "UDATA\\01234567\\ABCDEF012345\\profile");
     check_path("\\??\\T:\\$u\\contentmeta.xbx", save, "TDATA\\01234567\\$u\\contentmeta.xbx");
+
+    /* Physical system/cache defaults do not assume an extracted dashboard. */
+    check_path("C:\\asset.bin", save, "SystemData\\asset.bin");
+    check_path("\\??\\C:\\asset.bin", save, "SystemData\\asset.bin");
+    check_path("\\??\\Y:\\asset.bin", save, "Cache\\asset.bin");
+    check_path("Y:\\asset.bin", save, "Cache\\asset.bin");
+    check_path("\\Device\\Harddisk0\\Partition2\\asset.bin", save,
+               "SystemData\\asset.bin");
+    {
+        const XboxPathMount mounts[] = {
+            { "C:\\", game },
+            { "Y:\\", game },
+            { "\\Device\\Harddisk0\\Partition2\\", game },
+            { "Y:\\nested\\", save },
+            { "\\Device\\Custom\\", save }
+        };
+        const XboxPathMount invalid[] = { { "Y:", game } };
+        if (!xbox_path_set_mounts(mounts, 5)) failures++;
+        check_path("c:\\asset.bin", game, "asset.bin");
+        check_path("Y:\\asset.bin", game, "asset.bin");
+        check_path("\\Device\\Harddisk0\\Partition2\\asset.bin", game, "asset.bin");
+        check_path("Y:\\nested\\item", save, "item");
+        check_path("\\Device\\Harddisk0\\Partition2\\", save, "Partition2.img");
+        check_path("Y:\\nested2\\item", game, "nested2\\item");
+        check_path("\\Device\\Custom\\item", save, "item");
+        mounted = 2;
+        check_path("Y:\\item", save, "item");
+        mounted = 1;
+        if (xbox_translate_path("Y:\\item", translated, 2)) failures++;
+        {
+            const XboxPathMount bad_root[] = { { "Y:\\", NULL } };
+            const XboxPathMount bad_prefix[] = { { NULL, game } };
+            if (xbox_path_set_mounts(bad_root, 1) ||
+                xbox_path_set_mounts(bad_prefix, 1)) failures++;
+        }
+        if (xbox_path_set_mounts(invalid, 1)) failures++;
+        check_path("Y:\\asset.bin", game, "asset.bin");
+        if (xbox_path_set_mounts(NULL, 1) || xbox_path_set_mounts(mounts, -1)) failures++;
+        {
+#if defined(_WIN32)
+            const char *volume_root = "C:\\";
+#else
+            const char *volume_root = "/";
+#endif
+            const XboxPathMount root_mount = { "Y:\\", volume_root };
+            if (!xbox_path_set_mounts(&root_mount, 1)) failures++;
+            check_path("Y:\\", volume_root, "");
+            if (!xbox_path_set_mounts(NULL, 0)) failures++;
+        }
+        check_path("Y:\\asset.bin", save, "Cache\\asset.bin");
+    }
 
     /* Translation does not manufacture a missing save slot or metadata. */
     xbox_translate_path("U:\\FEDCBA543210\\SaveMeta.xbx", translated, MAX_PATH);
