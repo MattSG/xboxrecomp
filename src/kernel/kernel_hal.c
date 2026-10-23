@@ -48,7 +48,7 @@ int xbox_IrqlCurrent(void)
 /* The current IRQL, where guest code reads it: KPCR.Irql, fs:[0x24].
  *
  * The XDK does not always ask the kernel. DirectSound's lock
- * (sub_002F4175 in Burnout 3) reads fs:[0x24] directly and skips its
+ * (sub_002F4175 in a title) reads fs:[0x24] directly and skips its
  * critical section at raised IRQL, because a DPC must never block. Nothing
  * wrote that byte, so it read 0 everywhere: DirectSound's DPC took the
  * critical section, blocked against the thread that held it, and the title

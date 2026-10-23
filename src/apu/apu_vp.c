@@ -1277,7 +1277,7 @@ static void voice_process(MCPXAPUState *d,
             if (count < 0) break;
             /* An active voice that keeps producing nothing is an underrun,
              * not a reason to spin. Asking it again at once cannot change the
-             * answer, and this loop holds d->lock: Burnout 3's vehicle select
+             * answer, and this loop holds d->lock: a title's vehicle select
              * sat here indefinitely while the title waited in voice_lock. */
             if (count == 0 && ++empty > 4) break;
             sample_count += count;

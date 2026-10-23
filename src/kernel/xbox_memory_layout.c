@@ -2677,7 +2677,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Dynamically load ALL XBE sections by parsing the section headers.
      *
      * This replaces the old approach of hardcoding section addresses for
-     * a specific game (Burnout 3). By reading the section table from the
+     * a specific game. By reading the section table from the
      * XBE header, any game's sections are loaded automatically.
      *
      * Every section is copied to its original Xbox VA:
