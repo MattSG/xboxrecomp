@@ -9,13 +9,20 @@
  * Playback starts only when a port calls xbox_VideoPlayFile. Selection and
  * guest-file interception policy belong to that port.
  */
+#include "video_player.h"
+
+static void (*s_present_handler)(unsigned frame);
+void xbox_VideoSetPresentHandler(void (*handler)(unsigned frame))
+{
+    s_present_handler = handler;
+}
+
 #if defined(_WIN32)
 #define COBJMACROS
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "video_player.h"
 #include "d3d/d3d8_xbox.h"
 #include "d3d/d3d8_internal.h"
 
@@ -134,15 +141,7 @@ static DWORD WINAPI vp_thread(LPVOID unused)
         dev->lpVtbl->Present(dev, NULL, NULL, NULL, NULL);
         frames++;
 
-        /* A couple of frames to disc as evidence that real pixels were
-         * drawn -- two of them, far enough apart to show the picture moving
-         * rather than one still held for the duration. */
-        if ((frames == 60 || frames == 80) && getenv("RECOMP_FMV_DUMP")) {
-            char out[MAX_PATH];
-            _snprintf_s(out, sizeof(out), _TRUNCATE, "%s.%u.bmp",
-                        getenv("RECOMP_FMV_DUMP"), frames);
-            video_dump_frame_bmp(out);
-        }
+        if (s_present_handler) s_present_handler(frames);
 
         Sleep(1);
     }
