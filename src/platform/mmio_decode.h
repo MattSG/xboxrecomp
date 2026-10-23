@@ -24,11 +24,15 @@
 #ifndef MMIO_DECODE_H
 #define MMIO_DECODE_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #if defined(_WIN32) || defined(__x86_64__)
 #include "xbox_winnt.h"
+#if !defined(_WIN32)
+#include "win32_compat.h"
+#endif
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
@@ -104,104 +108,23 @@ static inline void mmio_set_flags(PCONTEXT ctx, uint64_t result, int size,
     if (!(parity & 1)) ctx->EFlags |= 0x0004u;
 }
 
-/* a OP b at the given width, with the flags a following jcc reads: ZF, SF, CF
- * and OF. PF and AF are left alone; nothing branches on them after a register
- * read. The logical operations clear CF and OF, as the hardware does. */
-static inline uint64_t mmio_alu(PCONTEXT ctx, int op, uint64_t a, uint64_t b,
-                                int size)
+/* Decode a caller-owned snapshot; no callback/context mutation before validation. */
+static inline int mmio_emulate_bytes(PCONTEXT ctx, uint32_t off, void *dev,
+                                     mmio_read_fn rd, mmio_write_fn wr,
+                                     const uint8_t *ip, size_t length)
 {
-    uint64_t m = mmio_size_mask(size), sign = 1ULL << (size * 8 - 1), r;
-    int cf = 0, of = 0;
-
-    a &= m; b &= m;
-    switch (op) {
-    case MMIO_ALU_ADD:
-        r  = (a + b) & m;
-        cf = r < a;
-        of = ((~(a ^ b) & (a ^ r)) & sign) != 0;
-        break;
-    case MMIO_ALU_SUB: case MMIO_ALU_CMP:
-        r  = (a - b) & m;
-        cf = a < b;
-        of = (((a ^ b) & (a ^ r)) & sign) != 0;
-        break;
-    case MMIO_ALU_OR:  r = a | b; break;
-    case MMIO_ALU_XOR: r = a ^ b; break;
-    default:           r = a & b; break;                /* AND, TEST */
-    }
-    ctx->EFlags &= ~(0x0001u | 0x0040u | 0x0080u | 0x0800u);
-    if (cf)       ctx->EFlags |= 0x0001u;               /* CF */
-    if (r == 0)   ctx->EFlags |= 0x0040u;               /* ZF */
-    if (r & sign) ctx->EFlags |= 0x0080u;               /* SF */
-    if (of)       ctx->EFlags |= 0x0800u;               /* OF */
-    return r;
-}
-
-/* A general register at an operand width. Without a REX prefix, byte
- * registers 4-7 are AH, CH, DH and BH -- bits 15:8 of registers 0-3. */
-static inline uint64_t mmio_get_reg(PCONTEXT c, int reg, int size, int has_rex)
-{
-    if (size == 1 && !has_rex && reg >= 4 && reg < 8)
-        return (*mmio_ctx_reg(c, reg - 4) >> 8) & 0xFF;
-    return *mmio_ctx_reg(c, reg) & mmio_size_mask(size);
-}
-
-/* Write with x86-64 width rules: a 32-bit write zeroes bits 63:32, an 8- or
- * 16-bit write merges into what was there. */
-static inline void mmio_set_reg(PCONTEXT c, int reg, uint64_t v, int size,
-                                int has_rex)
-{
-    uint64_t *d;
-    if (size == 1 && !has_rex && reg >= 4 && reg < 8) {
-        d  = mmio_ctx_reg(c, reg - 4);
-        *d = (*d & ~0xFF00ULL) | ((v & 0xFF) << 8);
-        return;
-    }
-    d = mmio_ctx_reg(c, reg);
-    if (size == 1)      *d = (*d & ~0xFFULL)   | (v & 0xFF);
-    else if (size == 2) *d = (*d & ~0xFFFFULL) | (v & 0xFFFF);
-    else if (size == 4) *d = v & 0xFFFFFFFFULL;
-    else                *d = v;
-}
-
-/* The immediate of an instruction whose operand size is `size`: imm8 for byte
- * forms, imm16 under a 66 prefix, otherwise imm32 sign-extended (REX.W). */
-static inline uint64_t mmio_imm(const uint8_t *p, int size, int *len)
-{
-    if (size == 1) { *len = 1; return p[0]; }
-    if (size == 2) { *len = 2; return (uint64_t)p[0] | ((uint64_t)p[1] << 8); }
-    *len = 4;
-    return (uint64_t)(int64_t)(int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8)
-                                      | ((uint32_t)p[2] << 16)
-                                      | ((uint32_t)p[3] << 24));
-}
-
-/* 1 if the instruction at ctx->Rip was serviced and Rip advanced past it.
- *
- * Covered: MOV both ways (88/89 8A/8B C6/C7), MOVZX (0F B6/B7), the
- * two-operand ALU forms in both directions for ADD/OR/AND/SUB/XOR/CMP
- * (00-03 08-0B 20-23 28-2B 30-33 38-3B), group 1 with an immediate
- * (80/81/83, not ADC/SBB), and TEST against a register or an immediate
- * (84/85, F6/F7 /0 and /1). A register-destination form reads the device
- * once; a memory-destination form reads, then writes (CMP and TEST only
- * read). ADC/SBB, the rest of F6/F7 (NOT/NEG/MUL/DIV), string moves and
- * anything else return 0. */
-static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
-                               mmio_read_fn rd, mmio_write_fn wr)
-{
-    const uint8_t *ip = (const uint8_t *)ctx->Rip;
     int prefix = 0, has66 = 0, rex = 0, has_rex = 0;
     const uint8_t *op;
     int size, rex_w, rex_r, rex_b, mlen, reg, ilen, alu;
     uint64_t m, v, imm;
 
-    if (!rd || !wr)
-        return 0;
-
+    if (!ctx || !ip || !rd || !wr) return 0;
+    if (length > 15) length = 15;
     for (;;) {
+        if ((size_t)prefix >= length) return 0;
         uint8_t b = ip[prefix];
-        if (b == 0x66)                   { has66 = 1; prefix++; }
-        else if (b == 0xF2 || b == 0xF3) { prefix++; }
+        if (b == 0x66) { has66 = 1; has_rex = 0; rex = 0; prefix++; }
+        else if (b == 0xF2 || b == 0xF3) { has_rex = 0; rex = 0; prefix++; }
         else if (b >= 0x40 && b <= 0x4F) { rex = b; has_rex = 1; prefix++; }
         else break;
     }
@@ -211,6 +134,29 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
 
     op   = ip + prefix;
     size = rex_w ? 8 : (has66 ? 2 : 4);
+
+    /* Validate the complete supported memory encoding before touching a device. */
+    {
+        size_t opcode_bytes = 1, modrm, total, immediate = 0;
+        switch (op[0]) {
+        case 0x0F:
+            if ((size_t)prefix + 1 >= length || (op[1] != 0xB6 && op[1] != 0xB7)) return 0;
+            opcode_bytes = 2;
+            break;
+        case 0xC7: immediate = size == 2 ? 2 : 4; break;
+        case 0xC6: immediate = 1; break;
+        case 0x88: case 0x89: case 0x8A: case 0x8B:
+        case 0x84: case 0x85: case 0x38: case 0x39:
+        case 0x08: case 0x09: case 0x20: case 0x21: break;
+        default: return 0;
+        }
+        modrm = (size_t)prefix + opcode_bytes;
+        if (modrm >= length || (ip[modrm] & 0xC0) == 0xC0) return 0;
+        if ((op[0] == 0xC6 || op[0] == 0xC7) && (ip[modrm] & 0x38)) return 0;
+        if ((ip[modrm] & 7) == 4 && modrm + 1 >= length) return 0;
+        total = modrm + mmio_modrm_len(ip + modrm, rex_b) + immediate;
+        if (total > length) return 0;
+    }
 
     switch (op[0]) {
     case 0x88: case 0x89:                            /* MOV r/m, r   (write) */
@@ -224,7 +170,6 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     case 0xC7: {                                     /* MOV r/m, imm16|32 */
         uint64_t value;
         int immediate_size = size == 2 ? 2 : 4;
-        if ((op[1] & 0x38) || (op[1] & 0xC0) == 0xC0) return 0;
         mlen = mmio_modrm_len(op + 1, rex_b);
         if (size == 2) {
             uint16_t immediate;
@@ -241,7 +186,6 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 
     case 0xC6:                                       /* MOV r/m8, imm8       */
-        if ((op[1] & 0x38) || (op[1] & 0xC0) == 0xC0) return 0;
         mlen = mmio_modrm_len(op + 1, rex_b);
         wr(dev, off, op[1 + mlen], 1);
         ctx->Rip += prefix + 1 + mlen + 1;
@@ -314,6 +258,32 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     default:
         return 0;
     }
+}
+
+/* Snapshot at most one architectural instruction without faulting on its page
+ * boundary. Usually one host read; byte reads recover a readable short prefix
+ * when the host refuses a cross-page bulk read. Preserve caller LastError. */
+static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+                               mmio_read_fn rd, mmio_write_fn wr)
+{
+    uint8_t code[15];
+    SIZE_T copied = 0;
+    DWORD error;
+    uintptr_t address;
+    if (!ctx || !rd || !wr) return 0;
+    error = GetLastError();
+    address = (uintptr_t)ctx->Rip;
+    ReadProcessMemory(GetCurrentProcess(), (const void *)address, code, sizeof(code), &copied);
+    if (!copied) {
+        while (copied < sizeof(code) && address <= UINTPTR_MAX - copied) {
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), (const void *)(address + copied),
+                                   code + copied, 1, &got) || got != 1) break;
+            copied++;
+        }
+    }
+    SetLastError(error);
+    return mmio_emulate_bytes(ctx, off, dev, rd, wr, code, copied);
 }
 
 #endif /* _WIN32 || __x86_64__ */
