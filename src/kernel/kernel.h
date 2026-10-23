@@ -854,6 +854,10 @@ extern UCHAR                   xbox_HDKey[16];
 extern UCHAR                   xbox_SignatureKey[16];
 extern UCHAR                   xbox_LANKey[16];
 extern UCHAR                   xbox_AlternateSignatureKeys[16][16];
+/* Counted host string: caller backs Length bytes and retains Buffer while
+ * native consumers use it. Bridge init copies bytes and MaximumLength capacity
+ * into guest storage; it does not assume a terminator. Invalid counts/pointers
+ * or allocation failure leave an empty guest descriptor. */
 extern XBOX_ANSI_STRING        xbox_XeImageFileName;
 extern UCHAR                   xbox_XePublicKeyData[284];
 /* Optional boot input, NULL for no launch page. Set before initialization,
@@ -966,6 +970,8 @@ ULONGLONG  __stdcall xbox_KeQueryInterruptTime(void);
 BOOLEAN __stdcall xbox_KeDisconnectInterrupt(PXBOX_KINTERRUPT Interrupt);
 
 /* HAL data exports -- ordinals 40/41/42 and 356/357 are variables, not calls. */
+/* Port-owned topology and counted strings, with the same lifetime/copy
+ * contract as xbox_XeImageFileName. Zero defaults mean unconfigured. */
 extern ULONG            xbox_HalDiskCachePartitionCount;
 extern XBOX_ANSI_STRING xbox_HalDiskModelNumber;
 extern XBOX_ANSI_STRING xbox_HalDiskSerialNumber;

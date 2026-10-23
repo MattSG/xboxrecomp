@@ -91,6 +91,57 @@ int main(int argc, char **argv)
         CHECK(xbox_HeapAlloc(4096,4096) >= XBOX_WORKER_STACK_END);
         xbox_kernel_shutdown();
     }
+    if (!strncmp(mode,"kernel-strings",14)) {
+        int empty=!strcmp(mode,"kernel-strings-empty"), invalid_strings=!strcmp(mode,"kernel-strings-invalid");
+        int maximum=!strcmp(mode,"kernel-strings-max"), exhausted=!strcmp(mode,"kernel-strings-oom");
+        char model[3]={'A',0,'B'}, serial[5]={'1','2','3','4','5'}, path[65535];
+        for (unsigned i=0;i<sizeof(path);i++) path[i]=(char)('a'+i%26);
+        if (empty) {
+            CHECK(!xbox_HalDiskModelNumber.Buffer && !xbox_HalDiskSerialNumber.Buffer && !xbox_XeImageFileName.Buffer);
+            CHECK(!xbox_HalDiskCachePartitionCount);
+        } else {
+            xbox_HalDiskModelNumber=(XBOX_ANSI_STRING){3,3,model};
+            xbox_HalDiskSerialNumber=(XBOX_ANSI_STRING){5,5,serial};
+            xbox_XeImageFileName=(XBOX_ANSI_STRING){maximum?65535:512,maximum?65535:512,path};
+            xbox_HalDiskCachePartitionCount=7;
+        }
+        if (invalid_strings) {
+            xbox_HalDiskModelNumber=(XBOX_ANSI_STRING){1,1,NULL};
+            xbox_HalDiskSerialNumber=(XBOX_ANSI_STRING){5,4,serial};
+            xbox_XeImageFileName=(XBOX_ANSI_STRING){0,1,path};
+        }
+        const unsigned ordinals[]={41,42,326};
+        const unsigned offsets[]={KDATA_DISK_MODEL_STR,KDATA_DISK_SERIAL_STR,KDATA_XE_IMAGE_FILENAME};
+        XBOX_ANSI_STRING *sources[]={&xbox_HalDiskModelNumber,&xbox_HalDiskSerialNumber,&xbox_XeImageFileName};
+        for (unsigned i=0;i<3;i++) *word(table_va+i*4)=0x80000000u|ordinals[i];
+        xbox_kernel_set_thunk_address(table_va,3);
+        xbox_kernel_init();
+        if (exhausted) {
+            while (xbox_HeapAlloc(1024*1024,4096)) {}
+            while (xbox_HeapAlloc(4096,4)) {}
+            while (xbox_HeapAlloc(4,4)) {}
+        }
+        xbox_kernel_bridge_init();
+        for (unsigned i=0;i<3;i++) {
+            uint32_t descriptor=XBOX_KERNEL_DATA_BASE+offsets[i];
+            uint16_t *counts=(uint16_t *)word(descriptor);
+            uint32_t buffer=*word(descriptor+4);
+            CHECK(xbox_resolve_ordinal(ordinals[i])==(ULONG_PTR)sources[i]);
+            CHECK(*word(table_va+i*4)==descriptor);
+            if (empty || exhausted || (invalid_strings && i<2)) {
+                CHECK(!counts[0] && !counts[1] && !buffer);
+            } else {
+                CHECK(counts[0]==sources[i]->Length && counts[1]==sources[i]->MaximumLength);
+                CHECK(buffer && xbox_HeapBlockSize(buffer)>=sources[i]->MaximumLength);
+                if (buffer) {
+                    CHECK(!memcmp(word(buffer),sources[i]->Buffer,sources[i]->Length));
+                    if (invalid_strings) CHECK(*(uint8_t *)word(buffer)==0);
+                }
+            }
+        }
+        CHECK(*word(XBOX_KERNEL_DATA_BASE+KDATA_DISK_CACHE_PARTS)==(empty?0u:7u));
+        xbox_kernel_shutdown();
+    }
     if (!strcmp(mode,"kernel-identity") || !strcmp(mode,"kernel-identity-default")) {
         int defaults=!strcmp(mode,"kernel-identity-default");
         CHECK(sizeof(xbox_HardwareInfo)==8 && sizeof(xbox_KrnlVersion)==8);

@@ -266,19 +266,11 @@ BOOL xbox_ConfigureKernelData(uint32_t base);
 #define KDATA_LAN_KEY           0x120  /* XboxLANKey (16 bytes) */
 #define KDATA_ALT_SIGNATURE_KEYS 0x130 /* XboxAlternateSignatureKeys (256 bytes) */
 #define KDATA_XE_PUBLIC_KEY     0x300  /* XePublicKeyData (284 bytes) */
-/* HAL disk identity strings (ordinals 41/42). Each is an XBOX_ANSI_STRING
- * (Length, MaximumLength, Buffer VA) followed by the string bytes it points to,
- * because HalRandGather dereferences Buffer to read the text as entropy. */
-#define KDATA_DISK_MODEL_STR    0x420  /* XBOX_ANSI_STRING (8 bytes) */
-#define KDATA_DISK_MODEL_BUF    0x430  /* model text (up to 48 bytes) */
-#define KDATA_DISK_SERIAL_STR   0x460  /* XBOX_ANSI_STRING (8 bytes) */
-#define KDATA_DISK_SERIAL_BUF   0x470  /* serial text (up to 32 bytes) */
-#define KDATA_DISK_CACHE_PARTS  0x4A0  /* HalDiskCachePartitionCount (4 bytes) */
-/* XeImageFileName's text. The exported symbol at KDATA_XE_IMAGE_FILENAME is
- * an XBOX_ANSI_STRING, and a title dereferences its Buffer -- the CRT reads
- * it to work out the running image's path. The struct was declared without
- * anything to point at, so Buffer held whatever was in that page. */
-#define KDATA_XE_IMAGE_BUF      0x4B0  /* image path text (up to 64 bytes) */
+/* Guest counted-string descriptors: two 16-bit counts and a 32-bit buffer VA.
+ * Bytes/capacity are owned guest heap copies of port-supplied native exports. */
+#define KDATA_DISK_MODEL_STR    0x420
+#define KDATA_DISK_SERIAL_STR   0x460
+#define KDATA_DISK_CACHE_PARTS  0x4A0
 
 /* Thread-local storage class for the recompiled register set. Must match
  * templates/runtime/recomp_types.h -- a mismatch is a link-time surprise. */

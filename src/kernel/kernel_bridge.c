@@ -337,10 +337,8 @@ static void kernel_data_init(void)
         BRIDGE_MEM32(channel+0x2C)=channel+0x28;
     }
 
-    /* HalDiskCachePartitionCount (ordinal 40) - number of cache partitions.
-     * Retail consoles report 3 (X, Y, Z). Titles size a partition array from
-     * this, so 0 gives a zero-length array and 1 hides two drives. */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_DISK_CACHE_PARTS) = 3;
+    /* Disk topology is supplied through the same export as native lookup. */
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_DISK_CACHE_PARTS) = xbox_HalDiskCachePartitionCount;
 
     /* IoCompletionObjectType (ordinal 64) - type object */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_COMPLETION_TYPE) = 0;
@@ -360,30 +358,32 @@ static void kernel_data_init(void)
     memcpy(XBOX_TO_NATIVE(XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY),
            xbox_XePublicKeyData, sizeof(xbox_XePublicKeyData));
 
-    /* HAL disk identity strings (ordinals 41/42). The exported symbol is an
-     * XBOX_ANSI_STRING whose Buffer must be an Xbox VA the title can deref --
-     * HalRandGather reads the bytes for entropy. Build the struct and its text
-     * inside the kernel data area so both are addressable. */
+    /* Host STRING contains a native pointer; marshal counts and a guest VA.
+     * Copy only Length source bytes, retaining the declared guest capacity.
+     * These boot copies live until memory shutdown, like launch-page input. */
     {
-        struct { uint32_t str_off, buf_off; const char *text; } d[] = {
-            { KDATA_DISK_MODEL_STR,  KDATA_DISK_MODEL_BUF,  "XBOXRECOMP VIRTUAL HDD" },
-            { KDATA_DISK_SERIAL_STR, KDATA_DISK_SERIAL_BUF, "XR0000000000" },
-            /* XeImageFileName (ordinal 326). Declared but never filled in, so
-             * its Buffer held whatever was in the page -- Half-Life 2's CRT
-             * reads it while working out the running image's path, took the
-             * uninitialised bytes as a char*, and dereferenced 0x68737572
-             * (the ASCII "rush"). A disc-booted title's value looks like this. */
-            { KDATA_XE_IMAGE_FILENAME, KDATA_XE_IMAGE_BUF,
-              "\\Device\\CdRom0\\default.xbe" },
+        const struct { uint32_t offset; const XBOX_ANSI_STRING *source; } strings[] = {
+            {KDATA_DISK_MODEL_STR, &xbox_HalDiskModelNumber},
+            {KDATA_DISK_SERIAL_STR, &xbox_HalDiskSerialNumber},
+            {KDATA_XE_IMAGE_FILENAME, &xbox_XeImageFileName}
         };
-        for (int k = 0; k < (int)(sizeof(d) / sizeof(d[0])); k++) {
-            uint32_t str_va = XBOX_KERNEL_DATA_BASE + d[k].str_off;
-            uint32_t buf_va = XBOX_KERNEL_DATA_BASE + d[k].buf_off;
-            size_t len = strlen(d[k].text);
-            memcpy(XBOX_TO_NATIVE(buf_va), d[k].text, len + 1);
-            BRIDGE_MEM16(str_va + 0) = (uint16_t)len;        /* Length */
-            BRIDGE_MEM16(str_va + 2) = (uint16_t)(len + 1);  /* MaximumLength */
-            BRIDGE_MEM32(str_va + 4) = buf_va;               /* Buffer (Xbox VA) */
+        for (unsigned i=0;i<sizeof(strings)/sizeof(strings[0]);i++) {
+            const XBOX_ANSI_STRING *source=strings[i].source;
+            uint32_t descriptor=XBOX_KERNEL_DATA_BASE+strings[i].offset;
+            uint32_t buffer, capacity=source->MaximumLength ? source->MaximumLength : 1;
+            memset(XBOX_TO_NATIVE(descriptor),0,8);
+            if (source->Length>source->MaximumLength || (!source->Buffer && source->Length)) {
+                fprintf(stderr,"  Kernel data: invalid counted string at offset %X\n",strings[i].offset);
+                continue;
+            }
+            if (!source->Buffer) continue;
+            buffer=xbox_HeapAlloc(capacity,4);
+            if (!buffer) continue;
+            memset(XBOX_TO_NATIVE(buffer),0,capacity);
+            memcpy(XBOX_TO_NATIVE(buffer),source->Buffer,source->Length);
+            BRIDGE_MEM16(descriptor)=source->Length;
+            BRIDGE_MEM16(descriptor+2)=source->MaximumLength;
+            BRIDGE_MEM32(descriptor+4)=buffer;
         }
     }
 
