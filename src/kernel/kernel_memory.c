@@ -1,12 +1,9 @@
 /*
  * kernel_memory.c - Xbox Memory Management
  *
- * Implements Mm* and NtAllocateVirtualMemory/NtFreeVirtualMemory/NtQueryVirtualMemory
- * using Win32 VirtualAlloc/VirtualFree/VirtualQuery.
- *
- * Xbox contiguous memory (MmAllocateContiguousMemory) is used for GPU-accessible
- * buffers. On Windows, actual GPU resources are handled by our D3D11 layer;
- * these allocations just need to return valid CPU-accessible memory.
+ * Native host allocation, mapping and query helpers. Guest ABI marshaling and
+ * owned guest allocation paths are handled separately by kernel_bridge.c.
+ * Several native wrappers below remain partial; see their implementation.
  */
 
 #include "kernel.h"
@@ -53,14 +50,9 @@ PVOID __stdcall xbox_MmAllocateContiguousMemoryEx(
     ULONG Alignment,
     ULONG Protect)
 {
-    /*
-     * Xbox requests physically contiguous, aligned memory for GPU use.
-     * We can't guarantee physical contiguity on Windows, but the game's
-     * CPU-side code just needs a valid pointer. GPU resources are handled
-     * separately by our D3D11 layer.
-     *
-     * Use _aligned_malloc for alignment, then VirtualAlloc for a fallback.
-     */
+    /* Partial native helper: low/high bounds are not enforced. The aligned
+     * heap path does not apply Protect, and page allocation fallback does not
+     * guarantee a larger caller-requested alignment. */
     PVOID p = NULL;
 
     if (Alignment > 0 && (Alignment & (Alignment - 1)) == 0) {
@@ -139,9 +131,10 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
     memset(MemoryStatistics, 0, sizeof(XBOX_MM_STATISTICS));
     MemoryStatistics->Length = sizeof(XBOX_MM_STATISTICS);
 
-    /* Xbox has 64MB RAM. Report plausible values. */
+    /* Installed guest RAM follows the caller's memory-layout configuration.
+     * Availability below remains a host estimate, not guest allocation accounting. */
     ULONG page_size = 4096;
-    MemoryStatistics->TotalPhysicalPages = 64 * 1024 * 1024 / page_size; /* 16384 pages */
+    MemoryStatistics->TotalPhysicalPages = (ULONG)(g_xbox_total_ram / page_size);
     MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
     if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
         MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;
