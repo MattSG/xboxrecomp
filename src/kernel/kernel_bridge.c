@@ -4279,11 +4279,10 @@ static void bridge_NtDeviceIoControlFile(void)
                     BRIDGE_MEM8(data_va + i) = 0;
 
                 /* An 8-byte MODE SENSE(10) parameter header, then the page.
-                 * The three bytes that matter are named by the title's own
-                 * validation at guest 0x0021EA56-0x0021EA6D, which is the only
-                 * specification of this page there is: byte 11 must be exactly
-                 * 1, and bytes 10 and 12 must both be non-zero. Anything else
-                 * is read as "not the expected disc". */
+                 * The three bytes that matter are the ones the title's own
+                 * validation reads: byte 11 must be exactly 1, and bytes 10
+                 * and 12 must both be non-zero. Anything else is read as "not
+                 * the expected disc". */
                 if (data_len >= 2) {
                     BRIDGE_MEM8(data_va + 0) = 0;
                     BRIDGE_MEM8(data_va + 1) = 26;   /* mode data length */
