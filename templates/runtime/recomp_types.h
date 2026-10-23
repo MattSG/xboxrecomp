@@ -288,6 +288,11 @@ static inline void recomp_dead_branch_log(uint32_t target)
 #define RECOMP_DEAD_BRANCH(target) recomp_dead_branch_log(target)
 #endif
 
+/* Opt-in stop for an unresolved call target: reports the caller and aborts,
+ * rather than returning from a stub that never ran its body. Select with
+ * -DRECOMP_UNRESOLVED_STUB_OBSERVE=recomp_unresolved_stub_stop. */
+void recomp_unresolved_stub_stop(uint32_t va);
+
 /* Indirect-branch target feedback. The ring buffer above is crash forensics --
  * 16 entries, overwritten constantly. This is a durable, deduplicated record of
  * every target the title ever reached, for feeding back into the next codegen
