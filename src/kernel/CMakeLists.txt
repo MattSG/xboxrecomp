@@ -47,6 +47,7 @@ set(KERNEL_SOURCES
     guest_strings.c
     kb_spline.c
     road_graph.c
+    polyline.c
     vec3_rotate.c
     guest_read.c
 )
