@@ -40,9 +40,9 @@ if(WIN32)
     add_library(platform INTERFACE)
     target_link_libraries(platform INTERFACE host_time)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
-    target_link_libraries(platform INTERFACE recomp_exit_hook)
+    target_sources(platform INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/line_server.c)
 else()
-    add_library(platform STATIC win32_compat.c)
+    add_library(platform STATIC win32_compat.c line_server.c)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
