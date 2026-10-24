@@ -1342,6 +1342,10 @@ class Lifter:
         # Addresses loaded as immediates into a register inside the current
         # function, used to resolve `jmp <reg>`. See _lift_jmp.
         self.imm_code_refs = set()
+        # Addresses inside a function that a caller may enter directly, as well as
+        # by falling through or branching. Each becomes a label, and the function
+        # dispatches to it when g_recomp_resume names it on entry.
+        self.resume_entries = set()
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.

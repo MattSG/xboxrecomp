@@ -1,6 +1,6 @@
 import unittest
 
-from unwind_patch import unwind_after_call
+from .unwind_patch import unwind_after_call
 
 
 class UnwindAfterCallTest(unittest.TestCase):
