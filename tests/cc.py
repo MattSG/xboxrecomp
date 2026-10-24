@@ -13,7 +13,7 @@ import shutil
 import sys
 
 NO_COMPILER_MESSAGE = (
-    "No C compiler: on Windows run `python scripts/devenv.py --shell` (MSVC), "
+    "No C compiler: on Windows load the MSVC environment (vcvars64.bat) (MSVC), "
     "elsewhere install gcc or clang."
 )
 
