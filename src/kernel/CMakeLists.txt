@@ -41,6 +41,7 @@ set(KERNEL_SOURCES
     feature_switch.c
     camera_math.c
     slot_publish.c
+    env_range.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
