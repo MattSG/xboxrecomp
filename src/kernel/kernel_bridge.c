@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "kernel_guest_io.h"
 #include "guest_vmem.h"
+#include "guest_state.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -5505,61 +5506,23 @@ static void bridge_IoInitializeIrp(void)
     g_eax = 0;
 }
 
-/* Guest kernel callbacks run nested on the recompiler's register file. Save
- * the complete modeled CPU state so a StartIo callback, dispatch callback, or
- * nested IofCompleteRequest obeys the Xbox call boundary instead of leaking
- * the callback's volatile registers/FPU state into its caller. */
-typedef struct bridge_guest_call_state {
-    uint32_t eax, ecx, edx, esp, ebx, esi, edi, ebp, seh_ebp, fs_base;
-    uint32_t caller;
-    int df, fp_top, fp_cmp;
-    uint16_t fp_control, fp_cc;
-    double fp_stack[8];
-    RecompMmx mmx[8];
-    RecompXmm xmm[8];
-    fenv_t host_fenv;
-#ifdef BRIDGE_HAS_MXCSR
-    uint32_t mxcsr;
-#endif
-} bridge_guest_call_state;
+/* Guest kernel callbacks run nested on the recompiler's register file. The
+ * shared guest-state helpers save the complete modeled CPU state, so a StartIo
+ * callback, dispatch callback, or nested IofCompleteRequest obeys the Xbox call
+ * boundary; the kernel's own caller record is kept alongside it. */
+typedef xbox_guest_state bridge_guest_call_state;
 
 static void bridge_guest_state_save(bridge_guest_call_state *s)
 {
-    s->eax=g_eax; s->ecx=g_ecx; s->edx=g_edx; s->esp=g_esp;
-    s->ebx=g_ebx; s->esi=g_esi; s->edi=g_edi; s->ebp=g_ebp;
-    s->seh_ebp=g_seh_ebp; s->fs_base=g_fs_base;
+    xbox_guest_state_save(s);
     s->caller=g_xbox_kernel_caller;
-    s->df=g_df; s->fp_top=g_fp_top; s->fp_cmp=g_fp_cmp;
-    s->fp_control=g_fp_control_word; s->fp_cc=g_fp_cc;
-    memcpy(s->fp_stack,g_fp_stack,sizeof(s->fp_stack));
-    s->mmx[0]=g_mm0; s->mmx[1]=g_mm1; s->mmx[2]=g_mm2; s->mmx[3]=g_mm3;
-    s->mmx[4]=g_mm4; s->mmx[5]=g_mm5; s->mmx[6]=g_mm6; s->mmx[7]=g_mm7;
-    s->xmm[0]=g_xmm0; s->xmm[1]=g_xmm1; s->xmm[2]=g_xmm2; s->xmm[3]=g_xmm3;
-    s->xmm[4]=g_xmm4; s->xmm[5]=g_xmm5; s->xmm[6]=g_xmm6; s->xmm[7]=g_xmm7;
-    fegetenv(&s->host_fenv);
-#ifdef BRIDGE_HAS_MXCSR
-    s->mxcsr=_mm_getcsr();
-#endif
 }
 
 static void bridge_guest_state_restore(const bridge_guest_call_state *s,
                                        uint32_t eax)
 {
-    g_eax=eax; g_ecx=s->ecx; g_edx=s->edx; g_esp=s->esp;
-    g_ebx=s->ebx; g_esi=s->esi; g_edi=s->edi; g_ebp=s->ebp;
-    g_seh_ebp=s->seh_ebp; g_fs_base=s->fs_base;
+    xbox_guest_state_restore(s, eax);
     g_xbox_kernel_caller=s->caller;
-    g_df=s->df; g_fp_top=s->fp_top; g_fp_cmp=s->fp_cmp;
-    g_fp_control_word=s->fp_control; g_fp_cc=s->fp_cc;
-    memcpy(g_fp_stack,s->fp_stack,sizeof(s->fp_stack));
-    g_mm0=s->mmx[0]; g_mm1=s->mmx[1]; g_mm2=s->mmx[2]; g_mm3=s->mmx[3];
-    g_mm4=s->mmx[4]; g_mm5=s->mmx[5]; g_mm6=s->mmx[6]; g_mm7=s->mmx[7];
-    g_xmm0=s->xmm[0]; g_xmm1=s->xmm[1]; g_xmm2=s->xmm[2]; g_xmm3=s->xmm[3];
-    g_xmm4=s->xmm[4]; g_xmm5=s->xmm[5]; g_xmm6=s->xmm[6]; g_xmm7=s->xmm[7];
-    fesetenv(&s->host_fenv);
-#ifdef BRIDGE_HAS_MXCSR
-    _mm_setcsr(s->mxcsr);
-#endif
 }
 
 /* Call a guest stdcall routine with `args` in guest memory. Preserve all
