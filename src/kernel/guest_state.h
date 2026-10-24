@@ -27,4 +27,15 @@ void xbox_guest_state_save(xbox_guest_state *s);
 /* Restores every field except caller; eax is the value the caller returns. */
 void xbox_guest_state_restore(const xbox_guest_state *s, uint32_t eax);
 
+/* The callee-saved set alone: ebx, esi, edi, ebp and the SEH frame pointer.
+ * A wrapper around a generated body that returns a value in eax or on the FPU
+ * stack uses this, because restoring the whole state would discard that value.
+ * The caller keeps ESP itself. */
+typedef struct {
+    uint32_t ebx, esi, edi, ebp, seh_ebp;
+} xbox_callee_saved;
+
+void xbox_callee_saved_save(xbox_callee_saved *s);
+void xbox_callee_saved_restore(const xbox_callee_saved *s);
+
 #endif
