@@ -10,6 +10,7 @@
 #define UI_RMLUI_HOST_H
 
 #include <RmlUi/Core.h>
+#include <stdio.h>
 
 struct RmlUiHostOptions {
     const char *title;
@@ -39,5 +40,27 @@ int rmlui_host_run(const RmlUiHostOptions *options, const RmlUiHostClient *clien
 /* Registers the first installed sans-serif pair (regular, then bold) under family, and as the
  * fallback face for glyphs the family lacks. Returns 0 when no candidate is installed. */
 int rmlui_host_load_sans_fonts(const char *family);
+
+/* A system interface that forwards to base and writes RmlUi's messages to
+ * stderr as "[tag] message", counting the errors. Set base before the host
+ * starts; the errors count feeds the client's first-frame check. */
+struct RmlUiHostLogSystem : Rml::SystemInterface {
+    Rml::SystemInterface *base = nullptr;
+    const char *tag = "rmlui";
+    unsigned errors = 0;
+    double GetElapsedTime() override { return base->GetElapsedTime(); }
+    void SetMouseCursor(const Rml::String &name) override { base->SetMouseCursor(name); }
+    void SetClipboardText(const Rml::String &text) override { base->SetClipboardText(text); }
+    void GetClipboardText(Rml::String &text) override { base->GetClipboardText(text); }
+    bool LogMessage(Rml::Log::Type type, const Rml::String &message) override
+    {
+        if (type == Rml::Log::LT_ERROR || type == Rml::Log::LT_ASSERT)
+            ++errors;
+        fprintf(stderr, "[%s] %s
+", tag, message.c_str());
+        fflush(stderr);
+        return true;
+    }
+};
 
 #endif
