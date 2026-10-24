@@ -56,3 +56,21 @@ void xbox_guest_state_restore(const xbox_guest_state *s, uint32_t eax)
     _mm_setcsr(s->mxcsr);
 #endif
 }
+
+void xbox_callee_saved_save(xbox_callee_saved *s)
+{
+    s->ebx = g_ebx;
+    s->esi = g_esi;
+    s->edi = g_edi;
+    s->ebp = g_ebp;
+    s->seh_ebp = g_seh_ebp;
+}
+
+void xbox_callee_saved_restore(const xbox_callee_saved *s)
+{
+    g_ebx = s->ebx;
+    g_esi = s->esi;
+    g_edi = s->edi;
+    g_ebp = s->ebp;
+    g_seh_ebp = s->seh_ebp;
+}
