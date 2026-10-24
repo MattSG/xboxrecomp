@@ -4,7 +4,7 @@ Run from the game checkout with its portable Windows toolchain:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
-. ./scripts/enter-env.ps1
+(enter the MSVC environment first, for example vcvars64.bat)
 cmake -S tools/xboxrecomp/tests/nv2a_textures -B conformance_tmp/texture-tests -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build conformance_tmp/texture-tests
 ctest --test-dir conformance_tmp/texture-tests --output-on-failure
