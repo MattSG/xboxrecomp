@@ -3517,8 +3517,17 @@ class Lifter:
         """Basic FPU instruction translation using double locals."""
         # x87 exception flags are not modelled, so clearing them and the
         # no-op form change nothing here. Everything else falls through.
-        if m in ("fnclex", "fclex", "fnop"):
+        if m in ("fnclex", "fclex", "fnop", "fwait"):
             return [f"/* {m}: x87 exception flags are not modelled */"]
+        # The tag word is not modelled, and freeing a register changes no
+        # value or TOP here, so ffree is a no-op in this model.
+        if m == "ffree":
+            return [f"/* ffree {insn.op_str}: x87 tag word is not modelled */"]
+        # TOP rotates without moving any value, as the hardware does.
+        if m == "fincstp":
+            return ["g_fp_top = (g_fp_top + 1) & 7; /* fincstp */"]
+        if m == "fdecstp":
+            return ["g_fp_top = (g_fp_top - 1) & 7; /* fdecstp */"]
         # FPU is complex. We translate common patterns to double operations.
         # Full accuracy would require an x87 stack emulator.
 
