@@ -1,3 +1,6 @@
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE /* PATH_MAX, lstat and O_NOFOLLOW in the POSIX block */
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
