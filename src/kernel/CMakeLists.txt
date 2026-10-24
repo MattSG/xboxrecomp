@@ -42,6 +42,7 @@ set(KERNEL_SOURCES
     camera_math.c
     slot_publish.c
     env_range.c
+    piece_cluster.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
