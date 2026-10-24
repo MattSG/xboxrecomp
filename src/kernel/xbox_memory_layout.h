@@ -192,6 +192,18 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);
+/* Copies size bytes at guest address va into out. Returns 1 only if the whole
+ * range is readable and inside the guest window; a fault is reported as 0 and
+ * never reaches the caller. Windows only: other hosts return 0. For diagnostics
+ * that must observe guest memory without introducing a guest fault. */
+int xbox_GuestRead(uint32_t va, void *out, size_t size);
+/* True if [va, va+bytes) lies inside the devkit guest window that a guest
+ * pointer may name. Pure arithmetic; touches no memory. */
+int xbox_GuestRangeInWindow(uint32_t va, uint32_t bytes);
+/* True if the whole range is inside that window and its host pages are
+ * committed and readable (writable for POSIX rw maps). Windows: VirtualQuery;
+ * POSIX: /proc/self/maps. */
+int xbox_GuestMapped(uint32_t va, uint32_t bytes);
 int xbox_IsContiguousMemoryAvailable(void);
 /* Runtime virtualized physical address space. Low RAM IDs are placed after
  * the complete guest VA range so a raw guest VA can never alias an ID. The

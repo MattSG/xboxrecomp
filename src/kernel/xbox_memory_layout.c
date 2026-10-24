@@ -274,6 +274,62 @@ static volatile LONG g_contig_alloc_count;
  * input in the only sense that matters here: the title can leave one
  * uninitialised, and 0xCCCCCCCC dereferenced is a crash in the runtime
  * rather than a fault the title would have taken. */
+int xbox_GuestRead(uint32_t va, void *out, size_t size)
+{
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    uintptr_t host;
+    if (va < 0x10000u || size > UINT32_MAX || va > UINT32_MAX - size)
+        return 0;
+    host = (uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset();
+    if (host > UINTPTR_MAX - size)
+        return 0;
+    return ReadProcessMemory(GetCurrentProcess(), (const void *)host, out, size, &copied)
+           && copied == size;
+#else
+    (void)va; (void)out; (void)size;
+    return 0;
+#endif
+}
+
+int xbox_GuestRangeInWindow(uint32_t va, uint32_t bytes)
+{
+    return va >= 0x10000u && va < XBOX_DEVKIT_RAM && bytes <= XBOX_DEVKIT_RAM - va;
+}
+
+int xbox_GuestMapped(uint32_t va, uint32_t bytes)
+{
+    uintptr_t host;
+    if (!xbox_GuestRangeInWindow(va, bytes))
+        return 0;
+    host = (uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset();
+#ifdef _WIN32
+    {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery((void *)host, &info, sizeof info) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return 0;
+        return host + bytes <= (uintptr_t)info.BaseAddress + info.RegionSize;
+    }
+#else
+    {
+        FILE *maps = fopen("/proc/self/maps", "r");
+        char line[256], access[5];
+        unsigned long long lo, hi;
+        int mapped = 0;
+        if (!maps)
+            return 0;
+        while (!mapped && fgets(line, sizeof line, maps))
+            if (sscanf(line, "%llx-%llx %4s", &lo, &hi, access) == 3 &&
+                access[0] == 'r' && access[1] == 'w' &&
+                host >= lo && host + bytes <= hi)
+                mapped = 1;
+        fclose(maps);
+        return mapped;
+    }
+#endif
+}
+
 size_t xbox_GetMappedSize(void)
 {
     return g_memory_size;
@@ -2359,6 +2415,14 @@ static void *xbox_map_device_section(HANDLE *mapping, uint32_t base, uint32_t by
     void *view;
     *mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, bytes, NULL);
     if (!*mapping) return NULL;
+#ifndef _WIN32
+    if (g_span_base && !w32_release_reserved_region(
+            (void *)((uintptr_t)base + g_memory_offset), bytes)) {
+        CloseHandle(*mapping);
+        *mapping = NULL;
+        return NULL;
+    }
+#endif
     view = MapViewOfFileEx(*mapping, FILE_MAP_ALL_ACCESS, 0, 0, bytes,
                            (void *)((uintptr_t)base + g_memory_offset));
     if (!view) { CloseHandle(*mapping); *mapping = NULL; }
@@ -2523,8 +2587,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * (tiled 0xF0000000, NV2A, MCPX, flash) have to stay ours between
          * mappings, and across a shutdown and re-init. */
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-        if (g_span_size < (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-            g_span_size = (size_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+        if (g_span_size < ((size_t)1 << 32))
+            g_span_size = (size_t)1 << 32;
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
             g_span_reservation_id = w32_reservation_id(g_span_base);
@@ -3256,8 +3320,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          */
         if (tiled_size > XBOX_CONTIG_SIZE)
             tiled_size = XBOX_CONTIG_SIZE;
-        span_release(tiled_native, tiled_size);
-        g_tiled_view = g_contig_mapping
+        BOOL tiled_slot_ready = TRUE;
+#ifndef _WIN32
+        if (g_span_base)
+            tiled_slot_ready = w32_release_reserved_region((void *)tiled_native, tiled_size);
+#endif
+        g_tiled_view = g_contig_mapping && tiled_slot_ready
             ? MapViewOfFileEx(
                 g_contig_mapping,
                 FILE_MAP_ALL_ACCESS,
@@ -3305,6 +3373,16 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     xbox_WatchInit();
+#ifndef _WIN32
+    /* Dynamic aliases use free slots and refuse foreign mappings. Exclude
+     * their arena from the otherwise reserved 32-bit guest address space. */
+    if (g_span_base && !w32_release_reserved_region(
+            (void *)((uintptr_t)XBOX_IOMAP_START + g_memory_offset),
+            XBOX_IOMAP_END - XBOX_IOMAP_START)) {
+        xbox_MemoryLayoutShutdown();
+        return FALSE;
+    }
+#endif
     AcquireSRWLockExclusive(&g_iomap_lock);
     g_iomap_available = 1;
     ReleaseSRWLockExclusive(&g_iomap_lock);
@@ -3318,6 +3396,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
 void xbox_MemoryLayoutShutdown(void)
 {
+    /* Stop new aliases and remove every owned view before waiting on workers
+     * or closing their backing sections. */
     AcquireSRWLockExclusive(&g_iomap_lock);
     g_iomap_available = 0;
     for (int i = 0; i < XBOX_IOMAP_MAX; i++) {
@@ -3352,13 +3432,6 @@ void xbox_MemoryLayoutShutdown(void)
     }
     g_kernel_memory = NULL;
     g_kernel_memory_owned = 0;
-    if (g_nv2a_ack_thread) {
-        InterlockedExchange(&g_nv2a_ack_stop, 1);
-        xbox_nv2a_wake_publish(&g_nv2a_wake);
-        WaitForSingleObject(g_nv2a_ack_thread, 1000);
-        CloseHandle(g_nv2a_ack_thread);
-        g_nv2a_ack_thread = NULL;
-    }
     if (g_ac97_veh) { RemoveVectoredExceptionHandler(g_ac97_veh); g_ac97_veh = NULL; }
     g_ac97_page = NULL;
     g_apu_mmio_trapped = 0;
