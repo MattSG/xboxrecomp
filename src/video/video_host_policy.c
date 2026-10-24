@@ -1,6 +1,6 @@
 #include "video_host_policy.h"
 #include "video_player.h"
-#include "kernel.h"
+#include "kernel/kernel.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
