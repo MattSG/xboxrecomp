@@ -17,14 +17,22 @@ else:
     import fcntl
 
 
+def windows_image_name(process_name):
+    """The image name tasklist reports for an executable, lower case."""
+    name = process_name.lower()
+    return name if name.endswith(".exe") else name + ".exe"
+
+
 def running_pids(process_name):
     """Sorted pids of processes whose executable is process_name."""
     if IS_WINDOWS:
         # Localized "INFO:" text can be in a code page the locale decoder rejects.
+        # Windows image names carry the extension, so accept the bare name too.
+        wanted = windows_image_name(process_name)
         result = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
                                 errors="replace")
         rows = csv.reader(result.stdout.splitlines())
-        pids = [row[1] for row in rows if len(row) > 1 and row[0].lower() == process_name.lower()]
+        pids = [row[1] for row in rows if len(row) > 1 and row[0].lower() == wanted]
     else:
         try:
             result = subprocess.run(["pgrep", "-x", process_name], capture_output=True, text=True)

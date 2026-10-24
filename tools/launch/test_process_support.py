@@ -35,6 +35,12 @@ class RunLogTest(unittest.TestCase):
             self.assertTrue(lines[1].endswith("[err] bad \ufffd bytes"))
 
 
+class ImageNameTest(unittest.TestCase):
+    def test_windows_image_names_carry_the_extension(self):
+        self.assertEqual(ps.windows_image_name("mm3_recomp"), "mm3_recomp.exe")
+        self.assertEqual(ps.windows_image_name("MM3_Recomp.EXE"), "mm3_recomp.exe")
+
+
 class RunningPidsTest(unittest.TestCase):
     def test_unknown_process_has_no_pids(self):
         self.assertEqual(ps.running_pids("no-such-process-for-contract-xyz"), [])
