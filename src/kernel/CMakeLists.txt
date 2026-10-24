@@ -34,6 +34,8 @@ set(KERNEL_SOURCES
     crash_report.c
     derived_cache.c
     nv2a_pb_recovery.c
+    recomp_lookup_cache.c
+    xbox_std_string.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
