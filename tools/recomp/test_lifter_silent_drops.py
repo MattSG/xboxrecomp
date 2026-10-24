@@ -75,6 +75,23 @@ class MovqXmmTest(unittest.TestCase):
 
 class X87FallthroughTest(unittest.TestCase):
 
+    def test_free_wait_and_stack_rotate_are_explicit(self):
+        # ffree and fwait change no value here; fincstp/fdecstp only move TOP.
+        for mnem, expect in (("ffree", "tag word is not modelled"),
+                             ("fwait", "not modelled")):
+            with self.subTest(mnemonic=mnem):
+                lifter, out = _lift(mnem, "st(3)" if mnem == "ffree" else "",
+                                    [_xmm("st(3)")] if mnem == "ffree" else [])
+                self.assertNotIn("RECOMP_UNIMPL", out)
+                self.assertIn(expect, out)
+                self.assertEqual(lifter.unimplemented, {})
+        for mnem, step in (("fincstp", "+ 1"), ("fdecstp", "- 1")):
+            with self.subTest(mnemonic=mnem):
+                lifter, out = _lift(mnem)
+                self.assertIn(f"g_fp_top = (g_fp_top {step}) & 7;", out)
+                self.assertNotIn("RECOMP_UNIMPL", out)
+                self.assertEqual(lifter.unimplemented, {})
+
     def test_exception_clear_and_nop_are_explicit_no_ops(self):
         # The model keeps no x87 exception flags, so these change nothing. They
         # must not be counted as missing, or a reached one stops the title.
