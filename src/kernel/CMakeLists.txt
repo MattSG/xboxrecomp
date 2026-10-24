@@ -32,6 +32,7 @@ set(KERNEL_SOURCES
     icall_diagnostics.c
     host_write_watch.c
     crash_report.c
+    derived_cache.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
