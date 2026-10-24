@@ -56,8 +56,7 @@ struct RmlUiHostLogSystem : Rml::SystemInterface {
     {
         if (type == Rml::Log::LT_ERROR || type == Rml::Log::LT_ASSERT)
             ++errors;
-        fprintf(stderr, "[%s] %s
-", tag, message.c_str());
+        fprintf(stderr, "[%s] %s\n", tag, message.c_str());
         fflush(stderr);
         return true;
     }
