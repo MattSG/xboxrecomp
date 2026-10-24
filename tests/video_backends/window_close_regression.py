@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def main():
     cc.skip_unless_windows("links user32")
     cc.require_compiler()
-    with tempfile.TemporaryDirectory(prefix="mm3-window-close-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="xboxrecomp-window-close-") as temporary:
         folder = Path(temporary)
         executable = folder / f"contract{cc.exe_suffix()}"
         subprocess.run(cc.compile_command(
