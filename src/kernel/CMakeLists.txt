@@ -38,6 +38,8 @@ set(KERNEL_SOURCES
     xbox_std_string.c
     fixed_step.c
     guest_call.c
+    feature_switch.c
+    camera_math.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
