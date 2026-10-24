@@ -43,6 +43,7 @@ set(KERNEL_SOURCES
     slot_publish.c
     env_range.c
     piece_cluster.c
+    string_ci.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
