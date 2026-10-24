@@ -36,4 +36,8 @@ struct RmlUiHostClient {
 /* Returns 1 when the backend started and the loop ran, 0 when it could not start. */
 int rmlui_host_run(const RmlUiHostOptions *options, const RmlUiHostClient *client);
 
+/* Registers the first installed sans-serif pair (regular, then bold) under family, and as the
+ * fallback face for glyphs the family lacks. Returns 0 when no candidate is installed. */
+int rmlui_host_load_sans_fonts(const char *family);
+
 #endif
