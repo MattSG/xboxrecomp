@@ -31,6 +31,7 @@ set(KERNEL_SOURCES
     nv2a_wbc_flush.c
     icall_diagnostics.c
     host_write_watch.c
+    crash_report.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
