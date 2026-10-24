@@ -40,6 +40,7 @@ set(KERNEL_SOURCES
     guest_call.c
     feature_switch.c
     camera_math.c
+    slot_publish.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
