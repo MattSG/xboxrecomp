@@ -48,6 +48,7 @@ set(KERNEL_SOURCES
     kb_spline.c
     road_graph.c
     polyline.c
+    thick_line.c
     vec3_rotate.c
     guest_read.c
 )

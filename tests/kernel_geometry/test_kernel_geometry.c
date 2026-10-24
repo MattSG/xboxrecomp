@@ -5,6 +5,7 @@
 #include "road_graph.h"
 #include "vec3_rotate.h"
 #include "guest_read.h"
+#include "thick_line.h"
 
 /* guest_read.c links against guest memory; this test never reads it. */
 #include <stddef.h>
@@ -83,6 +84,17 @@ static int test_kb_spline(void)
     return 0;
 }
 
+static int test_thick_line(void)
+{
+    /* A horizontal segment of width 2 becomes a band of half-width 1. */
+    float xy[8];
+    CHECK(thick_line_quad(xy, 0, 0, 10, 0, 2));
+    CHECK(NEAR(xy[0], 0) && NEAR(xy[1], -1) && NEAR(xy[2], 10) && NEAR(xy[3], -1));
+    CHECK(NEAR(xy[4], 10) && NEAR(xy[5], 1) && NEAR(xy[6], 0) && NEAR(xy[7], 1));
+    CHECK(!thick_line_quad(xy, 3, 3, 3, 3, 2));
+    return 0;
+}
+
 static int test_clock(void)
 {
     CHECK(recomp_clock_capped_advance(10, 3, 5) == 13);
@@ -92,7 +104,8 @@ static int test_clock(void)
 
 int main(void)
 {
-    if (test_polyline() || test_road_graph() || test_vec3_rotate() || test_kb_spline() || test_clock())
+    if (test_polyline() || test_road_graph() || test_vec3_rotate() || test_kb_spline() ||
+        test_thick_line() || test_clock())
         return 1;
     printf("kernel_geometry: all checks passed\n");
     return 0;
