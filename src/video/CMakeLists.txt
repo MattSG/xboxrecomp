@@ -3,6 +3,7 @@
 # texture). XBOXRECOMP_RENDERER (top-level CMakeLists.txt) picks the renderer.
 add_library(xbox_video STATIC
     video_player.c
+    video_host_policy.c
     video_pump.c
     fb_present.c
     spike_sampler.c
