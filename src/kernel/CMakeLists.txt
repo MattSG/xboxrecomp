@@ -47,6 +47,7 @@ set(KERNEL_SOURCES
     guest_strings.c
     kb_spline.c
     road_graph.c
+    vec3_rotate.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
