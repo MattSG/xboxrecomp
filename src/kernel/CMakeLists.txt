@@ -44,6 +44,7 @@ set(KERNEL_SOURCES
     env_range.c
     piece_cluster.c
     string_ci.c
+    guest_strings.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
