@@ -1,4 +1,4 @@
-/* Shared CPU and real-GPU regression for the road/headlight volume formats. */
+/* Shared CPU and real-GPU regression for 3D volume texture formats. */
 static void test_volume(void)
 {
     NvD3DTexture t = {0}; TexLayout l;
