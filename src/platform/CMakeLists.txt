@@ -23,8 +23,9 @@ get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOL
 if(WIN32)
     add_library(platform INTERFACE)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
+    target_sources(platform INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/line_server.c)
 else()
-    add_library(platform STATIC win32_compat.c)
+    add_library(platform STATIC win32_compat.c line_server.c)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
