@@ -274,6 +274,62 @@ static volatile LONG g_contig_alloc_count;
  * input in the only sense that matters here: the title can leave one
  * uninitialised, and 0xCCCCCCCC dereferenced is a crash in the runtime
  * rather than a fault the title would have taken. */
+int xbox_GuestRead(uint32_t va, void *out, size_t size)
+{
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    uintptr_t host;
+    if (va < 0x10000u || size > UINT32_MAX || va > UINT32_MAX - size)
+        return 0;
+    host = (uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset();
+    if (host > UINTPTR_MAX - size)
+        return 0;
+    return ReadProcessMemory(GetCurrentProcess(), (const void *)host, out, size, &copied)
+           && copied == size;
+#else
+    (void)va; (void)out; (void)size;
+    return 0;
+#endif
+}
+
+int xbox_GuestRangeInWindow(uint32_t va, uint32_t bytes)
+{
+    return va >= 0x10000u && va < XBOX_DEVKIT_RAM && bytes <= XBOX_DEVKIT_RAM - va;
+}
+
+int xbox_GuestMapped(uint32_t va, uint32_t bytes)
+{
+    uintptr_t host;
+    if (!xbox_GuestRangeInWindow(va, bytes))
+        return 0;
+    host = (uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset();
+#ifdef _WIN32
+    {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery((void *)host, &info, sizeof info) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return 0;
+        return host + bytes <= (uintptr_t)info.BaseAddress + info.RegionSize;
+    }
+#else
+    {
+        FILE *maps = fopen("/proc/self/maps", "r");
+        char line[256], access[5];
+        unsigned long long lo, hi;
+        int mapped = 0;
+        if (!maps)
+            return 0;
+        while (!mapped && fgets(line, sizeof line, maps))
+            if (sscanf(line, "%llx-%llx %4s", &lo, &hi, access) == 3 &&
+                access[0] == 'r' && access[1] == 'w' &&
+                host >= lo && host + bytes <= hi)
+                mapped = 1;
+        fclose(maps);
+        return mapped;
+    }
+#endif
+}
+
 size_t xbox_GetMappedSize(void)
 {
     return g_memory_size;
