@@ -304,6 +304,7 @@ void recomp_unresolved_stub_stop(uint32_t va);
  * RECOMP_ICALL_SEEN_* constants need not exist either. */
 #ifdef RECOMP_ICALL_FEEDBACK
 #include "recomp_icall_feedback.h"
+#include "recomp_cpu.h"
 #else
 #define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
 #define RECOMP_ICALL_OBSERVE_SITE(site, va) ((void)0)
