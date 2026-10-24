@@ -33,6 +33,7 @@ set(KERNEL_SOURCES
     host_write_watch.c
     crash_report.c
     derived_cache.c
+    nv2a_pb_recovery.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
