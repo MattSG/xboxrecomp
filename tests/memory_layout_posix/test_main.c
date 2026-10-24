@@ -174,6 +174,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* The guest-window helpers that the fork's diagnostics and the teleport
+     * endpoint rely on, checked against the real mapping on this host. */
+    check(xbox_GuestMapped(XBOX_STACK_BASE, 16),
+          "xbox_GuestMapped: the committed stack is readable",
+          "the stack range is not reported as mapped");
+    check(!xbox_GuestMapped(0x0FFFFu, 4),
+          "xbox_GuestMapped: below the guest window floor is refused", NULL);
+    check(!xbox_GuestMapped(XBOX_DEVKIT_RAM, 4),
+          "xbox_GuestMapped: beyond the devkit window is refused", NULL);
+    check(xbox_GuestRangeInWindow(0x10000u, 4) && !xbox_GuestRangeInWindow(0x0FFFFu, 4),
+          "xbox_GuestRangeInWindow: floor is exact", NULL);
+
     void  *base = xbox_GetMemoryBase();
     size_t size = xbox_GetMappedSize();
     check(base != NULL, "base pointer is non-NULL", NULL);
