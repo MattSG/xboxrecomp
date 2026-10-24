@@ -1663,6 +1663,14 @@ class Lifter:
             expr = {"stc": "1", "clc": "0", "cmc": "!_cf"}[m]
             return [f"_cf = {expr}; /* {m} */"]
 
+        # ── CPU identification ──
+        #
+        # cpuid answers from the Xbox profile in include/recomp_cpu.h, the same
+        # values xemu reports. Lowering it here means no title has to patch
+        # its CPUID sites into RECOMP_UNIMPL overrides to get past the probe.
+        if m == "cpuid":
+            return ["recomp_cpuid(eax, ecx, &eax, &ebx, &ecx, &edx);  /* cpuid */"]
+
         # ── Time stamp counter ──
         #
         # The guest reads wall-clock time through it. Xbox's
