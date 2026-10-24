@@ -28,7 +28,7 @@ def production_bodies(source):
 def main():
     cc.require_compiler()
     source = (ROOT / "src/video/nv2a_sdlgpu.c").read_text()
-    with tempfile.TemporaryDirectory(prefix="mm3-sdl-present-pacing-") as folder:
+    with tempfile.TemporaryDirectory(prefix="xboxrecomp-sdl-present-pacing-") as folder:
         folder = Path(folder)
         (folder / "production_pacing.inc").write_text(production_bodies(source))
         exe = folder / f"contract{cc.exe_suffix()}"
