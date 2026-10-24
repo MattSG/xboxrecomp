@@ -37,8 +37,8 @@ class RunLogTest(unittest.TestCase):
 
 class ImageNameTest(unittest.TestCase):
     def test_windows_image_names_carry_the_extension(self):
-        self.assertEqual(ps.windows_image_name("mm3_recomp"), "mm3_recomp.exe")
-        self.assertEqual(ps.windows_image_name("MM3_Recomp.EXE"), "mm3_recomp.exe")
+        self.assertEqual(ps.windows_image_name("game_exe"), "game_exe.exe")
+        self.assertEqual(ps.windows_image_name("Game_Exe.EXE"), "game_exe.exe")
 
 
 class RunningPidsTest(unittest.TestCase):
