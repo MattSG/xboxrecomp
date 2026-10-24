@@ -1,7 +1,7 @@
 """Run the generic title overlay/upload contract (MSVC environment required).
 
-Title-specific HUD and minimap placement live in the game repository's mods
-regressions. This harness verifies the actual renderer callback boundary.
+Title-specific HUD and minimap placement belong to each title's own regression
+suite. This harness verifies the actual renderer callback boundary.
 """
 from pathlib import Path
 import argparse
