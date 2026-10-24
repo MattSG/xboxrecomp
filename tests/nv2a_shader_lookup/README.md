@@ -26,7 +26,7 @@ For worker scheduling and all four specialized shader variants, also run the
 existing `tests/nv2a_ps_prewarm` GPU/scheduler suite. Shader bytecode SHA keys,
 manifest schema/family identity and graphics output are unchanged.
 
-From the game repository after loading `python scripts/devenv.py --shell`:
+After loading a shell with the MSVC environment (vcvars64.bat):
 
 ```powershell
 cmake -S tools/xboxrecomp/tests/nv2a_shader_lookup -B conformance_tmp/stutter-shader-lookup-test -G Ninja -DCMAKE_BUILD_TYPE=Release
