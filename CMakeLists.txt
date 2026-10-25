@@ -110,6 +110,16 @@ set(XBOXRECOMP_LIBS
     xbox_video
     xbox_host
 )
+add_library(xboxrecomp INTERFACE)
+if(UNIX AND NOT APPLE)
+    # The archives call each other both ways (the APU reaches the kernel's
+    # memory map, the kernel raises the APU's interrupt). GNU ld scans each
+    # archive once, so it needs the group; MSVC and ld64 rescan on their own.
+    target_link_libraries(xboxrecomp INTERFACE
+        -Wl,--start-group ${XBOXRECOMP_LIBS} -Wl,--end-group)
+else()
+    target_link_libraries(xboxrecomp INTERFACE ${XBOXRECOMP_LIBS})
+endif()
 # win32_compat.c uses the C99 fenv functions, which glibc provides in libm.
 if(NOT WIN32)
     target_link_libraries(xboxrecomp INTERFACE m)
