@@ -319,18 +319,8 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
         unsigned port = (aligned - HcRhPortStatus1) / 4;
         uint32_t *ps = &hc->reg[(HcRhPortStatus1 + port * 4) / 4];
 
-        /* Write-1-to-clear first, because the change bits a write carries
-         * refer to the state BEFORE it.
-         *
-         * This ordering is the whole bug it once had. A driver starting a
-         * fresh reset writes SetPortReset and ClearPortResetStatusChange in
-         * the same word -- "acknowledge the last reset, begin another" --
-         * which is both legal and what the Xbox USB stack does: DDS9 writes
-         * 0x01100010. Clearing afterwards wiped the PRSC this very write had
-         * just raised, so the reset never reported complete, the driver
-         * reset the port again, and enumeration looped forever one step from
-         * finishing. The port looked healthy the whole time: connected,
-         * enabled, powered. */
+        /* Acknowledge prior change bits before an immediate reset can raise
+         * new ones in the same write. */
         *ps &= ~(v & 0xFFFF0000u);
 
         if (v & PORT_W_CCS_CLEAR_ENABLE) *ps &= ~PORT_PES;
@@ -415,15 +405,8 @@ static UsbSetup g_setup_[USB_GAMEPAD_MAX];
 #define g_setup_pending g_setup_pending_[pad]
 #define g_setup         g_setup_[pad]
 
-/* The control transfer's data stage, across however many descriptors it takes.
- *
- * bMaxPacketSize0 is 8, so a driver asking for a 32-byte configuration
- * descriptor queues four 8-byte IN descriptors and expects successive chunks.
- * Answering each one from the top of the buffer hands it the first 8 bytes
- * four times: the descriptor it assembles is nonsense, it gives up and starts
- * again, which is exactly the loop DDS9 sat in -- GET_DESCRIPTOR, SET_ADDRESS,
- * GET_DESCRIPTOR, forever. The answer is computed once per setup packet and
- * then consumed. */
+/* Compute the control response once per setup, then consume it across the
+ * driver's packet-sized IN descriptors. */
 static uint8_t g_ctrl_buf_[USB_GAMEPAD_MAX][64];
 static int     g_ctrl_len_[USB_GAMEPAD_MAX] = {-1, -1, -1, -1};
 static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
@@ -469,14 +452,7 @@ static int guest_ok(uint32_t va, uint32_t bytes)
 
     if (va == 0 || mapped == 0)
         return 0;
-    /* Descriptors live where a driver puts DMA memory, and on Xbox that is
-     * MmAllocateContiguousMemory -- the contiguous window, not low RAM. The
-     * bound below reads as "is this in RAM", which is not the question: the
-     * window is mapped too, at the same offset, and is exactly where the Xbox
-     * USB stack builds its endpoint and transfer descriptors. Rejecting it
-     * made every rd32 return 0 and every wr32 a no-op, so the walker looked at
-     * an empty list and the driver waited forever for a done queue that could
-     * not be written. DDS9's first control transfer sits at 0x80408940. */
+    /* Contiguous DMA memory is a separate mapped window above low RAM. */
     if (va >= OHCI_CONTIG_BASE
             && (uint64_t)va + bytes <= (uint64_t)OHCI_CONTIG_BASE
                                      + OHCI_CONTIG_SIZE)
@@ -484,57 +460,46 @@ static int guest_ok(uint32_t va, uint32_t bytes)
     return (uint64_t)va + bytes <= (uint64_t)mapped;
 }
 
-/* A host controller is a bus master: every pointer the driver hands it --
- * HcHCCA, HcControlHeadED, ED and TD links, buffer pointers -- is a PHYSICAL
- * address. On hardware physical P and the contiguous window's 0x80000000 + P
- * are the same bytes. Here the window is separate storage, so a physical
- * address a driver took from MmGetPhysicalAddress names nothing it wrote.
- *
- * Burnout 3's XPP does exactly that: it builds its descriptors in
- * MmAllocateContiguousMemory at 0x825B50C0, converts, and writes 0x025B50C0.
- * Read as RAM, every ED came back all zeroes, the controller saw an empty
- * list, and enumeration waited forever for a transfer that never moved.
- * (DDS9's driver writes window addresses directly, which guest_ok already
- * accepts, so it never needed this.)
- *
- * Resolved the way the pushbuffer executor resolves surface offsets
- * (dma_resolve in nv2a_pb_exec.c): below the contiguous allocator's
- * high-water mark an address is memory some MmAllocateContiguousMemory call
- * returned, and its bytes live in the window.
- *
- * Except inside the loaded image. A driver also points transfers at its own
- * statics -- Burnout 3's first GET_DESCRIPTOR reads into 0x0041A904, in .data
- * -- and MmGetPhysicalAddress passes those through unchanged. A real kernel
- * never hands out contiguous memory that overlaps the image, so an address
- * inside it is the image. Sending that one to the window delivered the
- * descriptor where the driver never looked, and it reset the port and asked
- * again, forever. */
-static uint32_t bus_resolve(uint32_t addr)
+/* Resolve bus-master descriptor and payload addresses through the runtime's
+ * physical memory map, retaining legacy loaded-image VA precedence. */
+uint32_t xbox_OhciResolvePhysical(uint32_t addr, uint32_t bytes)
 {
+    uint32_t guest_va;
+    int kind;
+    /* Runtime physical IDs for ordinary RAM resolve to the same bytes the
+     * CPU maps at its guest VA. The namespace sits beyond the complete mapped
+     * VA range, so this is unambiguous even for enlarged development maps. */
+    kind = xbox_PhysicalAddressResolve(addr, bytes, &guest_va);
+    if (kind == 1)
+        return guest_va;
+    /* Legacy titles still pass a guest VA as a DMA pointer. Keep the loaded
+     * image ahead of the old low physical/contiguous heuristic: image statics
+     * must remain in ordinary RAM even when their numeric VA matches a
+     * contiguous allocation. */
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
-    if (addr && addr < xbox_ContiguousAllocatedBytes())
-        return OHCI_CONTIG_BASE + addr;
+    if (kind == 2)
+        return guest_va;
     return addr;
 }
 
 static uint32_t rd32(uint32_t va)
 {
-    va = bus_resolve(va);
+    va = xbox_OhciResolvePhysical(va, 4);
     if (!guest_ok(va, 4))
         return 0;
     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
 }
 static void wr32(uint32_t va, uint32_t v)
 {
-    va = bus_resolve(va);
+    va = xbox_OhciResolvePhysical(va, 4);
     if (!guest_ok(va, 4))
         return;
     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
-    va = bus_resolve(va);
+    va = xbox_OhciResolvePhysical(va, bytes);
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }
@@ -686,16 +651,8 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
      * what did. A driver computes the transferred length from it. */
     wr32(td + 4, (moved >= len) ? 0u : cbp + (uint32_t)moved);
 
-    /* A short IN packet on a TD without bufferRounding is DATA UNDERRUN
-     * (OHCI 1.0a): the controller retires this TD with that code
-     * and halts the endpoint -- the walker does so for any non-zero code --
-     * leaving the rest of the transfer for the driver to retire. A short
-     * packet still ends the stage; what the driver needs to see is that it
-     * did. Reporting NOERROR, and completing the trailing TDs with zero
-     * bytes, sent XAPI's done-queue handler down its success path, which
-     * walks from the ED head into the dummy tail TD and follows its garbage
-     * link: X-Men Legends asks for 80 bytes of configuration descriptor,
-     * gets 32, and faulted there. */
+    /* OHCI short IN without buffer rounding retires as DATA UNDERRUN;
+     * the endpoint walker halts it instead of consuming trailing TDs. */
     if (dp == TD_DP_IN && moved < len && !(info & TD_ROUNDING))
         return TD_CC_DATAUNDERRUN;
     return TD_CC_NOERROR;
@@ -1039,13 +996,6 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
  * A separate thread has its own copy, and it also happens to be what the
  * hardware does -- an interrupt arrives when the controller decides, not when
  * the driver next reads a register.
- *
- * ponytail: one delivery, of the root hub status change that is already
- * pending from bring-up. There is nothing behind it yet -- no descriptor list
- * walking, so an enumeration attempt has nothing to answer it -- and the point
- * of this delivery is to find out what the driver does when it finally gets
- * the interrupt it has been waiting for. Repeat delivery and the transfer
- * lists come after that answer, not before it.
  */
 static DWORD WINAPI ohci_thread(LPVOID unused)
 {
@@ -1149,10 +1099,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * a frame ever starting, enumeration stops one transfer past
          * SET_ADDRESS with the driver waiting for time to pass.
          *
-         * Twenty frames a tick because a frame is 1 ms and this loop sleeps
-         * 20. The count is what drivers compare; the rate is what they feel,
-         * and both are closer to right this way than a counter that never
-         * moves. */
+         * Each tick advances the count by OHCI_TICK_MS, with one emulated
+         * USB frame per millisecond. */
         {
             uint32_t hcca = hc->reg[HcHCCA / 4];
 
@@ -1213,17 +1161,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                 hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
         }
 
-        /* One done queue per pass, covering all three lists.
-         *
-         * The lists used to publish one after another, so the control list
-         * wrote HccaDoneHead straight over what the periodic list had just
-         * put there. That stayed invisible until a title used both at once:
-         * Burnout 3 sends its pad a rumble report (SET_REPORT, 21 09) on the
-         * control pipe every frame once its menus are up, the input report
-         * completing in the same pass was lost, and the driver -- which
-         * re-arms the interrupt endpoint from that completion -- stopped
-         * polling the pad. A real controller accumulates everything that
-         * retires in a frame and writes the queue back once; so does this. */
+        /* Publish one combined done queue for periodic, bulk and control
+         * completions, so no list overwrites another list's completed TDs. */
         if (pass_done)
             ohci_publish_done(hc, pass_done);
 
@@ -1243,7 +1182,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * one unmatched raise anywhere leaves the gate shut for the rest of
          * the run -- which is how this first showed up: no interrupt was ever
          * delivered and enumeration stopped at two empty control EDs. Real
-         * hardware is never masked for 80 ms, so past that the line is
+         * hardware does not use this recovery timeout; past the model holdoff
+         * the line is
          * asserted anyway. The common case still holds the ISR out of the
          * guest's critical section; the pathological case costs a delay
          * instead of the device. */
@@ -1332,9 +1272,7 @@ void xbox_OhciInit(void)
         return;
     done = 1;
 
-    /* Opt-in. Without a descriptor list walker behind it a driver that finds
-     * a port has nothing to enumerate, so this must not change how a title
-     * behaves until the rest of it exists. */
+    /* Device emulation is opt-in through RECOMP_USB. */
     if (!getenv("RECOMP_USB"))
         return;
 

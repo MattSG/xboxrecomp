@@ -53,14 +53,9 @@ PVOID __stdcall xbox_MmAllocateContiguousMemoryEx(
     ULONG Alignment,
     ULONG Protect)
 {
-    /*
-     * Xbox requests physically contiguous, aligned memory for GPU use.
-     * We can't guarantee physical contiguity on Windows, but the game's
-     * CPU-side code just needs a valid pointer. GPU resources are handled
-     * separately by our D3D11 layer.
-     *
-     * Use _aligned_malloc for alignment, then VirtualAlloc for a fallback.
-     */
+    /* Partial native helper: low/high bounds are not enforced. The aligned
+     * heap path does not apply Protect, and page allocation fallback does not
+     * guarantee a larger caller-requested alignment. */
     PVOID p = NULL;
 
     if (Alignment > 0 && (Alignment & (Alignment - 1)) == 0) {
@@ -139,9 +134,10 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
     memset(MemoryStatistics, 0, sizeof(XBOX_MM_STATISTICS));
     MemoryStatistics->Length = sizeof(XBOX_MM_STATISTICS);
 
-    /* Xbox has 64MB RAM. Report plausible values. */
+    /* Installed guest RAM follows the caller's memory-layout configuration.
+     * Availability below remains a host estimate, not guest allocation accounting. */
     ULONG page_size = 4096;
-    MemoryStatistics->TotalPhysicalPages = 64 * 1024 * 1024 / page_size; /* 16384 pages */
+    MemoryStatistics->TotalPhysicalPages = (ULONG)(g_xbox_total_ram / page_size);
     MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
     if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
         MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;
@@ -197,6 +193,9 @@ VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfB
 
 ULONG __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress)
 {
+    uint32_t protect;
+    if (xbox_IoMappingQuery(VirtualAddress, NULL, &protect, NULL))
+        return protect;
     MEMORY_BASIC_INFORMATION mbi;
     if (VirtualQuery(VirtualAddress, &mbi, sizeof(mbi))) {
         /* Return the Xbox-equivalent protection */
@@ -207,7 +206,13 @@ ULONG __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress)
 
 VOID __stdcall xbox_MmSetAddressProtect(PVOID BaseAddress, ULONG NumberOfBytes, ULONG NewProtect)
 {
+    int mapped = xbox_IoMappingSetProtect(BaseAddress, NumberOfBytes, NewProtect);
     DWORD old_protect;
+    if (mapped) {
+        if (mapped < 0) xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
+            "MmSetAddressProtect: rejected I/O mapping range/protection at %p", BaseAddress);
+        return;
+    }
     VirtualProtect(BaseAddress, NumberOfBytes, xbox_protect_to_win32(NewProtect), &old_protect);
     XBOX_TRACE(XBOX_LOG_MEM, "MmSetAddressProtect(%p, %u, 0x%X)", BaseAddress, NumberOfBytes, NewProtect);
 }

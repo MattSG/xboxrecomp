@@ -5,8 +5,8 @@
  * Not part of the public API - only included by d3d8_*.c files.
  */
 
-#ifndef BURNOUT3_D3D8_INTERNAL_H
-#define BURNOUT3_D3D8_INTERNAL_H
+#ifndef XBOXRECOMP_D3D8_INTERNAL_H
+#define XBOXRECOMP_D3D8_INTERNAL_H
 
 #define COBJMACROS
 #include "d3d8_xbox.h"
@@ -289,7 +289,7 @@ HRESULT d3d8_shaders_init(void);
 void    d3d8_shaders_shutdown(void);
 
 /* Select programmable/FVF vertex state and refresh fixed-function pixel state. */
-void    d3d8_shaders_prepare_draw(DWORD handle);
+HRESULT d3d8_shaders_prepare_draw(DWORD handle);
 
 /* ================================================================
  * NV2A Register Combiner pixel shaders (d3d8_combiners.c)
@@ -318,4 +318,4 @@ void    d3d8_states_apply_sampler(DWORD stage);
 
 #endif /* _WIN32 -- end of D3D11 backend section */
 
-#endif /* BURNOUT3_D3D8_INTERNAL_H */
+#endif /* XBOXRECOMP_D3D8_INTERNAL_H */

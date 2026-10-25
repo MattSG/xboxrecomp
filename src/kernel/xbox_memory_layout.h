@@ -1,23 +1,7 @@
-/**
- * Xbox Memory Layout Compatibility
- *
- * The Xbox has 64MB of unified memory shared between CPU and GPU.
- * Memory is identity-mapped (physical == virtual for most of it).
- * Game code and data are linked to specific address ranges which vary
- * per game. Section addresses are parsed dynamically from the XBE header
- * at runtime, so this module works with ANY Xbox game.
- *
- * On Windows, we:
- * 1. Create a 64MB file mapping (CreateFileMapping)
- * 2. Map the base view + 28 mirror views at 64MB intervals
- * 3. Parse the XBE section table and copy sections to their Xbox VAs
- * 4. Set up simulated stack, heap, TIB, and kernel data area
- *
- * The mirror views ensure Xbox RAM wrapping works correctly: the Xbox
- * memory controller uses a 26-bit address bus, so ALL addresses wrap
- * modulo 64MB. File mapping views backed by the same section give us
- * true aliases where writes at one address are visible at all mirrors.
- */
+/* Guest memory integration: image-derived sections, caller-configured RAM
+ * and backing size, shared thread state and owned allocation/mapping APIs.
+ * Device aliases and extended reservations have explicit ownership; unbacked
+ * guest addresses do not implicitly alias ordinary RAM. */
 
 #ifndef XBOX_MEMORY_LAYOUT_H
 #define XBOX_MEMORY_LAYOUT_H
@@ -36,45 +20,20 @@ extern "C" {
 /* Base address of all XBE files in Xbox memory */
 #define XBOX_BASE_ADDRESS       0x00010000
 
-/* Start of mapped region - includes low memory (KPCR at 0x0) because
- * game code reads from addresses like 0x20 and 0x28 (Xbox kernel structures). */
+/* Guest VA origin; low guard and KPCR storage are configured separately. */
 #define XBOX_MAP_START          0x00000000
 
-/* Xbox physical memory. 64 MB is the retail default; debug/beta builds ship for
- * 128 MB devkits and allocate accordingly (Halo's cachebeta pre-allocates ~57 MB
- * plus its debug arrays, which only fits on a devkit). Runtime-overridable via
- * xbox_SetTotalRam() before xbox_MemoryLayoutInit(); see g_xbox_total_ram. */
+/* Installed guest RAM budget. Configure before memory initialization. */
 #define XBOX_TOTAL_RAM          (64 * 1024 * 1024)  /* 64 MB (default) */
 #define XBOX_DEVKIT_RAM         (128 * 1024 * 1024) /* 128 MB (debug kit) */
 #define XBOX_GPU_RESERVED       (4 * 1024 * 1024)   /* ~4 MB for GPU */
 
-/* Actual mapped RAM for this run. Defaults to XBOX_TOTAL_RAM; a title with a
- * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top and
- * mirror stride derive from this, not from the compile-time constant. */
+/* Installed RAM and backed guest address space are separate quantities. */
 extern size_t g_xbox_total_ram;
 
-/* How much guest address space to map, when that must exceed RAM.
- *
- * These are not the same quantity and conflating them is a bug. RAM is what
- * the console has and what the heap is carved out of; the mapped range is how
- * much guest address space is backed by distinct host pages. The runtime
- * mirrors RAM at intervals of the mapped size, because a real Xbox wraps
- * addresses on a 26-bit bus -- so anything a title allocates above the mapped
- * range silently shares storage with low memory.
- *
- * Half-Life 2 needs this: its allocator sub-allocates past the top of RAM, and
- * at 64 MB its first commit past the boundary (0x04F80000) aliases the base of
- * the live heap (0x00F80000). A CUtlRBTree element array landed at 0x0CB80000,
- * aliasing 0x00B80000, and its links were overwritten between one insert and
- * the next search.
- *
- * Raising g_xbox_total_ram instead does not work: the heap top and anything
- * the guest is told about memory derive from that, so the title sizes itself
- * differently and faults during CRT init. Growing only the mapping leaves both
- * alone.
- *
- * Zero means "same as RAM", which is the existing behaviour for every title
- * that does not ask. Set before xbox_MemoryLayoutInit(). */
+/* Backed guest VA span; zero selects the installed RAM size. Set before init.
+ * Pages above reported RAM remain distinct storage. The heap may use this span
+ * while coordinating ownership with reservations and loaded image ranges. */
 extern size_t g_xbox_map_size;
 void xbox_SetMapSize(size_t bytes);
 
@@ -82,6 +41,8 @@ void xbox_SetMapSize(size_t bytes);
  * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.
  * See the implementation for why reservations must not come from the heap. */
 uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align);
+/* 1 if va lies in memory xbox_ReserveAlloc has handed out (above RAM). */
+int xbox_ReserveRangeAllocated(uint32_t va);
 
 /* Bounds of the guest's executable sections, derived from the XBE at load.
  *
@@ -239,6 +200,10 @@ BOOL xbox_IsXboxAddress(uintptr_t address);
  * Returns NULL if memory layout is not initialized.
  */
 void *xbox_GetMemoryBase(void);
+/* Runtime-owned 4 KiB kernel probe page, zeroed at initialization. NULL when
+ * unavailable; invalid after memory shutdown. Contains no emulated PE image.
+ * Ports may populate compatibility data before guest execution. */
+void *xbox_GetKernelMemoryBase(void);
 
 /**
  * Get the offset from Xbox VA to actual mapped address.
@@ -316,24 +281,11 @@ void xbox_WatchInit(void);
 #define KDATA_LAN_KEY           0x120  /* XboxLANKey (16 bytes) */
 #define KDATA_ALT_SIGNATURE_KEYS 0x130 /* XboxAlternateSignatureKeys (256 bytes) */
 #define KDATA_XE_PUBLIC_KEY     0x300  /* XePublicKeyData (284 bytes) */
-/* HAL disk identity strings (ordinals 41/42). Each is an XBOX_ANSI_STRING
- * (Length, MaximumLength, Buffer VA) followed by the string bytes it points to,
- * because HalRandGather dereferences Buffer to read the text as entropy. */
-#define KDATA_DISK_MODEL_STR    0x420  /* XBOX_ANSI_STRING (8 bytes) */
-#define KDATA_DISK_MODEL_BUF    0x430  /* model text (up to 48 bytes) */
-#define KDATA_DISK_SERIAL_STR   0x460  /* XBOX_ANSI_STRING (8 bytes) */
-#define KDATA_DISK_SERIAL_BUF   0x470  /* serial text (up to 32 bytes) */
-#define KDATA_DISK_CACHE_PARTS  0x4A0  /* HalDiskCachePartitionCount (4 bytes) */
-/* XeImageFileName's text. The exported symbol at KDATA_XE_IMAGE_FILENAME is
- * an XBOX_ANSI_STRING, and a title dereferences its Buffer -- the CRT reads
- * it to work out the running image's path. The struct was declared without
- * anything to point at, so Buffer held whatever was in that page. */
-#define KDATA_XE_IMAGE_BUF      0x4B0  /* image path text (up to 64 bytes) */
-
-/** Size of the simulated Xbox stack (8 MB).
- *  Increased from 1 MB because failed RECOMP_ICALL indirect calls
- *  can leak stdcall args onto the stack each frame. An 8 MB stack
- *  provides enough headroom for extended gameplay sessions. */
+/* Guest counted-string descriptors: two 16-bit counts and a 32-bit buffer VA.
+ * Bytes/capacity are owned guest heap copies of port-supplied native exports. */
+#define KDATA_DISK_MODEL_STR    0x420
+#define KDATA_DISK_SERIAL_STR   0x460
+#define KDATA_DISK_CACHE_PARTS  0x4A0
 
 /* Thread-local storage class for the recompiled register set. Must match
  * templates/runtime/recomp_types.h -- a mismatch is a link-time surprise. */
@@ -522,7 +474,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 /**
- * Free a block from the Xbox heap. Currently a no-op (bump allocator).
+ * Free a block from the Xbox heap and coalesce adjacent free blocks.
  */
 void xbox_HeapFree(uint32_t xbox_va);
 
@@ -535,55 +487,69 @@ void xbox_HeapFree(uint32_t xbox_va);
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
 
 /**
- * True when RECOMP_HEAP_RECLAIM is set: freed heap blocks are split rather than
- * handed over whole, and NtFreeVirtualMemory returns heap memory to the heap.
- * Off by default; it changes which address later allocations get.
+ * True when RECOMP_HEAP_RECLAIM is set: NtFreeVirtualMemory returns heap memory
+ * to the heap and zeroes decommitted pages. Off by default. Ordinary heap
+ * allocation always splits reused blocks, independently of this switch.
  */
 int xbox_HeapReclaimEnabled(void);
 
 /**
  * Get the file mapping handle for the Xbox memory region.
- * Used by the VEH handler to map additional mirror views on demand.
  * Returns NULL if file mapping is not available.
  */
 HANDLE xbox_GetMappingHandle(void);
 
-#ifdef __cplusplus
-}
-#endif
 
 
-/* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
- * stack top, or 0 when the pool is exhausted. */
-uint32_t xbox_AllocThreadStack(void);
+/* Optional page-aligned worker minimum, configured before memory init.
+ * Zero restores the image-derived default. Invalid/active changes preserve
+ * policy. Requests/defaults are page-rounded; backing/heap capacity bounds
+ * allocation, without a fixed thread-count cap. Startup/reset is quiesced. */
+BOOL xbox_ConfigureThreadStack(uint32_t minimum_bytes);
+/* Zero request uses XBE StackCommit (at least one page), enlarged by any port
+ * minimum. Returns an owned guest top, 16-byte aligned, or zero on failure. */
+uint32_t xbox_AllocThreadStackSized(uint32_t requested_bytes);
+uint32_t xbox_AllocThreadStack(void); /* equivalent to a zero-sized request */
 
 /* A TIB and TLS block for a newly spawned guest thread, copied from the
  * template the loader built. Returns the new TIB's Xbox VA, or 0. */
 uint32_t xbox_AllocThreadTib(void);
 
-/**
- * Return a worker's stack when the worker ends. Takes the value
- * xbox_AllocThreadStack returned. Without this the pool counts threads ever
- * created rather than threads alive, and a title that cycles workers exhausts
- * it -- after which PsCreateSystemThreadEx runs them inline, which deadlocks
- * any caller that then waits for the worker it thought it had spawned.
- */
+/* Release the exact top returned by either allocator. Unowned, interior,
+ * duplicate or zero values are ignored; no other heap block is released.
+ * Addresses are invalid after memory shutdown, even if later reused. */
 void xbox_FreeThreadStack(uint32_t stack_top);
+/* Exact-size guest kernel stack, returning the exclusive high address.
+ * Delete requires its matching high/low pair; ordinary heaps/worker stacks
+ * cannot be released through this API. Zero size fails. No guard/debugger
+ * placement semantics are supplied. Memory teardown remains quiesced. */
+uint32_t xbox_AllocKernelStack(uint32_t bytes);
+void xbox_FreeKernelStack(uint32_t high,uint32_t low);
+/* Allocation containing a guest SP: main, owned worker/kernel or retained
+ * callback lease. Bounds are [low, high); unknown/freed addresses return FALSE
+ * and zero optional outputs. Retain stack/lease lifetime while using bounds;
+ * this is an ownership lookup, not a host-thread identity or backing probe. */
+BOOL xbox_GetStackBounds(uint32_t address, uint32_t *low, uint32_t *high);
 
-/* Worker stack slices for host-tick-driven titles (see XBOX_WORKER_STACK_* and
- * docs/technical/burnout3-reunification.md). Additive; unused by default-model
- * titles. */
+
+/* Guest stack slices for host callbacks: DPCs, interrupts and host-driven
+ * guest calls. See XBOX_WORKER_STACK_* and docs/runtime/README.md. */
+/* Startup/quiesced reset; zero disables leases. Base is caller-owned guest RAM. */
+void xbox_worker_stack_reset(uint32_t base);
 int  xbox_worker_stack_alloc(void);   /* slice index, or -1 if none free */
 void xbox_worker_stack_free(int slot);
 void   xbox_set_game_thread(void *h);  /* HANDLE, recorded for the host watchdog */
 void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline model */
 
-/* PsCreateSystemThreadEx behaviour. Default INLINE runs the first call as the
- * game (Halo, Crimson Skies). SPAWN makes every call a real thread so a
- * host-tick-driven title's entry can return and let the host drive -- call
- * xbox_SetThreadMode(XBOX_THREAD_MODE_SPAWN) before the game starts. */
+/* Both guest thread-create APIs default to independent spawned threads.
+ * Ports may explicitly opt into first-call INLINE compatibility before guest
+ * execution starts; later calls still use the worker policy. */
 #define XBOX_THREAD_MODE_INLINE 0
 #define XBOX_THREAD_MODE_SPAWN  1
 void xbox_SetThreadMode(int mode);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* XBOX_MEMORY_LAYOUT_H */

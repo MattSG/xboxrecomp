@@ -7,20 +7,17 @@ function that contains the assert, so the string cross-references in
 strings.json map function addresses back to the original source file they were
 compiled from.
 
-Two passes produce the attribution:
+Two passes propose attribution:
 
-  direct       A function references a __FILE__ string -> that function came
-               from that file. Majority vote when a function references more
-               than one (inlining pulls foreign asserts into a caller).
+  direct       References to source-path strings vote for a source file.
+               Multiple references can include inlined or unrelated code.
 
-  interpolated The linker emits each object file's functions contiguously, so an
-               unattributed run of functions bracketed by two functions that
-               agree on the same file almost certainly belongs to that file too.
-               Only fills runs where both endpoints agree, and never crosses a
-               section boundary.
+  interpolated Unattributed functions between agreeing endpoints inherit a
+               tentative file attribution within the same section. Original
+               object-file boundaries and linker ordering are not verified.
 
-The result is written as a {address: name} map, the same shape tools/ghidra_naming
-emits, so the recompiler picks it up from functions.json without further work.
+The result includes address-to-name and attribution maps plus a summary.
+Optional application merges those proposals into the supplied functions.json.
 """
 
 import json
@@ -41,7 +38,7 @@ _CODE_EXTS = "c|cc|cpp|cxx"
 _HEADER_EXTS = "h|hh|hpp|hxx"
 
 # The scanner sometimes glues a preceding string's tail onto the front of a
-# literal ("-2>c:\halo\SOURCE\camera\observer.c"). Matching unanchored at the
+# literal ("-2>c:\sample\SOURCE\camera\observer.c"). Matching unanchored at the
 # front handles that; these are the characters a real path never starts with.
 _LEAD_JUNK = re.compile(r"^[^A-Za-z0-9_.\\/]+")
 
@@ -61,7 +58,7 @@ def _extract_path(text, pattern):
 
 
 def _strip_common_root(paths):
-    """Drop the shared build-machine prefix (e.g. 'c:/halo/SOURCE/')."""
+    """Drop the shared build-machine prefix (e.g. 'c:/sample/SOURCE/')."""
     if not paths:
         return {}
     dirs = [p.rsplit("/", 1)[0] + "/" for p in paths]
@@ -81,9 +78,8 @@ def _strip_common_root(paths):
 def _module_name(rel_path):
     """'ai/actor_combat.c' -> 'actor_combat', as a valid C identifier.
 
-    Source filenames are not required to be identifier-safe: Halo alone ships
-    bungie_net/common/64bit_math.c, and a name starting with a digit does not
-    compile.
+    Source filenames need not be identifier-safe. A leading digit or
+    punctuation must be sanitized before a filename becomes a C identifier.
     """
     stem = os.path.splitext(os.path.basename(rel_path))[0]
     stem = re.sub(r"[^A-Za-z0-9_]", "_", stem)

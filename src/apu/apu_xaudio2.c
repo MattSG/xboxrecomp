@@ -95,11 +95,25 @@ int xa2_init(void)
         goto fail;
     }
 
+    hr = IXAudio2_RegisterForCallbacks(g_xa2, &g_xa2_callback);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[XA2] RegisterForCallbacks failed: 0x%08lX\n", hr);
+        goto fail;
+    }
+
     hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
         XA2_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
     if (FAILED(hr)) {
         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
         goto fail;
+    }
+    {   /* RECOMP_AUDIO_MUTE=1: the device runs and paces as usual, at volume 0
+         * (scripted runs). */
+        const char *mute = getenv("RECOMP_AUDIO_MUTE");
+        g_xa2_gain = (mute && *mute && *mute != '0') ? 0.0f : 1.0f;
+        g_xa2_muted = 0;
+        if (g_xa2_gain == 0.0f)
+            IXAudio2MasteringVoice_SetVolume(g_xa2_master, 0.0f, XAUDIO2_COMMIT_NOW);
     }
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -142,6 +156,10 @@ fail:
 
 void xa2_shutdown(void)
 {
+    if (g_xa2_pcm_dump) {
+        fclose(g_xa2_pcm_dump);
+        g_xa2_pcm_dump = NULL;
+    }
     if (g_xa2_source) {
         IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
         IXAudio2SourceVoice_FlushSourceBuffers(g_xa2_source);

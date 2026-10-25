@@ -1,30 +1,13 @@
 /*
- * d3d8_gl.c - OpenGL 3.3 backend for the D3D8 compat layer (Linux)
- *
- * The Windows build keeps using D3D11 (d3d8_device.c / d3d8_resources.c /
- * d3d8_states.c / d3d8_combiners.c / d3d8_vsh.c / d3d8_shaders.c). The
- * CMake split picks this file on POSIX.
- *
- * This is the FIRST cut of the real OpenGL backend:
- *   - SDL2 window + GL 3.3 core context
- *   - All Xbox D3D8 COM interfaces wired up (every vtable slot has a body)
- *   - Real Clear, Present, BeginScene/EndScene, viewport, scissor
- *   - Render-state caching with a small "apply" path for depth/blend/cull/etc.
- *   - CreateTexture / CreateVertexBuffer / CreateIndexBuffer with shadow
- *     memory + a GL handle ready for upload
- *   - DrawPrimitive(UP) / DrawIndexedPrimitive(UP) with a fixed GLSL program
- *     supporting position + diffuse + UV (the FVF set the recompiled RW
- *     driver actually emits at this point)
- *
- * Next iterations: real texture-format mapping, FVF-driven input layouts
- * beyond pos/diffuse/UV, Xbox VSH bytecode → GLSL, register-combiner
- * pixel programs → GLSL fragment.
+ * OpenGL backend for the D3D8 object interface, selected on POSIX builds.
+ * Uses an SDL3 window/context and host resource/state translation.
+ * Supported behavior is bounded by the implementation and focused tests;
+ * vtable entries alone do not establish complete interface conformance.
  */
-
 #include "d3d8_xbox.h"
 #include "d3d8_fvf.h"
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include <epoxy/gl.h>
 
 #include <stdio.h>
@@ -472,9 +455,11 @@ static HRESULT __stdcall tex_LockRect(IDirect3DTexture8 *self, UINT lvl, D3DLOCK
 static HRESULT __stdcall tex_UnlockRect(IDirect3DTexture8 *self, UINT lvl)
 {
     GLTexture *t=(GLTexture*)self; (void)lvl;
-    if (t->dirty && t->gl_tex) {
+    /* Only 32-bit BGRA8 is uploaded; other formats stay staged, since reading
+     * them as BGRA8 would run past their narrower rows. */
+    if (t->dirty && t->gl_tex &&
+        (t->format == D3DFMT_A8R8G8B8 || t->format == D3DFMT_X8R8G8B8)) {
         glBindTexture(GL_TEXTURE_2D, t->gl_tex);
-        /* First cut: assume BGRA8 layout (matches D3DFMT_A8R8G8B8/X8R8G8B8). */
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
                      t->width, t->height, 0,
                      GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, t->sys_mem);
@@ -553,7 +538,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
      * but leaves the process running until the game's loop notices. */
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
+        if (ev.type == SDL_EVENT_QUIT) {
             fprintf(stderr, "[d3d8_gl] window close requested\n");
         }
     }
@@ -662,7 +647,7 @@ static HRESULT __stdcall dev_SetIndices(IDirect3DDevice8 *s, IDirect3DIndexBuffe
 static HRESULT __stdcall dev_GetIndices(IDirect3DDevice8 *s, IDirect3DIndexBuffer8 **pp, UINT *pb)
 { (void)s; if(pp) *pp=g.ib; if(pb) *pb=g.ib_base; return D3D_OK; }
 
-/* Vertex layout setup for the FVF the recompiled RW driver actually emits at
+/* Vertex layout setup for the FVF the recompiled game's D3D path actually emits at
  * this point: XYZ (or XYZRHW) + DIFFUSE + optional TEX1. */
 static void setup_fvf_attribs(DWORD fvf, UINT stride)
 {
@@ -805,6 +790,41 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *s, D3DPRIMIT
                                        iptr, ifmt, vb->sys_mem, g.vb_stride);
 }
 
+/* Staging layout for CreateTexture/LockRect: compressed formats are 4x4
+ * blocks (8 or 16 bytes each); the rest use their texel size. Unlisted
+ * formats keep the old 32 bpp assumption. */
+static BOOL gl_format_is_block(D3DFORMAT fmt)
+{
+    switch (fmt) {
+    case D3DFMT_DXT1: case D3DFMT_CTX1: case D3DFMT_DXT3: case D3DFMT_DXT5:
+    case D3DFMT_DXT3A: case D3DFMT_DXT5A: case D3DFMT_DXN:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static UINT gl_row_pitch(D3DFORMAT fmt, UINT w)
+{
+    switch (fmt) {
+    case D3DFMT_DXT1: case D3DFMT_CTX1:
+        return ((w + 3) / 4) * 8;
+    case D3DFMT_DXT3: case D3DFMT_DXT5: case D3DFMT_DXT3A: case D3DFMT_DXT5A: case D3DFMT_DXN:
+        return ((w + 3) / 4) * 16;
+    case D3DFMT_L8: case D3DFMT_A8: case D3DFMT_P8:
+        return w;
+    case D3DFMT_R5G6B5: case D3DFMT_A1R5G5B5: case D3DFMT_X1R5G5B5: case D3DFMT_A4R4G4B4:
+    case D3DFMT_A8L8: case D3DFMT_L16: case D3DFMT_D16:
+        return w * 2;
+    case D3DFMT_G32R32F: case D3DFMT_A16B16G16R16: case D3DFMT_A16B16G16R16F:
+        return w * 8;
+    case D3DFMT_A32B32G32R32F:
+        return w * 16;
+    default:
+        return w * 4;
+    }
+}
+
 static HRESULT __stdcall dev_CreateTexture(IDirect3DDevice8 *s, UINT w, UINT h, UINT lvls,
         DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DTexture8 **pp)
 {
@@ -814,8 +834,8 @@ static HRESULT __stdcall dev_CreateTexture(IDirect3DDevice8 *s, UINT w, UINT h, 
     t->iface.lpVtbl = &g_tex_vtbl;
     t->ref = 1; t->width = w; t->height = h; t->format = fmt;
     t->levels = lvls ? lvls : 1;
-    t->pitch = w * 4;                              /* assume 32bpp for now */
-    t->sys_mem = (BYTE *)calloc(1, t->pitch * h);
+    t->pitch = gl_row_pitch(fmt, w);
+    t->sys_mem = (BYTE *)calloc(1, (size_t)t->pitch * (gl_format_is_block(fmt) ? (h + 3) / 4 : h));
     glGenTextures(1, &t->gl_tex);
     *pp = &t->iface;
     return D3D_OK;
@@ -992,10 +1012,8 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,  24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    g.window = SDL_CreateWindow(g_window_title,
-                                SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-                                g.backbuf_w, g.backbuf_h,
-                                SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+    g.window = SDL_CreateWindow(g_window_title, g.backbuf_w, g.backbuf_h,
+                                SDL_WINDOW_OPENGL);
     if (!g.window) {
         fprintf(stderr, "[d3d8_gl] SDL_CreateWindow failed: %s\n", SDL_GetError());
         return D3DERR_INVALIDCALL;
@@ -1068,6 +1086,3 @@ IDirect3DDevice8 *d3d8_GetDevice(void)
     return &g_device;
 }
 
-/* Used by nv2a_pb_replay to skip Present when it owns the frame. The
- * Windows backend defines this in d3d8_device.c; we mirror it here. */
-volatile int g_suppress_present = 0;

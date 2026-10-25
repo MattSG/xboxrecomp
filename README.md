@@ -259,16 +259,13 @@ above stay the documented route (#223).
 
 ### What To Expect
 
-The first time you run a recompiled game, **it will crash**. That's normal. The process is iterative:
+Treat analysis and generation as an iterative bring-up process. Inspect missing
+functions, ABI assumptions, indirect-call targets and runtime behavior before
+adding overrides. Reusable instruction/runtime fixes belong in the toolkit;
+application addresses, compatibility choices and assets belong in the port.
 
-1. **Boot** — get past the entry point (usually straightforward)
-2. **Stub** — identify and stub out functions that touch hardware you haven't implemented yet
-3. **Fix ICALLs** — indirect calls (vtable dispatches, function pointers) are the hardest 10%
-4. **Add runtime** — implement kernel functions, D3D calls, and input as the game needs them
-5. **Debug** — use the ICALL trace ring buffer, memory access logging, and your debugger
-6. **Iterate** — each crash teaches you something about the game. Fix it and move on.
-
-With Burnout 3 (the first game recompiled with this toolkit), the process from "empty repo" to "game boots and renders textured 3D tracks" took about two weeks of iterative development.
+Use focused synthetic regressions for shared changes, then collect bounded
+startup and gameplay evidence for the port. Keep unsupported paths explicit.
 
 ## Repository Structure
 
@@ -308,8 +305,8 @@ xboxrecomp/
 │   │   └── src/main.c           # Host entry point: loads XBE, boots guest
 │   └── runtime/                 # Runtime shim templates
 │       ├── recomp_types.h       # Register model + ICALL macros
-│       ├── xbox_memory.h        # Memory layout helpers
-│       └── kernel_stubs.h       # Kernel function stub templates
+│       ├── xbox_memory.h        # Includes runtime memory interface
+│       └── kernel_stubs.h       # Includes runtime kernel interface
 └── docs/                        # Documentation
     ├── pipeline/                # Step-by-step pipeline guides
     ├── technical/               # Deep technical documentation
@@ -371,10 +368,8 @@ so there is one place to keep correct:
 - **[The Register Model](docs/technical/register-model.md)** — why the guest
   registers are globals (and thread-local), how the guest stack is simulated,
   and why every recompiled function is `void f(void)`.
-- **[Memory Layout](docs/technical/memory-layout.md)** — reproducing the Xbox
-  address space with `CreateFileMapping` + 28 mirror views, and why
-  `VirtualAlloc` cannot do it (mirrors must alias the same physical pages, not
-  copy them).
+- **[Memory Layout](docs/technical/memory-layout.md)** — image-derived mapping,
+  owned guest storage, explicit aliases and quiesced shutdown.
 - **[Indirect Call Dispatch](docs/technical/indirect-calls.md)** — `call [eax+0x10]`
   with no compile-time target. The hardest part of any bring-up.
 - **[NV2A Shader Translation](docs/technical/nv2a-shaders.md)** — register
@@ -382,27 +377,11 @@ so there is one place to keep correct:
 - **[SEH and Exception Handling](docs/technical/seh-handling.md)** — how
   `__SEH_prolog`/`__SEH_epilog` are detected per title and bridged.
 
-## Games That Work Well As Targets
+## Evaluating a Target
 
-Based on our experience with Burnout 3, the best candidates for Xbox static recomp share these traits:
-
-| Factor | Easier | Harder |
-|--------|--------|--------|
-| **Engine** | RenderWare (shared patterns) | Custom engine (unique quirks) |
-| **Threading** | Single-threaded | Multi-threaded with sync |
-| **GPU usage** | Standard D3D8 calls | NV2A push buffer microcode |
-| **Code size** | Small .text section | Large with LTCG |
-| **Online** | Offline only | Xbox Live dependent |
-| **PC port** | No PC version (worth the effort!) | Good PC port exists |
-
-See [docs/technical/candidate-games.md](docs/technical/candidate-games.md) for a detailed list of promising targets.
-
-## Projects Using This Toolkit
-
-- **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The origin title and most mature target. 22,097 functions lifted. An earlier build was playable to the main menu at 60fps, but leaned on hand-written menu and render scaffolding; that is being replaced with genuinely recompiled code, and the honest bring-up currently reaches engine/RenderWare init. Treat the old "playable" claim as retired until the recompiled path gets back there.
-- **[Xbox Dashboard](https://github.com/sp00nznet/xboxdashboard)** — The original Xbox system shell (build 3944); the toolkit on system software rather than a game. Nothing renders yet: the earlier "green orb at 60fps" was the project's own scaffolding drawing a disc, and has been retired along with the fake scene root and hand-rolled asset loader around it. What runs is the dashboard's own code — full init chain, its own D3D8 sizing and allocating its own 640x480 surfaces, its own NV2A pushbuffer, its own `default.xip` read. Its UI is driven by a **VRML97 + JavaScript scene engine** (text→bytecode compiler + stack-machine VM + node-class reflection registry), which is the piece still to come online.
-- **[Wreckless: The Yakuza Missions](https://github.com/sp00nznet/wreckless)** — Xbox launch title (2002). Custom engine, 3,407 functions, boots through CRT init into game main. Debugging early gameplay crash.
-- **[Blood Wake](https://github.com/sp00nznet/bloodwake)** — First-party Microsoft naval combat (2001). Stormfront Studios custom engine. 4,608 functions, 367K lines of C generated (99.1% success). Project scaffolded, working toward first build.
+Inspect the executable, required runtime behavior and unresolved paths before
+estimating a port. See [Target Evaluation](docs/technical/candidate-games.md)
+for the evidence checklist and reusable-mechanism/port-policy boundary.
 
 ## How You Can Help
 
@@ -504,16 +483,16 @@ The runtime libraries (C) use:
 A: This project provides tools and documentation. You must own a legitimate copy of any game you recompile. No copyrighted game code or assets are included in this repository.
 
 **Q: How is this different from an emulator?**
-A: Emulators interpret or JIT-compile code at runtime. Static recompilation translates the entire binary ahead of time into native C code that compiles to a regular `.exe`. There's no CPU emulation at runtime — the recompiled functions execute directly.
+A: Generated functions compile ahead of time. The runtime still models guest state, hardware and host services; those paths require their own validation.
 
 **Q: Can I use this on Xbox 360 games?**
 A: No. Xbox 360 uses PowerPC (big-endian, different ISA). See [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) for Xbox 360 static recompilation. This toolkit is specifically for the original Xbox's x86 code.
 
 **Q: How long does it take to get a game running?**
-A: It depends on the game's complexity. Burnout 3 went from zero to "boots and renders 3D tracks" in about two weeks. Simple games might be faster; complex ones with custom engines could take longer. The toolchain handles the mechanical translation — the real work is building the runtime shims and debugging indirect calls.
+A: Estimate from recovered code/ABI coverage, unresolved indirect targets, required devices and observed runtime behavior. Measure startup and representative gameplay before estimating the remaining port work.
 
 **Q: Why C output instead of direct x86-64 binary translation?**
-A: C is portable, debuggable, and the compiler optimizes it for you. You can read the output, set breakpoints in it, and modify individual functions. Direct binary translation would be faster to run but impossible to debug or modify.
+A: C exposes translated state and control flow to ordinary compilers and debuggers. You can inspect the output, set breakpoints and change individual functions while validating the translation.
 
 ## License
 

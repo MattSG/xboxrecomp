@@ -1,21 +1,8 @@
-"""
-Self-check for the per-title kernel ordinal remap generator.
+"""Synthetic checks for explicit name-based ordinal-map generation.
 
-Run: py -3 tools/kernel_audit/test_gen_ordinal_remap.py
-
-The remap translates a title's XDK ordinals into the kernel's canonical ordinal
-space by function name. The properties that matter:
-
-  - a title whose XDK matches the kernel needs NO remap (all identity), and must
-    not be told to install one it does not need;
-  - a title on a different XDK remaps only the ordinals that differ, and by
-    NAME -- the same function at a different number;
-  - a name the title imports that the kernel's table does not have, or that the
-    title's parser could not resolve, is left identity and reported, never
-    silently pointed at whatever sits at that ordinal.
-
-Measured against the real analyses: Halo (XDK 3911) and Crimson (5659) match the
-kernel and remap nothing; Burnout 3 (5849) remaps 47 and leaves 3 unresolved.
+Run: python tools/kernel_audit/test_gen_ordinal_remap.py
+These fixtures test matching labels, changed source IDs and unresolved names;
+they do not establish any title's actual ABI or XDK compatibility.
 """
 
 import json
@@ -39,7 +26,7 @@ def _canon(monkey):
     G.canonical_name_to_ordinal = lambda: monkey
 
 
-def test_matching_xdk_needs_no_remap():
+def test_matching_labels_emit_identity():
     _canon({"DbgPrint": 8, "ExFreePool": 17, "HalReturnToFirmware": 49})
     with tempfile.TemporaryDirectory() as tmp:
         a = _analysis(tmp, [
@@ -52,7 +39,7 @@ def test_matching_xdk_needs_no_remap():
     assert identity == 3 and total == 3 and unresolved == []
 
 
-def test_shifted_xdk_remaps_by_name():
+def test_changed_source_ids_remap_by_name():
     # A title where HalRequestSoftwareInterrupt sits at 49, not the canonical 48.
     _canon({"HalRequestSoftwareInterrupt": 48, "HalReturnToFirmware": 49,
             "ExFreePool": 17})
@@ -96,6 +83,24 @@ def test_emitted_header_is_valid_c_and_indexable():
     body = re.search(r"\{(.*?)\}", text, re.S).group(1)
     vals = [int(x) for x in re.findall(r"\d+", body)]
     assert len(vals) == 50 and vals[49] == 48 and sum(vals) == 48, vals[:5]
+
+
+def test_cli_reports_unresolved_without_claiming_abi_match():
+    from contextlib import redirect_stdout
+    from pathlib import Path
+    import io
+    _canon({"ExFreePool": 17})
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "analysis.json"
+        output = Path(tmp) / "remap.h"
+        source.write_text(json.dumps({"title": "Synthetic \u03b1", "kernel_imports": [
+            {"ordinal": 99, "name": "Unknown_99"}]}), encoding="utf-8")
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            assert G.main([str(source), "--out", str(output)]) == 0
+        assert "Synthetic \u03b1" in output.read_text(encoding="utf-8")
+        assert "ordinal 99" in stdout.getvalue()
+        assert "review unresolved imports and ABI evidence" in stdout.getvalue()
 
 
 def _run():

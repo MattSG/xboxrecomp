@@ -1,6 +1,6 @@
 # Xbox D3D8 Compatibility Layer
 #   _WIN32 -> backed by Direct3D 11 (d3d8_*.c, d3d8_combiners.c, d3d8_vsh.c)
-#   POSIX  -> backed by OpenGL 3.3 core via SDL2 + libepoxy (d3d8_gl.c)
+#   POSIX  -> backed by OpenGL 3.3 core via SDL3 + libepoxy (d3d8_gl.c)
 
 if(WIN32)
     add_library(xbox_d3d8 STATIC
@@ -21,7 +21,7 @@ else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c
     )
-    find_package(SDL2 REQUIRED)
+    include(Sdl3)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(EPOXY REQUIRED epoxy)
     target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS})
@@ -30,7 +30,7 @@ else()
     # link path. That holds for the top-level build and not when this is pulled
     # in via add_subdirectory from tests/, where the link fails with
     # "library 'epoxy' not found". The _LINK_LIBRARIES form is absolute paths.
-    target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
+    target_link_libraries(xbox_d3d8 PUBLIC platform SDL3::SDL3 ${EPOXY_LINK_LIBRARIES})
 endif()
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

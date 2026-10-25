@@ -481,7 +481,4 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                            uint32_t fault_xbox_va, int is_write)
 { (void)ctx; (void)fault_addr; (void)fault_xbox_va; (void)is_write; return false; }
 
-bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
-{ (void)fault_addr; (void)fault_xbox_va; return false; }
-
-#endif /* _WIN32 */
+#endif /* _WIN32 || __x86_64__ */

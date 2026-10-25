@@ -50,7 +50,7 @@ def _merge_flag_states(states):
     Float compares join the same way (see _SSE_COMPARES). Without that, a jbe
     after "comiss xmm3, xmm0" on one edge and "comiss xmm0, xmm3" on the other
     -- MSVC's shape for a clamp whose direction depends on a sign -- fell back
-    to the never-assigned _flags, and the clamp always fired. T()NY zeroed its driven wheels' torque that way; the car crawled.
+    to the never-assigned _flags, and the clamp always fired. A title's driven wheels got zero torque that way, so the car crawled.
     """
     if not states or any(not state or not state[0] for state in states):
         return None
@@ -2443,6 +2443,9 @@ class FunctionTranslator:
                 insn.end_address for insn in instructions
                 if (insn.mnemonic == "int3"
                     and insn.end_address in instruction_starts))
+        # A resume entry starts its own block, so it has a label to jump to.
+        switch_leaders.update(
+            entry for entry in self.lifter.resume_entries if start < entry < end)
 
         return (imm_refs, computed_jump_edges, debug_slide_int3s,
                 debug_slide_bypasses, switch_leaders)
@@ -2940,6 +2943,16 @@ class FunctionTranslator:
         if frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue:
             lines.append(f"    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */")
 
+        # Resume entries: a caller that set g_recomp_resume enters the body at
+        # that address, after the prologue above has set up the frame. The
+        # address is consumed on entry so ordinary calls run from the top.
+        resume = sorted(entry for entry in self.lifter.resume_entries if start < entry < end)
+        if resume:
+            lines.append("    if (g_recomp_resume) { uint32_t _resume = g_recomp_resume; g_recomp_resume = 0;")
+            for entry in resume:
+                lines.append(f"        if (_resume == 0x{entry:08X}u) goto loc_{entry:08X};")
+            lines.append("    }")
+
         lines.append(f"")
 
         # Generate code for each basic block
@@ -2982,8 +2995,8 @@ class FunctionTranslator:
                 "jmp", "ud2", "hlt", "iret", "iretd")
                       or (last.mnemonic == "int3"
                           and last.address not in debug_slide_int3s))
-            if not leaves and i + 1 < len(blocks):
-                preds[blocks[i + 1].start].add(bb.start)
+            if not leaves and last.end_address in preds:
+                preds[last.end_address].add(bb.start)
 
         # Settle the flag state before emitting anything.
         #
@@ -3040,8 +3053,9 @@ class FunctionTranslator:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
                 unseen_entries.update(self.lifter._analyze_switch_table(insn.operands))
         edge_vars, edge_sets, block_lines = [], [], {}
+        block_starts = {bb.start for bb in blocks}
 
-        for bb in blocks:
+        for block_index, bb in enumerate(blocks):
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
                 # The trailing ';' is load-bearing: C requires a statement after
@@ -3089,6 +3103,14 @@ class FunctionTranslator:
             last = bb.instructions[-1] if bb.instructions else None
             block_lines[bb.start] = (first, len(lines),
                                      bool(last and (last.is_branch or last.is_ret)))
+            # C emission order need not match either overlapping guest stream.
+            # Make the not-taken/sequential edge explicit when they differ.
+            if (last is not None and not last.is_ret and not last.is_jump
+                    and last.mnemonic not in ("ud2", "hlt", "iret", "iretd")
+                    and last.end_address in block_starts
+                    and (block_index + 1 == len(blocks)
+                         or blocks[block_index + 1].start != last.end_address)):
+                lines.append(f"    goto loc_{last.end_address:08X}; /* guest fallthrough */")
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
             if bypass is not None:
                 lines.append(
@@ -3133,23 +3155,7 @@ class FunctionTranslator:
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
 
-        # Validate: comment out goto targets that reference missing labels
-        # (dead code after unconditional jumps may reference non-existent labels)
-        import re
-        defined_labels = set()
-        goto_lines = []
-        for idx, line in enumerate(lines):
-            lbl_match = re.match(r'^(loc_[0-9A-Fa-f]+):', line)
-            if lbl_match:
-                defined_labels.add(lbl_match.group(1))
-            goto_match = re.search(r'goto (loc_[0-9A-Fa-f]+);', line)
-            if goto_match:
-                goto_lines.append((idx, goto_match.group(1)))
-        for idx, target in goto_lines:
-            if target not in defined_labels:
-                lines[idx] = lines[idx].replace(
-                    f"goto {target};",
-                    f"(void)0; /* goto {target} - dead code, label not in function */")
+        mark_missing_label_gotos(lines)
 
         # Ensure labels at end of function have a statement after them.
         # In C, a label must be followed by a statement; a comment alone is not
@@ -3214,6 +3220,32 @@ class FunctionTranslator:
                         regs.add(op.reg)
         return regs
 
+
+
+def mark_missing_label_gotos(lines):
+    """Turn each `goto loc_X;` whose label is not defined into RECOMP_DEAD_BRANCH.
+
+    Dead code after an unconditional jump can name labels that were never
+    emitted. A residual reached one reports and stops rather than falling
+    through. Edits `lines` in place and returns how many gotos were marked.
+    """
+    defined_labels = set()
+    goto_lines = []
+    for idx, line in enumerate(lines):
+        lbl_match = re.match(r'^(loc_[0-9A-Fa-f]+):', line)
+        if lbl_match:
+            defined_labels.add(lbl_match.group(1))
+        goto_match = re.search(r'goto (loc_[0-9A-Fa-f]+);', line)
+        if goto_match:
+            goto_lines.append((idx, goto_match.group(1)))
+    marked = 0
+    for idx, target in goto_lines:
+        if target not in defined_labels:
+            lines[idx] = lines[idx].replace(
+                f"goto {target};",
+                f"RECOMP_DEAD_BRANCH(0x{int(target[4:], 16):08X}u); /* goto {target} - label not in function */")
+            marked += 1
+    return marked
 
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(memory_regressions_test C)
+project(memory_regressions_test C CXX)
 # Cross-platform, like tests/kernel_bridge: the heap and the memory bridge are
 # the same code on both hosts.
 set(CMAKE_C_STANDARD 11)

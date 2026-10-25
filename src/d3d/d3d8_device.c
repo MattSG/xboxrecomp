@@ -244,6 +244,18 @@ static HRESULT d3d11_create_device_and_swap_chain(
         return hr;
     }
 
+    /* The recompiled title can call the shared immediate context from worker
+     * threads. D3D11 leaves that context unprotected by default. */
+    {
+        ID3D11Multithread *multithread = NULL;
+        if (SUCCEEDED(ID3D11DeviceContext_QueryInterface(
+                state->d3d11_context, &IID_ID3D11Multithread,
+                (void **)&multithread))) {
+            ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
+            ID3D11Multithread_Release(multithread);
+        }
+    }
+
     state->hwnd = pp->hDeviceWindow;
     state->width = scd.BufferDesc.Width;
     state->height = scd.BufferDesc.Height;
@@ -840,9 +852,10 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
 
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &vertex_count);
     if (vertex_count == 0) return E_INVALIDARG;
+    HRESULT shader_hr = d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    if (FAILED(shader_hr)) return shader_hr;
 
     /* Prepare pipeline: shaders, input layout, constant buffers, render states */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -860,9 +873,9 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
 
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &index_count);
     if (index_count == 0) return E_INVALIDARG;
+    HRESULT shader_hr = d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    if (FAILED(shader_hr)) return shader_hr;
 
-    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -884,6 +897,8 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
 
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &vertex_count);
     if (vertex_count == 0) return E_INVALIDARG;
+    HRESULT shader_hr = d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    if (FAILED(shader_hr)) return shader_hr;
 
     /* Convert triangle fans and quad lists to triangle lists */
     if (PrimitiveType == D3DPT_TRIANGLEFAN || PrimitiveType == D3DPT_QUADLIST) {
@@ -905,8 +920,6 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
         0, 1, &g_up_ring_buffer, &VertexStreamZeroStride, &ring_offset);
 
-    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -940,6 +953,8 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
 
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &index_count);
     if (index_count == 0) return E_INVALIDARG;
+    HRESULT shader_hr = d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    if (FAILED(shader_hr)) return shader_hr;
 
     idx_bytes = (IndexDataFormat == D3DFMT_INDEX32) ? 4 : 2;
     ib_fmt = (IndexDataFormat == D3DFMT_INDEX32) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
@@ -969,8 +984,6 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     ID3D11DeviceContext_IASetIndexBuffer(g_device_state.d3d11_context,
         tmp_ib, ib_fmt, 0);
 
-    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 

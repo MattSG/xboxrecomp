@@ -53,8 +53,14 @@ add_subdirectory(src/usb)
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
 
+# Network: Ethernet controller, NAT and peer tunnel
+add_subdirectory(src/net)
+
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
+
+# Host bring-up: MMIO routing to the APU/USB/NV2A models, window and device
+add_subdirectory(src/host)
 
 # ── Umbrella target ───────────────────────────────────────────
 

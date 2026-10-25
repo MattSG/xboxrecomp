@@ -20,27 +20,13 @@
  * Game code accesses them directly via the thunk table.
  * ============================================================================ */
 
-/* Hardware info - default report is a standard retail Xbox.
- * A target may override via xbox_kernel_set_version() or by patching the
- * global directly; no title-specific values are baked in. */
-XBOX_HARDWARE_INFO xbox_HardwareInfo = {
-    .Flags       = 0x00000020,  /* Retail Xbox */
-    .GpuRevision = 0xD2,       /* NV2A D2 revision */
-    .McpRevision = 0xD4,       /* MCPX D4 revision */
-    .Reserved    = {0, 0}
-};
+/* Unconfigured identity exports are zero. Ports choose any compatibility
+ * values explicitly before native/bridge initialization. These values do not
+ * certify hardware emulation or an SDK-specific kernel ABI. */
+XBOX_HARDWARE_INFO xbox_HardwareInfo = {0};
+XBOX_KRNL_VERSION xbox_KrnlVersion = {0};
 
-/* Kernel version - default is a stock retail value. Titles built against a
- * different XDK can report their own through xbox_kernel_set_version(). */
-XBOX_KRNL_VERSION xbox_KrnlVersion = {
-    .Major = 1,
-    .Minor = 0,
-    .Build = 5849,
-    .Qfe   = 1
-};
-
-/* Override the kernel version reported to game code (ordinal 324).
- * Match the XDK revision the target title was built with if it checks it. */
+/* Set caller-selected reported version; bridge initialization copies it. */
 void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qfe)
 {
     xbox_KrnlVersion.Major = major;
@@ -49,29 +35,22 @@ void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qf
     xbox_KrnlVersion.Qfe   = qfe;
 }
 
-/* Crypto keys - zeroed, not needed for PC operation.
- * These are unique per-console on real hardware. */
+/* Console credentials; zero until supplied by the port. */
 UCHAR xbox_EEPROMKey[16]              = {0};
 UCHAR xbox_HDKey[16]                  = {0};
 UCHAR xbox_SignatureKey[16]           = {0};
 UCHAR xbox_LANKey[16]                 = {0};
 UCHAR xbox_AlternateSignatureKeys[16][16] = {{0}};
 
-/* Public key data for Xbox Live signature verification - not needed */
+/* Public-key bytes; zero until supplied by the port. */
 UCHAR xbox_XePublicKeyData[284] = {0};
 
-/* Image filename - the XBE path as seen by the kernel */
-static char g_image_filename[] = "\\Device\\CdRom0\\default.xbe";
-XBOX_ANSI_STRING xbox_XeImageFileName = {
-    .Length        = sizeof(g_image_filename) - 1,
-    .MaximumLength = sizeof(g_image_filename),
-    .Buffer        = g_image_filename
-};
+/* Caller-owned counted image path; zero means unconfigured. */
+XBOX_ANSI_STRING xbox_XeImageFileName = {0};
 
-/* Launch data page - used for title-to-title launches (e.g., Xbox Dashboard → game).
- * Allocated dynamically and zeroed for normal game boot. */
-static XBOX_LAUNCH_DATA_PAGE g_launch_data_page = {0};
-XBOX_LAUNCH_DATA_PAGE* xbox_LaunchDataPage = &g_launch_data_page;
+/* Optional port-owned boot input. Native consumers use this host pointer;
+ * bridge initialization copies its complete 4096-byte guest layout. */
+XBOX_LAUNCH_DATA_PAGE* xbox_LaunchDataPage = NULL;
 
 /* ============================================================================
  * Section Loading
@@ -363,8 +342,9 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
 ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
 {
     (void)Verify;
-    /* Return link up, 100 Mbps, full duplex */
-    return 0x01; /* XNET_ETHERNET_LINK_ACTIVE */
+    /* Link up, 100 Mbps, full duplex: XNET_ETHERNET_LINK_ACTIVE |
+     * _100MBPS | _FULL_DUPLEX, the bits the kernel reads off the PHY. */
+    return 0x01 | 0x02 | 0x08;
 }
 
 NTSTATUS __stdcall xbox_PhyInitialize(BOOLEAN ForceReset, PVOID Param2)

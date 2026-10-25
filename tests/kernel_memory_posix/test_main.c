@@ -1,26 +1,5 @@
-/*
- * The kernel's memory APIs on a POSIX host -- written to fail.
- *
- * These sit on the Win32 shim rather than on the Xbox layout, and the shim's
- * VirtualQuery is a constant: it reports RegionSize 0x1000, MEM_COMMIT,
- * PAGE_READWRITE and AllocationBase NULL for every address it is ever handed,
- * mapped or not. Four kernel entry points are built on that answer, and one of
- * them picks a deallocator with it.
- *
- *   1. free/alloc pairing  MmAllocateContiguousMemory always uses VirtualAlloc
- *                          (mmap here). MmFreeContiguousMemory routes to
- *                          VirtualFree only when AllocationBase == the
- *                          pointer, which a hardcoded NULL never satisfies --
- *                          so every contiguous buffer is released with free()
- *                          on an mmap'd pointer
- *   2. AllocationBase      must name the allocation a pointer belongs to
- *   3. unmapped addresses  must not be reported as committed and readable
- *   4. MmQueryAllocationSize  must not answer 0x1000 for every allocation
- *
- * Checks that can abort the process run in a forked child, because the failure
- * mode for (1) is the allocator calling abort(), which would take the whole
- * run with it and report nothing about the other three.
- */
+/* POSIX host-memory API checks. Guest backing, physical-address round trips
+ * and thunk dispatch are exercised by kernel_io_mapping and kernel_bridge. */
 #include "kernel.h"
 #include "win32_compat.h"
 

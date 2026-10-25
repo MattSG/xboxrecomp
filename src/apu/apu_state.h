@@ -25,118 +25,7 @@
 #include "apu_regs.h"
 #include "apu_debug.h"
 
-/* ============================================================
- * DSP CPU registers
- * ============================================================ */
-
-#define DSP_REG_MAX     0x40
-#define DSP_XRAM_SIZE   4096
-#define DSP_YRAM_SIZE   2048
-#define DSP_PRAM_SIZE   4096
-#define DSP_MIXBUFFER_SIZE 1024
-#define DSP_PERIPH_SIZE 128
-
-/* ============================================================
- * DSP Core State (from dsp_cpu.h)
- * ============================================================ */
-
-typedef struct dsp_core_s {
-    bool is_gp;
-    bool is_idle;
-    uint32_t cycle_count;
-
-    uint16_t instr_cycle;
-
-    uint32_t pc;
-    uint32_t registers[DSP_REG_MAX];
-
-    /* stack[0=ssh], stack[1=ssl] */
-    uint32_t stack[2][16];
-
-    uint32_t xram[DSP_XRAM_SIZE];
-    uint32_t yram[DSP_YRAM_SIZE];
-    uint32_t pram[DSP_PRAM_SIZE];
-    const void *pram_opcache[DSP_PRAM_SIZE];
-
-    uint32_t mixbuffer[DSP_MIXBUFFER_SIZE];
-
-    /* peripheral space */
-    uint32_t periph[DSP_PERIPH_SIZE];
-
-    uint32_t loop_rep;
-    uint32_t pc_on_rep;
-
-    /* Interruptions */
-    uint16_t interrupt_state;
-    uint16_t interrupt_instr_fetch;
-    uint16_t interrupt_save_pc;
-    uint16_t interrupt_counter;
-    uint16_t interrupt_ipl_to_raise;
-    uint16_t interrupt_pipeline_count;
-    int16_t interrupt_ipl[12];
-    uint16_t interrupt_is_pending[12];
-
-    /* callbacks */
-    uint32_t (*read_peripheral)(struct dsp_core_s *core, uint32_t address);
-    void (*write_peripheral)(struct dsp_core_s *core, uint32_t address, uint32_t value);
-
-    uint32_t num_inst;
-    uint32_t cur_inst_len;
-    uint32_t cur_inst;
-
-    char str_disasm_memory[2][50];
-    uint32_t disasm_memory_ptr;
-    bool exception_debugging;
-
-    uint32_t disasm_prev_inst_pc;
-    bool disasm_is_looping;
-
-    uint32_t disasm_cur_inst;
-    uint16_t disasm_cur_inst_len;
-
-    char disasm_str_instr[256];
-    char disasm_str_instr2[523];
-    char disasm_parallelmove_name[64];
-
-    uint32_t disasm_registers_save[64];
-} dsp_core_t;
-
-/* ============================================================
- * DSP DMA State (from dsp_dma.h)
- * ============================================================ */
-
-typedef void (*dsp_scratch_rw_func)(
-    void *opaque, uint8_t *ptr, uint32_t addr, size_t len, bool dir);
-typedef void (*dsp_fifo_rw_func)(
-    void *opaque, uint8_t *ptr, unsigned int index, size_t len, bool dir);
-
-typedef struct DSPDMAState {
-    dsp_core_t *core;
-
-    void *rw_opaque;
-    dsp_scratch_rw_func scratch_rw;
-    dsp_fifo_rw_func fifo_rw;
-
-    uint32_t configuration;
-    uint32_t control;
-    uint32_t start_block;
-    uint32_t next_block;
-
-    bool error;
-    bool eol;
-} DSPDMAState;
-
-/* ============================================================
- * DSP State (from dsp_state.h)
- * ============================================================ */
-
-typedef struct DSPState {
-    dsp_core_t core;
-    DSPDMAState dma;
-    int save_cycles;
-    uint32_t interrupts;
-    bool is_gp;
-} DSPState;
+#include "dsp/dsp.h"
 
 /* ============================================================
  * SVF (State Variable Filter) - from vp/svf.h
@@ -234,7 +123,7 @@ hrtf_filter_set_target_params(HrtfFilter *f, float hrir_coeff[2][HRTF_NUM_TAPS],
         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
             s += fabsf(coeff[k]);
         }
-        if (s == 0.0f || s == 1.0f) break;
+        if (s == 0.0f || s == 1.0f) continue;
         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
             coeff[k] /= s;
         }
@@ -270,14 +159,21 @@ static inline void hrtf_filter_process(HrtfFilter *f,
             int di = (int)d;
             float dfrac = d - di;
             float acc = 0.0f;
-            for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-                int idx1 = (f->buf_pos - di - k + HRTF_BUFLEN) % HRTF_BUFLEN;
-                float s = buf[idx1];
-                if (dfrac > 0.0f) {
-                    int idx2 = (idx1 - 1 + HRTF_BUFLEN) % HRTF_BUFLEN;
+            int idx1 = (f->buf_pos - di + HRTF_BUFLEN) % HRTF_BUFLEN;
+            if (dfrac > 0.0f) {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    float s = buf[idx1];
+                    int idx2 = idx1 == 0 ? HRTF_BUFLEN - 1 : idx1 - 1;
                     s = s * (1 - dfrac) + buf[idx2] * dfrac;
+                    acc += coeff[k] * s;
+                    idx1 = idx1 == 0 ? HRTF_BUFLEN - 1 : idx1 - 1;
                 }
-                acc += coeff[k] * s;
+            } else {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    float s = buf[idx1];
+                    acc += coeff[k] * s;
+                    idx1 = idx1 == 0 ? HRTF_BUFLEN - 1 : idx1 - 1;
+                }
             }
             out[n][ch] = acc;
         }
@@ -313,13 +209,7 @@ static inline int adpcm_decode_block(int16_t *outbuf, const uint8_t *inbuf,
 
     for (int ch = 0; ch < channels; ch++) {
         *outbuf++ = pcmdata[ch] = (int16_t)(inbuf[0] | (inbuf[1] << 8));
-        /* The fourth header byte is RESERVED, not validated: the MCPX does not
-         * refuse a block over it, and titles ship blocks where it is non-zero
-         * (Jet Set Radio Future ends every ADPCM buffer in a 0x08 pad, and
-         * 3.5-4.4% of its blocks were silenced by this test). The step index
-         * is clamped for the same reason -- and it must be clamped, not
-         * trusted, because step_table has 89 entries. Refusing either returned
-         * 0 AFTER the first sample of each channel had been written. */
+        /* Ignore the reserved header byte and clamp the step-table index. */
         index[ch] = (int8_t)inbuf[2];
         ADPCM_CLIP(index[ch], 0, 88);
         inbufsize -= 4;
@@ -521,6 +411,14 @@ struct MCPXAPUState {
     struct {
         McpxApuDebugMonitorPoint point;
         int16_t frame_buf[256][2];
+        uint8_t ep_pcm_buf[256 * 2 * sizeof(int16_t)];
+        size_t ep_pcm_offset;
+        uint8_t *ep_pcm_queue;
+        size_t ep_pcm_queued, ep_pcm_capacity;
+        size_t ep_pcm_head; /* Byte offset of the oldest pending whole frame. */
+        bool ep_pcm_ready;
+        bool frame_mixed; /* Retained host frame must be mixed only once. */
+        uint64_t ep_pcm_dropped_frames;
         void *stream; /* SDL_AudioStream* - stubbed */
         int queued_bytes_low, queued_bytes_high;
     } monitor;

@@ -1,10 +1,15 @@
-"""Name a target XBE's statically-linked library functions by byte-matching a
-COFF .lib (which carries function name + code together -- no MAP needed).
+"""Match external COFF library names onto a target XBE.
 
-Parses the archive's object members, pulls each function's opening bytes from
-its .text, and searches for that signature in the target's .text, keeping
-unique matches that land on a detected function start. Used here to test
-whether RenderWare 3.7 (rwcore.lib) matches Burnout 3's RW36.
+Usage: python -m tools.symbols.lib_port donor.lib target.xbe
+       target_analysis.json target_functions.json names.json
+
+Reads caller-supplied i386 COFF archive members, extracts opening-byte
+signatures from .text symbols, and keeps unique target matches that coincide
+with detected function starts. Output is a JSON address-to-name mapping.
+
+This is a heuristic naming aid, not proof of function identity or ABI
+compatibility. Donor versions and compiler settings affect matching. Validate
+proposed names against target code; malformed-input coverage is incomplete.
 """
 import json
 import struct

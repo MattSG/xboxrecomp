@@ -23,8 +23,8 @@
  *
  * 3. SHADER CACHE
  *    We hash the full NV2ACombinerState and maintain a fixed-size cache
- *    (128 entries) of compiled ID3D11PixelShader objects. Most Xbox games
- *    use fewer than 20 unique combiner configurations, so this is ample.
+ *    (128 entries) of compiled ID3D11PixelShader objects, evicting a cached
+ *    shader only after its replacement is compiled successfully.
  *
  * 4. DRAW INTEGRATION
  *    d3d8_combiners_prepare_draw() is called before each draw. It checks
@@ -60,7 +60,6 @@ static ID3D11Buffer *g_combiner_cb = NULL;
  * Shader Cache
  *
  * Simple open-addressing hash table with linear probing.
- * 128 entries is generous - most games use <20 unique PS configs.
  * On a full table, the oldest entry is evicted (LRU approximation
  * via frame counter).
  * ================================================================ */
@@ -876,7 +875,6 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
 
     /*
      * Table is full - evict the least recently used entry.
-     * This is rare in practice (most games use <20 configs).
      */
     {
         uint32_t lru_slot = idx;
@@ -891,13 +889,13 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
             }
         }
 
+        ps = compile_combiner_shader(state);
+        if (!ps) return NULL; /* Preserve the live cache entry on failure. */
+
         entry = &g_cache[lru_slot];
         if (entry->shader) {
             ID3D11PixelShader_Release(entry->shader);
         }
-
-        ps = compile_combiner_shader(state);
-        if (!ps) return NULL;
 
         entry->hash = hash;
         memcpy(&entry->state, state, sizeof(NV2ACombinerState));

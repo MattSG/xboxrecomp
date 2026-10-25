@@ -63,9 +63,29 @@ def test_ida_autonames_leave_nothing_behind():
         assert final == {"0x00014C60": "CSound_Play"}
 
 
+def test_generated_suffix_cannot_collide_with_real_name():
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "functions.json"), "w") as f:
+            json.dump([{"address": a, "name": n} for a, n in
+                       (("0x00000100", "Render_00000300"),
+                        ("0x00000200", "Render"),
+                        ("0x00000300", "Render"))], f)
+        final, _, _ = merge_names.build_map(d)
+        assert len(set(final.values())) == 3, final
+        assert final["0x00000100"] == "Render_00000300"
+        # The --names-json path uses the same allocator.
+        seen = {}
+        names = [merge_names.unique_name(n, a, seen) for a, n in
+                 (("0x00000100", "Render_00000300"),
+                  ("0x00000200", "Render"), ("0x00000300", "Render"))]
+        assert len(set(names)) == 3, names
+
+
+
 if __name__ == "__main__":
     for fn in (test_placeholders_dropped, test_real_names_kept,
                test_flirt_library_outranks_a_plain_symbol,
-               test_ida_autonames_leave_nothing_behind):
+               test_ida_autonames_leave_nothing_behind,
+               test_generated_suffix_cannot_collide_with_real_name):
         fn()
         print("ok ", fn.__name__)

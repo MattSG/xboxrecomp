@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(cpu_helpers C)
+enable_testing()
+add_executable(cpu_helpers test_main.c)
+target_include_directories(cpu_helpers PRIVATE ../../include)
+add_test(NAME cpu_helpers COMMAND cpu_helpers)

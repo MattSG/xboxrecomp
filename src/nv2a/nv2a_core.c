@@ -9,7 +9,6 @@
  */
 
 #include "nv2a_state.h"
-#include "nv2a_pgraph_d3d11.h"
 
 /* ============================================================
  * Global state
@@ -76,22 +75,6 @@ DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address)
         .address    = (frame & NV_DMA_ADDRESS) | GET_MASK(flags, NV_DMA_ADJUST),
         .limit      = limit,
     };
-}
-
-void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len)
-{
-    DMAObject dma = nv_dma_load(d, dma_obj_address);
-    dma.address &= 0x07FFFFFF;
-
-    if (dma.address >= memory_region_size(d->vram)) {
-        fprintf(stderr, "[NV2A] DMA map address 0x%llx out of VRAM range\n",
-                (unsigned long long)dma.address);
-        *len = 0;
-        return NULL;
-    }
-
-    *len = dma.limit;
-    return d->vram_ptr + dma.address;
 }
 
 /* ============================================================
@@ -555,19 +538,15 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
 {
     g_pgraph_method_count++;
 
-    /* Route through D3D11 translator first */
-    if (pgraph_d3d11_method(subchannel, method, param)) {
-        /* Handled by D3D11 translator — still store in regs for state queries */
-        if (method < 0x2000 * 4) {
-            d->pgraph.regs[method / 4] = param;
+    /* Log unhandled methods (first 20 + periodic), behind the executor's
+     * verbose flag, read once. */
+    {
+        static int verbose = -1;
+        if (verbose < 0) verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+        if (verbose && (g_pgraph_method_count <= 20 || (g_pgraph_method_count % 5000) == 0)) {
+            fprintf(stderr, "[PGRAPH] #%u UNHANDLED sub=%u 0x%04X = 0x%08X\n",
+                    g_pgraph_method_count, subchannel, method, param);
         }
-        return;
-    }
-
-    /* Log unhandled methods (first 20 + periodic) */
-    if (g_pgraph_method_count <= 20 || (g_pgraph_method_count % 5000) == 0) {
-        fprintf(stderr, "[PGRAPH] #%u UNHANDLED sub=%u 0x%04X = 0x%08X\n",
-                g_pgraph_method_count, subchannel, method, param);
     }
 
     /* Store method parameters in PGRAPH register space */

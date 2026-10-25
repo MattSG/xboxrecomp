@@ -313,17 +313,25 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
 {
-    (void)dwFlags;
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
-    if (!g_pads[dwPort])
+#if defined(_WIN32)
+    {
+        XINPUT_CAPABILITIES xi_caps;
+        DWORD result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
+        if (result != ERROR_SUCCESS) return result;
+        memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+        pCaps->Type = xi_caps.Type;
+        pCaps->SubType = xi_caps.SubType;
+        pCaps->Flags = xi_caps.Flags;
+    }
+#else
+    (void)dwFlags;
+    if (!sdl_pad(dwPort))
         return ERROR_DEVICE_NOT_CONNECTED;
-
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
-    pCaps->Type    = 1;   /* XINPUT_DEVTYPE_GAMEPAD */
+    pCaps->Type = 1;      /* XINPUT_DEVTYPE_GAMEPAD */
     pCaps->SubType = 1;   /* XINPUT_DEVSUBTYPE_GAMEPAD */
-    pCaps->Flags   = 0;
+#endif
     return ERROR_SUCCESS;
 }
-
-#endif /* _WIN32 */

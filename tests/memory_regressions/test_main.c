@@ -10,7 +10,10 @@
  *
  *   default       No switch set. Pins what every title gets today, so a change
  *                 that alters the default shows up here.
- *   heap-reclaim  RECOMP_HEAP_RECLAIM=1. Each check fails without the fix:
+ *   model-churn     No switch set. Model-sized temporary buffers mixed with
+ *                 small retained objects must not consume the entire heap.
+ *   heap-reclaim  RECOMP_HEAP_RECLAIM=1 additionally enables NT release and
+ *                 decommit. Reuse/splitting and contiguous frees are default.
  *
  *   1. A small request after a large free takes only what it needs. Reuse used
  *      to hand over the whole block, so a 16-byte request could take 2 MB.
@@ -257,18 +260,10 @@ int main(int argc, char **argv)
         s1 = xbox_HeapAlloc(16, 16);
         s2 = xbox_HeapAlloc(16, 16);
 
-        if (reclaim) {
-            snprintf(d, sizeof d, "block is %u bytes, expected 16", xbox_HeapBlockSize(s1));
-            check(xbox_HeapBlockSize(s1) == 16, "16-byte request takes 16 bytes of a freed 2 MB", d);
-            snprintf(d, sizeof d, "second request at 0x%08X, outside 0x%08X", s2, a);
-            check(s2 >= a && s2 < a + big, "the rest of the block is still available", d);
-        } else {
-            snprintf(d, sizeof d, "block is %u bytes", xbox_HeapBlockSize(s1));
-            check(s1 == a && xbox_HeapBlockSize(s1) == big,
-                  "default: reuse hands over the whole freed block", d);
-            check(s2 < a || s2 >= a + big,
-                  "default: the second request cannot share it", NULL);
-        }
+        snprintf(d, sizeof d, "block is %u bytes, expected 16", xbox_HeapBlockSize(s1));
+        check(xbox_HeapBlockSize(s1) == 16, "16-byte request takes 16 bytes of a freed 2 MB", d);
+        snprintf(d, sizeof d, "second request at 0x%08X, outside 0x%08X", s2, a);
+        check(s2 >= a && s2 < a + big, "the rest of the block is still available", d);
     }
 
     /* 2. Three neighbours freed so that the third meets an empty slot. */
@@ -412,11 +407,13 @@ int main(int argc, char **argv)
             snprintf(d, sizeof d, "status 0x%08X, base 0x%08X", st, base);
             check(st == 0 && base == hi && size == 0x100000,
                   "reserve at 0x76000000 returns that address", d);
+            if (st != 0 || base != hi || size != 0x100000) goto shutdown;
 
             /* Commit the first 64 KB and use it. */
             base = hi; size = 0x10000;
             st = nt_alloc_at(&base, &size, 0x1000);
             check(st == 0 && base == hi, "commit inside the reservation succeeds", NULL);
+            if (st != 0 || base != hi) goto shutdown;
             *G(hi) = 0xC0FFEE01u;
             *G(hi + 0xFFFC) = 0xC0FFEE02u;
             check(*G(hi) == 0xC0FFEE01u && *G(hi + 0xFFFC) == 0xC0FFEE02u,
@@ -439,17 +436,17 @@ int main(int argc, char **argv)
             snprintf(d, sizeof d, "status 0x%08X", st);
             check(st == 0xC0000018u, "reserving it again is STATUS_CONFLICTING_ADDRESSES", d);
 
-            /* An address inside the mirrors would alias live memory. */
+            /* An address in the slots above RAM is not free to hand out. */
             base = 0x10000000u; size = 0x100000;
             st = nt_alloc_at(&base, &size, 0x2000);
             snprintf(d, sizeof d, "status 0x%08X", st);
-            check(st == 0xC0000018u, "an address inside the mirrors is refused", d);
+            check(st == 0xC0000018u, "an address in the slots above RAM is refused", d);
             st = nt_query(0x10000000u, mbi);
             snprintf(d, sizeof d, "state 0x%X", mbi[4]);
             check(st == 0 && mbi[4] == 0x2000,
-                  "query: the mirrors read as reserved, so a scanner moves on", d);
+                  "query: the slots read as reserved, so a scanner moves on", d);
 
-            /* base = 0 still comes from the heap, below the mirrors. */
+            /* base = 0 still comes from the heap, below the slots. */
             st = nt_alloc(0x10000, &base);
             snprintf(d, sizeof d, "status 0x%08X, base 0x%08X", st, base);
             check(st == 0 && base && base < 0x04000000u,
@@ -468,7 +465,23 @@ int main(int argc, char **argv)
         }
     }
 
+shutdown: ;
+#ifdef _WIN32
+    void *host_base = (void *)((uintptr_t)xbox_GetMemoryOffset());
+#endif
     xbox_MemoryLayoutShutdown();
+    check(xbox_GetKernelMemoryBase() == NULL, "shutdown retires the kernel probe view", NULL);
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION host_info;
+    /* Released means no longer ours: free, or already reused by an unrelated
+     * allocation -- the renderer's shader-compile threads keep allocating
+     * while this runs, and the freed range is a natural place for them to
+     * land (often at its very start). The reservation itself spans at least
+     * base + mirrors, gigabytes, which nothing else here comes near. */
+    check(VirtualQuery(host_base, &host_info, sizeof host_info) &&
+          (host_info.State == MEM_FREE || host_info.RegionSize < ((SIZE_T)1 << 30)),
+          "shutdown releases the host placeholder reservation", NULL);
+#endif
     free(xbe);
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;

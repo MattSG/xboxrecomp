@@ -237,6 +237,15 @@ def load_json(path):
         return json.load(f)
 
 
+def unique_name(name, addr, seen):
+    if name in RESERVED:
+        name = "%s_%s" % (name, addr[2:])
+    while name in seen and seen[name] != addr:
+        name = "%s_%s" % (name, addr[2:])
+    seen[name] = addr
+    return name
+
+
 def build_map(export_dir):
     funcs = load_json(os.path.join(export_dir, "functions.json"))
     syms = load_json(os.path.join(export_dir, "symbols.json"))
@@ -294,12 +303,7 @@ def build_map(export_dir):
     final = {}
     for addr in sorted(chosen.keys()):
         info = chosen[addr]
-        nm = info["name"]
-        if nm in RESERVED:
-            nm = "%s_%s" % (nm, addr[2:])  # append addr without 0x
-        if nm in seen_names and seen_names[nm] != addr:
-            nm = "%s_%s" % (nm, addr[2:])
-        seen_names[nm] = addr
+        nm = unique_name(info["name"], addr, seen_names)
         final[addr] = nm
         bucket_counts[info["bucket"]] = bucket_counts.get(info["bucket"], 0) + 1
 
@@ -371,17 +375,7 @@ def main():
             clean = sanitize(name)
             if not clean or is_placeholder(name):
                 continue
-            # Same reserved-word rule as build_map. A linker MAP hands back the
-            # title's real CRT routine names (strchr, memcpy, sqrt), which
-            # collide with the declarations the generated code already gets
-            # from <string.h>/<math.h>.
-            if clean in RESERVED:
-                clean = "%s_%s" % (clean, a[2:])
-            # Same de-dup rule as build_map: distinct addresses must not
-            # collapse onto one C identifier.
-            if clean in seen:
-                clean = "%s_%s" % (clean, a[2:])
-            seen[clean] = a
+            clean = unique_name(clean, a, seen)
             final[a] = clean
             buckets["symbol"] = buckets.get("symbol", 0) + 1
         print("loaded %d names from %s" % (len(final), args.names_json))

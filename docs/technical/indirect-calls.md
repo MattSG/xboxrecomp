@@ -291,7 +291,10 @@ Static analysis cannot see where a vtable call goes. Running the title can.
 
 Build with `RECOMP_ICALL_FEEDBACK` defined and every indirect branch records its
 target into a flat byte array indexed by guest VA — one subtract, one compare,
-one OR on the hot path, and nothing at all in a default build. Dump it from
+one OR on the hot path, and nothing at all in a default build. The XBE loader
+configures its executable bounds; there is no reference-title window to edit.
+Standalone hosts configure a window with `recomp_icall_feedback_configure(base, size)`
+before guest workers start. Reconfiguration discards the previous image's observations. Dump it from
 `atexit` and from your crash handler (a title that dies mid-boot is exactly the
 one whose targets you want):
 
@@ -322,11 +325,9 @@ in an earlier run is never dropped because a later run did not reach it. That is
 what makes the loop converge — each pass translates more code, which lets the
 title reach further, which surfaces more targets.
 
-This is the local equivalent of the two feedback inputs Microsoft's own
-recompiler takes: `VirtualDispatchTraceFiles` (recorded indirect-branch target
-sets) and `UpdateEnlightenments: true` (a persisted analysis database the
-compiler rewrites on every build). See
-[ms-fusion-codegen-teardown.md](ms-fusion-codegen-teardown.md).
+Recorded targets feed a cumulative database and filtered detection seeds.
+Caller-supplied foreign-module comparison is a separate analysis aid; see
+[Reference Analysis](fusion-analysis.md) for its inputs and limitations.
 
 It replaces inference with measurement. `analyze_unresolved.py` classifies
 unresolved addresses by where they land relative to known functions, which is a

@@ -60,38 +60,20 @@ When recompiled code does `call [0x0036B7C0]`, it reads the synthetic VA (e.g., 
 
 ## Data vs Function Exports
 
-Some kernel ordinals export data, not functions. For example:
+Data imports must point to readable guest storage, not function-dispatch VAs.
+For example, ExEventObjectType is ordinal 16, KeTickCount is 156,
+XboxHardwareInfo is 322 and XboxKrnlVersion is 324. The bridge selects the
+corresponding offset in the runtime-owned kernel-data page. Its base is a
+runtime value chosen by memory initialization or explicit port configuration.
 
-| Ordinal | Export | Type |
-|---------|--------|------|
-| 17 | ExEventObjectType | Data (type object) |
-| 156 | KeTickCount | Data (counter) |
-| 322 | XboxHardwareInfo | Data (hardware info struct) |
-| 324 | XboxKrnlVersion | Data (version struct) |
-
-The game reads these thunk entries and **dereferences** the result to access the data:
-
-```asm
-mov eax, [0x0036B800]    ; read thunk entry for KeTickCount
-mov ecx, [eax]           ; dereference to get the tick count value
-```
-
-For data exports, the thunk entry must point to actual readable memory containing the expected structure. A "kernel data area" is allocated at 0x00740000 with the necessary structures:
-
-```c
-// XboxHardwareInfo at kernel data area
-BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 0) = 0;     // Retail
-BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 4)  = 0xA1;  // NV2A rev A1
-BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 5)  = 0xB1;  // MCPX rev B1
-
-// XboxKrnlVersion
-BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 0) = 1;     // Major
-BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 2) = 0;     // Minor
-BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) = 5849;  // Build (XDK version)
-
-// KeTickCount - updated every ~1ms by a background thread
-BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = GetTickCount();
-```
+Hardware/version and credential exports are port-owned values shared with
+native resolution. Before initialization, set the exported host objects and
+use `xbox_kernel_set_version` for the reported version. The bridge copies those
+bytes rather than guessing an identity or reading environment policy. Zero
+identity defaults are unconfigured; reporting a version does not implement that
+kernel's behavior or alter canonical ordinal numbering. KeTickCount is updated
+from the host clock. See `xbox_memory_layout.h` for current offsets and
+[memory ownership](memory-layout.md) for placement/lifetime requirements.
 
 ## Per-Ordinal Bridge Functions
 

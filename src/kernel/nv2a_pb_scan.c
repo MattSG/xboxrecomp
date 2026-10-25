@@ -152,6 +152,25 @@ static const char *nv097_name(uint32_t m)
     return "";
 }
 
+/* Every word the walk reads must lie in the 64 MB contiguous window. A real
+ * stream lives in RAM, so a JUMP or CALL target above it is a parameter read
+ * as a command after a desync. Wrapping it would execute whatever sits at the
+ * wrapped address and corrupt GPU state quietly; the walk stops there
+ * instead, as PFIFO does at its DMA limit (xemu's pfifo.c raises a protection
+ * error; it never wraps). apexJCL's walker (blinx2-v0.4.0) made the same
+ * bounded-walk choice. */
+static int pb_in_window(uint32_t va)
+{
+    return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;
+}
+
+static NV2A_PB_STOP_HANDLER s_stop_handler;
+
+void nv2a_pb_set_stop_handler(NV2A_PB_STOP_HANDLER handler)
+{
+    s_stop_handler = handler;
+}
+
 void nv2a_pb_scan_report(void)
 {
     int i;
@@ -159,6 +178,10 @@ void nv2a_pb_scan_report(void)
     if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
+        fprintf(stderr, "[PB] %u walks stopped short of PUT\n", s_tot_stops);
+        if (s_tot_refused)
+            fprintf(stderr, "[PB] %u segments refused: GET or PUT outside the"
+                            " contiguous window\n", s_tot_refused);
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;

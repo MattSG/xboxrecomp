@@ -1,6 +1,11 @@
 # IDE channel export regression
 
-No game files are required. The test installs synthetic imports for
+No game files are required. Native resolution must be NULL until a host
+explicitly supplies an object; a caller-provided pointer resolves unchanged.
+That contract does not implement native IDE hardware or translate its fields.
+The fixture explicitly selects storage for its standalone guest export page.
+
+ The test installs synthetic imports for
 IdexChannelObject and XboxSignatureKey. It checks that the exported IDE channel
 has a circular empty DeviceQueue.DeviceListHead and independent storage.
 The old initialization leaves null links at +0x28/+0x2C, inside the key region.

@@ -35,6 +35,7 @@
 #define XBE_SECTION_COUNT_OFFSET 0x011C
 #define XBE_SECTION_HEADERS_OFFSET 0x0120
 #define XBE_TLS_ADDR_OFFSET     0x012C
+#define XBE_STACK_COMMIT_OFFSET 0x0130
 
 /* XBE section header layout (56 bytes each) */
 #define SECTHDR_FLAGS       0x00
@@ -47,7 +48,47 @@
 
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
+uint32_t g_xbox_stack_base, g_xbox_stack_size;
+static uint32_t s_main_stack_base, s_main_stack_size;
+static uint32_t s_thread_stack_minimum, g_thread_stack_default;
+
+BOOL xbox_ConfigureThreadStack(uint32_t minimum_bytes)
+{
+    if (g_memory_base || (minimum_bytes & 4095u)) return FALSE;
+    s_thread_stack_minimum=minimum_bytes;
+    return TRUE;
+}
+uint32_t g_xbox_kernel_data_base;
+static uint32_t s_kernel_data_base;
+
+BOOL xbox_ConfigureKernelData(uint32_t base)
+{
+    if (g_memory_base || (base & 4095u) ||
+        (base && base < XBOX_BASE_ADDRESS) ||
+        (uint64_t)base + XBOX_KERNEL_DATA_SIZE > UINT32_MAX)
+        return FALSE;
+    s_kernel_data_base = g_xbox_kernel_data_base = base;
+    return TRUE;
+}
+static void xbox_allocators_reset(void);
+static void xbox_allocator_cache_sync(void);
+static uint32_t heap_runtime_floor(void);
+
+BOOL xbox_ConfigureMainStack(uint32_t base, uint32_t size)
+{
+    if (g_memory_base || (base & 4095u) || (size & 4095u) ||
+        (base && (!size || base < XBOX_BASE_ADDRESS)) ||
+        (uint64_t)base + size > UINT32_MAX)
+        return FALSE;
+    s_main_stack_base = base;
+    s_main_stack_size = size;
+    return TRUE;
+}
+
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
+/* One lock for heap, contiguous and reservation ownership metadata. */
+static CRITICAL_SECTION g_allocator_lock;
+static int g_allocator_lock_initialized;
 
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
@@ -398,9 +439,124 @@ static void *win_reserve_guest_window(HANDLE mapping, size_t ram_size)
  * input in the only sense that matters here: the title can leave one
  * uninitialised, and 0xCCCCCCCC dereferenced is a crash in the runtime
  * rather than a fault the title would have taken. */
+int xbox_GuestRead(uint32_t va, void *out, size_t size)
+{
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    uintptr_t host;
+    if (va < 0x10000u || size > UINT32_MAX || va > UINT32_MAX - size)
+        return 0;
+    host = (uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset();
+    if (host > UINTPTR_MAX - size)
+        return 0;
+    return ReadProcessMemory(GetCurrentProcess(), (const void *)host, out, size, &copied)
+           && copied == size;
+#else
+    (void)va; (void)out; (void)size;
+    return 0;
+#endif
+}
+
+int xbox_GuestRangeInWindow(uint32_t va, uint32_t bytes)
+{
+    return va >= 0x10000u && va < XBOX_DEVKIT_RAM && bytes <= XBOX_DEVKIT_RAM - va;
+}
+
+int xbox_GuestMapped(uint32_t va, uint32_t bytes)
+{
+    uintptr_t host;
+    if (!xbox_GuestRangeInWindow(va, bytes))
+        return 0;
+    host = (uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset();
+#ifdef _WIN32
+    {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery((void *)host, &info, sizeof info) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return 0;
+        return host + bytes <= (uintptr_t)info.BaseAddress + info.RegionSize;
+    }
+#else
+    {
+        FILE *maps = fopen("/proc/self/maps", "r");
+        char line[256], access[5];
+        unsigned long long lo, hi;
+        int mapped = 0;
+        if (!maps)
+            return 0;
+        while (!mapped && fgets(line, sizeof line, maps))
+            if (sscanf(line, "%llx-%llx %4s", &lo, &hi, access) == 3 &&
+                access[0] == 'r' && access[1] == 'w' &&
+                host >= lo && host + bytes <= hi)
+                mapped = 1;
+        fclose(maps);
+        return mapped;
+    }
+#endif
+}
+
 size_t xbox_GetMappedSize(void)
 {
     return g_memory_size;
+}
+
+int xbox_IsContiguousMemoryAvailable(void)
+{
+    int available;
+    AcquireSRWLockShared(&g_iomap_lock);
+    available = g_iomap_available && g_memory_base && g_contig_memory;
+    ReleaseSRWLockShared(&g_iomap_lock);
+    return available;
+}
+
+static uint32_t xbox_ram_physical_base_unlocked(void)
+{
+    uint64_t base;
+    if (!g_iomap_available || !g_memory_base || !g_memory_size) return 0;
+    base = ((uint64_t)g_memory_size + XBOX_CONTIG_SIZE - 1u) &
+           ~((uint64_t)XBOX_CONTIG_SIZE - 1u);
+    /* Keep the synthetic RAM range disjoint from guest VAs and all current
+     * device apertures. A too-large layout remains usable through guest VAs;
+     * it simply has no 32-bit runtime physical namespace. */
+    if (!base || base + g_memory_size > XBOX_NV2A_BASE ||
+        base + g_memory_size > UINT32_MAX)
+        return 0;
+    return (uint32_t)base;
+}
+
+uint32_t xbox_GetRamPhysicalBase(void)
+{
+    uint32_t base;
+    AcquireSRWLockShared(&g_iomap_lock);
+    base = xbox_ram_physical_base_unlocked();
+    ReleaseSRWLockShared(&g_iomap_lock);
+    return base;
+}
+
+int xbox_PhysicalAddressResolve(uint32_t physical, uint32_t bytes,
+                                uint32_t *guest_va)
+{
+    uint64_t end = (uint64_t)physical + bytes;
+    uint32_t ram_base;
+    if (!bytes || end > 0x100000000ULL) return 0;
+    AcquireSRWLockShared(&g_iomap_lock);
+    ram_base = xbox_ram_physical_base_unlocked();
+    if (ram_base && physical >= ram_base &&
+        end <= (uint64_t)ram_base + g_memory_size) {
+        if (guest_va) *guest_va = physical - ram_base;
+        ReleaseSRWLockShared(&g_iomap_lock);
+        return 1;
+    }
+    ReleaseSRWLockShared(&g_iomap_lock);
+    /* MapPhysicalMemory exposes the complete backed contiguous section. Its
+     * unallocated pages still resolve to that section; callers that model
+     * allocation ownership can retain their narrower policy separately. */
+    if (physical < XBOX_CONTIG_SIZE && end <= XBOX_CONTIG_SIZE &&
+        xbox_IsContiguousMemoryAvailable()) {
+        if (guest_va) *guest_va = XBOX_CONTIG_BASE + physical;
+        return 2;
+    }
+    return 0;
 }
 
 static size_t xbox_TiledApertureSize(void)
@@ -413,6 +569,7 @@ static size_t xbox_TiledApertureSize(void)
 
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
+static XBOX_NV2A_WAKE g_nv2a_wake;
 
 /*
  * NV2A busy-bit acknowledgement.
@@ -520,16 +677,45 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  * the ring base, and the free-space subtraction then goes negative and is
  * clamped to zero. The reserve wants 0x2000 bytes, gets 0, and spins.
  *
- * Not acknowledged here, only reported. DDS9 reads the USER pair and never
- * reaches the fallback, so every value in this block is zero for the one
- * title that was traced -- mirroring PUT to GET would be a guess dressed as
- * a handshake. The watchdog prints them so the next title to spin here is
- * diagnosed from data instead.
+ * Titles using xbox_Nv2aDmaPublish keep these pointers synchronized with the
+ * USER channel. PUT is published before USER PUT; GET advances only after the
+ * corresponding words have executed and prior readbacks have completed.
  */
 #define NV2A_PFIFO_DMA_PUT        0x003240u
 #define NV2A_PFIFO_DMA_GET        0x003244u
 #define NV2A_PFIFO_REF            0x003248u
 #define NV2A_PFIFO_DMA_SUBROUTINE 0x00324Cu
+#define NV2A_PGRAPH_STATUS        0x400700u
+
+/* Serialize only the register stores. Neither GPU calls nor waits run while
+ * holding this lock, so publication cannot clear a newer submission's busy
+ * state or overwrite a concurrently completed GET with an older value. */
+static SRWLOCK g_nv2a_dma_lock = SRWLOCK_INIT;
+static volatile LONG g_nv2a_dma_sync;
+
+void xbox_Nv2aDmaPublish(uint32_t put_va, uint32_t value)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
+    if (!regs || put_va != XBOX_NV2A_BASE + NV2A_USER_DMA_PUT) {
+        /* Software channels keep exactly the original guest store, including
+         * its normal fault behavior if the supplied address is invalid. */
+        *(volatile uint32_t *)((uintptr_t)put_va + g_memory_offset) = value;
+        return;
+    }
+    AcquireSRWLockExclusive(&g_nv2a_dma_lock);
+    if (!g_nv2a_dma_sync) {
+        *(volatile uint32_t *)((char *)regs + NV2A_PFIFO_DMA_GET) =
+            *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+        InterlockedExchange(&g_nv2a_dma_sync, 1);
+    }
+    *(volatile uint32_t *)((char *)regs + NV2A_PFIFO_DMA_PUT) = value;
+    *(volatile uint32_t *)((char *)regs + NV2A_PGRAPH_STATUS) =
+        value != *(volatile uint32_t *)((char *)regs + NV2A_PFIFO_DMA_GET);
+    /* This is the publication observed by the executor. The cache pointers
+     * and busy state must already describe it when the guest checks them. */
+    *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT) = value;
+    ReleaseSRWLockExclusive(&g_nv2a_dma_lock);
+}
 
 /*
  * Free-running counters in the MCPX aperture.
@@ -589,8 +775,9 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 static void *g_ac97_page = NULL;      /* host address of the trapped page */
 static void *g_ac97_veh  = NULL;
 static RECOMP_TLS int s_ac97_stepping = 0;
+static RECOMP_TLS void *s_ac97_step_page;
 
-static void ac97_clear_reset_bits(void)
+static void ac97_clear_reset_bits(void *page)
 {
     /* Every bus-master channel, not the three a PC AC'97 has.
      *
@@ -604,7 +791,7 @@ static void ac97_clear_reset_bits(void)
     uint32_t off;
 
     for (off = 0x10B; off < 0x180; off += 0x10) {
-        volatile uint8_t *r = (volatile uint8_t *)((char *)g_ac97_page + off);
+        volatile uint8_t *r = (volatile uint8_t *)((char *)page + off);
         if (*r & AC97_RR)
             *r = (uint8_t)(*r & ~AC97_RR);
     }
@@ -626,8 +813,9 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
      * mid-step. */
     if (code == EXCEPTION_SINGLE_STEP && s_ac97_stepping) {
         s_ac97_stepping = 0;
-        ac97_clear_reset_bits();
-        VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
+        ac97_clear_reset_bits(s_ac97_step_page);
+        VirtualProtect(s_ac97_step_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
+        s_ac97_step_page = NULL;
         ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -635,12 +823,20 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     if (code == EXCEPTION_ACCESS_VIOLATION
             && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
         uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+        uint32_t physical;
+        int alias = fault >= (uintptr_t)g_memory_offset &&
+                    fault - (uintptr_t)g_memory_offset <= UINT32_MAX
+            ? xbox_IoMappingResolve((uint32_t)(fault - (uintptr_t)g_memory_offset), 1, &physical) : 0;
+        uintptr_t canonical = alias == 1 ? (uintptr_t)physical + g_memory_offset : fault;
+        if (alias < 0) return EXCEPTION_CONTINUE_SEARCH;
 
-        if (fault >= (uintptr_t)g_ac97_page
-                && fault < (uintptr_t)g_ac97_page + AC97_TRAP_BYTES) {
-            if (!VirtualProtect(g_ac97_page, AC97_TRAP_BYTES,
+        if (canonical >= (uintptr_t)g_ac97_page
+                && canonical < (uintptr_t)g_ac97_page + AC97_TRAP_BYTES) {
+            void *page = (void *)(fault & ~(uintptr_t)(AC97_TRAP_BYTES - 1));
+            if (!VirtualProtect(page, AC97_TRAP_BYTES,
                                 PAGE_READWRITE, &old))
                 return EXCEPTION_CONTINUE_SEARCH;
+            s_ac97_step_page = page;
             s_ac97_stepping = 1;
             ep->ContextRecord->EFlags |= 0x100u;   /* TF: step the write */
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -972,25 +1168,6 @@ static void poke_tick(void)
     }
 }
 
-static void dsp_ack_tick(void)
-{
-    int i;
-
-    for (i = 0; i < g_dsp_ack_count; i++) {
-        /* fence_readable rather than a bare bounds test: these land in the
-         * contiguous window, which a plain size check against the main map
-         * rejects. */
-        if (!fence_readable(g_dsp_ack[i], 4))
-            continue;
-        {
-            volatile uint32_t *w = (volatile uint32_t *)
-                ((uintptr_t)g_dsp_ack[i] + g_memory_offset);
-            if (*w)
-                *w = 0;
-        }
-    }
-}
-
 static const uint32_t MCPX_COUNTERS[] = {
     0x020010,   /* APU GP sample counter, DirectSound SetupVoiceProcessor */
 };
@@ -1004,16 +1181,27 @@ static int g_apu_mmio_trapped = 0;
 
 /*
  * GPU completion fences the title waits on in guest memory rather than in the
- * aperture. See xbox_Nv2aMirrorFence in the header for why this is the same
- * acknowledgement the NV2A_ACK table makes, and why the address has to be
- * followed through the device struct instead of being a constant.
+ * aperture. The port supplies its device pointer/field layout and semaphore
+ * selector; the executor supplies the actual release target/value. Publication
+ * waits for consumption and prior GPU readbacks.
  */
 #define XBOX_MAX_FENCE_MIRRORS 4
+
+typedef struct XBOX_COMMAND_FENCE {
+    struct XBOX_COMMAND_FENCE *next;
+    uint32_t target, value;
+    int native_heap;
+} XBOX_COMMAND_FENCE;
 
 static struct {
     uint32_t device_ptr_va;
     uint32_t put_off;
     uint32_t get_ptr_off;
+    int command_mode, command_pending;
+    uint32_t command_dma, command_offset, command_value, command_fence_va;
+    XBOX_COMMAND_FENCE *command_head, *command_tail;
+    int capture_layout_valid;
+    XBOX_NV2A_CAPTURE_LAYOUT capture_layout;
 } g_fence_mirrors[XBOX_MAX_FENCE_MIRRORS];
 static int g_fence_mirror_count = 0;
 
@@ -1031,6 +1219,35 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
             device_ptr_va, put_off, get_ptr_off);
     return 0;
 }
+
+int xbox_Nv2aCommandFence(uint32_t device_ptr_va,
+                          uint32_t dma_context, uint32_t semaphore_offset)
+{
+    for (int i = 0; i < g_fence_mirror_count; i++) {
+        if (g_fence_mirrors[i].device_ptr_va != device_ptr_va) continue;
+        if (g_fence_mirrors[i].command_pending) return -1;
+        g_fence_mirrors[i].command_dma = dma_context;
+        g_fence_mirrors[i].command_offset = semaphore_offset;
+        g_fence_mirrors[i].command_pending = 0;
+        /* Configure before entering guest code. From this point the next
+         * submitted counter is never an indication of completed GPU work. */
+        g_fence_mirrors[i].command_mode = 1;
+        return 0;
+    }
+    return -1;
+}
+int xbox_Nv2aCaptureLayout(uint32_t device_ptr_va,
+                           const XBOX_NV2A_CAPTURE_LAYOUT *layout)
+{
+    for (int i = 0; i < g_fence_mirror_count; i++) {
+        if (g_fence_mirrors[i].device_ptr_va != device_ptr_va) continue;
+        if (layout) g_fence_mirrors[i].capture_layout = *layout;
+        g_fence_mirrors[i].capture_layout_valid = layout != NULL;
+        return 0;
+    }
+    return -1;
+}
+
 /* A guest address is usable only once the window is mapped and it lands
  * inside it; the chain is followed fresh every poll because the title may not
  * have built it yet. */
@@ -1349,19 +1566,25 @@ static void framebuffer_probe_tick(void)
 {
     static DWORD last_ms;
     static uint32_t last_sum;
-    DWORD now = GetTickCount();
-    uint32_t sum = 0, nonzero = 0, i, n;
+    DWORD now;
+    uint32_t sum = 0, nonzero = 0, i, n, mode_pitch, height;
+    uint64_t bytes;
     const uint32_t *p;
 
     if (!s_nv2a_trace || !s_fb_va || !s_fb_pitch)
         return;
+    now = GetTickCount();
     if (last_ms && (now - last_ms) < 1000)
         return;
     last_ms = now;
-    if ((size_t)s_fb_va + s_fb_pitch * s_fb_height > g_memory_size)
+    if (!xbox_GetDisplayMode(&mode_pitch, NULL, NULL, &height) ||
+        mode_pitch != s_fb_pitch)
+        return;
+    bytes = (uint64_t)s_fb_pitch * height;
+    if (bytes > UINT32_MAX || !fence_readable(s_fb_va, (uint32_t)bytes))
         return;
     p = (const uint32_t *)((uintptr_t)s_fb_va + g_memory_offset);
-    n = (s_fb_pitch * s_fb_height) / 4;
+    n = (uint32_t)(bytes / 4);
     for (i = 0; i < n; i++) {
         sum = sum * 33u + p[i];
         if (p[i]) nonzero++;
@@ -1474,12 +1697,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          *
          * The advance now happens after the scan, further down, which is
          * also the only ordering that gives the title real back-pressure. */
-        fence_mirrors_tick();
-        dsp_ack_tick();
+        trace_begin = nv2a_ack_hitch_checkpoint(trace_frequency.QuadPart,
+                                               trace_begin, "ack_status", 8);
+        /* What was executed behind a flip becomes visible -- DMA_GET and any
+         * fence release -- once the flip's surfaces are in guest memory. */
+        nv2a_publish_readback_complete(regs);
+        trace_begin = nv2a_ack_hitch_checkpoint(trace_frequency.QuadPart,
+                                               trace_begin, "ack_readback_publish", 8);
+
         poke_tick();
-        counter_mirrors_tick();
-        frame_counters_tick();
         framebuffer_probe_tick();
+        trace_begin = nv2a_ack_hitch_checkpoint(trace_frequency.QuadPart,
+                                               trace_begin, "ack_tick_helpers", 8);
 
         /* Which framebuffer the display would be scanning out.
          *
@@ -1636,16 +1865,29 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * millisecond unit, so the rate matches. */
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
+        trace_begin = nv2a_ack_hitch_checkpoint(trace_frequency.QuadPart,
+                                               trace_begin, "ack_submission", 33);
 
+        {
+            /* Loading screens and movies are shown without flips. */
+            extern void nv2a_d3d_tick(void);
+            nv2a_d3d_tick();
+        }
+        trace_begin = nv2a_ack_hitch_checkpoint(trace_frequency.QuadPart,
+                                               trace_begin, "ack_renderer_tick", 8);
         Sleep(0);  /* yield; the waiter is spinning on another core */
+        nv2a_ack_hitch_checkpoint(trace_frequency.QuadPart,
+                                  trace_begin, "ack_yield", 8);
     }
     return 0;
 }
 
 static void xbox_Nv2aAckStart(void)
 {
-    dsp_ack_init();
+
     poke_init();
+    g_nv2a_dma_sync = 0;
+    xbox_nv2a_wake_init(&g_nv2a_wake);
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
@@ -1761,6 +2003,9 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 RECOMP_TLS uint32_t g_seh_ebp = 0;
+/* Nonzero asks the next entry into a function with resume entries to jump to
+ * that address (see Lifter.resume_entries). The function clears it on entry. */
+RECOMP_TLS uint32_t g_recomp_resume = 0;
 RECOMP_TLS double g_fp_stack[8];
 RECOMP_TLS int g_fp_top = 0;
 
@@ -2435,7 +2680,9 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 
     for (i = 0; i < 400 && esp; i++) {
         uint32_t a = esp + i * 4;
-        if (a < XBOX_STACK_BASE || a >= XBOX_STACK_TOP) break;
+        /* XAPI workers allocate their stacks from guest virtual memory;
+         * they need not occupy the host entry thread's fixed stack range. */
+        if (!peek_readable(a)) break;
         fprintf(stderr, "    GS %08X %08X\n", a,
                 *(const uint32_t *)(mem + a));
     }
@@ -2528,21 +2775,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     /* Map the full Xbox address space (covers all sections + stack + heap).
      * Size is runtime-configurable: retail 64 MB, devkit debug builds 128 MB. */
-    /* The mapped range, which is not necessarily RAM. Mirrors are placed
-     * at multiples of this, so growing it is what stops a title's
-     * above-RAM allocations from aliasing low memory. */
+    /* The mapped range, which is not necessarily RAM. Anything a title
+     * allocates above it is unmapped and faults, so growing it is what lets
+     * the title use that space at all. */
     g_memory_size = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
     /*
      * Create a file mapping backed by the page file.
      *
-     * Using file mapping instead of VirtualAlloc allows us to map the same
-     * physical pages at multiple virtual addresses via MapViewOfFileEx.
-     * This is critical for the Xbox RAM mirror: the Xbox memory controller
-     * uses a 26-bit address bus, so ALL addresses wrap modulo 64 MB.
-     * Code that writes to address 0x20000448 is really writing to 0x00000448.
-     * With file mapping views, we create aliased mappings at 64 MB intervals
-     * that all point to the same physical memory.
+     * Using file mapping instead of VirtualAlloc lets the contiguous window
+     * and the tiled aperture be views of the same physical pages via
+     * MapViewOfFileEx. Nothing above the mapped range is a view: see the
+     * slot reservation below.
      */
     g_mapping_handle = CreateFileMappingA(
         INVALID_HANDLE_VALUE,   /* page file backed */
@@ -2559,19 +2803,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
-     * Map the base view at the desired virtual address.
-     * Try the original Xbox base address first. If that fails (common on
-     * Windows 11 where low addresses are often reserved), try page-aligned
-     * addresses upward until we find a free region.
+     * Map guest RAM at an OS-chosen host address first. Placing the base at
+     * 0x10000 can succeed while later above-RAM slots collide with unrelated
+     * Windows mappings (for example, guest 0x78000000); guest accesses already
+     * go through g_memory_offset, so there is no benefit to pinning the host
+     * view to the guest address.
      */
     {
         static const uintptr_t try_bases[] = {
+            0,                      /* let Windows choose a host range */
             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
             0x00800000,             /* 8 MB - above typical PEB/TEB region */
             0x01000000,             /* 16 MB */
             0x02000000,             /* 32 MB */
             0x10000000,             /* 256 MB */
-            0,                      /* sentinel - let OS choose */
         };
 
         /* Iterate the whole array, sentinel included. The old condition
@@ -2772,6 +3017,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         if (header_size > xbe_size)
             header_size = (DWORD)xbe_size;
         memcpy(XBOX_VA(XBOX_BASE_ADDRESS), xbe, header_size);
+        loaded_header_end = XBOX_BASE_ADDRESS + header_size;
         fprintf(stderr, "  XBE header: %u bytes at %p (Xbox VA 0x%08X)\n",
                 header_size, XBOX_VA(XBOX_BASE_ADDRESS), XBOX_BASE_ADDRESS);
     }
@@ -2780,7 +3026,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Dynamically load ALL XBE sections by parsing the section headers.
      *
      * This replaces the old approach of hardcoding section addresses for
-     * a specific game (Burnout 3). By reading the section table from the
+     * a specific game. By reading the section table from the
      * XBE header, any game's sections are loaded automatically.
      *
      * Every section is copied to its original Xbox VA:
@@ -2821,43 +3067,44 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             DWORD sec_name_va  = *(const DWORD *)(sh + SECTHDR_NAME_ADDR);
 
             /* Read section name from XBE header */
-            const char *sec_name = "?";
+            char sec_name[32] = "?";
             DWORD name_off = sec_name_va - base_addr;
-            if (name_off < xbe_size && name_off + 8 <= xbe_size)
-                sec_name = (const char *)(xbe + name_off);
+            if (sec_name_va >= base_addr && name_off < xbe_size) {
+                size_t bytes = xbe_size - name_off;
+                if (bytes >= sizeof sec_name) bytes = sizeof sec_name - 1;
+                memcpy(sec_name, xbe + name_off, bytes);
+                sec_name[bytes] = 0;
+            }
 
-            /* Validate: section must fit within our 64MB mapped region */
-            if (sec_va < XBOX_BASE_ADDRESS || sec_va + sec_vsize > XBOX_TOTAL_RAM)
-                continue;
+            /* Section addresses are guest VAs in this run's backed range.
+             * Widen before adding so a wrapped end cannot pass validation. */
+            if (sec_va < XBOX_BASE_ADDRESS ||
+                (uint64_t)sec_va + sec_vsize > g_memory_size ||
+                (uint64_t)sec_va + sec_vsize > UINT32_MAX) {
+                fprintf(stderr, "  XBE: invalid section range %08X + %08X\n",
+                        (unsigned)sec_va, (unsigned)sec_vsize);
+                xbox_MemoryLayoutShutdown();
+                return FALSE;
+            }
 
             /* Determine copy size (raw_size may exceed vsize due to alignment) */
             DWORD copy_size = (sec_raw_size < sec_vsize) ? sec_raw_size : sec_vsize;
 
-            /* Zero the full virtual size first (handles BSS) */
-            memset(XBOX_VA(sec_va), 0, sec_vsize);
-
-            /*
-             * Copy initialized data from XBE.
-             *
-             * A section whose raw data runs past the end of the buffer is a
-             * truncated or corrupt image, not a BSS section, and it must not
-             * be counted among the sections loaded. Reporting it as loaded is
-             * how a 4MB title read through a 1MB buffer produced "Loaded
-             * 17/17 sections" with every byte of every section still zero --
-             * including the kernel thunk table, which then resolved 0 imports
-             * and looked like a title that calls no kernel functions.
-             */
-            int have_data = (copy_size == 0) ||
-                            (sec_raw_off + copy_size <= xbe_size);
-            if (copy_size > 0 && have_data) {
-                memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
-            } else if (!have_data) {
-                fprintf(stderr,
-                        "  WARNING: section %u (%s) raw data 0x%08X+%u runs past "
-                        "the %zu-byte image -- left zeroed\n",
-                        si, sec_name, sec_raw_off, copy_size, xbe_size);
-                sections_short++;
+            if (copy_size && (uint64_t)sec_raw_off + copy_size > xbe_size) {
+                fprintf(stderr, "  XBE: invalid section data %08X + %08X\n",
+                        (unsigned)sec_raw_off, (unsigned)copy_size);
+                xbox_MemoryLayoutShutdown();
+                return FALSE;
             }
+            if (s_kernel_data_base && sec_vsize &&
+                (uint64_t)s_kernel_data_base < (uint64_t)sec_va + sec_vsize &&
+                (uint64_t)s_kernel_data_base + XBOX_KERNEL_DATA_SIZE > sec_va) {
+                fprintf(stderr, "  Kernel data: selected page overlaps an image section\n");
+                xbox_MemoryLayoutShutdown();
+                return FALSE;
+            }
+            memset(XBOX_VA(sec_va), 0, sec_vsize);
+            if (copy_size) memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
 
             /* Every loaded section, executable or not. Anything that writes
              * guest memory from outside the title -- the pushbuffer executor
@@ -3294,24 +3541,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  *
                  * Enabled by the same variable, because neither half is any
                  * use without the other. */
-                /* Registers and the VP only (0x00000-0x2FFFF). The GP and EP
-                 * windows above them (0x30000-0x7FFFF) are the DSPs' own
-                 * X/Y/P memories, which behave as RAM on hardware and which
-                 * the APU model does not implement -- it drops writes there
-                 * and reads back 0. Trapping them bought nothing, and cost a
-                 * fault on any access the MMIO decoder cannot emulate:
-                 * Burnout 3's DirectSound bulk-copies DSP memory with
-                 * rep movsd, which the lifter lowers to a host memcpy, and
-                 * that faulted at 0xFE830B78 with no way to resume. Plain
-                 * memory keeps what the title writes. */
-                enum { APU_TRAP_BYTES = 0x00030000 };
+                /* Route GP/EP uploads and reset writes to the DSP interpreter. */
+                enum { APU_TRAP_BYTES = 0x00080000 };
                 DWORD old_protect;
                 if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
-                                    " (GP/EP DSP memory left as RAM)\n",
+                                    " (including GP/EP DSP memory)\n",
                             XBOX_MCPX_BASE, XBOX_MCPX_BASE + APU_TRAP_BYTES);
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
@@ -3350,20 +3588,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
-    if (g_nv2a_memory) {
-        xbox_Nv2aAckStart();
-    }
-
-    /*
-     * Allocate a page at Xbox kernel address space (0x80010000).
-     *
-     * RenderWare's Xbox driver code (xbcache.c) reads MEM32(0x8001003C)
-     * to parse the Xbox kernel's PE header and find the INIT section for
-     * CPU cache line sizing. On PC, we provide a minimal fake PE header
-     * with 0 sections so the function gracefully skips the cache init.
-     *
-     * The actual native address is 0x80010000 + g_memory_offset.
-     */
+    /* Map a zeroed kernel probe page. A port may populate compatibility data
+     * through xbox_GetKernelMemoryBase before guest execution. */
     {
         #define XBOX_KERNEL_BASE 0x80010000u
         #define KERNEL_PAGE_SIZE 4096
@@ -3730,11 +3956,13 @@ void xbox_MemoryLayoutShutdown(void)
  * the RAM heap does not work: Half-Life 2 asks for 128 MB and then 200 MB, and
  * clamping those to what the heap can back left it sub-allocating across a
  * range it believed it owned, walking past the top of RAM and aliasing low
- * memory through the mirrors.
+ * memory.
  *
  * So reservations come from the mapped space *above* RAM instead. Those pages
- * are already backed and distinct, nothing else hands them out, and a commit
- * inside one is a no-op because it is real memory already.
+ * are already backed and distinct, and a commit inside one is a no-op because
+ * it is real memory already. The ordinary heap can also grow above RAM when
+ * the mapping is extended, so both allocators must exclude exact ownership
+ * spans from the other; a high-water mark includes unissued alignment gaps.
  *
  * Returns 0 when the mapping is no larger than RAM -- the default for titles
  * that never call xbox_SetMapSize -- which leaves the old behaviour untouched.
@@ -3744,24 +3972,13 @@ void xbox_MemoryLayoutShutdown(void)
  * a real allocator; none has yet.
  */
 static uint32_t g_reserve_next;
-
-uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align)
-{
-    uint32_t base;
-
-    if (g_memory_size <= g_xbox_total_ram || size == 0)
-        return 0;
-    if (!align)
-        align = 4096;
-    if (!g_reserve_next)
-        g_reserve_next = (uint32_t)g_xbox_total_ram;
-
-    base = (g_reserve_next + align - 1) & ~(align - 1);
-    if ((size_t)base + size > g_memory_size)
-        return 0;
-    g_reserve_next = base + size;
-    return base;
-}
+#define XBOX_RESERVE_MAX_ALLOCS 65536
+/* Reservations remain owned after the bridge's release/decommit no-ops.
+ * Sorted append-only spans also keep DMA from treating skipped heap blocks
+ * or alignment padding as above-RAM reservations. */
+static struct { uint32_t addr, size; } g_reserve_allocs[XBOX_RESERVE_MAX_ALLOCS];
+static int g_reserve_alloc_count;
+static RECOMP_TLS uint32_t t_reserve_begin, t_reserve_end;
 
 BOOL xbox_IsXboxAddress(uintptr_t address)
 {
@@ -3806,88 +4023,16 @@ static struct { uint32_t addr; uint32_t size; uint8_t free; }
     g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
 
-/* Guest threads allocate at once (audio, movie and streaming threads next to
- * the main one), and the table above is shared state. */
-static SRWLOCK g_heap_lock = SRWLOCK_INIT;
-
-/* RECOMP_HEAP_RECLAIM: give memory back properly.
- *
- * Reuse below hands a whole freed block to whatever asks next, however small,
- * and freeing skips over the empty slots that merging leaves behind, so a
- * title that allocates and frees a lot drains the heap far faster than it
- * uses it. Fixing that changes which address every later allocation gets, in
- * every title that ever frees, so it is off unless asked for. Read once: the
- * heap is hit constantly and the answer does not change. */
-int xbox_HeapReclaimEnabled(void)
-{
-    static int on = -1;
-    if (on < 0)
-        on = getenv("RECOMP_HEAP_RECLAIM") != NULL;
-    return on;
-}
-
-/* Insert a free block at index `at`, keeping address order. Reuses an empty
- * slot (size 0, left behind by coalescing) when one is already there. */
-static int heap_insert_free(int at, uint32_t addr, uint32_t size)
-{
-    if (!(at < g_heap_block_count && g_heap_blocks[at].size == 0)) {
-        if (g_heap_block_count >= XBOX_HEAP_MAX_BLOCKS)
-            return 0;
-        memmove(&g_heap_blocks[at + 1], &g_heap_blocks[at],
-                (size_t)(g_heap_block_count - at) * sizeof g_heap_blocks[0]);
-        g_heap_block_count++;
-    }
-    g_heap_blocks[at].addr = addr;
-    g_heap_blocks[at].size = size;
-    g_heap_blocks[at].free = 1;
-    return 1;
-}
-
-/* Take exactly `size` bytes, aligned, out of the first free block that has room
- * for them; what is left in front of and behind the piece stays free. Returns 0
- * when no free block fits. Caller holds g_heap_lock. */
-static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
-{
-    for (int i = 0; i < g_heap_block_count; i++) {
-        uint32_t a, start, end, front, back;
-        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
-            continue;
-        a = g_heap_blocks[i].addr;
-        start = (a + alignment - 1) & ~(alignment - 1);
-        end = a + g_heap_blocks[i].size;
-        if (start + size > end || start + size < start)
-            continue;   /* not enough room once aligned */
-        front = start - a;
-        back = end - (start + size);
-        if (front && !heap_insert_free(i, a, front))
-            continue;   /* table full: leave this block alone */
-        if (front)
-            i++;        /* the taken piece moved up one slot */
-        g_heap_blocks[i].addr = start;
-        g_heap_blocks[i].size = size;
-        g_heap_blocks[i].free = 0;
-        if (back && !heap_insert_free(i + 1, start + size, back))
-            g_heap_blocks[i].size += back;   /* table full: keep it attached */
-        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
-        return start;
-    }
-    return 0;
-}
-
-/*
- * Simulated stacks for spawned threads.
- *
- * The main thread owns the top of the XBOX_STACK region and grows down; worker
- * stacks are carved from the bottom upward so the two cannot meet until the
- * whole 8 MB is gone. Xbox VAs, not host memory: recompiled code addresses its
- * stack through MEM32() like any other Xbox pointer.
- */
+/* Spawned threads receive separate heap-backed guest stacks. Recompiled
+ * code accesses them through guest MEM macros, like the main stack. */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
-#define XBOX_THREAD_STACK_SIZE  (512 * 1024)
-#define XBOX_MAX_THREAD_STACKS  8
-
-static int g_thread_stacks_used = 0;
+struct owned_guest_stack {
+    uint32_t base,end;
+    int worker;
+    struct owned_guest_stack *next;
+};
+static struct owned_guest_stack *g_guest_stacks;
 
 /* A TIB and TLS block for a newly spawned guest thread.
  *
@@ -4512,9 +4657,17 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
                 fflush(stderr);
             }
         }
+        LeaveCriticalSection(&g_allocator_lock);
         return 0;
     }
+    result = (uint32_t)candidate;
 
+    /* Exact physical ownership depends on recording every heap block. */
+    if (g_heap_block_count >= XBOX_HEAP_MAX_BLOCKS) {
+        fprintf(stderr, "xbox_HeapAlloc: allocation table full\n");
+        LeaveCriticalSection(&g_allocator_lock);
+        return 0;
+    }
     g_heap_next = result + size;
 
     /* Zero-fill the allocated block (Xbox memory is always zeroed) */
@@ -4528,6 +4681,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     }
 
     g_heap_alloc_count++;
+    heap_watch("new", result, size);
     /* Rate-limited: a debug title makes thousands of these and the log is a
      * diagnostic, not a transaction record. */
     if (g_heap_alloc_count <= 32 || (g_heap_alloc_count % 512) == 0) {
@@ -4538,6 +4692,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
         fflush(stderr);
     }
 
+    LeaveCriticalSection(&g_allocator_lock);
     return result;
 }
 
@@ -4557,22 +4712,23 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
 {
     int i;
-    uint32_t r = 0;
 
     if (!xbox_va)
         return 0;
-    AcquireSRWLockShared(&g_heap_lock);
+    EnterCriticalSection(&g_allocator_lock);
     for (i = 0; i < g_heap_block_count; i++) {
         if (g_heap_blocks[i].free)
             continue;
         if (xbox_va >= g_heap_blocks[i].addr &&
             xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size) {
-            r = g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
-            break;
+            uint32_t remaining = g_heap_blocks[i].size -
+                                 (xbox_va - g_heap_blocks[i].addr);
+            LeaveCriticalSection(&g_allocator_lock);
+            return remaining;
         }
     }
-    ReleaseSRWLockShared(&g_heap_lock);
-    return r;
+    LeaveCriticalSection(&g_allocator_lock);
+    return 0;
 }
 
 void xbox_HeapFree(uint32_t xbox_va)
@@ -4582,7 +4738,7 @@ void xbox_HeapFree(uint32_t xbox_va)
     if (!xbox_va) {
         return;
     }
-    AcquireSRWLockExclusive(&g_heap_lock);
+    EnterCriticalSection(&g_allocator_lock);
     frees++;
     if (frees <= 8) {
         fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",

@@ -7,6 +7,8 @@
  *   T:\               -> <save_dir>/TitleData/
  *   U:\               -> <save_dir>/UserData/
  *   Z:\               -> <save_dir>/Cache/
+ *   Partition1\UDATA/TDATA -> explicit <save_dir>/UDATA/TDATA, otherwise
+ *                              <game_dir>/UDATA/TDATA
  *
  * The Win32 build emits UTF-16 paths (for CreateFileW); the Linux build
  * emits UTF-8 paths with '/' separators (for open()).
@@ -36,6 +38,38 @@ static int match_prefix(const char* path, const char* prefix)
         i++;
     }
     return i;
+}
+
+static const XboxPathMount *s_mounts;
+static int s_mount_count;
+
+BOOL xbox_path_set_mounts(const XboxPathMount *mounts, int count)
+{
+    if (count < 0 || (count && !mounts)) return FALSE;
+    for (int i = 0; i < count; i++) {
+        const char *prefix = mounts[i].guest_prefix;
+        const char *root = mounts[i].host_root;
+        size_t n;
+        if (!prefix || !root || !root[0] || strlen(root) >= MAX_PATH)
+            return FALSE;
+        n = strlen(prefix);
+        if (!n || n >= MAX_PATH || prefix[n - 1] != '\\' || strchr(prefix, '/'))
+            return FALSE;
+    }
+    s_mounts = mounts;
+    s_mount_count = count;
+    return TRUE;
+}
+
+static const XboxPathMount *find_mount(const char *path, int *skip)
+{
+    const XboxPathMount *mount = NULL;
+    *skip = 0;
+    for (int i = 0; i < s_mount_count; i++) {
+        int n = match_prefix(path, s_mounts[i].guest_prefix);
+        if (n > *skip) { mount = &s_mounts[i]; *skip = n; }
+    }
+    return mount;
 }
 
 /* A device-path translation rule, shared by both backends. */
@@ -462,23 +496,16 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
             wcscpy_s(s_save_dir, MAX_PATH, full);
     }
 
-    /* Create the save-side directories. T:/U:/Z: map into subdirectories of
-     * save_dir, and a title that opens a file there with a create disposition
-     * fails if the parent does not exist -- which reads as "cannot create save
-     * file" and sends the title down its init-failure path. Halo asserts
-     * exactly that at saved games/game_state_xbox.c:97 and then unwinds,
-     * clearing global_d3d_device on the way out, so a missing directory
-     * surfaces as a graphics failure.
-     *
-     * Cheap and idempotent: SHCreateDirectoryExW builds intermediates and is
-     * happy if they already exist. */
+    /* Create save-side parent directories before guest create requests.
+     * SHCreateDirectoryExW also creates intermediate directories. */
     {
         static const WCHAR *subs[] = { L"TitleData", L"UserData", L"Cache",
-                                       L"SystemData" };
+                                       L"SystemData", L"UDATA", L"TDATA" };
         WCHAR image[MAX_PATH];
         WCHAR dir[MAX_PATH];
         SHCreateDirectoryExW(NULL, s_save_dir, NULL);
         for (int i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
+            if (i >= 4 && !s_explicit_save_root) continue;
             swprintf_s(dir, MAX_PATH, L"%s\\%s", s_save_dir, subs[i]);
             SHCreateDirectoryExW(NULL, dir, NULL);
         }
@@ -566,9 +593,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
  * A caller that wants to act on the file a title just opened -- playing an FMV
  * the host can decode itself, say -- has the guest path but not the host one,
  * and re-deriving it would duplicate every rule above. */
-/* Thread-local: several threads open files at once, and a plain static let one
- * thread's translation overwrite another's between the translate and the read.
- * That showed up as the FMV trigger firing on roughly two runs in three. */
+/* Thread-local: concurrent translations must not overwrite each other. */
 
 static void xbox_remember_host_path(const wchar_t *p)
 {
@@ -582,6 +607,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     const char*  remainder = NULL;
     const WCHAR* base_dir  = NULL;
     const char*  sub_dir   = NULL;
+    WCHAR mounted_root[MAX_PATH];
     int          skip;
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
@@ -620,11 +646,12 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 translate:
     if (g_xbox_path_hook)
         g_xbox_path_hook(xbox_path);
-    fprintf(stderr, "  [PATH] %s\n", xbox_path);
-    fflush(stderr);
     {
         WCHAR remainder_wide[MAX_PATH];
-        MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH);
+        if (!MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH))
+            return FALSE;
+        if (wcslen(base_dir) + (sub_dir ? strlen(sub_dir) : 0) +
+            wcslen(remainder_wide) + 2 > buf_size) return FALSE;
 
         for (WCHAR* p = remainder_wide; *p; p++) {
             if (*p == L'/') *p = L'\\';
@@ -649,7 +676,7 @@ translate:
          * directory into STATUS_OBJECT_PATH_NOT_FOUND. */
         {
             size_t n = wcslen(host_path_buf);
-            while (n > 1 && (host_path_buf[n - 1] == L'\\'
+            while (n > wcslen(base_dir) && (host_path_buf[n - 1] == L'\\'
                              || host_path_buf[n - 1] == L'/'))
                 host_path_buf[--n] = L'\0';
         }
@@ -707,6 +734,7 @@ static void mkdir_p(const char* path)
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
+    s_explicit_save_root = save_dir && save_dir[0];
     if (game_dir) {
         snprintf(s_game_dir, sizeof(s_game_dir), "%s", game_dir);
     } else {
@@ -717,7 +745,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         snprintf(s_game_dir, sizeof(s_game_dir), "%s/game", cwd);
     }
 
-    if (save_dir) {
+    if (s_explicit_save_root) {
         snprintf(s_save_dir, sizeof(s_save_dir), "%s", save_dir);
     } else {
         /* XDG base-directory spec: $XDG_DATA_HOME or ~/.local/share */
@@ -865,8 +893,13 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
+    if (g_xbox_path_hook)
+        g_xbox_path_hook(xbox_path);
     {
         char remainder_posix[MAX_PATH];
+        if (strlen(remainder) >= sizeof(remainder_posix) ||
+            strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0) +
+            strlen(remainder) + 2 > buf_size) return FALSE;
         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);
 
         /* Xbox paths use backslashes -> POSIX slashes. */
@@ -908,3 +941,19 @@ translate:
 }
 
 #endif /* _WIN32 */
+
+BOOL xbox_get_save_directory(xbox_host_char* buffer, DWORD capacity)
+{
+    size_t length;
+    if (!buffer || !capacity) return FALSE;
+    if (!s_initialized) xbox_path_init(NULL, NULL);
+#if defined(_WIN32)
+    length = wcslen(s_save_dir);
+#else
+    mkdir_p(s_save_dir);
+    length = strlen(s_save_dir);
+#endif
+    if (length >= capacity) return FALSE;
+    memcpy(buffer, s_save_dir, (length + 1) * sizeof(*buffer));
+    return TRUE;
+}

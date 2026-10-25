@@ -1,7 +1,6 @@
-"""White-room readers for Microsoft's shipped Xbox BC (Ficl/Fission) modules.
+"""Readers for caller-supplied Microsoft Xbox BC (Ficl/Fission) modules.
 
-These parse *publicly distributed retail binaries* (the recompiled `xefu_*`/`xeo3_*`
-DLLs in a BC package) to extract facts useful to this project: a per-title symbol
-table, the guest address map, and the source/title identity. No Microsoft code, IR,
-or output is copied into or emitted by this toolkit -- see docs/technical/ms-fusion-*.md.
+Tools inspect module metadata, guest address maps and reference listings for
+recompiler analysis. No captured module, guest binary or title-derived signature
+database is bundled here. Analysis output is not replacement runtime code.
 """

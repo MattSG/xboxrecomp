@@ -13,38 +13,212 @@
  * the dispatcher. tests/kernel_directory uses the same seam for the directory
  * ABI; this one covers kernel memory ordinals.
  *
- * Checked here with ordinal 173, MmGetPhysicalAddress, which had two
- * implementations that disagreed -- the bridge translating through the
- * contiguous window and xbox_MmGetPhysicalAddress returning its argument
- * unchanged. The bridge now calls the latter, and that delegation is what
- * these checks pin: asserting only on xbox_MmGetPhysicalAddress leaves a
- * bridge that stops delegating entirely green.
+ * Checked here with ordinal 173, MmGetPhysicalAddress. The minimal XBE fixture
+ * initializes the real runtime memory map, so the contiguous alias at
+ * 0x80001000 resolves to physical 0x1000.
  */
 /* kernel.h brings the NT type vocabulary: <windows.h> on Windows, the
  * shim in platform/xbox_winnt.h elsewhere. Nothing below is
  * platform-specific. */
 #include "kernel.h"
+#include "kernel_guest_io.h"
+#include "recomp_icall_feedback.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#define SCRATCH_SP 0x30000u
+typedef void (*recomp_func_t)(void);
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
+
 /* Provided by the generated title; a regression harness has no title, and a
  * static archive resolves only what gets pulled in. Nothing here calls a
  * guest function. */
-typedef void (*recomp_func_t)(void);
+static uint8_t *g_guest_mem;
+static uint32_t g_complete_entry;
+static uint32_t g_dispatch_mode;
+static uint32_t g_start_order[8];
+static uint32_t g_start_count;
+static uint32_t g_nested_preserved;
+static uint32_t g_start_action;
+static uint32_t g_start_complete_entry;
+static uint32_t g_start_packet_entry;
+static uint32_t g_start_enqueue_irp;
+static uint32_t g_start_enqueue_key_va;
+static uint32_t g_start_completed_and_freed;
+static uint32_t g_sync_pending_irp;
+static uint32_t g_sync_complete_entry;
+static HANDLE g_sync_dispatch_entered;
+static int g_sync_event_header_expected;
+static int g_sync_event_header_ok = 1;
+static uint32_t g_sync_event_header_checks;
+static uint32_t call_fast_slot(uint8_t *mem, uint32_t entry_va,
+                               uint32_t ecx, uint32_t edx);
+
+#define TEST_DISPATCH_VA 0x45080u
+#define TEST_STARTIO_VA  0x45084u
+
+static void test_dispatch_callback(void)
+{
+    uint32_t *sp = (uint32_t *)(g_guest_mem + g_esp);
+    uint32_t irp_va = sp[2];
+    XBOX_GUEST_IRP *irp = (XBOX_GUEST_IRP *)(g_guest_mem + irp_va);
+    recomp_func_t complete;
+
+    if (g_sync_event_header_expected) {
+        uint32_t event_va = irp->user_event;
+        XBOX_GUEST_DISPATCHER_HEADER *header = event_va ?
+            (XBOX_GUEST_DISPATCHER_HEADER *)(g_guest_mem + event_va) : NULL;
+        if (!header || header->type != 0 || header->absolute != 0 ||
+            header->size != 4 || header->inserted != 0 ||
+            header->signal_state != 0 ||
+            header->wait_list_head[0] != event_va + 8 ||
+            header->wait_list_head[1] != event_va + 8)
+            g_sync_event_header_ok = 0;
+        ++g_sync_event_header_checks;
+    }
+
+    irp->io_status.status = g_dispatch_mode == 1 ? 0x00000103u :
+                            g_dispatch_mode == 2 ? 0xC0000001u :
+                            g_dispatch_mode == 3 ? 0x80000005u : 0;
+    irp->io_status.information = g_dispatch_mode == 2 ? 9 :
+                                  g_dispatch_mode == 3 ? 13 : 7;
+    /* Mode 2 returns success with an IOSB error; mode 3 returns the warning
+     * STATUS_BUFFER_OVERFLOW. Xbox ordinal 84 returns the dispatch status on
+     * immediate completion but copies IOSB.Information for either status. */
+    g_eax = g_dispatch_mode == 2 ? 0 : irp->io_status.status;
+    if (g_dispatch_mode == 1 && g_sync_dispatch_entered) {
+        g_sync_pending_irp = irp_va;
+        SetEvent(g_sync_dispatch_entered);
+    } else if (g_dispatch_mode != 1) {
+        uint32_t result = g_eax;
+        g_ecx = irp_va;
+        g_edx = 0;
+        g_esp -= 4; /* kernel thunk dispatch consumes its dummy call return */
+        *(uint32_t *)(g_guest_mem + g_esp) = 0;
+        complete = recomp_lookup_kernel(*(uint32_t *)(g_guest_mem + g_complete_entry));
+        complete();
+        g_nested_preserved = g_eax == 0 && g_esp == SCRATCH_SP - 12;
+        g_eax = result;
+    }
+    g_esp += 12; /* stdcall dispatch routine consumed return + two arguments */
+}
+
+static DWORD WINAPI complete_pending_sync_irp(LPVOID parameter)
+{
+    (void)parameter;
+    if (WaitForSingleObject(g_sync_dispatch_entered, 2000) != WAIT_OBJECT_0)
+        return 1;
+    Sleep(10); /* let dispatch return STATUS_PENDING before completion */
+    XBOX_GUEST_IRP *irp = (XBOX_GUEST_IRP *)(g_guest_mem + g_sync_pending_irp);
+    irp->io_status.status = 0;
+    irp->io_status.information = 13;
+    (void)call_fast_slot(g_guest_mem, g_sync_complete_entry,
+                         g_sync_pending_irp, 0);
+    return 0;
+}
+
+static void test_start_io_callback(void)
+{
+    uint32_t *sp = (uint32_t *)(g_guest_mem + g_esp);
+    uint32_t device_va = sp[1];
+    uint32_t irp_va = sp[2];
+    XBOX_GUEST_IRP *irp = (XBOX_GUEST_IRP *)(g_guest_mem + irp_va);
+    if (g_start_count < sizeof(g_start_order) / sizeof(g_start_order[0]))
+        g_start_order[g_start_count++] = irp->original_file_object;
+    if (g_start_action) {
+        recomp_func_t complete, start_packet;
+        uint32_t saved_esp = g_esp;
+        g_ecx = irp_va; g_edx = 0; g_esp -= 4;
+        *(uint32_t *)(g_guest_mem + g_esp) = 0;
+        complete = recomp_lookup_kernel(*(uint32_t *)(g_guest_mem +
+                                      g_start_complete_entry));
+        complete();
+        g_start_completed_and_freed = xbox_HeapBlockSize(irp_va) == 0;
+
+        g_esp -= 16;
+        *(uint32_t *)(g_guest_mem + g_esp) = 0;
+        *(uint32_t *)(g_guest_mem + g_esp + 4) = device_va;
+        *(uint32_t *)(g_guest_mem + g_esp + 8) = g_start_enqueue_irp;
+        *(uint32_t *)(g_guest_mem + g_esp + 12) = g_start_enqueue_key_va;
+        start_packet = recomp_lookup_kernel(*(uint32_t *)(g_guest_mem +
+                                          g_start_packet_entry));
+        start_packet();
+        g_esp = saved_esp;
+        g_start_action = 0;
+    }
+    /* Simulate a callback clobbering volatile and callee-saved CPU state. */
+    g_eax = 0xE0E0E0E0u; g_ecx = 0xC1C1C1C1u; g_edx = 0xD2D2D2D2u;
+    g_ebx = 0xB3B3B3B3u; g_esi = 0x51515151u; g_edi = 0xD1D1D1D1u;
+    g_esp += 12;
+}
+
+#define TEST_UNWIND_VA 0x45098u
+static unsigned unwind_calls;
+static uint32_t unwind_frame,unwind_flags;
+static void test_unwind_callback(void)
+{
+    uint32_t *sp=(uint32_t *)(g_guest_mem+g_esp);
+    unwind_calls++; unwind_frame=sp[2];
+    unwind_flags=*(uint32_t *)(g_guest_mem+sp[1]+4);
+    g_esp+=4; /* cdecl return; caller owns the four arguments */
+}
+#define TEST_THREAD_VA 0x45088u
+static DWORD thread_id;
+static uint32_t thread_context[2], thread_stack, thread_tib;
+static unsigned thread_context_count;
+static uint32_t thread_stack_probe;
+static int thread_has_bounds;
+static void test_thread_callback(void)
+{
+    thread_id = GetCurrentThreadId();
+    thread_context[0] = *(uint32_t *)(g_guest_mem + g_esp + 4);
+    thread_context[1] = thread_context_count==2 ? *(uint32_t *)(g_guest_mem + g_esp + 8) : 0;
+    thread_stack = g_esp;
+    thread_stack_probe=xbox_HeapBlockSize(g_esp-1024*1024);
+    thread_has_bounds=xbox_GetStackBounds(g_esp,NULL,NULL);
+    thread_tib = g_fs_base;
+    g_ebx = 0xBAD;
+    g_esp += 4 + 4*thread_context_count; /* translated stdcall return */
+}
+
 recomp_func_t recomp_lookup(uint32_t xbox_va);
-recomp_func_t recomp_lookup(uint32_t xbox_va) { (void)xbox_va; return NULL; }
+recomp_func_t recomp_lookup(uint32_t xbox_va)
+{
+    if (xbox_va == TEST_UNWIND_VA) return test_unwind_callback;
+    if (xbox_va == TEST_THREAD_VA) return test_thread_callback;
+    if (xbox_va == TEST_DISPATCH_VA) return test_dispatch_callback;
+    if (xbox_va == TEST_STARTIO_VA) return test_start_io_callback;
+    return NULL;
+}
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NULL; }
 
 /* The seam, plus the guest CPU state the dispatcher reads and writes. */
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
+extern RECOMP_TLS uint32_t g_ecx, g_edx, g_ebx, g_esi, g_edi;
 extern ptrdiff_t g_xbox_mem_offset;
 
 static int failures;
+
+static int all_zero(const uint8_t *bytes, size_t size)
+{
+    for (size_t i = 0; i < size; i++)
+        if (bytes[i] != 0) return 0;
+    return 1;
+}
+
+static int all_value(const uint8_t *bytes, size_t size, uint8_t value)
+{
+    for (size_t i = 0; i < size; i++)
+        if (bytes[i] != value) return 0;
+    return 1;
+}
 
 static void check(int ok, const char *what, const char *detail)
 {
@@ -84,16 +258,16 @@ int main(void)
         /* stdcall: the guest pushed a return address, then the argument. */
         uint32_t *sp = (uint32_t *)(mem + STACK_VA);
         sp[0] = 0xBEEF0001u;          /* guest return address */
-        sp[1] = 0x80001000u;          /* inside the contiguous window */
+        sp[1] = 0x80001000u;          /* initialized contiguous alias */
         g_esp = STACK_VA;
         g_eax = 0xDEADBEEFu;
         fn();
 
         char detail[128];
         snprintf(detail, sizeof detail,
-                 "bridge returned 0x%08X, expected 0x00001000", g_eax);
-        check(g_eax == 0x00001000u,
-              "ordinal 173 translates through the contiguous window", detail);
+                 "bridge returned 0x%08X, expected physical 0x00001000", g_eax);
+        check(g_eax == 0x1000u,
+              "ordinal 173 resolves the initialized contiguous alias", detail);
 
         /* And the argument must come off the guest stack. A wrong
          * stdcall_args_for_ordinal entry corrupts the caller's frame away
