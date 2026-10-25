@@ -106,6 +106,8 @@ int main(int argc, char **argv)
 
     for (i = 0; i < N_SLOTS; i++)
         *(uint32_t *)(mem + THUNK_VA + 4 * i) = 0x80000000u | ORD[i];
+    /* The fork selects kernel data storage explicitly (upstream has a fixed region). */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 11;
     xbox_kernel_set_thunk_address(THUNK_VA, N_SLOTS);
     xbox_kernel_bridge_init();
     for (i = 0; i < N_SLOTS; i++) {
