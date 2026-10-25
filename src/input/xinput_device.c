@@ -478,8 +478,24 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
 
-    if (dwPort == 0)
-        keyboard_merge(pState);
+    /* Merge the keyboard on top of a real pad rather than only standing in
+     * for a missing one: the pad's buttons stay and the keyboard adds to them. */
+    if (dwPort == 0 && keyboard_enabled()) {
+        XBOX_INPUT_STATE kb;
+        int i;
+        keyboard_state(&kb);
+        pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
+        for (i = 0; i < 8; i++)
+            if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
+                pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+        if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
+        if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
+        if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
+        if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
+        /* The input layer records edges, so an unchanged packet number is
+         * read as the same state and the press never happens. */
+        pState->dwPacketNumber = kb.dwPacketNumber;
+    }
 
     /* Mouse+keyboard merges on top of a real pad too: the mouse owns the
      * aim stick while it is moving, WASD owns movement while held. */
