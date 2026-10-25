@@ -15,7 +15,6 @@
 #define NV2A_MMIO_SIZE  0x01000000u  /* 16MB */
 #define NV2A_VRAM_SIZE  (64 * 1024 * 1024)  /* 64MB Xbox VRAM */
 #define NV2A_RAMIN_SIZE (1 * 1024 * 1024)   /* 1MB RAMIN */
-#define NV2A_PVIDEO_MMIO 0x8000u            /* PVIDEO's 4 KB register block */
 
 /* Statistics */
 static volatile LONG g_mmio_read_count = 0;
@@ -110,9 +109,6 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     if (!ctx || fault_xbox_va < NV2A_MMIO_BASE ||
         fault_xbox_va - NV2A_MMIO_BASE >= NV2A_MMIO_SIZE) return false;
     uint32_t mmio_offset = fault_xbox_va - NV2A_MMIO_BASE;
-    bool pvideo = mmio_offset >= NV2A_PVIDEO_MMIO &&
-                  mmio_offset < NV2A_PVIDEO_MMIO + 0x1000u;
-    bool handled;
 
     bool handled;
     bool pvideo = mmio_offset >= 0x8000u && mmio_offset < 0x9000u;
