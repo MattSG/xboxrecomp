@@ -24,7 +24,6 @@ static void note(char c) { assert(calls+1<sizeof order); order[calls++]=c; order
 BOOL xbox_MemoryLayoutInit(const void *data,size_t size)
 { assert(data && size); note('M'); return strcmp(mode,"memory-fail")!=0; }
 void xbox_MemoryLayoutShutdown(void) { note('m'); }
-ptrdiff_t xbox_GetMemoryOffset(void) { return 0x10000000; }
 void xbox_kernel_init(void) { note('K'); }
 void xbox_kernel_shutdown(void) { note('k'); }
 void xbox_path_init(const char *dir,const char *save) { assert(dir && !save); note('P'); }
