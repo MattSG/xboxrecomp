@@ -98,8 +98,7 @@ add_subdirectory(src/host)
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
-add_library(xboxrecomp INTERFACE)
-target_link_libraries(xboxrecomp INTERFACE
+set(XBOXRECOMP_LIBS
     xbox_kernel
     xbox_d3d8
     xbox_dsound
