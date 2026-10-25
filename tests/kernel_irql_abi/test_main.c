@@ -34,6 +34,8 @@ int main(void) {
     g_xbox_mem_offset=(ptrdiff_t)memory;
     uint32_t *imports=(uint32_t *)(memory+0x10000);
     imports[0]=0x800000A0; imports[1]=0x800000A1;
+    /* The fork selects kernel data storage explicitly; upstream has a fixed region. */
+    if(!xbox_ConfigureKernelData(0x00740000u)) return 11;
     xbox_kernel_set_thunk_address(0x10000,2); xbox_kernel_bridge_init();
     int failed=0;
     failed|=call_irql(160,0xBEEF0002,0,2);
