@@ -15,7 +15,6 @@
 #define NV2A_MMIO_SIZE  0x01000000u  /* 16MB */
 #define NV2A_VRAM_SIZE  (64 * 1024 * 1024)  /* 64MB Xbox VRAM */
 #define NV2A_RAMIN_SIZE (1 * 1024 * 1024)   /* 1MB RAMIN */
-#define NV2A_PVIDEO_MMIO 0x8000u            /* PVIDEO's 4 KB register block */
 
 /* Statistics */
 static volatile LONG g_mmio_read_count = 0;
@@ -120,10 +119,6 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 }
 
 #else /* no x86-64 instruction decoder for this host */
-
-bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
-{ (void)regs; return false; }
-void nv2a_hook_pvideo_consume(unsigned bank) { (void)bank; }
 
 bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
 { (void)regs; return false; }

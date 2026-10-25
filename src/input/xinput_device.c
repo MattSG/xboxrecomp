@@ -13,8 +13,6 @@
  */
 
 #include "xinput_xbox.h"
-#include "keyboard.h"
-#include "mkb_input.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -478,13 +476,34 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
 
-    if (dwPort == 0)
-        keyboard_merge(pState);
-
-    /* Mouse+keyboard merges on top of a real pad too: the mouse owns the
-     * aim stick while it is moving, WASD owns movement while held. */
-    if (dwPort == 0)
-        mkb_merge(dwPort, pState);
+    /* Merge the keyboard on top rather than only standing in for a missing
+     * pad.
+     *
+     * The first version put the keyboard behind XInput's failure, on the
+     * assumption that with nothing plugged in the call would fail. It does
+     * not: under Wine XInputGetState returns ERROR_SUCCESS and a gamepad
+     * with every button at rest, so the fallback was unreachable and
+     * pressing a key did nothing at all.
+     *
+     * Merging is also the better rule. A real pad keeps working -- its
+     * buttons are already in pState and the keyboard only adds to them --
+     * and there is no special case left to get wrong. */
+    if (dwPort == 0 && keyboard_enabled()) {
+        XBOX_INPUT_STATE kb;
+        int i;
+        keyboard_state(&kb);
+        pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
+        for (i = 0; i < 8; i++)
+            if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
+                pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+        if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
+        if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
+        if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
+        if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
+        /* The input layer records edges, so an unchanged packet number is
+         * read as the same state and the press never happens. */
+        pState->dwPacketNumber = kb.dwPacketNumber;
+    }
 
     return finish_state(dwPort, pState);
 }

@@ -415,105 +415,6 @@ static DWORD xbox_share_to_win32(ULONG Share)
     return result;
 }
 
-/* FATX overwrite semantics (Win32 side; the POSIX backend below has the
- * same rule and the long story, at s_overwrite_pending).
- *
- * An overwrite open (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF) of an
- * existing file sets its size to 0 on FATX, but FATX keeps no valid-data
- * length, so a later SetEndOfFile that grows the file brings back the bytes
- * already on disk. A title's z: texture cache can depend on it: it writes
- * x.tmp, reopens it with CREATE_ALWAYS, only sets the end of file to the true
- * size, and renames it to x.dat. CREATE_ALWAYS / TRUNCATE_EXISTING on NTFS (and
- * Wine's ftruncate) zero-fill on the regrow, so every cache file came out as
- * zeros of the right length.
- *
- * So an overwrite of an existing non-empty file opens it with OPEN_EXISTING
- * and marks the handle pending. If the first thing done with it is setting
- * the end of file, that is a plain SetEndOfFile to the new size, which keeps
- * the bytes below it. Anything else (read, write, size query, allocation,
- * close) first truncates to 0, the normal overwrite. A position query does
- * not settle: XAPI SetEndOfFile makes one before it sets the end of file. */
-#define FATX_PENDING_MAX 64
-static HANDLE s_overwrite_pending[FATX_PENDING_MAX];
-static SRWLOCK s_overwrite_lock = SRWLOCK_INIT;
-
-static int disposition_overwrites(ULONG disposition)
-{
-    return disposition == XBOX_FILE_SUPERSEDE
-        || disposition == XBOX_FILE_OVERWRITE
-        || disposition == XBOX_FILE_OVERWRITE_IF;
-}
-
-/* Mark h pending. Returns 0 if the table is full. */
-static int overwrite_mark(HANDLE h)
-{
-    int i, ok = 0;
-    AcquireSRWLockExclusive(&s_overwrite_lock);
-    for (i = 0; i < FATX_PENDING_MAX; i++)
-        if (!s_overwrite_pending[i]) { s_overwrite_pending[i] = h; ok = 1; break; }
-    ReleaseSRWLockExclusive(&s_overwrite_lock);
-    return ok;
-}
-
-/* Take the pending mark without truncating. Returns 1 if h was pending. */
-static int overwrite_take(HANDLE h)
-{
-    int i, was = 0;
-    if (!h || h == INVALID_HANDLE_VALUE)
-        return 0;
-    AcquireSRWLockExclusive(&s_overwrite_lock);
-    for (i = 0; i < FATX_PENDING_MAX; i++)
-        if (s_overwrite_pending[i] == h) { s_overwrite_pending[i] = NULL; was = 1; break; }
-    ReleaseSRWLockExclusive(&s_overwrite_lock);
-    return was;
-}
-
-/* Truncate to 0, keeping the file pointer where it was. */
-static void truncate_to_zero(HANDLE h)
-{
-    LARGE_INTEGER cur, zero;
-    zero.QuadPart = 0;
-    if (!SetFilePointerEx(h, zero, &cur, FILE_CURRENT))
-        cur.QuadPart = 0;
-    SetFilePointerEx(h, zero, NULL, FILE_BEGIN);
-    if (!SetEndOfFile(h))
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                 "overwrite: truncate failed err=%u", GetLastError());
-    SetFilePointerEx(h, cur, NULL, FILE_BEGIN);
-}
-
-/* Finish a pending overwrite: truncate to 0. */
-static void overwrite_settle(HANDLE h)
-{
-    if (overwrite_take(h))
-        truncate_to_zero(h);
-}
-
-/* The missing-file report's high/low split: a miss under a directory that
- * exists is a file the dump lacks; one under a directory that does not is
- * usually a title probing a loose-file layout it never shipped. Same answer
- * as the POSIX version below for the same tree. */
-int xbox_host_parent_exists(const xbox_host_char *host_path)
-{
-    WCHAR dir[MAX_PATH];
-    const WCHAR *cut;
-    DWORD attrs;
-
-    if (!host_path)
-        return 0;
-    cut = wcsrchr(host_path, L'\\');
-    {
-        const WCHAR *fwd = wcsrchr(host_path, L'/');
-        if (fwd && (!cut || fwd > cut)) cut = fwd;
-    }
-    if (!cut || cut == host_path || (size_t)(cut - host_path) >= MAX_PATH)
-        return 0;
-    memcpy(dir, host_path, (size_t)(cut - host_path) * sizeof(WCHAR));
-    dir[cut - host_path] = 0;
-    attrs = GetFileAttributesW(dir);
-    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
-}
-
 /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
 static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
                                WCHAR* win_path, DWORD buf_size)
@@ -716,7 +617,6 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
-    overwrite_settle(FileHandle);
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
@@ -771,11 +671,6 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
-
-    /* Not for a position query: XAPI SetEndOfFile makes one before it
-     * sets the end of file, and a pending overwrite must survive it. */
-    if (FileInformationClass != XboxFilePositionInformation)
-        overwrite_settle(FileHandle);
 
     switch (FileInformationClass) {
         case XboxFileBasicInformation: {
@@ -870,9 +765,6 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             LARGE_INTEGER cur, zero = {0};
-            /* A pending overwrite ends here: SetEndOfFile to the new size
-             * keeps the old bytes below it (see s_overwrite_pending). */
-            overwrite_take(FileHandle);
             SetFilePointerEx(FileHandle, zero, &cur, FILE_CURRENT);
             SetFilePointerEx(FileHandle, info->EndOfFile, NULL, FILE_BEGIN);
             if (!SetEndOfFile(FileHandle)) {
@@ -900,7 +792,6 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_END_OF_FILE_INFORMATION info =
                 (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             FILE_ALLOCATION_INFO fai;
-            overwrite_settle(FileHandle);
             fai.AllocationSize = info->EndOfFile;
             if (!SetFileInformationByHandle(FileHandle, FileAllocationInfo,
                                             &fai, sizeof(fai))) {
@@ -1264,66 +1155,6 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     return STATUS_SUCCESS;
 }
 
-
-/* Rename an open file. See the POSIX version for the cases; this one asks
- * the handle to do it (FileRenameInfo), which needs DELETE access, and falls
- * back to MoveFileExW on the path the handle names. Tested under Proton
- * only. */
-NTSTATUS __stdcall xbox_RenameFileByHandle(
-    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
-{
-    WCHAR src[MAX_PATH], dst[MAX_PATH];
-    const char *name = get_xbox_path(NewName);
-    DWORD n;
-
-    if (!name || !*name)
-        return STATUS_INVALID_PARAMETER;
-    n = GetFinalPathNameByHandleW(FileHandle, src, MAX_PATH,
-                                  FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-    if (!n || n >= MAX_PATH)
-        return STATUS_INVALID_HANDLE;
-
-    if (!NewName->RootDirectory && !strchr(name, '\\') && !strchr(name, ':')) {
-        WCHAR *slash = wcsrchr(src, L'\\');
-        size_t dir = slash ? (size_t)(slash - src) + 1 : 0;
-        memcpy(dst, src, dir * sizeof(WCHAR));
-        if (!MultiByteToWideChar(CP_ACP, 0, name, -1, dst + dir,
-                                 (int)(MAX_PATH - dir)))
-            return STATUS_OBJECT_NAME_INVALID;
-    } else if (!translate_obj_path(NewName, dst, MAX_PATH)) {
-        return STATUS_OBJECT_PATH_NOT_FOUND;
-    }
-
-    {
-        size_t len = wcslen(dst);
-        size_t bytes = sizeof(FILE_RENAME_INFO) + len * sizeof(WCHAR);
-        FILE_RENAME_INFO *fri = (FILE_RENAME_INFO *)calloc(1, bytes);
-        BOOL ok = FALSE;
-        if (fri) {
-            fri->ReplaceIfExists = ReplaceIfExists ? TRUE : FALSE;
-            fri->RootDirectory = NULL;
-            fri->FileNameLength = (DWORD)(len * sizeof(WCHAR));
-            memcpy(fri->FileName, dst, (len + 1) * sizeof(WCHAR));
-            ok = SetFileInformationByHandle(FileHandle, FileRenameInfo, fri,
-                                            (DWORD)bytes);
-            free(fri);
-        }
-        if (!ok)
-            ok = MoveFileExW(src, dst,
-                             ReplaceIfExists ? MOVEFILE_REPLACE_EXISTING : 0);
-        if (!ok) {
-            DWORD e = GetLastError();
-            return e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS
-                 ? STATUS_OBJECT_NAME_COLLISION
-                 : e == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED
-                 : STATUS_UNSUCCESSFUL;
-        }
-    }
-    fprintf(stderr, "  [FILE] rename %S -> %S\n", src, dst);
-    fflush(stderr);
-    return STATUS_SUCCESS;
-}
-
 /* ======================================================================== */
 #else /* !_WIN32 */
 /* ====================  POSIX backend  =================================== */
@@ -1354,59 +1185,6 @@ static int posix_open_flags(ACCESS_MASK access, ULONG disposition)
     return rw | extra;
 }
 
-/* FATX overwrite semantics.
- *
- * An overwrite open (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF) of an
- * existing file sets its size to 0 on FATX, but FATX keeps no valid-data
- * length: growing the file again with SetEndOfFile, without writing, brings
- * back the bytes already on disk. A title can rely on this when it builds a
- * utility-drive texture cache:
- *
- *   CreateFile(x.tmp, CREATE_ALWAYS, NO_BUFFERING|OVERLAPPED)
- *   SetEndOfFile(size rounded up to 512); WriteFile(all of it); CloseHandle
- *   CreateFile(x.tmp, CREATE_ALWAYS)      <- the second overwrite
- *   SetEndOfFile(true size); CloseHandle; rename x.tmp -> x.dat
- *
- * The second open only trims the sector padding. With O_TRUNC the host
- * filesystem zero-fills on the regrow, so every cache file came out as zeros
- * of the right length, and the game later loaded zero textures from them.
- *
- * So an overwrite of an existing non-empty file is opened without O_TRUNC
- * and marked pending. If the first thing done with the handle is setting
- * the end of file, that is a plain ftruncate to the new size, which keeps
- * the old bytes below it as FATX does. Anything else (read, write, size
- * query, allocation, close) first truncates to 0, which is the normal
- * overwrite. The table is indexed by host fd. */
-#define FATX_PENDING_MAX 4096
-static volatile unsigned char s_overwrite_pending[FATX_PENDING_MAX];
-
-static int disposition_overwrites(ULONG disposition)
-{
-    return disposition == XBOX_FILE_SUPERSEDE
-        || disposition == XBOX_FILE_OVERWRITE
-        || disposition == XBOX_FILE_OVERWRITE_IF;
-}
-
-/* Finish a pending overwrite: truncate to 0. */
-static void overwrite_settle(int fd)
-{
-    if (fd >= 0 && fd < FATX_PENDING_MAX && s_overwrite_pending[fd]) {
-        s_overwrite_pending[fd] = 0;
-        if (ftruncate(fd, 0) != 0) { /* nothing more to do */ }
-    }
-}
-
-/* Take the pending mark without truncating (end-of-file set). Returns 1 if
- * the handle was pending. */
-static int overwrite_take(int fd)
-{
-    if (fd >= 0 && fd < FATX_PENDING_MAX && s_overwrite_pending[fd]) {
-        s_overwrite_pending[fd] = 0;
-        return 1;
-    }
-    return 0;
-}
-
 static void unix_to_filetime(time_t sec, long nsec, LARGE_INTEGER* out)
 {
     /* 100-ns ticks since 1601-01-01 */
@@ -1424,23 +1202,6 @@ static ULONG mode_to_xbox_attrs(mode_t m)
     if (!(m & S_IWUSR))  a |= XBOX_FILE_ATTRIBUTE_READONLY;
     if (a == 0)          a = XBOX_FILE_ATTRIBUTE_NORMAL;
     return a;
-}
-
-/* See the Win32 version: the same test, the same answer. */
-int xbox_host_parent_exists(const xbox_host_char *host_path)
-{
-    char dir[MAX_PATH];
-    const char *cut;
-    struct stat st;
-
-    if (!host_path)
-        return 0;
-    cut = strrchr(host_path, '/');
-    if (!cut || cut == host_path || (size_t)(cut - host_path) >= sizeof dir)
-        return 0;
-    memcpy(dir, host_path, (size_t)(cut - host_path));
-    dir[cut - host_path] = '\0';
-    return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 static NTSTATUS errno_to_status(int e)
@@ -1632,7 +1393,6 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_INVALID_HANDLE;
     }
 
-    overwrite_settle(fd);
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
@@ -1669,7 +1429,6 @@ NTSTATUS __stdcall xbox_NtWriteFile(
         return STATUS_INVALID_HANDLE;
     }
 
-    overwrite_settle(fd);
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
@@ -1724,9 +1483,6 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
 
     struct stat st;
     if (FileInformationClass != XboxFilePositionInformation) {
-        /* Not for a position query: XAPI SetEndOfFile makes one before it
-         * sets the end of file, and a pending overwrite must survive it. */
-        overwrite_settle(fd);
         if (fstat(fd, &st) != 0)
             return STATUS_UNSUCCESSFUL;
     }
@@ -1805,29 +1561,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         }
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
-            /* A pending overwrite ends here: ftruncate to the new size keeps
-             * the old bytes below it (see s_overwrite_pending). */
-            overwrite_take(fd);
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
-                return STATUS_UNSUCCESSFUL;
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            return STATUS_SUCCESS;
-        }
-        case XboxFileAllocationInformation: {
-            /* Reserve space before writing. The Win32 backend already handles
-             * this; POSIX fell through to STATUS_NOT_IMPLEMENTED. A title calls it as it copies textures
-             * into the utility-drive cache.
-             *
-             * NT semantics: an allocation below the end of file truncates to
-             * it; one above only reserves space and leaves the size alone.
-             * POSIX has no portable reservation, and the caller only needs the
-             * write that follows to succeed, so growing is a no-op. */
-            PXBOX_FILE_END_OF_FILE_INFORMATION info =
-                (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
-            struct stat st;
-            overwrite_settle(fd);
-            if (fstat(fd, &st) == 0 && (off_t)info->EndOfFile.QuadPart < st.st_size
-                    && ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
@@ -1858,77 +1592,6 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
-}
-
-/* Rename an open file (NtSetInformationFile, FileRenameInformation).
- *
- * A title can build each utility-drive cache file as z:\...\name.tmp, then
- * rename it to name.dat and later open the .dat. With this class
- * unimplemented the rename failed, so every .dat open failed with
- * STATUS_OBJECT_NAME_NOT_FOUND and the title rebuilt the cache instead.
- *
- * The new name is resolved the way NT does:
- *   RootDirectory set    relative to that directory handle
- *   bare name, no root   within the file's own directory
- *   anything else        a full Xbox path, through the path table
- * POSIX rename() replaces an existing target, so ReplaceIfExists = FALSE is
- * checked first. The handle keeps working (the fd follows the inode), and its
- * recorded path is updated so a later delete-on-close removes the new name. */
-NTSTATUS __stdcall xbox_RenameFileByHandle(
-    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
-{
-    char dst[MAX_PATH];
-    const char *src = w32_handle_path(FileHandle);
-    const char *name = get_xbox_path(NewName);
-    struct stat st;
-
-    if (!src)
-        return STATUS_INVALID_HANDLE;
-    if (!name || !*name)
-        return STATUS_INVALID_PARAMETER;
-
-    if (NewName->RootDirectory
-            || (!strchr(name, '\\') && !strchr(name, ':'))) {
-        const char *base = NewName->RootDirectory
-                         ? w32_handle_path(NewName->RootDirectory) : src;
-        const char *slash;
-        size_t dir;
-        char *p;
-
-        if (!base)
-            return STATUS_INVALID_HANDLE;
-        if (NewName->RootDirectory) {
-            dir = strlen(base);
-        } else {
-            slash = strrchr(base, '/');
-            dir = slash ? (size_t)(slash - base) : 0;
-        }
-        if (dir + 1 + strlen(name) >= sizeof dst)
-            return STATUS_OBJECT_NAME_INVALID;
-        memcpy(dst, base, dir);
-        dst[dir] = '/';
-        strcpy(dst + dir + 1, name[0] == '\\' ? name + 1 : name);
-        for (p = dst + dir + 1; *p; p++)
-            if (*p == '\\') *p = '/';
-    } else if (!xbox_translate_path(name, dst, MAX_PATH)) {
-        return STATUS_OBJECT_PATH_NOT_FOUND;
-    }
-
-    if (strcmp(src, dst) != 0) {
-        if (!ReplaceIfExists && stat(dst, &st) == 0)
-            return STATUS_OBJECT_NAME_COLLISION;
-        if (rename(src, dst) != 0) {
-            int e = errno;
-            fprintf(stderr, "  [FILE] rename %s -> %s FAILED (%s)\n",
-                    src, dst, strerror(e));
-            fflush(stderr);
-            return errno_to_status(e);
-        }
-    }
-    fprintf(stderr, "  [FILE] rename %s -> %s\n", src, dst);
-    fflush(stderr);
-    w32_handle_set_path(FileHandle, dst);
-    return STATUS_SUCCESS;
 }
 
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
@@ -1994,7 +1657,8 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 
     if (!FileInformation)
         return STATUS_INVALID_PARAMETER;
-    if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH))
+    const char* xbox_path = get_xbox_path(ObjectAttributes);
+    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     if (stat(host_path, &st) != 0)
         return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -2046,26 +1710,6 @@ static void xbox_dir_context_close(HANDLE FileHandle)
         ctx->pattern[0] = '\0';
     }
     CloseHandle(FileHandle);
-    LeaveCriticalSection(&s_dir_cs);
-}
-
-/* As on Win32: a closed directory handle takes its enumeration with it. The
- * handle is a heap object, and the allocator hands a freed one straight back,
- * so a search abandoned after one result otherwise resumed under the next
- * directory opened: its first answer came from the old directory. */
-void xbox_dir_context_drop(HANDLE FileHandle)
-{
-    if (!s_dir_cs_init)
-        return;
-    EnterCriticalSection(&s_dir_cs);
-    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
-        if (s_dir_contexts[i].handle == FileHandle) {
-            if (s_dir_contexts[i].dir)
-                closedir(s_dir_contexts[i].dir);
-            s_dir_contexts[i].dir = NULL;
-            s_dir_contexts[i].handle = NULL;
-        }
-    }
     LeaveCriticalSection(&s_dir_cs);
 }
 

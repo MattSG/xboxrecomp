@@ -63,9 +63,6 @@ LONG InterlockedDecrement(volatile LONG *p)        { return __atomic_sub_fetch(p
 LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 
-LONG InterlockedAnd(volatile LONG *p, LONG v)      { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
-LONG InterlockedOr(volatile LONG *p, LONG v)       { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
-
 LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
 {
     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
@@ -858,18 +855,6 @@ const char *w32_handle_path(HANDLE h)
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
-void w32_handle_set_path(HANDLE h, const char *host_path)
-{
-    w32_object *o = (w32_object *)h;
-    char *old;
-
-    if (!o || o->kind != K_FILE)
-        return;
-    old = o->file_path;
-    o->file_path = host_path ? strdup(host_path) : NULL;
-    free(old);
-}
-
 BOOL CloseHandle(HANDLE h)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
@@ -1420,19 +1405,6 @@ static void *thread_trampoline(void *arg)
     t_self_obj = o;
     t_tid      = o->tid;
 
-#if defined(__linux__)
-    /* The process mask, not the creator's: see process_mask_capture. */
-    if (s_process_mask) {
-        cpu_set_t set;
-        int i;
-        CPU_ZERO(&set);
-        for (i = 0; i < (int)(8 * sizeof s_process_mask) && i < CPU_SETSIZE; i++)
-            if (s_process_mask & ((DWORD_PTR)1 << i))
-                CPU_SET(i, &set);
-        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
-    }
-#endif
-
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
     pthread_cleanup_push(unlock_mutex_cleanup, &o->lock);
@@ -1540,9 +1512,6 @@ DWORD SuspendThread(HANDLE h)
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
-    if (o == t_self_obj)
-        while (o->suspend_count > 0)
-            pthread_cond_wait(&o->gate, &o->lock);
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
@@ -1580,51 +1549,6 @@ int GetThreadPriority(HANDLE h)
 {
     w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_lookup(h);
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
-}
-
-DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
-{
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
-    pthread_t th = (o && o->kind == K_THREAD) ? o->thread : pthread_self();
-    (void)th;
-    if (!mask)
-        return 0;
-    process_mask_capture();   /* before this thread's mask shrinks */
-#if defined(__linux__)
-    {
-        DWORD_PTR prev = 0;
-        cpu_set_t set;
-        int i;
-        if (pthread_getaffinity_np(th, sizeof set, &set) == 0)
-            for (i = 0; i < (int)(8 * sizeof prev) && i < CPU_SETSIZE; i++)
-                if (CPU_ISSET(i, &set))
-                    prev |= (DWORD_PTR)1 << i;
-        CPU_ZERO(&set);
-        for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
-            if (mask & ((DWORD_PTR)1 << i))
-                CPU_SET(i, &set);
-        if (pthread_setaffinity_np(th, sizeof set, &set) != 0)
-            return 0;
-        return prev ? prev : mask;
-    }
-#else
-    /* No thread affinity on this host: macOS has only affinity tags, a
-     * hint, so the guest threads' one-core pin (RECOMP_GUEST_CPUS) does
-     * nothing here and returns 0 as a failed call would. */
-    return 0;
-#endif
-}
-
-BOOL GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
-                            DWORD_PTR *system_mask)
-{
-    /* The process's mask, captured before any thread shrank its own:
-     * sched_getaffinity(0) would answer for the calling thread. */
-    DWORD_PTR mask = process_mask_capture();
-    (void)process;
-    if (process_mask) *process_mask = mask;
-    if (system_mask)  *system_mask  = mask;
-    return TRUE;
 }
 
 VOID SwitchToThread(void) { sched_yield(); }
@@ -3008,12 +2932,10 @@ static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
     static volatile LONG map_counter = 0;
-    /* The pid keeps two instances apart: with a bare counter, both open
-     * "/xbox_map_1" and the second O_EXCL loses. macOS caps the name at 31. */
     char shm_name[32];
     LONG seq = InterlockedIncrement(&map_counter);
     const char *base = name ? name : "xbox_map";
-    snprintf(shm_name, sizeof(shm_name), "/%.12s_%d_%ld", base, (int)getpid(), (long)seq);
+    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
@@ -3123,7 +3045,6 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
             SetLastError(ERROR_INVALID_ADDRESS);
             return NULL;
         }
-        placeholder = 1;
         flags |= MAP_FIXED;
 #else
         flags |= MAP_FIXED;
@@ -3131,14 +3052,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     }
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
-    if (p == MAP_FAILED) {
-        /* A failed MAP_FIXED leaves the placeholder where it was. Nothing has
-         * registered it, so UnmapViewOfFile could never free it, and every
-         * later attempt at this address would be refused as occupied. */
-        if (placeholder) munmap(baseAddr, len);
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return NULL;
-    }
+    if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     if (baseAddr && p != baseAddr) {
         /* MAP_FIXED_NOREPLACE hands back a different address instead of
          * failing on some kernels; treat that as the refusal it means. */

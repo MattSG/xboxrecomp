@@ -30,7 +30,6 @@ class Instruction:
     mnemonic: str
     op_str: str
     bytes_hex: str
-    groups: tuple = ()
 
     # Operand details (populated from Capstone)
     operands: list = field(default_factory=list)
@@ -163,7 +162,6 @@ class Disassembler:
             mnemonic=cs_insn.mnemonic,
             op_str=cs_insn.op_str,
             bytes_hex=cs_insn.bytes.hex(),
-            groups=tuple(cs_insn.groups),
         )
 
         try:

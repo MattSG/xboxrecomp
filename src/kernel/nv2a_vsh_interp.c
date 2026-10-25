@@ -39,14 +39,6 @@ static uint32_t s_const_load, s_const_word;
  * program or a copy of the constants knows when to refresh it. */
 static uint32_t s_program_version = 1, s_const_version = 1;
 static uint32_t s_cxt_write;
-static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
-
-static int vsh_dump_enabled(void)
-{
-    if (s_const_trace < 0)
-        s_const_trace = getenv("RECOMP_VSH_DUMP") != NULL;
-    return s_const_trace;
-}
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
@@ -79,8 +71,6 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 {
     s_const_load = index;
     s_const_word = 0;
-    if (vsh_dump_enabled())
-        fprintf(stderr, "  [VSH] constant load -> c[%u]\n", index);
 }
 
 void nv2a_vsh_constant_word(uint32_t word)
@@ -88,20 +78,6 @@ void nv2a_vsh_constant_word(uint32_t word)
     s_const_version++;
     if (s_const_load < NV2A_VSH_CONSTANTS)
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
-    else if (vsh_dump_enabled()) {
-        static int warned;
-        if (warned++ < 8)
-            fprintf(stderr, "  [VSH] constant write DROPPED (c[%u] >= %u)\n",
-                    s_const_load, NV2A_VSH_CONSTANTS);
-    }
-    if (vsh_dump_enabled() && s_const_word == 3 && s_const_load >= 64) {
-        static int shown;
-        if (shown++ < 96)
-            fprintf(stderr, "  [VSH] c[%u] = %.6g %.6g %.6g %.6g\n",
-                    s_const_load, s_const[s_const_load][0],
-                    s_const[s_const_load][1], s_const[s_const_load][2],
-                    s_const[s_const_load][3]);
-    }
     if (++s_const_word == 4) {
         s_const_word = 0;
         s_const_load++;
@@ -468,15 +444,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         }
         if (field(ins, 3, 0, 1)) {
             memcpy(out->pos, opos.v, sizeof out->pos);
-            /* The NV2A clamps the colour outputs to 0..1 before they are
-             * interpolated, as the fixed-function path already does here.
-             * Lighting programs push them well above 1 (SSX 3's riders), and
-             * unclamped every lit model came out washed out. */
-            for (int k = 0; k < 4; k++) {
-                float c0 = outregs[3][k], c1 = outregs[4][k];
-                out->d0[k] = c0 > 1.0f ? 1.0f : (c0 >= 0.0f ? c0 : 0.0f);
-                out->d1[k] = c1 > 1.0f ? 1.0f : (c1 >= 0.0f ? c1 : 0.0f);
-            }
+            memcpy(out->d0, outregs[3], sizeof out->d0);
+            memcpy(out->d1, outregs[4], sizeof out->d1);
             memcpy(out->fog, outregs[5], sizeof out->fog);
             memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);

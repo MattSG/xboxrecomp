@@ -358,7 +358,7 @@ int main(void)
 
     /* And the one that must fail. An unknown opcode reported as handled steps
      * over an instruction nobody decoded. */
-    { const uint8_t c[] = { 0xF7, 0x10 };                     /* not dword [rax] */
+    { const uint8_t c[] = { 0xF7, 0x00, 0x01, 0x00, 0x00, 0x00 };  /* test imm32 */
       memset(&dev, 0, sizeof dev);
       ctx.Rip = (uint64_t)(uintptr_t)c;
       CHECK("unknown opcode refused",

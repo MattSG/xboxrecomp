@@ -18,7 +18,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
-#include <stdlib.h>
 
 /* A project may set this to watch every guest path the kernel translates (for
  * example to print who opened a file). NULL by default. */
@@ -75,44 +74,13 @@ static const XboxPathMount *find_mount(const char *path, int *skip)
 /* A device-path translation rule, shared by both backends. */
 typedef struct {
     const char* prefix;     /* Xbox path prefix (backslash form)         */
-    int         to_save;    /* 1 = under save_dir, 0 = under game_dir,
-                               2 = under the user-data root (save_dir, or
-                               RECOMP_SAVE_DIR when set)                  */
+    int         to_save;    /* 1 = under save_dir, 0 = under game_dir    */
     const char* sub_win;    /* sub-directory, Win32 backslash form       */
     const char* sub_posix;  /* sub-directory, POSIX slash form           */
 } path_rule;
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
-    /* Saves. Titles map U: and T: themselves (XapiMapLetterToDirectory) to
-     * E:\UDATA\<title id> and E:\TDATA\<title id>, which are under
-     * Partition1. Without these two rules the Partition1 rule below put every
-     * save in the game dir, shared by all runs and all save dirs: a fresh
-     * XDG_DATA_HOME still saw the last run's save game. Listed first so they
-     * win over Partition1; no trailing separator, the title opens the bare
-     * directories too. RECOMP_SAVE_DIR moves just these (to_save 2), so a
-     * scripted run can start from an empty save without touching the rest of
-     * the save dir (partition images, caches). */
-    { "\\Device\\Harddisk0\\Partition1\\UDATA", 2, "\\UDATA",  "/UDATA"      },
-    { "\\Device\\Harddisk0\\Partition1\\TDATA", 2, "\\TDATA",  "/TDATA"      },
-    /* E:\CACHE is the title's own scratch on the console's hard disk, and it
-     * writes there: Burnout 3 opens CACHE\LocalCache00.bin and
-     * LocalCache08.bin with FILE_OPEN_IF. Under the Partition1 rule below
-     * those landed in the game dir, so every run wrote into the extracted
-     * game files and all save dirs shared one cache. It goes with the saves,
-     * for the same reasons they do.
-     *
-     * Its folder is TitleCache, not CACHE: Z: and Partition3-5 (the cache
-     * partitions behind X:, Y: and Z:) already go to <save>/Cache, and on a
-     * case-insensitive host (Windows, Proton, macOS) CACHE and Cache are one
-     * folder, so the title's files would mix with the utility-drive caches
-     * and could collide by name.
-     *
-     * Partition1 as a whole cannot follow it: a title may read its own assets
-     * through Partition1 (Wreckless links \??\Z: to Partition1\ and loads
-     * everything through z:\, see resolve_symlink), and those live in the
-     * game dir. So only the directories a title writes move, one rule each. */
-    { "\\Device\\Harddisk0\\Partition1\\CACHE", 2, "\\TitleCache","/TitleCache" },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* Physical partitions have host backing images; filesystem paths use
      * the rules below. Bare-device matching is handled before these rules. */
@@ -208,7 +176,7 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     { int skip; if (find_mount(out, &skip)) return 1; }
 
     for (i = 0; i < PATH_RULE_COUNT; i++) {
-        if (rule_match(out, &s_rules[i]))
+        if (match_prefix(out, s_rules[i].prefix))
             return 1;           /* the target is somewhere we can place */
     }
     return 0;
@@ -217,7 +185,8 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
 /* ======================================================================== */
 /* Shared by both backends, for the same reason as xbox_LastFileError: the
  * bridge calls it unconditionally, and a _WIN32-only definition breaks every
- * POSIX link. Both backends fill it at the end of a rule translation. */
+ * POSIX link. The Win32 backend fills this during translation; the POSIX one
+ * does not yet, so it reads empty there. */
 static XBOX_THREAD_LOCAL wchar_t s_last_host_path_shared[MAX_PATH];
 
 const wchar_t *xbox_LastHostPath(void)
@@ -293,26 +262,7 @@ static BOOL  s_initialized = FALSE;
  * cannot satisfy byte-offset device reads, so use a backing image. */
 #define XBOX_DISK_IMAGE_NAME   L"Partition0.img"
 
-/* Each partition device's size in 512-byte sectors, matching the table, so a
- * title that asks the device how big it is gets an answer consistent with
- * the table it just read. Partition0 is the whole disk and is not sized. */
-static const uint64_t s_part_sectors[6] = {
-    0,             /* 0: whole disk                   */
-    0x00465400ull, /* 1: E: game and saves            */
-    0x000FA000ull, /* 2: C: system                    */
-    0x00177000ull, /* 3: X: cache                     */
-    0x00177000ull, /* 4: Y: cache                     */
-    0x00177000ull, /* 5: Z: cache                     */
-};
-
-static void put_le32(unsigned char *p, uint32_t v)
-{
-    p[0] = (unsigned char)v;         p[1] = (unsigned char)(v >> 8);
-    p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24);
-}
-
-/* The 512-byte sector Partition0 carries at XBOX_PART_TABLE_OFFSET. */
-static void xbox_build_partition_table(unsigned char sector[512])
+static void xbox_write_partition_table(const WCHAR *path)
 {
     unsigned char sector[512];
     HANDLE h;
@@ -332,19 +282,18 @@ static void xbox_build_partition_table(unsigned char sector[512])
 }
 
 /*
- * A partition device, as opposed to a path on one.
+ * Map a partition device onto an image file.
  *
- * Matches "\Device\Harddisk0\PartitionN" with nothing below it, which is how
- * a device is opened, and returns the digit N ('0'-'9'); 0 otherwise. Anything
- * with a path under it -- Partition1\TDATA and the like -- is an ordinary
- * filesystem access and falls through to the rules table, which puts it in a
- * directory.
+ * Matches "\Device\Harddisk0\PartitionN" with nothing below it, which is how a
+ * device is opened. Anything with a path under it -- Partition1\TDATA and the
+ * like -- is an ordinary filesystem access and falls through to the rules
+ * table, which puts it in a directory.
  *
- * Partition0 is the whole disk and carries the partition table. The rest
- * start empty, which is what an unformatted partition looks like, so a title
- * that wants a filesystem there formats one.
+ * Partition0 is the whole disk and carries the partition table written above.
+ * The rest start empty, which is what an unformatted partition looks like, so
+ * a title that wants a filesystem there formats one.
  */
-static int xbox_partition_device_digit(const char *xbox_path)
+static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD n)
 {
     int index = xbox_partition_device_index(xbox_path);
     if (index < 0)
@@ -439,54 +388,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
-    /* RECOMP_SAVE_DIR: the root for the title's UDATA, TDATA and CACHE,
-     * created if missing. Absolute; under Wine a DOS path (Z:\home\...) is safest. */
-    {
-        const char *ov = getenv("RECOMP_SAVE_DIR");
-        /* Room for the longest suffix the rules append (UDATA\<title id>\
-         * <save>\<file>); a longer root would only truncate later. */
-        int n = (ov && ov[0])
-              ? MultiByteToWideChar(CP_UTF8, 0, ov, -1, s_user_dir, MAX_PATH) : 0;
-        if (ov && ov[0] && (n == 0 || n > MAX_PATH - 96)) {
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
-                     "RECOMP_SAVE_DIR %s: %s; using the default save dir",
-                     ov, n == 0 ? "conversion failed (longer than MAX_PATH?)" : "too long for the paths under it");
-            ov = NULL;
-        }
-        if (ov && ov[0]) {
-            for (WCHAR *p = s_user_dir; *p; p++)
-                if (*p == L'/') *p = L'\\';
-            len = wcslen(s_user_dir);
-            if (len > 3 && s_user_dir[len - 1] == L'\\')
-                s_user_dir[len - 1] = L'\0';
-            SHCreateDirectoryExW(NULL, s_user_dir, NULL);
-        } else {
-            wcscpy_s(s_user_dir, MAX_PATH, s_save_dir);
-        }
-
-        /* Saves still in the game dir stay there (s_user_in_game). */
-        for (int k = 0; k < 2; k++) {
-            static const WCHAR *names[2] = { L"UDATA", L"TDATA" };
-            WCHAR in_save[MAX_PATH], in_game[MAX_PATH];
-            DWORD fa, fg;
-            swprintf_s(in_save, MAX_PATH, L"%s\\%s", s_save_dir, names[k]);
-            swprintf_s(in_game, MAX_PATH, L"%s\\%s", s_game_dir, names[k]);
-            fa = GetFileAttributesW(in_save);
-            fg = GetFileAttributesW(in_game);
-            s_user_in_game[k] = !(ov && ov[0]) && fa == INVALID_FILE_ATTRIBUTES
-                             && fg != INVALID_FILE_ATTRIBUTES
-                             && (fg & FILE_ATTRIBUTE_DIRECTORY);
-            if (s_user_in_game[k])
-                xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
-                         "%S: saves found here and not in the save dir; kept "
-                         "here (move it to %S to use the save dir)",
-                         in_game, in_save);
-        }
-    }
-
     s_initialized = TRUE;
-    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S, user data=%S",
-             s_game_dir, s_save_dir, s_user_dir);
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
 }
 
 /* The host path the last translation produced.
@@ -540,7 +443,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = rule_match(xbox_path, &s_rules[i]);
+        skip = match_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = rule_uses_save_root(&s_rules[i], xbox_path) ? s_save_dir : s_game_dir;
@@ -574,7 +477,7 @@ translate:
 
             WCHAR dir_path[MAX_PATH];
             swprintf_s(dir_path, MAX_PATH, L"%s%s", base_dir, sub_wide);
-            CreateDirectoryW(base_dir, NULL);
+            CreateDirectoryW(s_save_dir, NULL);
             CreateDirectoryW(dir_path, NULL);
         } else {
             swprintf_s(host_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
@@ -611,7 +514,6 @@ translate:
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
-static char s_user_dir[MAX_PATH];   /* UDATA/TDATA/TitleCache root: s_save_dir or RECOMP_SAVE_DIR */
 static BOOL s_initialized = FALSE;
 
 /* Strip a single trailing '/' (but never the root '/'). */
@@ -712,86 +614,9 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
-    /* The save-side directories and the partition device images, as the
-     * Win32 backend makes them. Without Partition0.img a title's
-     * utility-drive mount fails to read the partition table, and a title
-     * that treats that as fatal quick-reboots. */
-    {
-        static const char *subs[] = { "TitleData", "UserData", "Cache",
-                                      "SystemData" };
-        char path[MAX_PATH];
-        unsigned char sector[512];
-        int fd;
-
-        mkdir_p(s_save_dir);
-        for (int i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
-            snprintf(path, sizeof(path), "%s/%s", s_save_dir, subs[i]);
-            mkdir_p(path);
-        }
-
-        snprintf(path, sizeof(path), "%s/Partition0.img", s_save_dir);
-        fd = open(path, O_WRONLY | O_CREAT, 0644);
-        if (fd >= 0) {
-            xbox_build_partition_table(sector);
-            if (pwrite(fd, sector, sizeof(sector), XBOX_PART_TABLE_OFFSET)
-                    != (ssize_t)sizeof(sector))
-                xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
-                         "%s: partition table write failed: %s",
-                         path, strerror(errno));
-            close(fd);
-        } else {
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "%s: %s",
-                     path, strerror(errno));
-        }
-
-        /* The other partition devices, sized to the table. ftruncate leaves
-         * a hole on the filesystems this runs on, so the 750 MB cache
-         * partitions cost nothing until something writes to them. An image
-         * that is already there keeps its contents; only the size is set. */
-        for (int part = 1; part <= 5; part++) {
-            snprintf(path, sizeof(path), "%s/Partition%d.img", s_save_dir, part);
-            fd = open(path, O_WRONLY | O_CREAT, 0644);
-            if (fd < 0)
-                continue;
-            if (ftruncate(fd, (off_t)(s_part_sectors[part] * 512ull)) != 0)
-                xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "%s: ftruncate: %s",
-                         path, strerror(errno));
-            close(fd);
-        }
-    }
-
-    /* RECOMP_SAVE_DIR: the root for the title's UDATA, TDATA and CACHE,
-     * created if missing, so a scripted run can start from an empty save. */
-    {
-        const char* ov = getenv("RECOMP_SAVE_DIR");
-        if (ov && ov[0]) {
-            snprintf(s_user_dir, sizeof(s_user_dir), "%s", ov);
-            strip_trailing_slash(s_user_dir);
-            mkdir_p(s_user_dir);
-        } else {
-            snprintf(s_user_dir, sizeof(s_user_dir), "%s", s_save_dir);
-        }
-
-        /* Saves still in the game dir stay there (s_user_in_game). */
-        for (int k = 0; k < 2; k++) {
-            static const char *names[2] = { "UDATA", "TDATA" };
-            char in_save[MAX_PATH], in_game[MAX_PATH];
-            struct stat sa, sg;
-            snprintf(in_save, sizeof(in_save), "%s/%s", s_save_dir, names[k]);
-            snprintf(in_game, sizeof(in_game), "%s/%s", s_game_dir, names[k]);
-            s_user_in_game[k] = !(ov && ov[0]) && stat(in_save, &sa) != 0
-                             && stat(in_game, &sg) == 0 && S_ISDIR(sg.st_mode);
-            if (s_user_in_game[k])
-                xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
-                         "%s: saves found here and not in the save dir; kept "
-                         "here (move it to %s to use the save dir)",
-                         in_game, in_save);
-        }
-    }
-
     s_initialized = TRUE;
-    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s, user data=%s",
-             s_game_dir, s_save_dir, s_user_dir);
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
+             s_game_dir, s_save_dir);
 }
 
 /* Xbox paths are case-insensitive and Windows hosts match them that way; a
@@ -877,7 +702,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = rule_match(xbox_path, &s_rules[i]);
+        skip = match_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = rule_uses_save_root(&s_rules[i], xbox_path) ? s_save_dir : s_game_dir;
@@ -930,17 +755,6 @@ translate:
         s_last_host_path_shared[MAX_PATH - 1] = 0;
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
-        /* As the Win32 backend does: the bridge reads back the host path
-         * the call it just made translated (the missing-file report, the
-         * FMV hook). Bytes widen one to one; the readers narrow them the
-         * same way, so ASCII host paths survive and others are out of
-         * scope on both backends. */
-        {
-            size_t k;
-            for (k = 0; k + 1 < MAX_PATH && host_path_buf[k]; k++)
-                s_last_host_path_shared[k] = (wchar_t)(unsigned char)host_path_buf[k];
-            s_last_host_path_shared[k] = 0;
-        }
         return TRUE;
     }
 }

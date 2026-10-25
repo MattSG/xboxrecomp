@@ -56,7 +56,6 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
-extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 enum { S_ALLOC, S_FREE, S_QUERY, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
@@ -552,21 +551,6 @@ int main(int argc, char **argv)
     }
 #endif
 
-    /* 0. A contiguous block and the loaded image share physical numbers
-     * unless RECOMP_CONTIG_AVOID_IMAGE keeps the block out of the image. */
-    if (!ext) {
-        uint32_t c = xbox_ContiguousAlloc(1024u * 1024u, 4096);
-        uint32_t phys = c - XBOX_CONTIG_BASE;
-        int overlaps = phys < g_xbox_image_hi && phys + 1024u * 1024u > g_xbox_image_lo;
-        snprintf(d, sizeof d, "block 0x%08X, image 0x%08X..0x%08X",
-                 c, g_xbox_image_lo, g_xbox_image_hi);
-        if (avoid)
-            check(c && !overlaps, "avoid-image: a 1 MB block lands outside the image", d);
-        else
-            check(c && overlaps, "a 1 MB block still fills from the bottom by default", d);
-        xbox_ContiguousFree(c);
-    }
-
     /* 1. A small request after a large free. */
     if (!ext) {
         const uint32_t big = 2u * 1024 * 1024;
@@ -639,6 +623,7 @@ int main(int argc, char **argv)
 
     /* 6. Contiguous memory can be given back. */
     if (!ext) {
+        extern int xbox_ContiguousFree(uint32_t addr);
         uint32_t c1 = xbox_ContiguousAlloc(0x20000, 4096);
         uint32_t c2;
 
@@ -662,23 +647,6 @@ int main(int argc, char **argv)
             check(!(st == 0 && base == hi),
                   "default: an explicit high base is not granted at that address", d);
         } else if (ext) {
-            /* The layout's own reservations (the Windows placeholder window,
-             * the POSIX span) cover this range; it must hand it over, or the
-             * tracker finds nothing free and stays off. */
-            check(guest_vmem_active(),
-                  "the tracker is on: the layout handed its range over",
-                  "\"could not reserve host memory\": the placeholder window "
-                  "or the span still held the range");
-            /* And the windows above it are still mapped: on Linux a span
-             * grown to make room pushed the contiguous window onto a
-             * neighbouring mapping. Writing to it faults if it is missing. */
-            {
-                uint32_t c = xbox_ContiguousAlloc(0x1000, 4096);
-                if (c)
-                    *G(c) = 0x5A5A5A5Au;
-                check(c && *G(c) == 0x5A5A5A5Au,
-                      "the contiguous window is mapped beside the tracker", NULL);
-            }
             /* Reserve the exact address. */
             base = hi; size = 0x100000;
             st = nt_alloc_at(&base, &size, 0x2000);

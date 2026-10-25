@@ -52,30 +52,6 @@ static uint32_t s_tot_refused;
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
-static int s_scan_enabled = -1;
-
-/* Clears the NV2A request bits (xbox_memory_layout.c); called every 256
- * words while executing, so kickoffs are answered mid-walk. */
-extern void xbox_Nv2aAckBusyBits(void);
-static uint32_t s_ack_tick;
-
-/* Either switch, read once. The answer "not set" has to be cached as well as
- * "set": this runs on every pass of the NV2A poll loop, and on the default
- * path -- neither switch set -- a cache that only remembered "set" called
- * getenv on every pass, which walks the whole environment. */
-static int pb_walk_enabled(void)
-{
-    if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (s_scan_enabled < 0)
-        s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
-    return s_exec_enabled || s_scan_enabled;
-}
-
-/* Slot + 1 of each (subchannel, method) in s_seen. note() runs for every
- * pushbuffer word, so a linear search here was the executor's largest cost
- * (about 40% of its thread in X-Men Legends' levels). */
-static uint16_t s_seen_slot[8][0x2000 / 4];
 
 /* Diagnostic timing stays outside the executor: a packet still reaches the
  * same decoder and methods, in the same order. Time a header's whole payload
@@ -151,11 +127,11 @@ static void pb_hitch_report(PB_HITCH *hitch, uint32_t start, uint32_t end,
 
 static void note(uint32_t subch, uint32_t method)
 {
-    uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
-
-    if (*slot) {
-        s_seen[*slot - 1].count++;
-        return;
+    for (int i = 0; i < s_seen_count; i++) {
+        if (s_seen[i].method == method && s_seen[i].subch == subch) {
+            s_seen[i].count++;
+            return;
+        }
     }
     if (s_seen_count >= PB_MAX_METHODS) {
         /* Silently dropping past the cap is how a truncated inventory reads as
@@ -173,13 +149,12 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
         s_seen_count++;
-        *slot = (uint16_t)s_seen_count;
     }
 }
 
 /* NV097 (Kelvin 3D class) methods worth naming. The point of the survey is to
  * decide what a translator has to implement, and a bare method number does not
- * answer that -- "0x1818 x412" only means something once it reads
+ * answer that -- "0x1808 x412" only means something once it reads
  * INLINE_ARRAY. Unnamed ones still get counted. */
 static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x0000, "SET_OBJECT" },
@@ -210,9 +185,8 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x1760, "SET_VERTEX_DATA_ARRAY_FORMAT" },
     { 0x17FC, "SET_BEGIN_END" },
     { 0x1800, "ARRAY_ELEMENT16" },
-    { 0x1808, "ARRAY_ELEMENT32" },
+    { 0x1808, "INLINE_ARRAY" },
     { 0x1810, "DRAW_ARRAYS" },
-    { 0x1818, "INLINE_ARRAY" },
     { 0x1B00, "SET_TEXTURE_OFFSET" },
     { 0x1B04, "SET_TEXTURE_FORMAT" },
     { 0x1B08, "SET_TEXTURE_ADDRESS" },

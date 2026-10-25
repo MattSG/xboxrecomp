@@ -83,7 +83,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
     dxgi
     dxguid
-    $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # see src/input/CMakeLists.txt
+    xinput
     winmm
     # Lets the fault handler resolve the host RIP back to the generated
     # function's symbol, i.e. to the guest function that faulted.

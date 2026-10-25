@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
+project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
 
 # Recompiled x86 code relies on what MSVC does anyway: signed arithmetic wraps
 # like the CPU's, and guest memory is read through whatever pointer type an
@@ -98,7 +98,8 @@ add_subdirectory(src/host)
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
-set(XBOXRECOMP_LIBS
+add_library(xboxrecomp INTERFACE)
+target_link_libraries(xboxrecomp INTERFACE
     xbox_kernel
     xbox_d3d8
     xbox_dsound

@@ -81,12 +81,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
  * the image-specific pointer global/offset. Returns 0, or -1 if full. */
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
 void xbox_Nv2aFrameCounterFlip(void);
-/* A word of the NV2A register file (offset from the register base); NULL until
- * the aperture is mapped. */
-volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
-/* Registered counters the title turned out to move itself (its vblank DPC),
- * which the toolkit has stopped bumping; for the [GPU] report. */
-uint32_t xbox_Nv2aFrameCountersOwned(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
@@ -172,10 +166,6 @@ int xbox_Nv2aNotifyWait(uint32_t object_va);
 void xbox_Nv2aFenceWait(uint32_t fence_va, uint32_t submitted,
                          uint32_t allowed_distance);
 
-/* Where the mirrored fence word is (0 if none is registered or it does not
- * resolve into the contiguous window). For the pushbuffer executor. */
-uint32_t xbox_Nv2aFenceWordVa(void);
-
 void xbox_MemoryLayoutShutdown(void);
 
 /**
@@ -235,19 +225,6 @@ int xbox_IoMappingQuery(const void *address, uint32_t *physical,
 int xbox_IoMappingResolve(uint32_t guest_va, int access, uint32_t *physical);
 /* 0: not ours; 1: changed; -1: invalid range/protection or host failure. */
 int xbox_IoMappingSetProtect(void *address, uint32_t bytes, uint32_t protect);
-
-/* Trapped hardware registers (APU, AC'97 bus master, USB OHCI). A title's
- * fault handler calls one of these first and resumes the thread when it
- * returns 1; only 0 is a crash. void * keeps windows.h and ucontext.h out of
- * here.
- *   xbox_VehMmioFault   Win32 VEH: the PEXCEPTION_POINTERS.
- *   xbox_PosixMmioFault POSIX SIGBUS/SIGSEGV handler: its ucontext_t * and
- *                       si_addr. Always 0 on a host with no decoder. */
-#if defined(_WIN32)
-int xbox_VehMmioFault(void *exception_pointers);
-#else
-int xbox_PosixMmioFault(void *ucv, uintptr_t fault);
-#endif
 
 /* Dump the guest call stack and abort if the title has not exited within
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;

@@ -247,15 +247,6 @@ cmake --build build --config Release
 build\Release\your_game_recomp.exe          # named after project() in your CMakeLists
 ```
 
-### An optional front end
-
-[xboxrecomp-cli](https://github.com/apexJCL/xboxrecomp-cli) (`xbr`, by
-[@apexJCL](https://github.com/apexJCL)) wraps this pipeline for game repos.
-A game repo describes itself in one `game.toml`, and the CLI provides pinned
-toolchains, cross-builds, packaging and a player build wizard. It is
-maintained outside this repo and tracks its tags. `regen.sh` and the steps
-above stay the documented route (#223).
-
 ### What To Expect
 
 Treat analysis and generation as an iterative bring-up process. Inspect missing
@@ -282,12 +273,8 @@ xboxrecomp/
 │   ├── symbols/ ghidra_naming/  # Optional symbol-name recovery (Ghidra)
 │   ├── ida_naming/              # ... or the same thing through IDA
 │   ├── xiso/ xmv/               # Disc image and video container tools
-│   ├── conformance/             # Differential tests: lifted C vs the real CPU
-│   ├── kernel_audit/            # Kernel import coverage per title
-│   ├── linux/ macos/            # Host setup scripts
 │   └── fusion/                  # MS Ficl/Fission study tooling
 ├── src/                         # Runtime libraries (C, link-time)
-│   ├── platform/                # Win32 vocabulary + its POSIX implementation
 │   ├── kernel/                  # xbox_kernel - Xbox kernel → Win32
 │   ├── d3d/                     # xbox_d3d8   - D3D8 → D3D11 graphics
 │   ├── audio/                   # xbox_dsound - DirectSound compat
@@ -297,7 +284,6 @@ xboxrecomp/
 │   ├── video/                   # xbox_video  - FMV playback + framebuffer window
 │   └── host/                    # xbox_host   - MMIO routing, window + device bring-up
 ├── include/xbox/                # Public umbrella header (xboxrecomp.h)
-├── tests/                       # Runtime C tests, one CMake project each
 ├── templates/                   # Starter templates for new projects
 │   ├── new-game/                # ** Copy this to start a game project **
 │   │   ├── CMakeLists.txt       # Builds the game .exe, links xboxrecomp
@@ -323,12 +309,12 @@ xboxrecomp/
 - **[Runtime Libraries](src/README.md)** — Architecture, build instructions, integration guide
 
 ### Per-Module API Reference
-- [xbox_kernel](src/kernel/README.md) — Memory layout, file I/O, threading, sync, crypto, EEPROM, SMBus
-- [xbox_d3d8](src/d3d/README.md) — D3D8 interface, register combiners, vertex shaders, texture unswizzle
-- [xbox_dsound](src/audio/README.md) — DirectSound buffers, 3D audio, mixbins
-- [xbox_apu](src/apu/README.md) — MCPX APU voice processor, mixer, MMIO
-- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH→D3D11
-- [xbox_input](src/input/README.md) — Gamepad state, vibration, button mapping
+- [xbox_kernel](src/kernel/README.md) — Memory layout, file I/O, threading, sync, crypto, EEPROM, SMBus (11,128 LOC)
+- [xbox_d3d8](src/d3d/README.md) — D3D8 interface, register combiners, vertex shaders, texture unswizzle (8,838 LOC)
+- [xbox_dsound](src/audio/README.md) — DirectSound buffers, 3D audio, mixbins (573 LOC)
+- [xbox_apu](src/apu/README.md) — MCPX APU voice processor, mixer, MMIO (4,168 LOC)
+- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH→D3D11 (4,892 LOC)
+- [xbox_input](src/input/README.md) — Gamepad state, vibration, button mapping (360 LOC)
 
 ### Pipeline Guides
 - [Extracting and Parsing XBE Files](docs/pipeline/01-xbe-parsing.md)
