@@ -276,70 +276,6 @@ int xbox_FramebufferOverlay(XboxOverlay *o)
     return 1;
 }
 
-/* The last PVIDEO frame shown. A frame stays on screen until the next one or
- * STOP, but once its bank is consumed the title may reuse the memory, so the
- * pixels are kept here rather than read again. */
-static uint8_t      *s_pvideo_source;
-static size_t        s_pvideo_bytes;
-static unsigned      s_pvideo_bank;
-static uint32_t      s_pvideo_regs[0x1000 / 4];
-
-/* Draw the video overlay over s_rgb: a newly submitted bank if there is one
- * (copied, drawn, then handed back to the title), else the last frame. */
-static void fb_overlay(void)
-{
-    uint32_t regs[0x1000 / 4];
-    unsigned bank;
-    bool presented = false;
-
-    if (!s_rgb || !nv2a_hook_pvideo_snapshot(regs)) return;
-    if ((regs[NV_PVIDEO_STOP / 4] & 1u) ||
-        (s_pvideo_source &&
-         regs[(NV_PVIDEO_SIZE_IN + s_pvideo_bank * 4) / 4] == UINT32_MAX)) {
-        free(s_pvideo_source);
-        s_pvideo_source = NULL;
-        if (regs[NV_PVIDEO_STOP / 4] & 1u) return;
-    }
-    for (bank = 0; bank < 2; ++bank) {
-        uint64_t physical = (uint64_t)regs[(NV_PVIDEO_BASE + bank * 4) / 4] +
-                            regs[(NV_PVIDEO_OFFSET + bank * 4) / 4];
-        unsigned pitch = regs[(NV_PVIDEO_FORMAT + bank * 4) / 4] & NV_PVIDEO_FORMAT_PITCH;
-        unsigned height = (regs[(NV_PVIDEO_SIZE_IN + bank * 4) / 4] >> 16) & 0x7ff;
-        uint64_t bytes = (uint64_t)pitch * height;
-        uintptr_t va;
-        MEMORY_BASIC_INFORMATION mapping;
-        uint8_t *snapshot;
-
-        if (!(regs[NV_PVIDEO_BUFFER / 4] & (1u << (bank * 4u)))) continue;
-        if (!bytes || physical + bytes > 0x04000000u) continue;
-        va = (uintptr_t)(0x80000000u + (uint32_t)physical) +
-             (uintptr_t)xbox_GetMemoryOffset();
-        if (!VirtualQuery((const void *)va, &mapping, sizeof(mapping)) ||
-            mapping.State != MEM_COMMIT ||
-            (mapping.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
-            bytes > mapping.RegionSize - (size_t)(va - (uintptr_t)mapping.BaseAddress))
-            continue;
-        snapshot = (uint8_t *)malloc((size_t)bytes);
-        if (!snapshot) continue;
-        memcpy(snapshot, (const void *)va, (size_t)bytes);
-        if (!pvideo_scanout(regs, snapshot, (size_t)bytes, s_rgb,
-                            s_fb_width, s_fb_height, bank)) {
-            free(snapshot);
-            continue;
-        }
-        free(s_pvideo_source);
-        s_pvideo_source = snapshot;
-        s_pvideo_bytes = (size_t)bytes;
-        s_pvideo_bank = bank;
-        memcpy(s_pvideo_regs, regs, sizeof(s_pvideo_regs));
-        presented = true;
-        nv2a_hook_pvideo_consume(bank);
-    }
-    if (!presented && s_pvideo_source)
-        pvideo_scanout(s_pvideo_regs, s_pvideo_source, s_pvideo_bytes, s_rgb,
-                       s_fb_width, s_fb_height, s_pvideo_bank);
-}
-
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     /* RECOMP_FB_VA pins the display to one guest address instead of following
@@ -349,16 +285,6 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
     s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
     if (pitch)
         s_fb_pitch = pitch;
-}
-
-/* Vertical anti-aliasing factor of the surface being shown: 2 for 2x2, where
- * the surface has twice the rows as well as twice the columns, and 1 for
- * everything else (2x1 included). Only the pushbuffer executor knows it. */
-static uint32_t s_fb_aa_sy = 1;
-
-void xbox_FramebufferWindowSetAA(uint32_t sy)
-{
-    s_fb_aa_sy = sy ? sy : 1;
 }
 
 /* Called by the pushbuffer executor when the title flips. */

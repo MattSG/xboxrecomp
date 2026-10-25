@@ -15,7 +15,7 @@ endif()
 
 if(WIN32)
     add_executable(d3d8_gamma test_gamma.c)
-    target_link_libraries(d3d8_gamma PRIVATE xbox_d3d8)
+    target_link_libraries(d3d8_gamma PRIVATE xbox_d3d8 recomp_exit_hook)
 
     add_executable(d3d8_smoke
         ${CMAKE_CURRENT_SOURCE_DIR}/test_main.c

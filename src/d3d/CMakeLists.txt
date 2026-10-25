@@ -12,7 +12,7 @@ if(WIN32)
         d3d8_combiners.c
         d3d8_vsh.c
     )
-    target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
+    target_link_libraries(xbox_d3d8 PUBLIC platform recomp_exit_hook d3d11 dxgi dxguid d3dcompiler)
 
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
@@ -30,7 +30,7 @@ else()
     # link path. That holds for the top-level build and not when this is pulled
     # in via add_subdirectory from tests/, where the link fails with
     # "library 'epoxy' not found". The _LINK_LIBRARIES form is absolute paths.
-    target_link_libraries(xbox_d3d8 PUBLIC platform SDL3::SDL3 ${EPOXY_LINK_LIBRARIES})
+    target_link_libraries(xbox_d3d8 PUBLIC platform recomp_exit_hook SDL3::SDL3 ${EPOXY_LINK_LIBRARIES})
 endif()
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
