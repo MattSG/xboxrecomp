@@ -14,7 +14,6 @@ RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_ebp, g_se
 RECOMP_TLS int g_df;
 static unsigned char memory[0x1000000];
 uint32_t g_xbox_code_lo = 0x12000, g_xbox_code_hi = 0x362000;
-static int g_mm3_frontend_icall_trace;
 ptrdiff_t xbox_GetMemoryOffset(void) { return g_xbox_mem_offset; }
 #include "icall_diagnostics.c"
 
