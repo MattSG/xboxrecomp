@@ -1,24 +1,12 @@
 /**
- * D3D8→D3D11 Compatibility Device Implementation
- *
- * Implements the Xbox D3D8 IDirect3DDevice8 interface using D3D11.
- * The game's translated RenderWare code calls D3D8 methods through
- * COM vtables; this layer translates those calls to D3D11 equivalents.
- *
- * Architecture:
- * - D3D11 device and swap chain created during initialization
- * - Render state tracking: D3D8 states mapped to D3D11 state objects
- * - Texture/buffer management: D3D8 resource handles wrap D3D11 resources
- * - Fixed-function pipeline: emulated via D3D11 shaders (the Xbox D3D8
- *   pipeline is configurable but not fully programmable)
- *
- * Build: Requires Windows SDK with d3d11.h and dxgi.h
+ * D3D8 object-interface implementation backed by D3D11.
+ * Translates host-adapted object calls, tracks state and manages resources.
+ * The consuming port owns its guest calling-convention adaptation.
  */
-
 #include "d3d8_internal.h"
+#include <d3d11_4.h>
 #include <stdio.h>
 #include <string.h>
-#include "recomp_exit_hook.h"
 
 /* ================================================================
  * Internal device state
@@ -141,11 +129,7 @@ void d3d8_PresentFrame(void)
     /* Pump Windows messages */
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-        if (msg.message == WM_QUIT) {
-            /* ExitProcess skips atexit, where the summary would print. */
-            recomp_exit_hook_run("window");
-            ExitProcess(0);
-        }
+        if (msg.message == WM_QUIT) ExitProcess(0);
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
@@ -474,7 +458,6 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) {
-            recomp_exit_hook_run("window");     /* ExitProcess skips atexit */
             ExitProcess(0);
         }
         TranslateMessage(&msg);
@@ -1409,7 +1392,6 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) {
-            recomp_exit_hook_run("window");     /* ExitProcess skips atexit */
             ExitProcess(0);
         }
         TranslateMessage(&msg);

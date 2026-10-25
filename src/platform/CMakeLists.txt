@@ -20,37 +20,17 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # declares its own project().
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
-# recomp_exit_hook: work that must run when a window ends the process with
-# ExitProcess, which skips atexit (recomp_exit_hook.h). A real library on
-# every host, carried by platform, so the D3D windows can call it without
-# linking the kernel.
-add_library(recomp_exit_hook STATIC recomp_exit_hook.c)
-target_include_directories(recomp_exit_hook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-
-# host_time: the host's monotonic clock and the timer thread's sleep
-# (host_time.h). A real library on every host, carried by platform to every
-# library of the runtime.
-add_library(host_time STATIC host_time.c)
-target_include_directories(host_time PUBLIC
-    ${XBOXRECOMP_SRC_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
 if(WIN32)
     add_library(platform INTERFACE)
-    target_link_libraries(platform INTERFACE host_time)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
-    target_link_libraries(platform INTERFACE recomp_exit_hook)
+    target_sources(platform INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/line_server.c)
 else()
-    add_library(platform STATIC win32_compat.c)
+    add_library(platform STATIC win32_compat.c line_server.c)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     find_package(Threads REQUIRED)
-    target_link_libraries(platform PUBLIC Threads::Threads recomp_exit_hook host_time)
-    if(NOT APPLE)
-        target_link_libraries(platform PUBLIC m)   # feclearexcept etc.; libSystem has them on macOS
-    endif()
+    target_link_libraries(platform PUBLIC Threads::Threads m)
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()

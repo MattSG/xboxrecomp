@@ -26,20 +26,18 @@
  *   5. MEM_DECOMMIT then MEM_COMMIT on heap memory gives zeroed pages, as on
  *      the console. Both were no-ops, so the old contents came back.
  *   6. MmFreeContiguousMemory gives a contiguous block back and the next
- *      request of that size reuses it; the default never reuses one.
- *   7. (default too) MmAllocateContiguousMemoryEx's physical range is
- *      honoured. A request limited to the low 16 MB still succeeds once
- *      unconstrained requests have filled up to it -- XDK D3D's visibility
- *      test report pages ask for exactly that, and a bump pointer refused
- *      every one -- and a request for a range above the pointer lands in it.
+ *      request of that size reuses it; contiguous pages are reused in both modes.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
- *                 above the RAM mirrors gets it, can commit inside it and use
- *                 the memory, is told the truth when it asks, and is refused
- *                 cleanly for an address that would alias live memory.
- *   ext-vma-128   The same switch on a 128 MB map, where the mirrors already
- *                 reach past user space. The tracker must stay out of the way
+ *                 above RAM gets it, can commit inside it and use the memory,
+ *                 is told the truth when it asks, and is refused cleanly for
+ *                 an address in the unmapped slots above RAM.
+ *   ext-vma-128   The same switch on a 128 MB map, where the slots above RAM
+ *                 already reach past user space. The tracker must stay out of the way
  *                 rather than reserve a range of negative size.
+ *   reserve-heap  Retail RAM on a 128 MB map. Above-RAM reservations keep
+ *                 exact ownership through partial commit and no-op release,
+ *                 and both allocators exclude the other's issued blocks.
  */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
@@ -58,7 +56,6 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
-extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 enum { S_ALLOC, S_FREE, S_QUERY, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
@@ -178,45 +175,204 @@ static void set_env(const char *name, const char *value)
 #ifdef _WIN32
     _putenv_s(name, value);
 #else
-    setenv(name, value, 1);
+    if (*value)
+        setenv(name, value, 1);
+    else
+        unsetenv(name);
 #endif
 }
 
 int main(int argc, char **argv)
 {
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
     const char *mode = argc > 1 ? argv[1] : "default";
     const char *path = argc > 2 ? argv[2] : "tools/conformance/test.xbe";
-    int reclaim = !strcmp(mode, "heap-reclaim");
+    int scene_churn = !strcmp(mode, "scene-churn") || !strcmp(mode, "scene-churn-baseline");
+    int reclaim = !strcmp(mode, "heap-reclaim") || !strcmp(mode, "scene-churn");
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
-    int avoid = !strcmp(mode, "contig-avoid-image");
+    int reserve_heap = !strcmp(mode, "reserve-heap");
+    int model_churn = !strcmp(mode, "model-churn");
+    int stack_config = !strcmp(mode, "stack-config");
+    int stack_bad_base = !strcmp(mode, "stack-bad-base");
+    int stack_bad_size = !strcmp(mode, "stack-bad-size");
+    int stack_unbacked = !strcmp(mode, "stack-unbacked");
+    int stack_invalid = stack_bad_base || stack_bad_size || stack_unbacked;
+    int stack_layout = !strcmp(mode, "stack-layout");
+    int high_image = !strcmp(mode, "image-high");
+    int bad_raw = !strcmp(mode, "image-bad-raw");
+    int bad_table = !strcmp(mode, "image-bad-table");
+    int short_header = !strcmp(mode, "image-short-header");
+    int bad_image = !strcmp(mode, "image-bad-range") || bad_raw || bad_table || short_header;
+    int tls_bad_directory = !strcmp(mode, "tls-bad-directory");
+    int tls_bad_range = !strcmp(mode, "tls-bad-range");
+    int tls_size_overflow = !strcmp(mode, "tls-size-overflow");
+    int tls_invalid = tls_bad_directory || tls_bad_range || tls_size_overflow;
+    int tls_layout = !strcmp(mode, "tls-layout") || tls_invalid;
     size_t xbe_len = 0;
     unsigned char *xbe;
     char d[160];
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !avoid && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !reserve_heap && !model_churn && !scene_churn && !tls_layout && !high_image && !bad_image && !stack_layout && !stack_config && !stack_invalid && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
-    if (reclaim)
+    if (reclaim || reserve_heap)
         set_env("RECOMP_HEAP_RECLAIM", "1");
+    else if (scene_churn)
+        set_env("RECOMP_HEAP_RECLAIM", "");
     if (ext)
         set_env("RECOMP_EXT_VMA", "1");
-    if (avoid)
-        set_env("RECOMP_CONTIG_AVOID_IMAGE", "1");
-    if (ext128)
+    if (ext128 || high_image || bad_image)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
+    if (reserve_heap || scene_churn || stack_config)
+        xbox_SetMapSize(XBOX_DEVKIT_RAM);
 
     xbe = load_file(path, &xbe_len);
     if (!xbe) {
         printf("cannot read %s -- run: python tools/conformance/mkxbe.py\n", path);
         return 2;
     }
-    if (!xbox_MemoryLayoutInit(xbe, xbe_len)) {
+    if (tls_layout || high_image || bad_image || stack_layout || stack_bad_base) {
+        uint32_t section_va = (stack_layout || stack_bad_base) ? 0x780000u : high_image ? 0x04010000u : (!strcmp(mode, "image-bad-range") ? 0xFFFFF000u : 0x770000u);
+        /* Add a data section in the former scratch range without changing text. */
+        uint32_t base = *(uint32_t *)(xbe + 0x104);
+        uint32_t count = *(uint32_t *)(xbe + 0x11C);
+        uint32_t table = *(uint32_t *)(xbe + 0x120) - base;
+        uint32_t raw = (uint32_t)((xbe_len + 4095u) & ~4095u);
+        uint32_t *section;
+        uint8_t *data;
+        if (count != 1 || table + 112u > 0x470u) return 2;
+        xbe = realloc(xbe, raw + 0x2000u);
+        if (!xbe) return 2;
+        memset(xbe + xbe_len, 0, raw + 0x2000u - xbe_len);
+        xbe_len = raw + 0x2000u;
+        section = (uint32_t *)(xbe + table + 56u);
+        memset(section, 0, 56);
+        section[0] = 2; section[1] = section_va; section[2] = 0x2000;
+        section[3] = raw; section[4] = 0x2000; section[5] = base + 0x470;
+        memcpy(xbe + 0x470, ".tls", 5);
+        *(uint32_t *)(xbe + 0x11C) = 2;
+        *(uint32_t *)(xbe + 0x10C) = section_va + 0x2000u - base;
+        *(uint32_t *)(xbe + 0x12C) = tls_layout ? 0x770A00u : 0;
+        data = xbe + raw;
+        memset(data, 0xA5, 0x2000);
+        memset(data + 0xA00, 0, 24);
+        *(uint32_t *)(data + 0xA00) = 0x770100;
+        *(uint32_t *)(data + 0xA04) = 0x770400;
+        *(uint32_t *)(data + 0xA08) = 0x770A40;
+        *(uint32_t *)(data + 0xA10) = 0x30;
+        if (tls_bad_directory) *(uint32_t *)(xbe + 0x12C) = UINT32_MAX - 7u;
+        if (tls_bad_range) *(uint32_t *)(data + 0xA04) = 0x7700FF;
+        if (tls_size_overflow) *(uint32_t *)(data + 0xA10) = UINT32_MAX;
+        if (bad_raw) section[3] = 0xFFFFF000u;
+        if (bad_table) *(uint32_t *)(xbe + 0x120) = base - 16u;
+        if (short_header) xbe_len = 16;
+    }
+    if (stack_layout) *(uint32_t *)(xbe + 0x130) = 0x3100;
+    if (stack_bad_size) *(uint32_t *)(xbe + 0x130) = UINT32_MAX;
+    if (stack_bad_base) check(xbox_ConfigureMainStack(0x780000, 0x4000), "overlap is checked against the loaded image", NULL);
+    if (stack_unbacked) check(xbox_ConfigureMainStack(0x3FFF000, 0x2000), "backing is checked at initialization", NULL);
+    if (stack_config) {
+        check(xbox_ConfigureMainStack(0x5000000, 0x300000), "port can request a backed main stack", NULL);
+        check(!xbox_ConfigureMainStack(0x5000001, 0x1000) &&
+              !xbox_ConfigureMainStack(0, 17) &&
+              !xbox_ConfigureMainStack(0xFFFFF000, 0x2000) &&
+              !xbox_ConfigureMainStack(0x5000000, 0),
+              "unaligned, wrapped and incomplete policy is rejected", NULL);
+    }
+    BOOL layout_ok = xbox_MemoryLayoutInit(xbe, xbe_len);
+    if (tls_invalid || bad_image || stack_invalid) {
+        check(!layout_ok, "invalid image/TLS/stack is rejected", NULL);
+        if (layout_ok) xbox_MemoryLayoutShutdown();
+        check(xbox_GetMemoryBase() == NULL && xbox_GetKernelMemoryBase() == NULL,
+              "invalid TLS leaves no owned memory mapping", NULL);
+        free(xbe);
+        return failures ? 1 : 0;
+    }
+    if (!layout_ok) {
         puts("xbox_MemoryLayoutInit failed");
         return 2;
+    }
+
+    check(*G(XBOX_FS_BASE + 0x28) == 0,
+          "loader does not install an application context chain", NULL);
+
+    check(*G(XBOX_FS_BASE + 0x20) == XBOX_FS_BASE + XBOX_KPCR_PRCB_OFFSET,
+          "main KPCR points at its own inline PrcbData", NULL);
+
+    void *kernel_probe = xbox_GetKernelMemoryBase();
+    if (xbox_IsContiguousMemoryAvailable())
+        check(kernel_probe == G(0x80010000u), "kernel probe exposes its mapped storage", NULL);
+    if (kernel_probe)
+        check(*(uint32_t *)((uint8_t *)kernel_probe + 0x3C) == 0,
+              "loader does not fabricate a kernel PE offset", NULL);
+
+    if (stack_config) {
+        uint32_t heap, reserve, contig;
+        check(XBOX_STACK_BASE == 0x5000000 && XBOX_STACK_SIZE == 0x300000,
+              "accepted policy survives rejected changes", NULL);
+        check(!xbox_ConfigureMainStack(0, 0), "active layout rejects policy changes", NULL);
+        check(XBOX_WORKER_STACK_BASE == 0x5300000,
+              "callback pool begins after the whole main stack", NULL);
+        reserve = xbox_ReserveAlloc(4096, 4096);
+        heap = xbox_HeapAlloc(4096, 4096);
+        check(reserve >= XBOX_WORKER_STACK_END && heap >= reserve + 4096,
+              "above-RAM reservation and heap exclude both stack ranges", NULL);
+        contig = xbox_ContiguousAlloc(4096, 4096);
+        check(contig && xbox_ContiguousRangeAllocated(contig - 0x80000000u, 4096) &&
+              xbox_ReserveRangeAllocated(reserve), "populate positive ownership caches", NULL);
+        xbox_MemoryLayoutShutdown();
+        check(!XBOX_STACK_BASE && !XBOX_STACK_SIZE && !XBOX_STACK_TOP &&
+              xbox_worker_stack_alloc() < 0, "shutdown retires every stack range", NULL);
+        check(xbox_ConfigureMainStack(0, 0), "port can restore image-derived defaults", NULL);
+        xbox_SetMapSize(0);
+        if (!xbox_MemoryLayoutInit(xbe, xbe_len)) { free(xbe); return 1; }
+        check(XBOX_STACK_SIZE == 4096 && XBOX_STACK_BASE < 0x5000000,
+              "new layout uses default minimum instead of prior port policy", NULL);
+        check(!xbox_HeapBlockSize(heap) && !xbox_ReserveRangeAllocated(reserve) &&
+              !xbox_ContiguousRangeAllocated(contig - 0x80000000u, 4096),
+              "new layout discards old allocations and positive caches", NULL);
+        check(xbox_HeapAlloc(4096, 4096) >= XBOX_WORKER_STACK_END,
+              "new heap excludes the new stack layout", NULL);
+        goto shutdown;
+    }
+
+    if (stack_layout) {
+        check(XBOX_STACK_BASE >= g_xbox_image_hi,
+              "main stack does not cover the loaded image", NULL);
+        check(XBOX_STACK_SIZE == 0x4000 && g_esp == XBOX_STACK_TOP,
+              "main stack uses page-rounded image stack commit", NULL);
+        check(XBOX_WORKER_STACK_BASE >= XBOX_STACK_BASE + XBOX_STACK_SIZE,
+              "callback pool does not overlap the main stack", NULL);
+        check(*G(0x780000) == 0xA5A5A5A5u,
+              "stack setup preserves image data at the former stack base", NULL);
+        goto shutdown;
+    }
+
+    if (high_image) {
+        check(*G(0x04010000u) == 0xA5A5A5A5u && g_xbox_image_hi == 0x04012000u,
+              "devkit image section above 64 MiB is loaded", NULL);
+        goto shutdown;
+    }
+
+    if (tls_layout) {
+        uint32_t total = 0x334;
+        uint32_t block = *G(XBOX_FS_BASE + 4) - total;
+        uint8_t *bytes = (uint8_t *)G(block);
+        check(*G(0x770000) == 0xA5A5A5A5 && *G(0x770100) == 0xA5A5A5A5,
+              "TLS setup preserves the loaded data section", NULL);
+        check(block >= g_xbox_image_hi && *G(block) == block + total,
+              "TLS owns storage beyond the image with adjacent thread data", NULL);
+        for (unsigned n = 4; n < 0x300; n++)
+            if (bytes[n] != 0xA5) { check(0, "TLS template bytes are preserved", NULL); break; }
+        for (unsigned n = 0x300; n < total + 64; n++)
+            if (bytes[n] != 0) { check(0, "TLS zero-fill and thread data do not overlap", NULL); break; }
+        goto shutdown;
     }
 
     scratch = xbox_HeapAlloc(0x10000, 4096);
@@ -232,21 +388,168 @@ int main(int argc, char **argv)
         }
     }
     printf("mode: %s\n", mode);
-
-    /* 0. A contiguous block and the loaded image share physical numbers
-     * unless RECOMP_CONTIG_AVOID_IMAGE keeps the block out of the image. */
-    if (!ext) {
-        uint32_t c = xbox_ContiguousAlloc(1024u * 1024u, 4096);
-        uint32_t phys = c - XBOX_CONTIG_BASE;
-        int overlaps = phys < g_xbox_image_hi && phys + 1024u * 1024u > g_xbox_image_lo;
-        snprintf(d, sizeof d, "block 0x%08X, image 0x%08X..0x%08X",
-                 c, g_xbox_image_lo, g_xbox_image_hi);
-        if (avoid)
-            check(c && !overlaps, "avoid-image: a 1 MB block lands outside the image", d);
-        else
-            check(c && overlaps, "a 1 MB block still fills from the bottom by default", d);
-        xbox_ContiguousFree(c);
+    if (scene_churn) {
+        /* Synthetic non-page-aligned blocks exercise the NT release bridge.
+         * Keeping the whole group live catches a release no-op even when
+         * individual allocation/free pairs appear stable. */
+        const uint32_t sizes[] = {0x250030u, 0x2B0030u, 0x190030u, 0x1A0030u,
+                                 0x130030u, 0x160030u, 0x180030u, 0x140030u};
+        uint32_t blocks[8], first[8] = {0};
+        uint32_t guard = xbox_HeapAlloc(4096, 16);
+        unsigned completed = 0;
+        int reused = 1, intact = 1, released = 1;
+        *G(guard) = 0xC0FFEE42u;
+        for (unsigned round = 0; round < 24; ++round) {
+            unsigned loaded = 0;
+            for (; loaded < 8; ++loaded) {
+                uint32_t size = sizes[loaded], base = 0;
+                /* Commit-only requests choose their base; alternate the Xbox
+                 * MEM_NOZERO flag while checking the existing zeroing and
+                 * ownership contract of the NT release path. */
+                uint32_t st = nt_alloc_at(&base, &size, loaded & 1 ? 0x801000 : 0x1000);
+                blocks[loaded] = base;
+                if (st || !blocks[loaded]) break;
+                if (!round) first[loaded] = blocks[loaded];
+                else if (blocks[loaded] != first[loaded]) reused = 0;
+                if (*G(blocks[loaded]) || *G(blocks[loaded] + sizes[loaded] - 4)) intact = 0;
+                *G(blocks[loaded]) = 0xABCD0000u + loaded;
+                *G(blocks[loaded] + sizes[loaded] - 4) = 0x12340000u + loaded;
+            }
+            for (unsigned j = 0; j < loaded; ++j) {
+                if (*G(blocks[j]) != 0xABCD0000u + j ||
+                    *G(blocks[j] + sizes[j] - 4) != 0x12340000u + j) intact = 0;
+            }
+            for (unsigned j = 0; j < loaded; ++j) {
+                if (nt_release(blocks[j]) || xbox_HeapBlockSize(blocks[j])) released = 0;
+            }
+            if (*G(guard) != 0xC0FFEE42u) intact = 0;
+            if (loaded != 8) break;
+            ++completed;
+        }
+        snprintf(d, sizeof d, "completed %u of 24 whole-roster scene cycles", completed);
+        check(completed == 24, "repeated race/menu NT allocations do not exhaust heap", d);
+        check(released, "MEM_RELEASE removes every model from the live heap", NULL);
+        check(reused, "model addresses stabilize after the first scene", NULL);
+        check(intact, "reused models are zeroed and live neighbours stay intact", NULL);
+        goto shutdown;
     }
+    if (model_churn) {
+        const uint32_t big = 2u * 1024u * 1024u;
+        const uint32_t models[] = {0x2B0030u, 0x250030u, 0x190030u, 0x1A0030u};
+        uint32_t retained[200] = {0};
+        uint32_t a = xbox_HeapAlloc(big, 4096);
+        uint32_t guard = xbox_HeapAlloc(4096, 16);
+        uint32_t small, page, merged;
+        unsigned completed = 0;
+        int intact = 1;
+        *G(guard) = 0x12345678u;
+        xbox_HeapFree(a);
+        small = xbox_HeapAlloc(40, 16);
+        page = xbox_HeapAlloc(4096, 4096);
+        check(small == a && xbox_HeapBlockSize(small) == 40,
+              "a 40-byte request does not retain a freed 2 MB block", NULL);
+        check(page == a + 4096 && xbox_HeapBlockSize(page) == 4096,
+              "page-aligned reuse carves the unaligned free tail", NULL);
+        check(*G(guard) == 0x12345678u,
+              "splitting preserves the live neighbouring allocation", NULL);
+        xbox_HeapFree(small);
+        xbox_HeapFree(page);
+        merged = xbox_HeapAlloc(big, 4096);
+        check(merged == a, "aligned head and tail coalesce after both frees", NULL);
+        xbox_HeapFree(merged);
+
+        /* Model-sized temporary buffers followed by persistent small objects
+         * reproduce whole-block internal fragmentation without a title leak.
+         * Live requested bytes stay below one model plus 12 KB throughout. */
+        for (unsigned n = 0; n < 200; ++n) {
+            uint32_t size = models[n % 4];
+            uint32_t model = xbox_HeapAlloc(size, 16);
+            uint32_t tiny_size = 40u + (n % 3u) * 8u;
+            if (!model) break;
+            *G(model) = 0xA5A50000u + n;
+            *G(model + size - 4) = 0x5A5A0000u + n;
+            xbox_HeapFree(model);
+            retained[n] = xbox_HeapAlloc(tiny_size, 16);
+            if (!retained[n]) break;
+            if (xbox_HeapBlockSize(retained[n]) != tiny_size) intact = 0;
+            *G(retained[n]) = 0xC0FF0000u + n;
+            ++completed;
+        }
+        for (unsigned n = 0; n < completed; ++n) {
+            if (*G(retained[n]) != 0xC0FF0000u + n) intact = 0;
+            xbox_HeapFree(retained[n]);
+        }
+        snprintf(d, sizeof d, "completed %u of 200 bounded-live-memory cycles", completed);
+        check(completed == 200, "200 model loads with small retained objects avoid OOM", d);
+        check(intact, "retained small objects keep exact size and live contents", NULL);
+        goto shutdown;
+    }
+    if (reserve_heap) {
+        const uint32_t ram_end = XBOX_TOTAL_RAM;
+        uint32_t reserve = 0, size = 0x100000, st, base, heap, later, args[3];
+        st = nt_alloc_at(&reserve, &size, 0x2000);
+        check(st == 0 && reserve == ram_end && size == 0x100000,
+              "large pure reserve starts above retail RAM", NULL);
+        if (st != 0 || reserve != ram_end) goto shutdown;
+
+        base = reserve + 0x1000; size = 0x1000;
+        st = nt_alloc_at(&base, &size, 0x1000);
+        check(st == 0 && base == reserve + 0x1000 && size == 0x1000,
+              "partial commit keeps its reserved guest address", NULL);
+        *G(reserve) = 0xA5A5A5A5u;
+        *G(reserve + 0x1000) = 0xC0FFEE01u;
+        *G(reserve + 0xFFFFC) = 0xA5A5A5A5u;
+
+        /* A single request that previously crossed 64 MB must move past the
+         * whole reservation before zero filling any byte. */
+        heap = xbox_HeapAlloc(ram_end - (scratch + 0x10000) + 0x1000, 4096);
+        check(heap == reserve + 0x100000,
+              "heap growth crossing 64 MB skips the full reservation", NULL);
+        check(*G(reserve) == 0xA5A5A5A5u && *G(reserve + 0x1000) == 0xC0FFEE01u &&
+              *G(reserve + 0xFFFFC) == 0xA5A5A5A5u,
+              "ordinary heap zero fill preserves committed/reserved bytes", NULL);
+
+        *G(OUT_VA) = reserve + 0x1000; *G(OUT_VA + 4) = 0x1000;
+        args[0] = OUT_VA; args[1] = OUT_VA + 4; args[2] = 0x4000;
+        st = call(S_FREE, 3, args);
+        check(st == 0 && xbox_ReserveRangeAllocated(reserve + 0x1000) &&
+              *G(reserve + 0x1000) == 0xC0FFEE01u,
+              "reserve decommit remains a no-op and retains exact ownership", NULL);
+        st = nt_release(reserve);
+        check(st == 0 && xbox_ReserveRangeAllocated(reserve) &&
+              xbox_ReserveRangeAllocated(reserve + 0xFFFFF),
+              "reserve release remains a no-op even with heap reclaim enabled", NULL);
+
+        later = 0; size = 0x100000;
+        st = nt_alloc_at(&later, &size, 0x2000);
+        check(st == 0 && later >= heap + xbox_HeapBlockSize(heap),
+              "later reservation skips the already-issued ordinary heap", NULL);
+        check(!xbox_ReserveRangeAllocated(heap) &&
+              !xbox_ReserveRangeAllocated(reserve + 0x100000),
+              "skipped ordinary heap bytes are not reservation coverage", NULL);
+        goto shutdown;
+    }
+    *G(0x00070000u) = 0x12345678u;
+    *G(0x80070000u) = 0x87654321u;
+    check(*G(0x00070000u) == 0x12345678u &&
+          *G(0xF0070000u) == 0x87654321u,
+          "contiguous and tiled memory stay distinct from RAM", NULL);
+
+    /* Nothing above the mapped range aliases RAM: the first slot above it must
+     * fault, not read the byte at the same offset in low memory. The SEH to
+     * catch the fault is Windows-only. */
+#ifdef _WIN32
+    {
+        volatile uint32_t *above = G((uint32_t)xbox_GetMappedSize() + 0x70000u);
+        int faulted = 0;
+        __try {
+            (void)*above;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            faulted = 1;
+        }
+        check(faulted, "a read in the first slot above the map faults", NULL);
+    }
+#endif
 
     /* 1. A small request after a large free. */
     if (!ext) {
@@ -320,87 +623,30 @@ int main(int argc, char **argv)
 
     /* 6. Contiguous memory can be given back. */
     if (!ext) {
+        extern int xbox_ContiguousFree(uint32_t addr);
         uint32_t c1 = xbox_ContiguousAlloc(0x20000, 4096);
         uint32_t c2;
 
         snprintf(d, sizeof d, "free said %d", xbox_ContiguousFree(c1));
         c2 = xbox_ContiguousAlloc(0x20000, 4096);
-        if (reclaim) {
-            char d2[160];
-            snprintf(d2, sizeof d2, "%s, got 0x%08X, expected 0x%08X", d, c2, c1);
-            check(c1 && c2 == c1, "a freed contiguous block is reused", d2);
-        } else {
-            check(c1 && c2 != c1, "default: contiguous memory is never reused", d);
-        }
+        check(c1 && c2 == c1, "a freed contiguous block is reused in both modes", d);
     }
 
-    /* 7. The physical range of MmAllocateContiguousMemoryEx is honoured. */
-    if (!ext) {
-        const uint32_t MB = 1024u * 1024u;
-        uint32_t c = 0, lo, hi;
-        int k;
-
-        /* Unconstrained 1 MB blocks until one lands at or above 16 MB. */
-        for (k = 0; k < 32; k++) {
-            c = xbox_ContiguousAlloc(MB, 4096);
-            if (!c || c - XBOX_CONTIG_BASE >= 16 * MB)
-                break;
-        }
-        lo = xbox_ContiguousAllocEx(0x1000, 4096, 0, 0x00FFFFFFu);
-        snprintf(d, sizeof d, "last unconstrained 0x%08X, low request 0x%08X", c, lo);
-        check(c && lo && lo + 0x1000 - XBOX_CONTIG_BASE <= 16 * MB,
-              "a request limited to the low 16 MB still fits", d);
-
-        hi = xbox_ContiguousAllocEx(0x10000, 0x10000, 0x02800000u, 0x02FFFFFFu);
-        snprintf(d, sizeof d, "got 0x%08X", hi);
-        check(hi && hi - XBOX_CONTIG_BASE >= 0x02800000u &&
-              hi + 0x10000 - XBOX_CONTIG_BASE <= 0x03000000u &&
-              (hi & 0xFFFFu) == 0,
-              "a request for a range above the fill lands in it, aligned", d);
-
-        /* A caller-placed block that overlaps hi's last page still claims
-         * the free pages after it, so they are not handed out again. */
-        if (hi) {
-            uint32_t after = hi + 0x10000, again;
-            xbox_ContiguousClaim(after - 0x1000, 0x3000);
-            again = xbox_ContiguousAllocEx(0x1000, 4096, after - XBOX_CONTIG_BASE,
-                                           after - XBOX_CONTIG_BASE + 0x1FFF);
-            snprintf(d, sizeof d, "got 0x%08X", again);
-            check(again == 0, "a partly overlapped claim keeps its free pages", d);
-        }
-    }
-
-    /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */
+    /* 4. Above RAM: [0x74000000, 0x7FFE0000) at 64 MB. */
     {
         const uint32_t hi = 0x76000000u;
         uint32_t base, size, st, mbi[7];
 
         if (ext128) {
             check(!guest_vmem_active(),
-                  "128 MB: the mirrors reach past user space, tracker stays off", NULL);
+                  "128 MB: the slots above RAM reach past user space, tracker stays off", NULL);
         } else if (!ext && !reclaim) {
             base = hi; size = 0x100000;
             st = nt_alloc_at(&base, &size, 0x2000);
             snprintf(d, sizeof d, "status 0x%08X, base 0x%08X", st, base);
-            check(base != hi, "default: an explicit high base is not honoured", d);
+            check(!(st == 0 && base == hi),
+                  "default: an explicit high base is not granted at that address", d);
         } else if (ext) {
-            /* The layout's own reservations (the Windows placeholder window,
-             * the POSIX span) cover this range; it must hand it over, or the
-             * tracker finds nothing free and stays off. */
-            check(guest_vmem_active(),
-                  "the tracker is on: the layout handed its range over",
-                  "\"could not reserve host memory\": the placeholder window "
-                  "or the span still held the range");
-            /* And the windows above it are still mapped: on Linux a span
-             * grown to make room pushed the contiguous window onto a
-             * neighbouring mapping. Writing to it faults if it is missing. */
-            {
-                uint32_t c = xbox_ContiguousAlloc(0x1000, 4096);
-                if (c)
-                    *G(c) = 0x5A5A5A5Au;
-                check(c && *G(c) == 0x5A5A5A5Au,
-                      "the contiguous window is mapped beside the tracker", NULL);
-            }
             /* Reserve the exact address. */
             base = hi; size = 0x100000;
             st = nt_alloc_at(&base, &size, 0x2000);

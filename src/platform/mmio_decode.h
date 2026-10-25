@@ -28,15 +28,10 @@
 #ifndef MMIO_DECODE_H
 #define MMIO_DECODE_H
 
-#include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
-#if defined(_WIN32) || defined(__x86_64__)
-#include "xbox_winnt.h"
-#if !defined(_WIN32)
-#include "win32_compat.h"
-#endif
+#if defined(_WIN32)
+#include <windows.h>
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
@@ -55,27 +50,6 @@ static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
     case 14: return (uint64_t *)&c->R14;   case 15: return (uint64_t *)&c->R15;
     default: return NULL;
     }
-}
-
-static inline uint64_t mmio_width_mask(int size)
-{
-    return size == 8 ? UINT64_MAX : (1ULL << (size * 8)) - 1;
-}
-
-static inline uint64_t mmio_read_reg(PCONTEXT ctx, int reg, int size, int rex)
-{
-    int high_byte = size == 1 && !rex && reg >= 4 && reg < 8;
-    return (*mmio_ctx_reg(ctx, high_byte ? reg - 4 : reg) >> (high_byte ? 8 : 0)) &
-           mmio_width_mask(size);
-}
-
-static inline void mmio_write_reg(PCONTEXT ctx, int reg, int size, int rex, uint64_t value)
-{
-    int high_byte = size == 1 && !rex && reg >= 4 && reg < 8;
-    int shift = high_byte ? 8 : 0;
-    uint64_t mask = mmio_width_mask(size), *dst = mmio_ctx_reg(ctx, high_byte ? reg - 4 : reg);
-    if (size >= 4) *dst = value & mask; /* DWORD writes clear the upper half. */
-    else *dst = (*dst & ~(mask << shift)) | ((value & mask) << shift);
 }
 
 static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
@@ -316,31 +290,5 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-/* Snapshot at most one architectural instruction without faulting on its page
- * boundary. Usually one host read; byte reads recover a readable short prefix
- * when the host refuses a cross-page bulk read. Preserve caller LastError. */
-static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
-                               mmio_read_fn rd, mmio_write_fn wr)
-{
-    uint8_t code[15];
-    SIZE_T copied = 0;
-    DWORD error;
-    uintptr_t address;
-    if (!ctx || !rd || !wr) return 0;
-    error = GetLastError();
-    address = (uintptr_t)ctx->Rip;
-    ReadProcessMemory(GetCurrentProcess(), (const void *)address, code, sizeof(code), &copied);
-    if (!copied) {
-        while (copied < sizeof(code) && address <= UINTPTR_MAX - copied) {
-            SIZE_T got = 0;
-            if (!ReadProcessMemory(GetCurrentProcess(), (const void *)(address + copied),
-                                   code + copied, 1, &got) || got != 1) break;
-            copied++;
-        }
-    }
-    SetLastError(error);
-    return mmio_emulate_bytes(ctx, off, dev, rd, wr, code, copied);
-}
-
-#endif /* _WIN32 || __x86_64__ */
+#endif /* _WIN32 */
 #endif /* MMIO_DECODE_H */

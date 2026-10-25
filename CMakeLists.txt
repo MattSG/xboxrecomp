@@ -1,17 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
-
-# Xbox Static Recompilation Runtime Library
-# Provides link-time libraries for statically recompiled Xbox games.
-# Pattern: extract emulator subsystems (xemu) into reusable static libraries.
-#
-# Libraries:
-#   xbox_kernel    - Xbox kernel replacement layer (147 imports → Win32)
-#   xbox_d3d8      - D3D8 → D3D11 graphics compatibility
-#   xbox_dsound    - DirectSound → software mixer compatibility
-#   xbox_input     - Xbox gamepad → XInput compatibility
-#   xbox_apu       - MCPX APU audio emulation (extracted from xemu)
-#   xbox_nv2a      - NV2A GPU emulation (extracted from xemu)
+project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
 
 # Recompiled x86 code relies on what MSVC does anyway: signed arithmetic wraps
 # like the CPU's, and guest memory is read through whatever pointer type an
@@ -20,6 +8,13 @@ project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 if(NOT MSVC)
     add_compile_options(-fwrapv -fno-strict-aliasing)
 endif()
+
+# Xbox Static Recompilation Runtime Library
+# Provides link-time libraries for statically recompiled Xbox games.
+# Pattern: extract emulator subsystems (xemu) into reusable static libraries.
+#
+# Runtime modules and their transitive host dependencies are declared below.
+# Link the xboxrecomp interface target rather than relying on a snapshot count.
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -103,7 +98,8 @@ add_subdirectory(src/host)
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
-set(XBOXRECOMP_LIBS
+add_library(xboxrecomp INTERFACE)
+target_link_libraries(xboxrecomp INTERFACE
     xbox_kernel
     xbox_d3d8
     xbox_dsound
@@ -115,14 +111,8 @@ set(XBOXRECOMP_LIBS
     xbox_video
     xbox_host
 )
-add_library(xboxrecomp INTERFACE)
-if(UNIX AND NOT APPLE)
-    # The archives call each other both ways (the APU reaches the kernel's
-    # memory map, the kernel raises the APU's interrupt). GNU ld scans each
-    # archive once, so it needs the group; MSVC and ld64 rescan on their own.
-    target_link_libraries(xboxrecomp INTERFACE
-        -Wl,--start-group ${XBOXRECOMP_LIBS} -Wl,--end-group)
-else()
-    target_link_libraries(xboxrecomp INTERFACE ${XBOXRECOMP_LIBS})
+# win32_compat.c uses the C99 fenv functions, which glibc provides in libm.
+if(NOT WIN32)
+    target_link_libraries(xboxrecomp INTERFACE m)
 endif()
 

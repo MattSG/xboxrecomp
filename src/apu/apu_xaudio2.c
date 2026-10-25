@@ -12,8 +12,8 @@
 #include <string.h>
 #include "apu_xaudio2.h"
 
-/* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl2.c provides
- * the same xa2_* functions over SDL2. */
+/* XAudio2 on Windows; elsewhere the same contract over an SDL3 audio
+ * stream (one queue, no callback). */
 #if defined(_WIN32)
 
 #define COBJMACROS
@@ -25,48 +25,41 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-/* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
- * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
- * override them at xa2_init, clamped to the static storage below. */
-#define XA2_BUF_SAMPLES_DEFAULT 512
-#define XA2_NUM_BUFS_DEFAULT    4
-#define XA2_BUF_SAMPLES_MIN     128
-#define XA2_BUF_SAMPLES_MAX     4096
-#define XA2_NUM_BUFS_MIN        2
-#define XA2_NUM_BUFS_MAX        8
-
-static int g_xa2_buf_samples = XA2_BUF_SAMPLES_DEFAULT;
-static int g_xa2_num_bufs    = XA2_NUM_BUFS_DEFAULT;
-#define XA2_BUF_SAMPLES g_xa2_buf_samples
-#define XA2_NUM_BUFS    g_xa2_num_bufs
-
-static int xa2_env_int(const char *name, int def, int lo, int hi)
-{
-    const char *e = getenv(name);
-    int v;
-    if (!e || !*e) return def;
-    v = atoi(e);
-    if (v < lo) v = lo;
-    if (v > hi) v = hi;
-    return v;
-}
+#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
+/* The APU submits 256 samples (5.33 ms), not a full 1024-sample slot.
+ * Three slots only covered 16 ms and dropped buffers during scheduler bursts.
+ * Sixty-four slots cover 341 ms: enough for the APU's bounded 250 ms
+ * catch-up plus scheduler jitter. Capacity does not force a full queue;
+ * steady-state submission remains one 256-sample buffer every 5.33 ms. */
+#define XA2_NUM_BUFS      64
+#define XA2_CUSHION       8      /* silent buffers queued after running dry */
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
 static IXAudio2SourceVoice    *g_xa2_source = NULL;
-/* One slot more than can be queued: with every buffer on the voice, the
- * next one is staged in a slot the voice does not hold. With only
- * XA2_NUM_BUFS slots the staging buffer was the oldest queued one, and
- * filling it overwrote audio the device had not played yet. */
-#define XA2_RING (XA2_NUM_BUFS + 1)
-static int16_t                 g_xa2_bufs[XA2_NUM_BUFS_MAX + 1][XA2_BUF_SAMPLES_MAX][2];
+static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
 static int                     g_xa2_next_buf = 0;
-static int                     g_xa2_fill = 0;  /* samples staged in bufs[next_buf] */
-static unsigned  g_xa2_underruns;
-static int       g_xa2_dry;
-static ULONGLONG g_xa2_underrun_logged;
+static float                   g_xa2_gain = 1.0f;  /* 0 under RECOMP_AUDIO_MUTE */
+static int                     g_xa2_muted;        /* pause state last applied */
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
+static FILE                   *g_xa2_pcm_dump = NULL;
+static volatile LONG g_xa2_error;
+static int g_xa2_error_reported;
+
+/* Endpoint loss otherwise looks like a permanently full queue. Keep the
+ * callback small; destruction/recovery must happen outside the audio thread. */
+static void STDMETHODCALLTYPE xa2_processing_start(IXAudio2EngineCallback *self) { (void)self; }
+static void STDMETHODCALLTYPE xa2_processing_end(IXAudio2EngineCallback *self) { (void)self; }
+static void STDMETHODCALLTYPE xa2_critical_error(IXAudio2EngineCallback *self, HRESULT error)
+{
+    (void)self;
+    InterlockedExchange(&g_xa2_error, (LONG)error);
+}
+static struct IXAudio2EngineCallbackVtbl g_xa2_callback_vtable = {
+    xa2_processing_start, xa2_processing_end, xa2_critical_error
+};
+static IXAudio2EngineCallback g_xa2_callback = { &g_xa2_callback_vtable };
 
 int xa2_init(void)
 {
@@ -76,12 +69,8 @@ int xa2_init(void)
 
     if (g_xa2_initialized) return 1;
 
-    g_xa2_buf_samples = xa2_env_int("RECOMP_AUDIO_BUF_SAMPLES",
-                                    XA2_BUF_SAMPLES_DEFAULT,
-                                    XA2_BUF_SAMPLES_MIN, XA2_BUF_SAMPLES_MAX);
-    g_xa2_num_bufs = xa2_env_int("RECOMP_AUDIO_BUF_COUNT", XA2_NUM_BUFS_DEFAULT,
-                                 XA2_NUM_BUFS_MIN, XA2_NUM_BUFS_MAX);
-
+    InterlockedExchange(&g_xa2_error, 0);
+    g_xa2_error_reported = 0;
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
         fprintf(stderr, "[XA2] CoInitializeEx failed: 0x%08lX\n", hr);
@@ -137,14 +126,19 @@ int xa2_init(void)
     }
 
     g_xa2_next_buf = 0;
-    g_xa2_fill = 0;
-    g_xa2_dry = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
+    {
+        const char *path = getenv("RECOMP_XA2_PCM_DUMP");
+        if (path && *path) {
+            g_xa2_pcm_dump = fopen(path, "wb");
+            fprintf(stderr, "[XA2] PCM capture %s: %s (s16le stereo 48000 Hz)\n",
+                    g_xa2_pcm_dump ? "opened" : "failed", path);
+        }
+    }
 
-    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)\n",
-            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES,
-            1000.0 * XA2_NUM_BUFS * XA2_BUF_SAMPLES / XA2_SAMPLE_RATE);
+    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
+            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
     return 1;
 
 fail:
@@ -185,48 +179,74 @@ int xa2_is_active(void)
     return g_xa2_initialized;
 }
 
-/* Hand mixed samples to XAudio2. Called from the APU frame thread with one
- * EP period (256 samples) at a time. Samples accumulate in the current device
- * buffer, which is submitted when full, so a call shorter than a buffer is
- * kept, not padded or dropped. Returns 1 if every sample was accepted; 0 if
- * the voice already had every buffer queued when one filled, in which case
- * that buffer is discarded (pacing by queue depth is what prevents it). */
+/* Submit a buffer of mixed samples to XAudio2.
+ * Called from APU frame thread. 1=accepted, 0=queue full, -1=failure. */
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     XAUDIO2_VOICE_STATE state;
     XAUDIO2_BUFFER xbuf;
-    int idx, n, ok = 1;
+    int idx;
+    int copy_samples;
     HRESULT hr;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
-
-    while (num_samples > 0) {
-        idx = g_xa2_next_buf;
-        n = XA2_BUF_SAMPLES - g_xa2_fill;
-        if (n > num_samples) n = num_samples;
-        memcpy(g_xa2_bufs[idx][g_xa2_fill], samples,
-               n * XA2_CHANNELS * sizeof(int16_t));
-        g_xa2_fill += n;
-        samples += n * XA2_CHANNELS;
-        num_samples -= n;
-        if (g_xa2_fill < XA2_BUF_SAMPLES)
-            break;
-
-        g_xa2_fill = 0;
-        IXAudio2SourceVoice_GetState(g_xa2_source, &state,
-                                     XAUDIO2_VOICE_NOSAMPLESPLAYED);
-        if ((int)state.BuffersQueued >= XA2_NUM_BUFS) { ok = 0; continue; }
-
-        memset(&xbuf, 0, sizeof(xbuf));
-        xbuf.AudioBytes = XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t);
-        xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
-        hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
-        if (FAILED(hr)) { ok = 0; continue; }
-
-        g_xa2_next_buf = (idx + 1) % XA2_RING;
-        g_xa2_frames_written++;
+    if (!samples || num_samples <= 0 || num_samples > XA2_BUF_SAMPLES) return -1;
+    if (!g_xa2_initialized || !g_xa2_source) return -1;
+    LONG engine_error = InterlockedCompareExchange(&g_xa2_error, 0, 0);
+    if (engine_error) {
+        if (!g_xa2_error_reported) {
+            fprintf(stderr, "[XA2] Critical engine error: 0x%08lX\n", engine_error);
+            g_xa2_error_reported = 1;
+        }
+        return -1;
     }
-    return ok;
+
+    {   /* Paused in the background (fb_present.c): quiet, not a held note. */
+        extern int xbox_FramebufferPaused(void);
+        int paused = xbox_FramebufferPaused();
+        if (paused != g_xa2_muted && g_xa2_master) {
+            /* Back to the configured gain, not to 1: a muted run stays muted. */
+            g_xa2_master->lpVtbl->SetVolume(g_xa2_master, paused ? 0.0f : g_xa2_gain,
+                                            XAUDIO2_COMMIT_NOW);
+            g_xa2_muted = paused;
+        }
+    }
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    /* The APU produces in real time, so the queue holds only what the last
+     * stall's catch-up left: usually next to nothing, and every hitch after
+     * that ran it dry -- the device played silence, a click each time. Run
+     * dry (or never filled), put XA2_CUSHION buffers of silence in front:
+     * one ~43 ms gap, then slack for the following hitches. */
+    if (state.BuffersQueued == 0) {
+        static const int16_t silence[XA2_BUF_SAMPLES][2];
+        if (g_xa2_frames_written)
+            fprintf(stderr, "[XA2] underrun after %d buffers\n", g_xa2_frames_written);
+        memset(&xbuf, 0, sizeof(xbuf));
+        xbuf.AudioBytes = num_samples * XA2_CHANNELS * sizeof(int16_t);
+        xbuf.pAudioData = (const BYTE *)silence;
+        for (idx = 0; idx < XA2_CUSHION; idx++)
+            if (FAILED(IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL)))
+                break;
+    }
+
+    idx = g_xa2_next_buf;
+    copy_samples = num_samples;
+    memcpy(g_xa2_bufs[idx], samples, copy_samples * XA2_CHANNELS * sizeof(int16_t));
+
+    memset(&xbuf, 0, sizeof(xbuf));
+    xbuf.AudioBytes = copy_samples * XA2_CHANNELS * sizeof(int16_t);
+    xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
+
+    hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+    if (FAILED(hr)) return -1;
+    if (g_xa2_pcm_dump) {
+        fwrite(g_xa2_bufs[idx], 1, xbuf.AudioBytes, g_xa2_pcm_dump);
+        fflush(g_xa2_pcm_dump);
+    }
+
+    g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
+    g_xa2_frames_written++;
+    return 1;
 }
 
 int xa2_get_buffer_size(void)
@@ -234,63 +254,111 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-int xa2_get_buffer_count(void)
-{
-    return XA2_NUM_BUFS;
-}
+#else /* !_WIN32 -- SDL3 audio stream */
 
-/* Samples handed over and not yet played: the buffers the voice still
- * holds plus what is staged in the next one. Also the underrun detector:
- * the voice running dry after audio has started is one underrun, counted
- * once per dry spell and reported at most once a second. A drain announced
- * by xa2_expect_drain (the frame thread pausing) is not one. */
-int xa2_queued_samples(void)
-{
-    XAUDIO2_VOICE_STATE state;
+#include <SDL3/SDL.h>
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
-    IXAudio2SourceVoice_GetState(g_xa2_source, &state,
-                                 XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if (state.BuffersQueued == 0 && g_xa2_frames_written > 0) {
-        if (!g_xa2_dry) {
-            ULONGLONG now = GetTickCount64();
-            g_xa2_dry = 1;
-            g_xa2_underruns++;
-            if (now - g_xa2_underrun_logged >= 1000) {
-                g_xa2_underrun_logged = now;
-                fprintf(stderr, "[XA2] underrun x%u\n", g_xa2_underruns);
-            }
-        }
-    } else {
-        g_xa2_dry = 0;
+#define XA2_SAMPLE_RATE   48000
+#define XA2_CHANNELS      2
+#define XA2_BUF_SAMPLES   1024
+/* Same depth as the XAudio2 queue: 64 submissions, ~341 ms at 256 samples. */
+#define XA2_NUM_BUFS      64
+#define XA2_CUSHION       8
+
+static SDL_AudioStream *g_stream;
+static float g_gain = 1.0f;
+static int g_frames_written;
+static FILE *g_pcm_dump;
+static int g_muted;   /* last pause state applied to the stream gain */
+
+int xa2_init(void)
+{
+    const SDL_AudioSpec spec = { SDL_AUDIO_S16LE, XA2_CHANNELS, XA2_SAMPLE_RATE };
+    const char *mute = getenv("RECOMP_AUDIO_MUTE");
+    const char *path = getenv("RECOMP_XA2_PCM_DUMP");
+
+    if (g_stream) return 1;
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        fprintf(stderr, "[XA2] SDL audio init failed: %s\n", SDL_GetError());
+        return 0;
     }
-    return (int)state.BuffersQueued * XA2_BUF_SAMPLES + g_xa2_fill;
+    g_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!g_stream) {
+        fprintf(stderr, "[XA2] SDL audio stream failed: %s\n", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        return 0;
+    }
+    g_gain = (mute && *mute && *mute != '0') ? 0.0f : 1.0f;
+    SDL_SetAudioStreamGain(g_stream, g_gain);
+    SDL_ResumeAudioStreamDevice(g_stream);
+    g_frames_written = 0;
+    g_muted = 0;   /* gain is g_gain now; re-apply the pause state on submit */
+    if (path && *path) {
+        g_pcm_dump = fopen(path, "wb");
+        fprintf(stderr, "[XA2] PCM capture %s: %s (s16le stereo 48000 Hz)\n",
+                g_pcm_dump ? "opened" : "failed", path);
+    }
+    fprintf(stderr, "[XA2] SDL audio initialized (%d Hz stereo 16-bit, %s)\n",
+            XA2_SAMPLE_RATE, SDL_GetCurrentAudioDriver());
+    return 1;
 }
 
-/* Mark the coming dry spell as already seen; the first call that finds
- * buffers queued again clears it, so later dry spells count as before. */
-void xa2_expect_drain(void)
+void xa2_shutdown(void)
 {
-    g_xa2_dry = 1;
+    if (g_pcm_dump) {
+        fclose(g_pcm_dump);
+        g_pcm_dump = NULL;
+    }
+    if (!g_stream) return;
+    SDL_DestroyAudioStream(g_stream);
+    g_stream = NULL;
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_frames_written);
 }
 
-unsigned xa2_underruns(void)
+int xa2_is_active(void)
 {
-    return g_xa2_underruns;
+    return g_stream != NULL;
 }
 
-uint64_t xa2_samples_played(void)
+int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
-    XAUDIO2_VOICE_STATE state;
+    int queued;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
-    IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
-    return state.SamplesPlayed;
+    if (!samples || num_samples <= 0 || num_samples > XA2_BUF_SAMPLES) return -1;
+    if (!g_stream) return -1;
+    const int bytes = num_samples * XA2_CHANNELS * (int)sizeof(int16_t);
+    {   /* Paused in the background (fb_present.c): quiet, not a held note. */
+        extern int xbox_FramebufferPaused(void);
+        int paused = xbox_FramebufferPaused();
+        if (paused != g_muted) {
+            SDL_SetAudioStreamGain(g_stream, paused ? 0.0f : g_gain);
+            g_muted = paused;
+        }
+    }
+    queued = SDL_GetAudioStreamQueued(g_stream);
+    if (queued < 0) return -1;
+    if (queued >= XA2_NUM_BUFS * bytes) return 0;
+    /* Ran dry: a short cushion of silence first, as the XAudio2 path does. */
+    if (queued == 0) {
+        static const int16_t silence[XA2_BUF_SAMPLES][2];
+        if (g_frames_written)
+            fprintf(stderr, "[XA2] underrun after %d buffers\n", g_frames_written);
+        for (int i = 0; i < XA2_CUSHION; i++)
+            SDL_PutAudioStreamData(g_stream, silence, bytes);
+    }
+    if (!SDL_PutAudioStreamData(g_stream, samples, bytes)) return -1;
+    if (g_pcm_dump) {
+        fwrite(samples, 1, (size_t)bytes, g_pcm_dump);
+        fflush(g_pcm_dump);
+    }
+    g_frames_written++;
+    return 1;
 }
 
-#else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */
-
-/* ISO C wants at least one declaration in a translation unit. */
-typedef int apu_xaudio2_posix_unused;
+int xa2_get_buffer_size(void)
+{
+    return XA2_BUF_SAMPLES;
+}
 
 #endif /* _WIN32 */

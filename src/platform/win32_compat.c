@@ -63,9 +63,6 @@ LONG InterlockedDecrement(volatile LONG *p)        { return __atomic_sub_fetch(p
 LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 
-LONG InterlockedAnd(volatile LONG *p, LONG v)      { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
-LONG InterlockedOr(volatile LONG *p, LONG v)       { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
-
 LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
 {
     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
@@ -858,18 +855,6 @@ const char *w32_handle_path(HANDLE h)
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
-void w32_handle_set_path(HANDLE h, const char *host_path)
-{
-    w32_object *o = (w32_object *)h;
-    char *old;
-
-    if (!o || o->kind != K_FILE)
-        return;
-    old = o->file_path;
-    o->file_path = host_path ? strdup(host_path) : NULL;
-    free(old);
-}
-
 BOOL CloseHandle(HANDLE h)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
@@ -1397,73 +1382,44 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
-/* Win32 gives a new thread the process's CPU mask; pthread_create copies
- * the creator's. A guest thread pinned to one core (xbox_GuestThreadPin)
- * would otherwise hand that core to every host thread it creates, the
- * kernel timer thread from KeSetTimer among them. The mask is taken once,
- * from the first thread to ask, before any pin. */
-static DWORD_PTR s_process_mask;
-
-static DWORD_PTR process_mask_capture(void)
+static void thread_finish(void *arg)
 {
-    DWORD_PTR mask = 0;
-    if (s_process_mask)
-        return s_process_mask;
-#if defined(__linux__)
-    {
-        cpu_set_t set;
-        int i;
-        if (sched_getaffinity(0, sizeof set, &set) == 0)
-            for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
-                if (CPU_ISSET(i, &set))
-                    mask |= (DWORD_PTR)1 << i;
+    w32_object *o = (w32_object *)arg;
+    cancel_thread_timers(o);
+    pthread_mutex_lock(&o->lock);
+    if (!o->exited) {
+        o->exited = 1;
+        o->signaled = 1;
+        pthread_cond_broadcast(&o->cond);
     }
-#endif
-    if (!mask) {
-        long n = sysconf(_SC_NPROCESSORS_ONLN);
-        if (n < 1) n = 1;
-        if (n >= (long)(8 * sizeof mask)) n = (long)(8 * sizeof mask) - 1;
-        mask = ((DWORD_PTR)1 << n) - 1;
-    }
-    s_process_mask = mask;
-    return mask;
+    pthread_mutex_unlock(&o->lock);
+    t_self_obj = NULL;
+    t_tid = 0;
+    obj_release(o); /* exactly one worker reference, for return or cancellation */
 }
 
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
+    pthread_cleanup_push(thread_finish, o);
     t_self_obj = o;
     t_tid      = o->tid;
 
-#if defined(__linux__)
-    /* The process mask, not the creator's: see process_mask_capture. */
-    if (s_process_mask) {
-        cpu_set_t set;
-        int i;
-        CPU_ZERO(&set);
-        for (i = 0; i < (int)(8 * sizeof s_process_mask) && i < CPU_SETSIZE; i++)
-            if (s_process_mask & ((DWORD_PTR)1 << i))
-                CPU_SET(i, &set);
-        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
-    }
-#endif
-
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
+    pthread_cleanup_push(unlock_mutex_cleanup, &o->lock);
     while (o->suspend_count > 0)
         pthread_cond_wait(&o->gate, &o->lock);
+    pthread_cleanup_pop(0);
     pthread_mutex_unlock(&o->lock);
 
     DWORD rc = o->start ? o->start(o->start_param) : 0;
-
     pthread_mutex_lock(&o->lock);
-    o->exit_code = rc;
-    o->exited    = 1;
-    o->signaled  = 1;
-    pthread_cond_broadcast(&o->cond);
+    if (!o->thread_termination_requested && !o->exited)
+        o->exit_code = rc;
     pthread_mutex_unlock(&o->lock);
 
-    obj_release(o);   /* drop the trampoline's reference */
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
@@ -1549,109 +1505,67 @@ DWORD ResumeThread(HANDLE h)
 
 DWORD SuspendThread(HANDLE h)
 {
-    /* POSIX cannot stop another thread at an arbitrary point, so suspending
-     * one only counts, for ResumeThread. A thread suspending *itself* is a
-     * different matter: it is at a known point, and it parks on the same gate
-     * CREATE_SUSPENDED uses until a ResumeThread brings the count to zero.
-     * Worker pools idle that way; returning at once turned one title's pool
-     * into a suspend/check spin of millions of calls a second. */
-    if (h == PSEUDO_CURRENT_THREAD) h = GetCurrentThread();
-    w32_object *o = (w32_object *)h;
-    if (!o || o == (w32_object *)PSEUDO_CURRENT_THREAD || o->kind != K_THREAD)
-        return (DWORD)-1;
+    /* True mid-run suspension is not supported on POSIX; only the
+     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
+    w32_object *o = obj_lookup(h);
+    if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
-    if (o == t_self_obj)
-        while (o->suspend_count > 0)
-            pthread_cond_wait(&o->gate, &o->lock);
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    if (h == PSEUDO_CURRENT_THREAD) {
+        ExitThread(exitCode);
+        return TRUE;
+    }
+    w32_object *o = obj_lookup(h);
     if (!o || o->kind != K_THREAD) return FALSE;
-    pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
-    o->exit_code = exitCode;
-    o->exited    = 1;
-    o->signaled  = 1;
-    pthread_cond_broadcast(&o->cond);
+    if (o->exited) {
+        pthread_mutex_unlock(&o->lock);
+        return TRUE;
+    }
+    int rc = pthread_cancel(o->thread);
+    if (rc == 0) {
+        o->exit_code = exitCode;
+        o->thread_termination_requested = 1;
+    }
     pthread_mutex_unlock(&o->lock);
-    return TRUE;
+    return rc == 0;
 }
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_lookup(h);
     if (o && o->kind == K_THREAD) o->priority = priority;
     return TRUE;   /* real RT priorities need privileges; tracked only */
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_lookup(h);
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
-DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
-{
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
-    pthread_t th = (o && o->kind == K_THREAD) ? o->thread : pthread_self();
-    (void)th;
-    if (!mask)
-        return 0;
-    process_mask_capture();   /* before this thread's mask shrinks */
-#if defined(__linux__)
-    {
-        DWORD_PTR prev = 0;
-        cpu_set_t set;
-        int i;
-        if (pthread_getaffinity_np(th, sizeof set, &set) == 0)
-            for (i = 0; i < (int)(8 * sizeof prev) && i < CPU_SETSIZE; i++)
-                if (CPU_ISSET(i, &set))
-                    prev |= (DWORD_PTR)1 << i;
-        CPU_ZERO(&set);
-        for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
-            if (mask & ((DWORD_PTR)1 << i))
-                CPU_SET(i, &set);
-        if (pthread_setaffinity_np(th, sizeof set, &set) != 0)
-            return 0;
-        return prev ? prev : mask;
-    }
-#else
-    /* No thread affinity on this host: macOS has only affinity tags, a
-     * hint, so the guest threads' one-core pin (RECOMP_GUEST_CPUS) does
-     * nothing here and returns 0 as a failed call would. */
-    return 0;
-#endif
-}
-
-BOOL GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
-                            DWORD_PTR *system_mask)
-{
-    /* The process's mask, captured before any thread shrank its own:
-     * sched_getaffinity(0) would answer for the calling thread. */
-    DWORD_PTR mask = process_mask_capture();
-    (void)process;
-    if (process_mask) *process_mask = mask;
-    if (system_mask)  *system_mask  = mask;
-    return TRUE;
-}
-
 VOID SwitchToThread(void) { sched_yield(); }
+VOID YieldProcessor(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
-    if (!o || o->kind != K_THREAD) return 0;
+    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? current_apc_object() : obj_lookup(thread);
+    if (!o || o->kind != K_THREAD || !func) return 0;
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
     if (o->apc_count < W32_MAX_APC) {
-        o->apc_func[o->apc_count] = func;
-        o->apc_data[o->apc_count] = data;
+        w32_apc *entry = &o->apcs[o->apc_count];
+        memset(entry, 0, sizeof(*entry));
+        entry->kind = W32_APC_USER;
+        entry->user_func = func;
+        entry->user_data = data;
         o->apc_count++;
         ok = 1;
     }
@@ -2655,71 +2569,361 @@ int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 }
 
 /* ===================================================================== */
-/* File mapping (memfd-backed) -- true aliased mirror views              */
+/* File mapping (memfd-backed)                                           */
 /* ===================================================================== */
 
-/* Registry of active views: UnmapViewOfFile takes no length, so we must
- * recover the mapping length here for munmap. */
-typedef struct { void *addr; size_t len; } w32_view;
-static w32_view        s_views[512];
-static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
-
-void view_register(void *addr, size_t len)
+/* Register one complete mapping. Failure is explicit: callers unmap it before
+ * publishing a pointer when all 512 ownership slots are occupied. */
+static int view_register(void *addr, size_t len, DWORD allocation_protect,
+                         DWORD type, DWORD page_state, int private_allocation)
 {
+    size_t page_count = len / vm_page_size();
+    if (!page_count || page_count > SIZE_MAX / sizeof(DWORD)) return 0;
+    DWORD *pages = (DWORD *)malloc(page_count * sizeof(*pages));
+    if (!pages) return 0;
+    DWORD value = page_state;
+    if (page_state == MEM_COMMIT) value |= allocation_protect & 0xFF;
+    for (size_t i = 0; i < page_count; i++) pages[i] = value;
+
+    int registered = 0;
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++)
-        if (!s_views[i].addr) { s_views[i].addr = addr; s_views[i].len = len; break; }
+        if (!s_views[i].addr) {
+            s_views[i].addr = addr;
+            s_views[i].allocation_base = addr;
+            s_views[i].len = len;
+            s_views[i].page_count = page_count;
+            s_views[i].allocation_protect = allocation_protect;
+            s_views[i].type = type;
+            s_views[i].private_allocation = private_allocation;
+            s_views[i].allocation_id = s_next_view_allocation_id++;
+            if (!s_views[i].allocation_id)
+                s_views[i].allocation_id = s_next_view_allocation_id++;
+            s_views[i].pages = pages;
+            registered = 1;
+            break;
+        }
     pthread_mutex_unlock(&s_views_lock);
+    if (!registered) free(pages);
+    return registered;
 }
 
-/* Non-destructive counterpart to view_take, and interior-aware: VirtualQuery
- * is asked about addresses *within* a region at least as often as about its
- * base -- a translated guest VA lands in the middle of the 64 MB window.
- * Picks the containing region and reports where it starts. */
-int view_lookup(const void *addr, void **base_out, size_t *len_out)
+/* Find a page-aligned range wholly inside one tracked mapping. */
+static int view_find_locked(const void *addr, size_t len, int require_private,
+                            int exact_base, int *index_out, size_t *first_out,
+                            size_t *count_out)
 {
+    uintptr_t p = (uintptr_t)addr;
+    size_t page = vm_page_size();
+    if ((p % page) || (len % page) || len > UINTPTR_MAX - p) return 0;
+    for (int i = 0; i < 512; i++) {
+        w32_view *v = &s_views[i];
+        if (!v->addr || (require_private && !v->private_allocation)) continue;
+        uintptr_t lo = (uintptr_t)v->addr, hi = lo + v->len;
+        if ((exact_base && p != lo) || p < lo || p >= hi || p + len > hi)
+            continue;
+        size_t first = (p - lo) / page, count = len / page;
+        if (index_out) *index_out = i;
+        if (first_out) *first_out = first;
+        if (count_out) *count_out = count;
+        return 1;
+    }
+    return 0;
+}
+
+static int view_commit(void *address, size_t size, DWORD protect)
+{
+    int prot = prot_from_page(protect), index;
+    size_t first, count;
+    void *base;
+    if (!vm_normalize_range(address, size, &base, &size)) return 0;
+    if (prot < 0) return 0;
+    pthread_mutex_lock(&s_views_lock);
+    int found = view_find_locked(base, size, 1, 0, &index, &first, &count);
+    if (!found) { pthread_mutex_unlock(&s_views_lock); return 0; }
+    w32_view *v = &s_views[index];
+    if (mprotect(base, size, prot) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) v->pages[first + i] = MEM_COMMIT | (protect & 0xFF);
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+}
+
+static int view_decommit(void *address, size_t size)
+{
+#if defined(__APPLE__)
+    /* Darwin's MADV_DONTNEED does not promise that contents are discarded
+     * before a recommit. Do not report Windows zero-on-recommit semantics. */
+    (void)address; (void)size;
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return 0;
+#else
+    size_t rounded;
+    void *base;
+    int index;
+    size_t first, count;
+    if (!address) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    pthread_mutex_lock(&s_views_lock);
+    if (size == 0) {
+        if (!view_find_locked(address, 0, 1, 1, &index, NULL, NULL)) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
+        base = address;
+        rounded = s_views[index].len;
+    } else if (!vm_normalize_range(address, size, &base, &rounded)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (!view_find_locked(base, rounded, 1, 0, &index, &first, &count)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return 0;
+    }
+    if (mprotect(base, rounded, PROT_NONE) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+#if defined(MADV_DONTNEED)
+    if (madvise(base, rounded, MADV_DONTNEED) != 0) {
+        w32_view *v = &s_views[index];
+        for (size_t i = 0; i < count; i++) {
+            DWORD page = v->pages[first + i];
+            if ((page & MEM_COMMIT) == MEM_COMMIT)
+                mprotect((char *)base + i * vm_page_size(), vm_page_size(),
+                         prot_from_page(page & 0xFF));
+        }
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+#else
+    /* Without a discard primitive, decommit cannot promise zero-on-recommit. */
+    w32_view *v = &s_views[index];
+    for (size_t i = 0; i < count; i++) {
+        DWORD page = v->pages[first + i];
+        if ((page & MEM_COMMIT) == MEM_COMMIT)
+            mprotect((char *)base + i * vm_page_size(), vm_page_size(),
+                     prot_from_page(page & 0xFF));
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return 0;
+#endif
+    for (size_t i = 0; i < count; i++) s_views[index].pages[first + i] = MEM_RESERVE;
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+#endif
+}
+
+static int view_protect(void *address, size_t size, DWORD protect, DWORD *old_protect)
+{
+    int prot = prot_from_page(protect), index;
+    size_t rounded, first, count;
+    void *base;
+    if (!old_protect || prot < 0 || !vm_normalize_range(address, size, &base, &rounded)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    pthread_mutex_lock(&s_views_lock);
+    if (!view_find_locked(base, rounded, 0, 0, &index, &first, &count)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return 0;
+    }
+    w32_view *v = &s_views[index];
+    for (size_t i = 0; i < count; i++) {
+        if ((v->pages[first + i] & MEM_COMMIT) != MEM_COMMIT) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
+    }
+    DWORD previous = v->pages[first] & 0xFF;
+    if (mprotect(base, rounded, prot) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) v->pages[first + i] = MEM_COMMIT | (protect & 0xFF);
+    if (old_protect) *old_protect = previous;
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+}
+
+static int view_release(void *address, SIZE_T size)
+{
+    int index;
+    pthread_mutex_lock(&s_views_lock);
+    if (size != 0 || !view_find_locked(address, 0, 1, 1, &index, NULL, NULL)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    w32_view *v = &s_views[index];
+    for (int i = 0; i < 512; i++) {
+        if (i != index && s_views[i].addr && s_views[i].private_allocation &&
+            s_views[i].allocation_id == v->allocation_id) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+    }
+    if (v->allocation_base != address) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (munmap(v->addr, v->len) != 0) {
+        pthread_mutex_unlock(&s_views_lock);
+        return 0;
+    }
+    free(v->pages);
+    memset(v, 0, sizeof(*v));
+    pthread_mutex_unlock(&s_views_lock);
+    return 1;
+}
+
+/* Read the page record under the registry lock; query pages with matching
+ * state/protection form the Win32 region around the input page. */
+static int view_query(const void *addr, MEMORY_BASIC_INFORMATION *buffer)
+{
+    uintptr_t p = (uintptr_t)addr;
+    size_t page = vm_page_size();
     int found = 0;
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++) {
-        if (!s_views[i].addr)
-            continue;
-        uintptr_t lo = (uintptr_t)s_views[i].addr;
-        uintptr_t hi = lo + s_views[i].len;
-        if ((uintptr_t)addr >= lo && (uintptr_t)addr < hi) {
-            if (base_out) *base_out = s_views[i].addr;
-            if (len_out)  *len_out  = s_views[i].len;
-            found = 1;
+        w32_view *v = &s_views[i];
+        uintptr_t lo = (uintptr_t)v->addr;
+        if (!v->addr || p < lo || p - lo >= v->len) continue;
+        size_t at = (p - lo) / page;
+        DWORD value = v->pages[at];
+        size_t begin = at, end = at + 1;
+        while (end < v->page_count && v->pages[end] == value) end++;
+        buffer->BaseAddress = (char *)v->addr + begin * page;
+        buffer->AllocationBase = v->allocation_base;
+        buffer->AllocationProtect = v->allocation_protect;
+        buffer->RegionSize = (end - begin) * page;
+        buffer->State = value & (MEM_COMMIT | MEM_RESERVE);
+        buffer->Protect = buffer->State == MEM_COMMIT ? (value & 0xFF) : 0;
+        buffer->Type = v->type;
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    if (!found) {
+        buffer->BaseAddress = (PVOID)((uintptr_t)addr & ~(uintptr_t)(page - 1));
+        buffer->State = MEM_FREE;
+        buffer->Protect = PAGE_NOACCESS;
+    }
+    return found;
+}
+
+uint64_t w32_reservation_id(LPVOID base)
+{
+    uint64_t id = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        if (s_views[i].addr == base && s_views[i].private_allocation) {
+            id = s_views[i].allocation_id;
             break;
         }
     }
     pthread_mutex_unlock(&s_views_lock);
-    return found;
+    return id;
 }
 
-/* Start of the lowest registered view above addr, or 0 when there is none.
- * VirtualQuery's answer for memory the shim does not own: the free run it
- * reports ends where the next mapping it knows of begins. */
-static uintptr_t view_next_above(const void *addr)
+BOOL w32_release_reserved_region(LPVOID address, SIZE_T size)
 {
-    uintptr_t next = 0;
+    int index, free_slot = -1;
+    size_t first, count;
+    if (!address || !size || ((uintptr_t)address % vm_page_size()) ||
+        (size % vm_page_size())) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 512; i++) {
-        uintptr_t lo = (uintptr_t)s_views[i].addr;
-        if (lo > (uintptr_t)addr && (!next || lo < next))
-            next = lo;
+    if (!view_find_locked(address, size, 1, 0, &index, &first, &count)) {
+        pthread_mutex_unlock(&s_views_lock);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    }
+    w32_view *v = &s_views[index];
+    for (size_t i = 0; i < count; i++) {
+        if (v->pages[first + i] != MEM_RESERVE) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return FALSE;
+        }
+    }
+    size_t left_count = first;
+    size_t right_count = v->page_count - first - count;
+    DWORD *right_pages = NULL;
+    if (left_count && right_count) {
+        for (int i = 0; i < 512; i++) {
+            if (!s_views[i].addr) { free_slot = i; break; }
+        }
+        if (free_slot < 0 || right_count > SIZE_MAX / sizeof(DWORD) ||
+            !(right_pages = (DWORD *)malloc(right_count * sizeof(DWORD)))) {
+            pthread_mutex_unlock(&s_views_lock);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return FALSE;
+        }
+        memcpy(right_pages, v->pages + first + count,
+               right_count * sizeof(DWORD));
+    }
+    if (munmap(address, size) != 0) {
+        free(right_pages);
+        pthread_mutex_unlock(&s_views_lock);
+        return FALSE;
+    }
+    if (left_count && right_count) {
+        w32_view right = *v;
+        right.addr = (char *)address + size;
+        right.len = right_count * vm_page_size();
+        right.page_count = right_count;
+        right.pages = right_pages;
+        v->len = left_count * vm_page_size();
+        v->page_count = left_count;
+        s_views[free_slot] = right;
+    } else if (left_count) {
+        v->len = left_count * vm_page_size();
+        v->page_count = left_count;
+    } else if (right_count) {
+        memmove(v->pages, v->pages + first + count, right_count * sizeof(DWORD));
+        v->addr = (char *)address + size;
+        v->len = right_count * vm_page_size();
+        v->page_count = right_count;
+    } else {
+        free(v->pages);
+        memset(v, 0, sizeof(*v));
     }
     pthread_mutex_unlock(&s_views_lock);
-    return next;
+    return TRUE;
 }
 
-size_t view_take(const void *addr)
+BOOL w32_release_reservation(uint64_t allocation_id)
 {
-    size_t len = 0;
+    if (!allocation_id) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    int ok = TRUE, found = FALSE;
     pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 512; i++)
-        if (s_views[i].addr == addr) { len = s_views[i].len; s_views[i].addr = NULL; break; }
+    for (int i = 0; i < 512; i++) {
+        w32_view *v = &s_views[i];
+        if (!v->addr || !v->private_allocation || v->allocation_id != allocation_id)
+            continue;
+        found = TRUE;
+        if (munmap(v->addr, v->len) != 0) {
+            ok = FALSE;
+            continue;
+        }
+        free(v->pages);
+        memset(v, 0, sizeof(*v));
+    }
     pthread_mutex_unlock(&s_views_lock);
-    return len;
+    if (!ok || !found) return FALSE;
+    return TRUE;
 }
 
 /* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
@@ -2728,12 +2932,10 @@ static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
     static volatile LONG map_counter = 0;
-    /* The pid keeps two instances apart: with a bare counter, both open
-     * "/xbox_map_1" and the second O_EXCL loses. macOS caps the name at 31. */
     char shm_name[32];
     LONG seq = InterlockedIncrement(&map_counter);
     const char *base = name ? name : "xbox_map";
-    snprintf(shm_name, sizeof(shm_name), "/%.12s_%d_%ld", base, (int)getpid(), (long)seq);
+    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
@@ -2789,19 +2991,47 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
-    w32_object *o = (w32_object *)mapping;
+    w32_object *o = obj_lookup(mapping);
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
-    off_t  off = ((off_t)offHigh << 32) | offLow;
-    SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
-    int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED;
-    int placeholder = 0;
+    uint64_t off_value = ((uint64_t)offHigh << 32) | offLow;
+    if (off_value > (uint64_t)INT64_MAX) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    off_t off = (off_t)off_value;
+    if ((off_value % (64 * 1024)) != 0 ||
+        (baseAddr && ((uintptr_t)baseAddr % (64 * 1024)) != 0)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    if (off < 0 || (SIZE_T)off >= o->map_size || (count && count > o->map_size - (SIZE_T)off)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    SIZE_T requested = count ? count : (o->map_size - (SIZE_T)off);
+    size_t len;
+    if (!vm_round_size(requested, &len)) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    int map_copy = access == FILE_MAP_COPY;
+    if (access != FILE_MAP_READ && access != FILE_MAP_WRITE &&
+        access != FILE_MAP_COPY && access != FILE_MAP_ALL_ACCESS) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    if ((o->map_protect == PAGE_READONLY && access != FILE_MAP_READ) ||
+        (o->map_protect == PAGE_WRITECOPY && access != FILE_MAP_READ && !map_copy)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    int prot   = PROT_READ | ((access == FILE_MAP_READ) ? 0 : PROT_WRITE);
+    DWORD page_protect = access == FILE_MAP_READ ? PAGE_READONLY
+                       : map_copy ? PAGE_WRITECOPY : PAGE_READWRITE;
+    int flags  = map_copy ? MAP_PRIVATE : MAP_SHARED;
 
     /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
      * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
-     * and succeeds. The Xbox memory model asks for 28 mirror views at computed
-     * addresses, so with a base the OS chose rather than one we picked, that
+     * and succeeds. The Xbox memory model maps its RAM view at an address it
+     * reserved, so with a base the OS chose rather than one we picked, that
      * difference is the process quietly destroying its own libraries and heap
      * and dying somewhere unrelated a moment later. */
     if (baseAddr) {
@@ -2815,7 +3045,6 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
             SetLastError(ERROR_INVALID_ADDRESS);
             return NULL;
         }
-        placeholder = 1;
         flags |= MAP_FIXED;
 #else
         flags |= MAP_FIXED;
@@ -2823,14 +3052,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     }
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
-    if (p == MAP_FAILED) {
-        /* A failed MAP_FIXED leaves the placeholder where it was. Nothing has
-         * registered it, so UnmapViewOfFile could never free it, and every
-         * later attempt at this address would be refused as occupied. */
-        if (placeholder) munmap(baseAddr, len);
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return NULL;
-    }
+    if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     if (baseAddr && p != baseAddr) {
         /* MAP_FIXED_NOREPLACE hands back a different address instead of
          * failing on some kernels; treat that as the refusal it means. */
@@ -2900,41 +3122,44 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
     if (!buffer || length < sizeof(*buffer)) return 0;
     memset(buffer, 0, sizeof(*buffer));
 
-    void  *base = NULL;
-    size_t len  = 0;
-
-    if (!view_lookup(address, &base, &len)) {
-        /* Not ours. Report it free rather than inventing a committed page,
-         * up to the next mapping the shim knows of (or the end of the address
-         * space). Win32 callers walk free memory region by region; a size of
-         * 0 never moved them on (guest_vmem's free-run scan spun forever).
-         * Mappings made outside the shim are invisible here, so a caller that
-         * then reserves at a fixed address can still be refused. */
-        uintptr_t next = view_next_above(address);
-        uintptr_t a    = (uintptr_t)address;
-        buffer->BaseAddress    = (PVOID)address;
+    if (!view_query(address, buffer)) {
+        /* Not ours. Report it free rather than inventing a committed page. */
         buffer->AllocationBase = NULL;
-        /* At address 0 the span to the top is UINTPTR_MAX + 1, which wraps
-         * to 0; report UINTPTR_MAX so the walk still moves on. */
-        buffer->RegionSize     = next ? next - a
-                               : a    ? UINTPTR_MAX - a + 1
-                                      : UINTPTR_MAX;
-        buffer->State          = MEM_FREE;
-        buffer->Protect        = PAGE_NOACCESS;
+        buffer->RegionSize     = 0;
         buffer->Type           = 0;
         return sizeof(*buffer);
     }
-
-    buffer->BaseAddress      = (PVOID)address;
-    buffer->AllocationBase   = base;
-    buffer->AllocationProtect = PAGE_READWRITE;
-    /* From the queried address to the end of the region, which is what Win32
-     * reports and what callers sizing a copy out of it depend on. */
-    buffer->RegionSize       = len - (size_t)((uintptr_t)address - (uintptr_t)base);
-    buffer->State            = MEM_COMMIT;
-    buffer->Protect          = PAGE_READWRITE;
-    buffer->Type             = MEM_PRIVATE;
     return sizeof(*buffer);
+}
+
+/* Win32 GetComputerNameA. The host name stands in for the NetBIOS name; the
+ * only caller hashes it into a console MAC seed, so it is not cut to 15 chars,
+ * which would merge distinct hosts. Same contract as Win32: *size is the length
+ * without the NUL, and a short buffer fails with ERROR_BUFFER_OVERFLOW and
+ * *size set to what is needed. */
+BOOL GetComputerNameA(LPSTR buffer, LPDWORD size)
+{
+    char name[256];
+    size_t len;
+
+    if (!buffer || !size) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (gethostname(name, sizeof name) != 0) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return FALSE;
+    }
+    name[sizeof name - 1] = '\0';
+    len = strlen(name);
+    if (len + 1 > *size) {
+        *size = (DWORD)(len + 1);
+        SetLastError(ERROR_BUFFER_OVERFLOW);
+        return FALSE;
+    }
+    memcpy(buffer, name, len + 1);
+    *size = (DWORD)len;
+    return TRUE;
 }
 
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)

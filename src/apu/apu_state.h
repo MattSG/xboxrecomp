@@ -270,15 +270,13 @@ typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
     SRC_STATE *resampler;
-    /* Linear-interpolation resampler state (voice_resample): the two source
-     * samples the output sits between, the output's position in [0,1)
-     * between them, and whether they have been fetched yet. */
-    float rs_last[2], rs_next[2], rs_pos;
-    int   rs_have;
+    double resample_phase;
+    float resample_pair[2][2];
+    unsigned int resample_valid;
+    unsigned int resample_read;
+    unsigned int resample_count;
     sv_filter svf[2];
     HrtfFilter hrtf;
-    float gain_prev[8];     /* each bin's gain at the end of the last frame */
-    bool gain_valid;
 } MCPXAPUVoiceFilter;
 
 typedef struct VoiceWorkItem {
@@ -317,9 +315,12 @@ typedef struct MCPXAPUVPState {
     uint8_t hrtf_headroom;
     uint8_t hrtf_submix[4];
     uint8_t submix_headroom[NUM_MIXBINS];
+    /* Rebuilt only if the audio thread's floating-point rounding changes. */
+    float attenuation[0x1000];
+    int attenuation_rounding;
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
-    volatile uint8_t voice_locked[MCPX_HW_MAX_VOICES];
-    volatile LONG voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
+    uint64_t voice_locked[4];
+    volatile long voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
 
     struct {
         int current_entry;
@@ -380,19 +381,21 @@ struct MCPXAPUState {
 
     uint32_t regs[0x20000];
 
-    /* The sequencer's sample counter (what XGSCNT reads back). Resets when
-     * the title writes XGSCNT; advances 48 kHz while the sequencer runs. */
-    uint64_t sample_count;
+    /* GP/EP frames are queued in output groups of up to eight. dsp_lock guards
+     * the cores, registers and published PCM. Acquire lock before dsp_lock
+     * when both are needed. The separate queue lock is not held during a frame. */
+    QemuThread dsp_thread;
+    QemuMutex dsp_lock, dsp_queue_lock;
+    QemuCond dsp_job_cond, dsp_done_cond;
+    int dsp_job_head, dsp_job_count;      /* oldest queued frame; frames queued or running */
+    int dsp_job_div[8];
+    float dsp_job_mixbins[8][NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
 
     int ep_frame_div;
     int sleep_acc_us;
     int frame_count;
     int64_t frame_count_time_ms;
     int64_t next_frame_time_us;
-    int pace_q_seen;            /* device queue at the last pacing decision */
-    int64_t pace_drain_us;      /* when that queue last fell or sat below high */
-    bool pace_stalled;          /* device stopped consuming: host-clock pacing,
-                                 * periods dropped (mcpx_apu_pace_step) */
 
     struct {
         struct {
@@ -433,59 +436,18 @@ void mcpx_apu_vp_init(MCPXAPUState *d);
 void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
+void mcpx_apu_fe_resume(MCPXAPUState *d);
 
-/* DSP functions (stubbed) */
+/* DSP functions */
 void mcpx_apu_dsp_init(MCPXAPUState *d);
-void mcpx_apu_dsp_finalize(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
-void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
-void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
-void mcpx_apu_dsp_gprst_write(uint32_t val);
-
-/* Monitor (host output): call after each 32-sample frame; on the last frame
- * of an EP period it adds the software mixer and test tone to frame_buf and
- * hands those 256 samples to the device. */
-void mcpx_apu_monitor_frame(MCPXAPUState *d);
-
-/* Frame-thread pacing at an EP-period boundary: 0 = render the next period
- * now, else microseconds to wait before asking again. See apu_core.c. */
-int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
-/* The period pace_step admitted was rendered: spend its credit. A pass that
- * renders nothing (front end trapped) spends none. */
-void mcpx_apu_pace_rendered(MCPXAPUState *d);
-
-/* Host starvation accounting (RECOMP_AUDIO_HOST; see apu_core.c). The
- * deficit is the wall clock since the baseline, in samples, less what the
- * device consumed; ref is the part of it already accounted for, as
- * reported loss or as jitter and clock drift. Only a device that ran dry
- * (its queue seen empty: an underrun) can have inserted silence, so a rise
- * with no dry spell behind it is the device's clock, never loss. */
-typedef struct {
-    int64_t  t0_us;             /* baseline wall time */
-    uint64_t played0;           /* device samples consumed at the baseline */
-    int64_t  deficit;           /* at the last step, samples */
-    double   ref;               /* deficit accounted for, samples */
-    int64_t  ref_us;            /* last step */
-    int      dry;               /* ran dry since the last report */
-} ApuStarve;
-void apu_starve_rebase(ApuStarve *s, int64_t now_us, uint64_t played);
-/* One submit: the samples of silence the device inserted since the last
- * report, once they exceed `jitter` (one device buffer), else 0. `dry`: the
- * device ran dry since the previous step. */
-int64_t apu_starve_step(ApuStarve *s, int64_t now_us, uint64_t played,
-                        int jitter, int dry);
+void mcpx_apu_dsp_pcm_consumed(MCPXAPUState *d);
+void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int div);
+uint64_t mcpx_apu_dsp_read(MCPXAPUState *d, bool gp, uint32_t addr, unsigned size);
+void mcpx_apu_dsp_write(MCPXAPUState *d, bool gp, uint32_t addr, uint64_t value, unsigned size);
 
 /* Debug globals */
 extern MCPXAPUState *g_state;
 extern struct McpxApuDebug g_dbg, g_dbg_cache;
 extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];
-
-/* RECOMP_APU_TRACE: idle-voice traps against the frames that ran. Traps are
- * counted under the APU lock, the rest by the frame thread. */
-typedef struct {
-    unsigned traps;             /* front-end traps latched (fe_method) */
-    unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
-    unsigned fe_trapped_frames; /* frames that found FECTL trapped */
-} ApuIrqStats;
-extern ApuIrqStats apu_irq_stats;

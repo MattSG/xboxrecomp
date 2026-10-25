@@ -70,7 +70,6 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 extern RECOMP_TLS double g_fp_stack[8];
 extern RECOMP_TLS int g_fp_top;
 extern RECOMP_TLS uint16_t g_fp_control_word;
-extern RECOMP_TLS uint32_t g_mxcsr;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
@@ -204,48 +203,10 @@ static void print_guest_context(void *rip)
     }
 }
 
-/* The emulated APU.
- *
- * Two entry points that had no callers anywhere in the tree. apu_mmio_hook.c
- * documents apu_hook_handle_mmio as "called from VEH in main.c" and no main.c
- * called it; apu_decode_and_handle's first line is `if (!g_apu_state) return
- * false` and nothing assigned g_apu_state. So with RECOMP_AC97_READY set the
- * APU's registers were unmapped to be trapped, and every trap was then
- * declined and surfaced as an access violation on the first register
- * DirectSound touched. The VEH below now reaches apu_hook_handle_mmio
- * through the toolkit's xbox_VehMmioFault.
- *
- * Declared rather than included so this does not depend on src/apu being on
- * the include path. */
-typedef struct MCPXAPUState MCPXAPUState;
-extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
-extern MCPXAPUState *g_apu_state;
-
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
         uintptr_t fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
-
-        /*
-         * GPU register probe at 0xFD000000 range.
-         * Some games probe NV2A registers directly. On real hardware this
-         * returns GPU state; here we just skip the instruction.
-         * TODO: Implement mini x86-64 decoder for instruction skipping,
-         * or connect to the xbox_nv2a library for proper handling.
-         */
-        if (fault_addr >= 0xFD000000 && fault_addr < 0xFE000000) {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-
-        /* Trapped hardware registers (APU, USB OHCI) -> their models.
-         *
-         * The other half of RECOMP_AC97_READY: reporting the codec ready is
-         * what lets DirectSoundCreate past its first gate, and from there it
-         * drives the APU directly, so the registers have to fault to be seen.
-         * "Handled" means the access was decoded and the instruction stepped
-         * over, so execution resumes instead of unwinding. */
-        if (xbox_VehMmioFault(ep))
-            return EXCEPTION_CONTINUE_EXECUTION;
 
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)ep->ContextRecord->Rip,

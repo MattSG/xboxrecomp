@@ -40,8 +40,7 @@ SITE = 0x00010040
 
 
 def _cc():
-    from tools.recomp.c_fixture import compiler
-    return compiler()
+    return shutil.which("clang") or shutil.which("gcc") or shutil.which("cc") or shutil.which("cl")
 
 
 def _macro(name):
@@ -129,12 +128,16 @@ int main(void) {
 """
 
 
-def _run(tmp, srcs, *, defines=(), include_dirs=()):
-    from tools.recomp.c_fixture import command
+def _run(tmp, srcs, extra=()):
     exe = os.path.join(tmp, "t.exe")
-    r = subprocess.run(command(_cc(), srcs, exe, defines=defines, include_dirs=include_dirs),
-                       cwd=tmp, capture_output=True, text=True)
-    assert r.returncode == 0, (r.stdout + r.stderr)[-3000:]
+    cc = _cc()
+    if os.path.basename(cc).lower() in ("cl", "cl.exe"):
+        command = [cc, "/nologo", "/w", "/std:c11", *extra, *srcs,
+                   "/Fe:" + exe, "/Fo:" + tmp + os.sep]
+    else:
+        command = [cc, "-w", *extra, *srcs, "-o", exe]
+    r = subprocess.run(command, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
     r = subprocess.run([exe], capture_output=True, text=True, cwd=tmp)
     return r
 
@@ -179,7 +182,7 @@ def test_runtime_site_dump_round_trips_through_the_merge_parser():
         with open(p, "w") as f:
             f.write(RECORDER)
         r = _run(tmp, [p, FEEDBACK_C],
-                 defines=['RECOMP_ICALL_FEEDBACK'], include_dirs=[FEEDBACK_H_DIR])
+                 ["-DRECOMP_ICALL_FEEDBACK", "-I", FEEDBACK_H_DIR])
         assert r.returncode == 0, r.stdout + r.stderr
         sites = parse_sites_dump(os.path.join(tmp, "icall_sites.dump"))
         assert sites[0x00010040] == ({0x00011000}, False)

@@ -2,17 +2,17 @@
 # Extracted from xemu (https://github.com/xemu-project/xemu)
 #
 # Voice Processor (VP): ADPCM/PCM decode, sample mixing, envelopes, filters
-# Global Processor (GP): Stub - effects bypass
-# Encode Processor (EP): Stub - direct mixbin passthrough
+# Global/Encode Processors: DSP56300 interpreter + DMA
 
 add_library(xbox_apu STATIC
     apu_core.c
     apu_vp.c
     apu_dsp.c
+    dsp/dsp.c
+    dsp/dsp_dma.c
+    dsp/interp/dsp_cpu.c
     apu_mmio_hook.c
     apu_xaudio2.c
-    apu_sdl2.c
-    apu_wav.c
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -67,8 +67,7 @@ if(WIN32)
     # XAudio2Create rather than at build time here.
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
-    # POSIX (macOS, Linux): platform layer (Win32 primitives on POSIX),
-    # SDL2 for the audio device (apu_sdl2.c) and libm
-    find_package(SDL2 REQUIRED)
-    target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
+    # Elsewhere: platform layer (Win32 primitives on POSIX) + SDL3 audio + libm
+    include(Sdl3)
+    target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
 endif()

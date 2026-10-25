@@ -473,8 +473,21 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
     nv2a_reg_log_write(NV_PVIDEO, addr, size, val);
-    /* STOP is a command, not storage. The title's D3D waits for the pending
-     * banks in BUFFER to clear after issuing it; xemu clears them at once. */
+    /* Trace command boundaries without printing every video frame. */
+    {
+        static int trace = -1;
+        if (trace < 0) trace = getenv("RECOMP_PVIDEO_TRACE") != NULL;
+        if (trace && (addr == NV_PVIDEO_STOP ||
+                      addr == NV_PVIDEO_BASE || addr == NV_PVIDEO_BASE + 4 ||
+                      addr == NV_PVIDEO_OFFSET || addr == NV_PVIDEO_OFFSET + 4 ||
+                      addr == NV_PVIDEO_SIZE_IN || addr == NV_PVIDEO_SIZE_IN + 4)) {
+            fprintf(stderr, "[PVIDEO_COMMAND] reg=%03llX value=%08llX pending=%08X\n",
+                    (unsigned long long)addr, (unsigned long long)val,
+                    d->pvideo.regs[NV_PVIDEO_BUFFER]);
+        }
+    }
+    /* STOP is a command, not storage. The engine waits for BUFFER[0] to
+     * clear after issuing it; xemu clears both pending banks synchronously. */
     if (addr == NV_PVIDEO_STOP) {
         if (val & 1)
             d->pvideo.regs[NV_PVIDEO_BUFFER] = 0;

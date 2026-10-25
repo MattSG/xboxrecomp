@@ -21,13 +21,13 @@
 /*
  * Initialize the NV2A GPU subsystem.
  * Call this during startup before the game code runs.
- * Allocates VRAM, RAMIN, and initializes register state, and makes the
- * PVIDEO register page fault so its accesses reach nv2a_hook_handle_mmio.
+ * Allocates VRAM/RAMIN once if no state exists. Failed initialization releases
+ * new backing. Existing caller-owned state is reused. Startup must be quiesced;
+ * the process-wide device has no teardown API. The offset is legacy/unused.
  */
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset);
 
-/* For the host scanout thread: copy the modeled PVIDEO registers (false
- * when there is no NV2A model), and mark a bank's frame as taken. */
+/* Copy modeled PVIDEO registers for the host scanout thread. */
 bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
 void nv2a_hook_pvideo_consume(unsigned bank);
 

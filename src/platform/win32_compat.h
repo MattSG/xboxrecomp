@@ -91,8 +91,6 @@ LONG InterlockedIncrement(volatile LONG *Addend);
 LONG InterlockedDecrement(volatile LONG *Addend);
 LONG InterlockedExchange(volatile LONG *Target, LONG Value);
 LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
-LONG InterlockedAnd(volatile LONG *Destination, LONG Value);
-LONG InterlockedOr(volatile LONG *Destination, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
@@ -131,8 +129,12 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 HANDLE      w32_open_handle(int fd, const char *host_path);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
-/* After a rename: later path-based operations on h follow the file. */
-void        w32_handle_set_path(HANDLE h, const char *host_path);
+/* Same, but enforcing Win32 share modes against every other open of the file.
+ * access and share are Win32 masks. On conflict: INVALID_HANDLE_VALUE with
+ * ERROR_SHARING_VIOLATION, and the caller still owns fd. truncate_to_zero
+ * truncates only after the share check passes. */
+HANDLE      w32_open_handle_shared(int fd, const char *host_path, DWORD access,
+                                   DWORD share, int truncate_to_zero);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
@@ -173,15 +175,8 @@ HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
-/* Linux: pthread_setaffinity_np on the thread; a new thread gets the
- * process's mask, as on Win32, not its creator's. macOS has no thread
- * affinity: the call does nothing and returns 0 (failure), as Win32 does
- * for an invalid mask. GetProcessAffinityMask is the mask the process
- * started with (macOS: every online core). */
-DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);
-BOOL   GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
-                              DWORD_PTR *system_mask);
 VOID   SwitchToThread(void);
+VOID   YieldProcessor(void);   /* spin-wait hint; sched_yield on POSIX */
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 
 /* ---- Sleep ------------------------------------------------------------ */
