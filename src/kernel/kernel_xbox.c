@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 #include <errno.h>
 #if defined(_WIN32)
 #include <io.h>
@@ -159,11 +160,29 @@ static void settings_checksum(unsigned char *data)
     memcpy(data, &checksum, 4);
 }
 
+/* The host's timezone bias in minutes (UTC minus local): the console clock
+ * starts on the host's zone. */
+static LONG host_timezone_bias(void)
+{
+#ifdef _WIN32
+    TIME_ZONE_INFORMATION tzi;
+    memset(&tzi, 0, sizeof tzi);
+    GetTimeZoneInformation(&tzi);
+    return tzi.Bias;
+#else
+    time_t now = time(NULL);
+    struct tm lt;
+    tzset();
+    localtime_r(&now, &lt);
+    return (LONG)(-lt.tm_gmtoff / 60);
+#endif
+}
+
 static void settings_defaults(unsigned char *data)
 {
     ULONG word;
     memset(data, 0, SETTINGS_SIZE);
-    word = (ULONG)-300; memcpy(data + 4, &word, 4);
+    word = (ULONG)host_timezone_bias(); memcpy(data + 4, &word, 4);
     word = 1; memcpy(data + 48, &word, 4); /* English */
     word = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
     memcpy(data + 52, &word, 4);
