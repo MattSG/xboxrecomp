@@ -177,6 +177,8 @@ int main(int argc, char **argv)
         printf("cannot read %s -- run: python tools/conformance/mkxbe.py\n", path);
         return 2;
     }
+    /* The fork selects kernel data storage explicitly, before the layout (upstream has a fixed region). */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 11;
     if (!xbox_MemoryLayoutInit(xbe, xbe_len)) {
         puts("xbox_MemoryLayoutInit failed");
         return 2;
