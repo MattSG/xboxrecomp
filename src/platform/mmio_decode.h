@@ -14,9 +14,7 @@
  *
  * The instructions covered are what the XDK device code actually emits against
  * registers -- moves both ways, the immediate forms, the zero-extending loads,
- * and the ALU, read-modify-write and flag-setting forms a poll loop is built
- * from (DirectSound polls with `test dword [mem], imm32`, and a C compiler
- * folds `x += REG` into an ALU op with a memory operand).
+ * and the read-modify-write and flag-setting forms a poll loop is built from.
  * Anything outside that set returns 0 rather than guessing: stepping over an
  * instruction that was not understood corrupts the guest silently, which is
  * far worse than a fault naming the opcode.
@@ -115,8 +113,7 @@ static inline int mmio_emulate_bytes(PCONTEXT ctx, uint32_t off, void *dev,
 {
     int prefix = 0, has66 = 0, rex = 0, has_rex = 0;
     const uint8_t *op;
-    int size, rex_w, rex_r, rex_b, mlen, reg, ilen, alu;
-    uint64_t m, v, imm;
+    int size, rex_w, rex_r, rex_b, mlen, reg;
 
     if (!ctx || !ip || !rd || !wr) return 0;
     if (length > 15) length = 15;
@@ -200,8 +197,10 @@ static inline int mmio_emulate_bytes(PCONTEXT ctx, uint32_t off, void *dev,
         mmio_write_reg(ctx, reg, size, has_rex, v);
         ctx->Rip += prefix + 1 + mlen;
         return 1;
+    }
 
-    case 0x84: case 0x85:                            /* TEST r/m, r          */
+    case 0x84: case 0x85: {                          /* TEST r/m, r          */
+        uint64_t m, r;
         if (op[0] == 0x84) size = 1;
         mlen = mmio_modrm_len(op + 1, rex_b);
         reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
@@ -247,7 +246,7 @@ static inline int mmio_emulate_bytes(PCONTEXT ctx, uint32_t off, void *dev,
     }
 
     case 0x0F:
-        if (op[1] == 0xB6 || op[1] == 0xB7) {        /* MOVZX r, r/m8|16     */
+        if (op[1] == 0xB6 || op[1] == 0xB7) {        /* MOVZX r32, r/m8|16   */
             int s = (op[1] == 0xB6) ? 1 : 2;
             mlen  = mmio_modrm_len(op + 2, rex_b);
             reg   = ((op[2] >> 3) & 7) | (rex_r ? 8 : 0);

@@ -3911,7 +3911,36 @@ static int present_kept(void)
     return 1;
 }
 
-static void present_surface(Surface *s)
+/* One wait per guest flip; tick/movie presentation passes no pacing state. */
+typedef struct FlipPacing {
+    int done;
+    int64_t ticks;
+} FlipPacing;
+
+static void pace_vblank(void);
+
+static int pace_after_present(void)
+{
+    static int after = -1;
+    if (after < 0) {
+        const char *e = getenv("RECOMP_PACE_AFTER_PRESENT");
+        after = e && atoi(e) != 0;
+    }
+    return after;
+}
+
+static void pace_flip(FlipPacing *pacing)
+{
+    int64_t begin;
+    if (!pacing || pacing->done) return;
+    pacing->done = 1;
+    begin = qpc();
+    pace_vblank();
+    pacing->ticks = qpc() - begin;
+    if (s_prof_on > 0) s_prof[PROF_PACE] += pacing->ticks;
+}
+
+static void present_surface(Surface *s, FlipPacing *pacing)
 {
     PresentConsts pc;
     s_last_present = GetTickCount();
@@ -3951,7 +3980,9 @@ static void present_surface(Surface *s)
                 return; /* The guest flip still receives its fallback wait. */
             }
             composite(rtv, s_swap_w, s_swap_h, s, &pc, 1);
+            keep_image(bb);                 /* game image only */
             xbox_FramebufferRenderHostOverlay(s_dev, s_ctx, rtv);
+            unbind_targets();
             if (!getenv("RECOMP_CAPTURE_SURFACE"))
                 capture_backbuffer(bb);
             if (vsync < 0) vsync = getenv("RECOMP_VSYNC") ? atoi(getenv("RECOMP_VSYNC")) : 0;
@@ -4127,16 +4158,18 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
         writeback_surfaces();
         t1 = s_prof_on > 0 ? qpc() : 0;
         if (show)
-            present_surface(s);
+            present_surface(s, &pacing);
         if (s_prof_on > 0) {
             s_prof[PROF_WRITEBACK] += t1 - t0;
             s_prof[PROF_PRESENT] += qpc() - t1 - pacing.ticks;
         }
     }
     if (show) {
-        int64_t t0 = qpc();
-        pace_vblank();
-        frame_csv(qpc() - t0);
+        /* Legacy A/B mode, or a missing surface/swap-chain/GetBuffer path,
+         * still completes exactly one paced guest flip. A failed Present has
+         * already waited before the attempt and must not wait a second time. */
+        pace_flip(&pacing);
+        frame_csv(pacing.ticks);
     }
     RECOMP_PROFILE_FRAME();
     prof_report();
@@ -4151,8 +4184,8 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
 }
 
 /* The last flipped frame shown again, paced like a flip: for a title that
- * has nothing new to draw this frame (a console-rate title mod between world
- * updates). Asked from the title's thread, done on this one, which owns the
+ * has nothing new to draw between world updates. Asked from the title's
+ * thread, done on this one, which owns the
  * device; the asker waits for it as it would for a flip. */
 static volatile LONG s_repeat;
 
@@ -4206,14 +4239,14 @@ void nv2a_d3d_tick(void)
         s_interp_seen = done;
         { static int rp; if (++rp % 600 == 0) fprintf(stderr, "[INTERP] replays %d t %.2f\n", rp, s_interp_t); }   /* DIAG */
         if (!nv2a_pb_replay(s_interp_t) && !present_kept())   /* nothing recorded yet */
-            present_surface(s_shown);
+            present_surface(s_shown, NULL);
         InterlockedExchange(&s_interp_req, 0);
         return;
     }
     if (s_repeat) {
         int64_t t0;
         if (!present_kept())
-            present_surface(s_shown);
+            present_surface(s_shown, NULL);
         t0 = qpc();
         pace_vblank();
         frame_csv(qpc() - t0);
