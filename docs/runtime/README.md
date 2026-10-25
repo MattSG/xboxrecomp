@@ -1,12 +1,12 @@
 # Runtime Implementation Guide
 
-The recompiled C code needs a host environment to run. This directory documents the runtime subsystems supplied by XboxRecomp and the boundaries a game port configures.
+The recompiled C code needs a host environment to run. This directory documents the four major runtime subsystems you need to build for each game.
 
 ## The Four Pillars
 
 ### 1. Memory Layout (`xbox_memory.c`)
 
-Use `xbox_MemoryLayoutInit` from `xbox_kernel`. It parses the supplied XBE and maps its sections; do not copy another title's addresses or write a second allocator.
+Reproduce the Xbox's 64 MB address space at the correct virtual addresses. This is the most critical piece — get it wrong and nothing else works.
 
 See: [../technical/memory-layout.md](../technical/memory-layout.md)
 
@@ -14,7 +14,7 @@ Template: [../../templates/runtime/xbox_memory.h](../../templates/runtime/xbox_m
 
 ### 2. Kernel Shim (`xbox_kernel.c`)
 
-Link `xbox_kernel` and initialize imports from the loaded XBE. Unsupported operations must remain observable; do not replace them with unconditional success. The legacy template include forwards to the real runtime header.
+Replace the 147 Xbox kernel imports with Win32 equivalents. Most can be stubbed (return STATUS_SUCCESS). The critical ones are memory allocation and file I/O.
 
 See: [../technical/kernel-replacement.md](../technical/kernel-replacement.md)
 
