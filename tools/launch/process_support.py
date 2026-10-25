@@ -23,14 +23,18 @@ def windows_image_name(process_name):
     return name if name.endswith(".exe") else name + ".exe"
 
 
-def running_pids(process_name):
-    """Sorted pids of processes whose executable is process_name."""
+def running_pids(process_name, quiet=False):
+    """Sorted pids of processes whose executable is process_name.
+
+    quiet is for GUI callers: on Windows, tasklist runs without a console window
+    and with a 10 second limit."""
     if IS_WINDOWS:
         # Localized "INFO:" text can be in a code page the locale decoder rejects.
         # Windows image names carry the extension, so accept the bare name too.
         wanted = windows_image_name(process_name)
+        extra = {"creationflags": 0x08000000, "timeout": 10} if quiet else {}
         result = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
-                                errors="replace")
+                                errors="replace", **extra)
         rows = csv.reader(result.stdout.splitlines())
         pids = [row[1] for row in rows if len(row) > 1 and row[0].lower() == wanted]
     else:
