@@ -7,10 +7,13 @@
 #include <windows.h>
 #include <xaudio2.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 
-static HRESULT com_result, create_result, master_result, source_result;
+/* fb_present.c is not linked: never paused. */
+int xbox_FramebufferPaused(void) { return 0; }
+
+static HRESULT com_result, create_result, callback_result, master_result, source_result;
 static HRESULT start_result, submit_result;
 static int com_refs, releases, master_destroys, source_destroys, failures;
 static IXAudio2 engine;
@@ -18,10 +21,9 @@ static IXAudio2MasteringVoice master;
 static IXAudio2SourceVoice source;
 static IXAudio2MasteringVoiceVtbl master_vtable;
 static IXAudio2SourceVoiceVtbl source_vtable;
-static const BYTE *queued[8];
-static BYTE snapshots[8][4096 * 4];
-static UINT32 queued_bytes[8], queue_count;
-static UINT32 max_queue = 3;   /* the buffer count the backend was given */
+static const BYTE *queued[64];
+static BYTE snapshots[64][4096];
+static UINT32 queued_bytes[64], queue_count;
 
 #define CHECK(test) do { if (!(test)) { \
     fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #test); failures++; \
@@ -80,8 +82,8 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
 {
     check_queued();
     if (FAILED(submit_result)) return submit_result;
-    CHECK(queue_count < max_queue);
-    if (queue_count >= max_queue) return E_FAIL;
+    CHECK(queue_count < 64);
+    if (queue_count == 64) return E_FAIL;
     queued[queue_count] = buffer->pAudioData;
     queued_bytes[queue_count] = buffer->AudioBytes;
     memcpy(snapshots[queue_count], buffer->pAudioData, buffer->AudioBytes);
@@ -93,6 +95,8 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
 #define CoInitializeEx(...) fake_com_init()
 #define CoUninitialize() ((void)--com_refs)
 #define XAudio2Create(out, ...) fake_create(out)
+#undef IXAudio2_RegisterForCallbacks
+#define IXAudio2_RegisterForCallbacks(...) callback_result
 #undef IXAudio2_CreateMasteringVoice
 #define IXAudio2_CreateMasteringVoice(engine, out, ...) fake_master(out)
 #undef IXAudio2_CreateSourceVoice
@@ -129,14 +133,14 @@ static void reset(void)
     g_xa2_dry = 0;
     com_refs = releases = master_destroys = source_destroys = 0;
     queue_count = 0;
-    com_result = create_result = master_result = source_result = S_OK;
+    com_result = create_result = callback_result = master_result = source_result = S_OK;
     start_result = submit_result = S_OK;
 }
 
 static void check_init_failures(HRESULT com_hr)
 {
-    HRESULT *stages[] = { &create_result, &master_result, &source_result, &start_result };
-    for (int stage = 0; stage < 4; stage++) {
+    HRESULT *stages[] = { &create_result, &callback_result, &master_result, &source_result, &start_result };
+    for (int stage = 0; stage < 5; stage++) {
         reset();
         com_result = com_hr;
         *stages[stage] = E_FAIL;
@@ -144,8 +148,8 @@ static void check_init_failures(HRESULT com_hr)
         CHECK(!xa2_is_active());
         CHECK(com_refs == 0);
         CHECK(releases == (stage >= 1));
-        CHECK(master_destroys == (stage >= 2));
-        CHECK(source_destroys == (stage >= 3));
+        CHECK(master_destroys == (stage >= 3));
+        CHECK(source_destroys == (stage >= 4));
         CHECK(!g_xa2 && !g_xa2_master && !g_xa2_source);
         xa2_shutdown();
         CHECK(releases == (stage >= 1));
@@ -173,30 +177,63 @@ int main(void)
     CHECK(xa2_init() == 1 && xa2_is_active());
     CHECK(xa2_init() == 1 && com_refs == 1);
     int16_t samples[1024][2];
+    /* Reject invalid submissions without copying, truncating or advancing. */
+    CHECK(xa2_submit_samples(NULL, 256) == -1);
+    CHECK(xa2_submit_samples(&samples[0][0], -1) == -1);
+    CHECK(xa2_submit_samples(&samples[0][0], INT_MIN) == -1);
+    CHECK(xa2_submit_samples(&samples[0][0], INT_MAX) == -1);
+    CHECK(xa2_submit_samples(&samples[0][0], 0) == -1);
+    CHECK(xa2_submit_samples(&samples[0][0], 1025) == -1);
+    CHECK(queue_count == 0 && g_xa2_next_buf == 0 && g_xa2_frames_written == 0);
     memset(samples, 1, sizeof(samples));
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+    /* An empty queue gets XA2_CUSHION silent buffers in front of the first real one. */
+    CHECK(XA2_CUSHION == 8);
+    CHECK(queue_count == XA2_CUSHION + 1 && g_xa2_frames_written == 1 && g_xa2_next_buf == 1);
+    for (UINT32 i = 0; i < XA2_CUSHION; i++) {
+        CHECK(queued_bytes[i] == 1024 * 2 * sizeof(int16_t));
+        CHECK(queued[i] != (const BYTE *)g_xa2_bufs[0]);
+        for (UINT32 b = 0; b < queued_bytes[i]; b++) if (queued[i][b]) { CHECK(!"cushion not silent"); break; }
+    }
+    CHECK(queued[XA2_CUSHION] == (const BYTE *)g_xa2_bufs[0]);
+    CHECK(queued[XA2_CUSHION][0] == 1);
+    check_queued();
     submit_result = E_FAIL;
     for (int i = 0; i < 3; i++) {
         memset(samples, 2 + i, sizeof(samples));
-        CHECK(xa2_submit_samples(&samples[0][0], 1024) == 0);
+        CHECK(xa2_submit_samples(&samples[0][0], 1024) == -1);
         CHECK(g_xa2_next_buf == 1 && g_xa2_frames_written == 1);
         check_queued();
     }
     submit_result = S_OK;
-    CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
-    CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+    CHECK(XA2_NUM_BUFS == 64);
+    /* The cushion takes slots of the 64-buffer queue: 56 real buffers fit. */
+    for (int i = 1; i < XA2_NUM_BUFS - XA2_CUSHION; i++)
+        CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 0);
-    CHECK(g_xa2_frames_written == 3);
+    CHECK(queue_count == XA2_NUM_BUFS);
+    CHECK(g_xa2_frames_written == XA2_NUM_BUFS - XA2_CUSHION && g_xa2_next_buf == XA2_NUM_BUFS - XA2_CUSHION);
     check_queued();
-    /* Complete the oldest buffer, then wrap the ring into that free slot. */
-    for (UINT32 i = 0; i < 2; i++) {
-        queued[i] = queued[i + 1];
-        queued_bytes[i] = queued_bytes[i + 1];
-        memcpy(snapshots[i], snapshots[i + 1], queued_bytes[i]);
+    /* Retire the oldest buffer, then submit into the slot it freed. The first
+     * retirements are silence; after 64 submissions the ring has wrapped. */
+    for (int i = 0; i < XA2_NUM_BUFS; i++) {
+        for (UINT32 j = 0; j + 1 < queue_count; j++) {
+            queued[j] = queued[j + 1];
+            queued_bytes[j] = queued_bytes[j + 1];
+            memcpy(snapshots[j], snapshots[j + 1], queued_bytes[j]);
+        }
+        queue_count--;
+        memset(samples, 9, sizeof(samples));
+        CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+        check_queued();
     }
-    queue_count--;
-    memset(samples, 9, sizeof(samples));
-    CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+    CHECK(g_xa2_next_buf == XA2_NUM_BUFS - XA2_CUSHION);
+    CHECK(g_xa2_frames_written == 2 * XA2_NUM_BUFS - XA2_CUSHION);
+    xa2_critical_error(&g_xa2_callback, E_FAIL);
+    CHECK(g_xa2_error == (LONG)E_FAIL && g_xa2_error_reported == 0);
+    CHECK(xa2_submit_samples(&samples[0][0], 1024) == -1);
+    CHECK(g_xa2_error_reported == 1);
+    CHECK(xa2_submit_samples(&samples[0][0], 1024) == -1);
     check_queued();
     xa2_shutdown();
     CHECK(!xa2_is_active() && releases == 1);

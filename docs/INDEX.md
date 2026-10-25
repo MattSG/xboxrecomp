@@ -44,23 +44,18 @@ One per stage, in the order you run them.
 
 - [D3D8 to D3D11 Translation](technical/d3d-translation.md) — Bridging Xbox's graphics API to modern DirectX
 - [NV2A Shader Translation](technical/nv2a-shaders.md) — Register combiners and vertex microcode to HLSL
-- [D3D8LTCG Device Context](technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions
-- [Pushbuffer Executor](technical/pushbuffer-executor.md) — Executing a statically linked XDK D3D title's pushbuffer: DMA-engine walk, answering the title, fixed-function transform and lighting, anti-aliased surfaces, render back ends
+- [D3D8LTCG Device Context](technical/d3d8ltcg-device-context.md) — Per-image state recovery, queue contracts and hook ownership
 
-### Microsoft's own recompiler
+### Reference analysis
 
-- [Microsoft's Own Recompiler](technical/ms-fusion-recompiler.md) — White-room analysis of Ficl/Fission: pipeline, address map, HLE boundary
-- [Ficl/Fission Codegen Teardown](technical/ms-fusion-codegen-teardown.md) — What both translators emit, and how it reframes the roadmap
-- [Ficl/Fission Across Four Titles](technical/ms-fusion-corpus.md) — What the recompiler does, separated from what one title needed
-- [Adopting the Crimson Skies Findings](technical/ms-fusion-adoption-plan.md) — Working plan and status
-- [SVOD Extraction](technical/svod-extraction.md) — Getting the guest XBE out of a BC package, and the gate that catches a plausible-looking bad extraction
+- [Reference Analysis](technical/fusion-analysis.md) — Caller-supplied modules, packages, signature candidates and proof limits
 
 ### Project
 
-- [Lessons Learned](technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
-- [Gap Analysis vs xemu](technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
-- [Candidate Games](technical/candidate-games.md) — Choosing a target, tiered by difficulty
-- [Burnout 3 Reunification](technical/burnout3-reunification.md) — Bringing the origin title back onto the extracted toolkit
+- [Integration Checks](technical/lessons-learned.md) — Generic integration review checks
+- [Runtime Support](technical/gap-analysis.md) — Runtime support claims and validation boundaries
+- [Target Evaluation](technical/candidate-games.md) — Executable requirements, runtime gaps and acceptance evidence
+- [Runtime Integration](runtime/README.md) — Generic runtime interfaces and guest thread startup
 - [xemu GDB Debugging](technical/xemu-debugging.md) — xemu's GDB stub as a reference debugger for runtime state
 
 ## Xbox Formats

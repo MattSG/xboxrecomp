@@ -2,7 +2,7 @@
  * Xbox Direct3D 8 Compatibility Layer - Type Definitions
  *
  * Defines the Xbox D3D8 types, enums, and COM interface structures
- * used by the statically-linked RenderWare Xbox driver code.
+ * used by recompiled Xbox graphics code.
  *
  * Xbox D3D8 differs from PC D3D8 in several ways:
  * - Push buffer (command buffer) based rendering
@@ -12,11 +12,11 @@
  * - No CAPS querying (known fixed hardware)
  *
  * This header provides the ABI-compatible types so that translated
- * game/RW code can compile against our D3D11-backed implementation.
+ * guest code can compile against the shared graphics implementation.
  */
 
-#ifndef BURNOUT3_D3D8_XBOX_H
-#define BURNOUT3_D3D8_XBOX_H
+#ifndef XBOXRECOMP_D3D8_XBOX_H
+#define XBOXRECOMP_D3D8_XBOX_H
 
 #include <stdint.h>
 #include "platform/xbox_winnt.h"
@@ -1157,7 +1157,7 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
 /**
  * Present frame and pump window messages.
- * Called from recompiled game code (replaces RW driver Present path).
+ * Called from recompiled game code (replaces the game's own Present path).
  */
 void d3d8_PresentFrame(void);
 
@@ -1165,4 +1165,4 @@ void d3d8_PresentFrame(void);
 }
 #endif
 
-#endif /* BURNOUT3_D3D8_XBOX_H */
+#endif /* XBOXRECOMP_D3D8_XBOX_H */

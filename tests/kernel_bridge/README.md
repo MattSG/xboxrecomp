@@ -1,7 +1,7 @@
 # Kernel bridge
 
-The dispatch path a title's kernel calls actually take. No game files and no
-mapped guest window are needed -- a plain buffer stands in for guest memory.
+Tests the dispatch path used by guest kernel calls, with a synthetic XBE and
+runtime-owned guest mappings. No game executable or assets are required.
 
 ```
 cmake -S tests/kernel_bridge -B build/kernel-bridge
@@ -22,8 +22,7 @@ both places rather than only one.
 
 ## What it guarantees
 
-Checks on ordinal 173, `MmGetPhysicalAddress`, and ordinal 197,
-`NtDuplicateObject`.
+The ordinal 173 checks exercise `MmGetPhysicalAddress`:
 
 **A thunk entry resolves to a bridge entry point.** Given an import in the
 form an XBE stores it (`0x80000000 | ordinal`), `xbox_kernel_bridge_init()`
@@ -84,3 +83,61 @@ for this one building there.
 title. A regression harness has no title, and a static archive resolves only
 what gets pulled in, so reaching the kernel bridge needs stand-ins. Nothing
 here calls a guest function.
+
+
+## Thread entry contracts
+
+The four thread modes exercise default spawned and explicitly selected inline
+entry for ordinals 254/255. Ordinal 254 uses five API arguments and calls its
+start routine with one context; ordinal 255 calls its supplied system routine
+with two contexts. The fixture simulates a translated stdcall return, checks
+exact caller ESP, correct context delivery and independent spawned registers,
+stack and TIB. Poisoned words beyond the five simple-API arguments reject the
+old seven-argument decode. Signatures: [nxdk kernel header](https://github.com/XboxDev/nxdk/blob/master/lib/xboxkrnl/xboxkrnl.h).
+
+These cases do not prove suspended/debugger creation, optional thread-ID output,
+full thread-object/reference semantics or every thread teardown path.
+
+Worker resource cases exhaust the guest heap for both create APIs and require
+STATUS_NO_MEMORY, cleared handle output and no inline/spawned execution. Ex
+also tests a multi-megabyte requested stack and an overflowing request. Native
+host allocation/CreateThread failure cleanup is reviewed but not fault-injected.
+
+## Unwind bounds
+
+Seventeen cases exercise main, worker, retained callback and guest kernel-stack
+bounds, targeted/exit walks, last complete/truncated frames, foreign or absent
+targets, cyclic/unresolved chains, truncated arguments, insufficient/unowned
+scratch and supplied records. Actual cdecl-style handler returns must preserve
+caller ESP. The kernel-stack case uses the real create/delete bridge routes;
+existing spawned-thread callbacks also query their owned stack bounds.
+
+These are bounded traversal/ownership checks. They do not establish full SEH,
+context transfer, handler dispositions or validation of caller-provided TIB and
+exception-record mappings.
+
+## Native callbacks and optional guest system entry
+
+Seven native cases execute real host threads with the one-context start and
+two-argument system callbacks, optional default system entry, host suspension,
+thread-ID output, termination status and invalid/unsupported requests. Native
+callbacks are host code; guest CPU/TLS/object extension/debugger setup is not
+provided by this facade. Outputs are cleared on rejected requests.
+
+Guest Ex cases exercise a missing system routine in spawned/inline modes: the
+supplied start routine receives one context. Missing or unresolved entries
+report failure with no execution or fake handle. Existing custom-system cases
+retain the two-context contract. Guest suspension/ID and broader object/native
+semantics still need their own work.
+
+
+## Port-supplied function bridges
+
+`bridge-override` exercises canonical selection after one ordinal remap,
+replacement/clearing, rejected invalid/data IDs, unchanged native resolution,
+original stdcall argument cleanup and fastcall register arguments. Callbacks
+receive ESP after the dispatcher consumes the guest return-address slot.
+`object-reference-default` checks that unsupported object references report an
+error with a cleared output, reject invalid handles and validate the output span.
+No shared guest KTHREAD is fabricated. Live object identity/type/lifetime and
+per-handle thread state still require a real implementation or port policy.

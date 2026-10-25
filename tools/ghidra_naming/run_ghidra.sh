@@ -3,7 +3,7 @@
 #
 # Steps:
 #   1. (re)build the flat raw image from the XBE via extract_for_ghidra.py
-#   2. import the flat image into a Ghidra project as raw x86:LE:32 @ 0x10000
+#   2. import the flat image at the base recorded in sections.json
 #   3. run auto-analysis (FunctionID/FidDb + RTTI + decompiler analyzers on)
 #   4. run ExportXbeNames.py post-script to dump functions/symbols JSON
 #      (and optionally decompiled C)
@@ -90,6 +90,7 @@ fi
 # Step 1: build flat image (idempotent)
 echo "[1/3] Building flat image from XBE ..."
 py -3 "$HERE/extract_for_ghidra.py" "$XBE" --out-dir "$WORK"
+IMAGE_BASE="$(py -3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["base_address"])' "$WORK/sections.json")"
 
 # Convert paths to Windows form for the .bat (analyzeHeadless is a Windows batch).
 to_win() { cygpath -w "$1" 2>/dev/null || echo "$1"; }
@@ -104,7 +105,7 @@ ANALYZE="${ANALYZE:-1}"
 # Analyzer enablement is done by the -preScript (SetAnalysisOptions.java).
 # Do NOT pass "-analysisTimeoutPerFile 0": in headless that means a ZERO-second
 # timeout (analysis aborts immediately), not "unlimited". Omitting it = no
-# per-file timeout, which is what we want for a full 7.6 MB analysis.
+# per-file timeout; full input analysis is not bounded here.
 ANALYSIS_PROPS=()
 
 # Step 2/3: import + analyze + export, OR re-open + export.
@@ -115,7 +116,7 @@ if [ "$IMPORT" = "1" ]; then
   "$HEADLESS" "$W_PROJ_DIR" "$PROJ_NAME" \
     -import "$W_FLAT" \
     -loader BinaryLoader \
-    -loader-baseAddr 0x10000 \
+    -loader-baseAddr "$IMAGE_BASE" \
     -processor "x86:LE:32:default" \
     -cspec windows \
     -overwrite \

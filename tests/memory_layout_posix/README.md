@@ -31,10 +31,11 @@ MSVC generator and fails under Ninja or Unix Makefiles.
 
 ## What it pins down
 
-The model maps 64 MB at a base address and then 28 mirror views of the same
-pages at 64 MB intervals, because the console's 26-bit address bus wraps: guest
-`0x04070000` has to read what `0x00070000` holds. Five properties, each naming a
-distinct way that went wrong on arm64 macOS:
+The model maps 64 MB at a base address and reserves 28 slots of the same size
+above it, unmapped. A guest address above the mapped range is not an alias of
+RAM: the console translates a virtual address through page tables and a page
+with no entry faults. So reading a slot must fault. Five properties, each naming
+a distinct way that went wrong on arm64 macOS:
 
 1. **`xbox_MemoryLayoutInit` succeeds.** Every entry in `try_bases[]` sits below
    4 GB, which on Apple Silicon is inside `__PAGEZERO` and unmappable, and the
@@ -43,10 +44,10 @@ distinct way that went wrong on arm64 macOS:
 2. **Base and size are aligned to the *host* page.** The code says 4096 in
    places; Apple Silicon uses 16384. 4 KB is right as a *guest* constant and
    wrong as host granularity, and the two meanings are easy to conflate.
-3. **All 28 mirrors alias the base, in both directions.** Reading through a
-   mirror proves the mapping; writing through one and seeing it at the base
-   proves it is shared memory rather than a copy, which is what a title's
-   out-of-range write actually depends on.
+3. **Nothing above the map aliases RAM.** Writing through the base and reading
+   each of the 28 slots above it must fault. The slots used to be mirror views
+   of the base, and Half-Life 2 and Halo both built corrupt structures on that
+   alias before it was removed.
 4. **Shutdown then re-init works**, so teardown releases every view rather than
    leaving addresses claimed.
 5. **`RECOMP_TRAP_NULL` actually traps, and leaves the TIB standing.** Both
@@ -58,16 +59,16 @@ distinct way that went wrong on arm64 macOS:
    that traps it and clobbers the TIB, which is why the TIB is checked too.
 
 Deliberately not asserted: the tiled aperture at `0xF0000000`. That is a
-specific architectural alias the layout protects by sacrificing a wrap mirror,
-and whether it survives relocation to a high host base is a question about what
+specific architectural alias of RAM, separate from the slots above the map, and
+whether it survives relocation to a high host base is a question about what
 guest code assumes. Encoding a guess here would bake in an answer nobody has
 established.
 
-## Why the mirror probe forks
+## Why the slot probe forks
 
-A mirror the layout could not place is unmapped, so reading it faults. Catching
+An unmapped slot faults when read. Catching
 `SIGSEGV` and recovering with `siglongjmp` works for one fault and dies when two
-unmapped mirrors fall next to each other; asking `mach_vm_region` first reports
+unmapped slots fall next to each other; asking `mach_vm_region` first reports
 some of these addresses as mapped when reading them still faults. Reading in a
 forked child cannot be wrong about it -- the child dies, the parent sees the
-signal, and the other 27 mirrors still get checked.
+signal, and the other slots still get checked.

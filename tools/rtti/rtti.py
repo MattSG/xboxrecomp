@@ -3,23 +3,12 @@ tools/rtti/rtti.py
 
 Recover C++ classes, vtables and virtual methods from an XBE's MSVC RTTI.
 
-A title compiled as C++ with RTTI left enabled carries, in the shipping binary,
-a complete description of its own class graph. Where it is present this is the
-single richest symbol source on the platform, because unlike a name-only string
-table it points at *code*:
+The supported record patterns connect decorated class names, locators,
+hierarchies and method tables. Recovered addresses are candidate function starts,
+not proof of boundaries or ABI. See docs/technical/rtti-recovery.md.
 
-  * every polymorphic class name, as a decorated ".?AV...@@" TypeDescriptor
-  * every vtable -- MSVC stores the CompleteObjectLocator at vtable[-1], so a
-    word pointing at a COL is immediately followed by the method array
-  * every virtual method address, by walking that array
-  * the full inheritance chain, from the ClassHierarchyDescriptor
-
-The addresses are also *proof of function entry points*, which is what makes
-this worth running before disassembly rather than after: see seeds() and
-docs/technical/rtti-recovery.md.
-
-Most Xbox titles are C, or C++ with RTTI disabled, and yield nothing. That is a
-normal result, not a failure -- callers get empty dicts and should carry on.
+Images without supported records may yield empty results. That does not prove
+that every compiler/layout variant has been recognized.
 
 Structures (32-bit MSVC; all fields are plain VAs, with none of the
 image-relative indirection x64 RTTI uses):
@@ -41,7 +30,8 @@ from tools.abi_analysis.xbe_min import XbeFile
 TD_NAME = re.compile(rb"\.\?A[VU][A-Za-z0-9_@?$]{2,250}@@\x00")
 
 # Sections whose contents are executable, so a vtable slot pointing into one is
-# plausibly a method. XDK library code lives in its own named sections.
+# plausibly a method. Honor executable flags too; named SDK sections are
+# retained for images that omit their executable flag.
 CODE_SECTIONS = (".text", "D3D", "D3DX", "XGRPH", "DSOUND", "XPP", "XONLINE",
                  "XNET", "WMVDEC", "XACTENG")
 # Sections that can hold vtables and RTTI records.
@@ -49,7 +39,7 @@ DATA_SECTIONS = (".rdata", ".data")
 
 
 def demangle(name):
-    """'.?AVCNPC_Alyx@@' -> 'CNPC_Alyx'. Template arguments stay decorated."""
+    """'.?AVWidget@@' -> 'Widget'. Template arguments stay decorated."""
     if name.startswith((".?AV", ".?AU")) and name.endswith("@@"):
         name = name[4:-2]
     if name.startswith("?$"):
@@ -65,19 +55,22 @@ class Image:
     def __init__(self, path):
         xbe = XbeFile(path)
         self.d = xbe.data
-        self.secs = [(s.virtual_address, s.raw_address, s.raw_size, s.name)
-                     for s in xbe.sections]
-        self.code = [(v, v + rs) for v, _, rs, n in self.secs
-                     if n in CODE_SECTIONS]
+        self.secs, self.code = [], []
+        for section in xbe.sections:
+            size = min(section.raw_size, max(0, len(self.d) - section.raw_address))
+            va = section.virtual_address
+            self.secs.append((va, section.raw_address, size, section.name))
+            if section.flags & 0x4 or section.name in CODE_SECTIONS:
+                self.code.append((va, va + size))
 
-    def raw(self, va):
+    def raw(self, va, size=1):
         for v, r, rs, _ in self.secs:
-            if v <= va < v + rs:
+            if size > 0 and v <= va and va + size <= v + rs:
                 return r + (va - v)
         return None
 
     def u32(self, va):
-        r = self.raw(va)
+        r = self.raw(va, 4)
         return struct.unpack_from("<I", self.d, r)[0] if r is not None else None
 
     def is_code(self, va):
@@ -157,7 +150,7 @@ def vtables(img, cols):
 
 
 def recover(path):
-    """Everything, from a path. Empty results mean the title has no RTTI."""
+    """Recover supported records from a caller image; absence is not full coverage."""
     img = Image(path)
     td = type_descriptors(img)
     cols = locators(img, td)
@@ -183,8 +176,8 @@ def recover(path):
 def seeds(result):
     """Sorted virtual-method addresses, for tools.disasm --seed-functions.
 
-    A vtable slot is proof of a function entry point, which linear sweep and
-    call-target scanning both miss for methods only ever called virtually.
+    These are candidate starts from recovered vtables, not proven function
+    boundaries. Validate them against the input and downstream analysis.
     """
     return sorted({m for _, _, _, ms in result["vtables"] for m in ms})
 
@@ -192,15 +185,9 @@ def seeds(result):
 def owning_class(result):
     """{method_va: owner class name} for methods whose owner is well defined.
 
-    A method address appearing in several vtables is one implementation shared
-    by those classes -- inherited, not duplicated. The class that declared it is
-    then the one that is an ancestor of every other class in the set. Unlike
-    "which slot did which ancestor declare", this needs only the hierarchy sets
-    and is unambiguous: on Half-Life 2 it resolves 2,528 shared methods and
-    returns no ambiguous case at all.
-
-    Methods with no common ancestor (multiple inheritance, or unrelated classes
-    sharing a compiler-generated thunk) are omitted rather than guessed at.
+    Propose the unique candidate that is an ancestor of all holding classes,
+    or omit the method when no unique candidate exists. This uses recovered
+    hierarchy sets, not complete MSVC layout or declaration modelling.
     """
     ancestors = {demangle(k): {demangle(b) for b in v}
                  for k, v in result["hierarchy"].items()}
@@ -221,8 +208,7 @@ def names(result):
 
     The method's own name is not recoverable -- RTTI carries class names, not
     member names -- so the address is kept to stay unique and the class is
-    prepended. "CBaseEntity__000162C2" beats "sub_000162C2" for reading
-    generated code and for crash stacks.
+    prepended as a heuristic label for source and diagnostic navigation.
     """
     return {f"0x{addr:08X}": f"{owner}__{addr:08X}"
             for addr, owner in owning_class(result).items()}

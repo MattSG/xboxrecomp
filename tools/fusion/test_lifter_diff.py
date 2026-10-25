@@ -26,9 +26,9 @@ def test_guest_field_access():
 
 
 def test_guest_global_access():
-    # mov ebp, [r15 + 0x32dd8c]  -> guest global, offset 0x32dd8c
-    txt, off = _one(b"\x41\x8B\xAF\x8C\xDD\x32\x00")
-    assert off == 0x32dd8c and "guest global" in txt
+    # mov ebp, [r15 + 0x123450]  -> guest global, offset 0x123450
+    txt, off = _one(b"\x41\x8B\xAF\x50\x34\x12\x00")
+    assert off == 0x123450 and "guest global" in txt
 
 
 def test_emulator_scratch_not_guest():

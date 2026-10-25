@@ -22,6 +22,17 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "fpconv.h"
+#include <fenv.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <sched.h>
+#endif
+
+/* Optional host calibration of the VP-only monitor; hardware mixing is unchanged. */
+#ifndef XBOXRECOMP_APU_VP_MONITOR_GAIN
+#define XBOXRECOMP_APU_VP_MONITOR_GAIN 1.0f
+#endif
 
 /* #define DEBUG_MCPX */
 
@@ -42,6 +53,61 @@ static const struct {
     { NV_PAPU_TVL3D, NV_PAPU_CVL3D, NV_PAPU_NVL3D }, /* 3D */
     { NV_PAPU_TVLMP, NV_PAPU_CVLMP, NV_PAPU_NVLMP }, /* MP */
 };
+
+/* ============================================================
+ * Front-end method queue
+ *
+ * The hardware feeds the title's methods to the front end through a FIFO,
+ * and a halted or trapped front end takes none. DirectSound relies on that:
+ * when a voice goes idle the voice processor traps the front end with
+ * SE2FE_IDLE_VOICE, and the service routine reads FEDECMETH/FEDECPARAM and
+ * unlinks the voice from its list before letting the front end run again.
+ * Methods used to run at once on the title's thread, beside that routine on
+ * the frame thread: one could overwrite FEDECPARAM before the routine read
+ * it, or link a new voice next to the one being unlinked and drop it from
+ * the list. A dropped voice never plays and never goes idle, so DirectSound
+ * never gets it back; enough of them and the title can start no sound at all
+ * (sound effects die mid-race while music plays on; a mission waiting on
+ * speech never ends). Methods written while the front end is stopped now
+ * wait here, and run when the title sets it running again.
+ * ============================================================ */
+
+#define FE_QUEUE_LEN 4096
+
+static QemuMutex s_fe_lock;
+static struct { uint32_t method, argument; } s_fe_queue[FE_QUEUE_LEN];
+static unsigned s_fe_queued;
+
+static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument);
+
+static bool fe_running(MCPXAPUState *d)
+{
+    return (qatomic_read(&d->regs[NV_PAPU_FECTL]) & NV_PAPU_FECTL_FEMETHMODE)
+           == NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
+}
+
+/* With s_fe_lock held: run what waited, in order, while the front end runs. */
+static void fe_drain(MCPXAPUState *d)
+{
+    unsigned i = 0;
+    while (i < s_fe_queued && fe_running(d)) {
+        fe_method(d, s_fe_queue[i].method, s_fe_queue[i].argument);
+        i++;
+    }
+    if (i) {
+        memmove(s_fe_queue, s_fe_queue + i,
+                (s_fe_queued - i) * sizeof s_fe_queue[0]);
+        s_fe_queued -= i;
+    }
+}
+
+/* FECTL was written: if the front end runs again, catch up. */
+void mcpx_apu_fe_resume(MCPXAPUState *d)
+{
+    qemu_mutex_lock(&s_fe_lock);
+    fe_drain(d);
+    qemu_mutex_unlock(&s_fe_lock);
+}
 
 /* ============================================================
  * Notify status helper
@@ -66,6 +132,11 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 /* ============================================================
  * Filter helpers
  * ============================================================ */
+
+/* The gain each voice last mixed into each of its eight bins, so a change
+ * ramps across the next frame instead of stepping (see voice_process). */
+static float s_gain_prev[MCPX_HW_MAX_VOICES][8];
+static uint8_t s_gain_valid[MCPX_HW_MAX_VOICES];
 
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
@@ -97,10 +168,20 @@ static float clampf(float v, float mn, float mx)
     return v;
 }
 
-static float attenuate(uint16_t vol)
+static float attenuate(const MCPXAPUState *d, uint16_t vol)
 {
-    vol &= 0xFFF;
-    return (vol == 0xFFF) ? 0.0f : powf(10.0f, vol / (64.0f * -20.0f));
+    return d->vp.attenuation[vol & 0xFFF];
+}
+
+static void prepare_attenuation(MCPXAPUState *d)
+{
+    int rounding = fegetround();
+    if (d->vp.attenuation_rounding == rounding)
+        return;
+    for (unsigned vol = 0; vol < 0xFFF; ++vol)
+        d->vp.attenuation[vol] = powf(10.0f, vol / (64.0f * -20.0f));
+    d->vp.attenuation[0xFFF] = 0.0f;
+    d->vp.attenuation_rounding = rounding;
 }
 
 /* ============================================================
@@ -144,26 +225,50 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
-/* Per voice, as in xemu. A title's VOICE_LOCK arrives on its own thread while
- * the frame thread holds d->lock across every voice of a frame, so taking
- * d->lock here made each lock wait out the whole frame. The title only has to
- * wait while the voice processor is working on the voice it locks. */
+/* Per voice, as in xemu: the title's VOICE_LOCK waits only while the voice
+ * processor is working on that same voice. It used to take d->lock, which
+ * the processor holds for a whole frame of every voice, blocking the title
+ * until all voices have been processed. */
 static void voice_spin_lock(MCPXAPUState *d, uint16_t v)
 {
-    while (InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
-        SwitchToThread();
+#ifdef _MSC_VER
+    while (_InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
+        YieldProcessor();
+#else
+    while (__sync_val_compare_and_swap(&d->vp.voice_spin[v], 0, 1))
+        sched_yield();
+#endif
 }
 
 static void voice_spin_unlock(MCPXAPUState *d, uint16_t v)
 {
-    InterlockedExchange(&d->vp.voice_spin[v], 0);
+#ifdef _MSC_VER
+    _InterlockedExchange(&d->vp.voice_spin[v], 0);
+#else
+    __sync_lock_release(&d->vp.voice_spin[v]);
+#endif
 }
 
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
     voice_spin_lock(d, v);
-    d->vp.voice_locked[v] = lock;
+
+    uint64_t mask = 1ULL << (v % 64);
+    if (lock) {
+#ifdef _MSC_VER
+        _InterlockedOr64((volatile LONG64 *)&d->vp.voice_locked[v / 64], (LONG64)mask);
+#else
+        __sync_fetch_and_or(&d->vp.voice_locked[v / 64], mask);
+#endif
+    } else {
+#ifdef _MSC_VER
+        _InterlockedAnd64((volatile LONG64 *)&d->vp.voice_locked[v / 64], (LONG64)~mask);
+#else
+        __sync_fetch_and_and(&d->vp.voice_locked[v / 64], ~mask);
+#endif
+    }
+
     voice_spin_unlock(d, v);
     qemu_cond_signal(&d->cond);
 }
@@ -242,6 +347,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
         d->vp.ssl[selected_handle].ssl_seg = 0;
         d->vp.ssl[selected_handle].ssl_index = 0;
+        d->vp.filters[selected_handle].resample_phase = 0.0;
+        d->vp.filters[selected_handle].resample_valid = 0;
+        d->vp.filters[selected_handle].resample_read = 0;
+        d->vp.filters[selected_handle].resample_count = 0;
+        s_gain_valid[selected_handle] = 0;
 
         unsigned int ea_start = GET_MASK(argument, NV1BA0_PIO_VOICE_ON_ENVA);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
@@ -568,8 +678,37 @@ uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
     (void)opaque; (void)size;
 
     switch (addr) {
-    case NV1BA0_PIO_FREE:
-        return 0x80; /* Always pretend queue is empty */
+    case NV1BA0_PIO_FREE: {
+        /* Free FIFO bytes (32 entries of 4). Methods held back while the
+         * front end is trapped are what the hardware FIFO would still hold,
+         * and DirectSound waits for it to read empty (0x80) before editing
+         * the voice lists itself. Answering empty regardless lets those edits run
+         * ahead of a queued VOICE_ON: the voice then goes into a list after
+         * DirectSound has already taken it out, and starting it again links
+         * it to itself (MP list loops, half-second stalls, sound lost). The
+         * lock orders the drained methods' writes before the title's.
+         * A front end left stopped past 50 ms is not going to drain (see the
+         * overflow in mcpx_apu_vp_write): answer empty then, as before. */
+        static ULONGLONG busy_since;
+        static unsigned gave_up;
+        unsigned queued;
+        qemu_mutex_lock(&s_fe_lock);
+        queued = s_fe_queued;
+        qemu_mutex_unlock(&s_fe_lock);
+        if (!queued) {
+            busy_since = 0;
+            return 0x80;
+        }
+        if (!busy_since) {
+            busy_since = GetTickCount64();
+        } else if (GetTickCount64() - busy_since > 50) {
+            if (gave_up++ < 4)
+                fprintf(stderr, "[APU] front end stopped with %u methods queued for 50 ms;"
+                        " reporting the FIFO empty\n", queued);
+            return 0x80;
+        }
+        return queued >= 0x20 ? 0 : 0x80 - queued * 4;
+    }
     default:
         break;
     }
@@ -582,21 +721,50 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
     MCPXAPUState *d = (MCPXAPUState *)opaque;
     (void)size;
 
-    /* Dispatch known methods through fe_method */
-    fe_method(d, (uint32_t)addr, (uint32_t)val);
+    /* Dispatch known methods through fe_method, in order, or keep them for
+     * when a stopped front end runs again (see fe_drain). */
+    qemu_mutex_lock(&s_fe_lock);
+    fe_drain(d);
+    if (fe_running(d) && !s_fe_queued) {
+        fe_method(d, (uint32_t)addr, (uint32_t)val);
+    } else if (s_fe_queued < FE_QUEUE_LEN) {
+        s_fe_queue[s_fe_queued].method = (uint32_t)addr;
+        s_fe_queue[s_fe_queued].argument = (uint32_t)val;
+        s_fe_queued++;
+    } else {
+        /* A front end left stopped this long is not coming back: run it. */
+        fe_drain(d);
+        fe_method(d, (uint32_t)addr, (uint32_t)val);
+    }
+    qemu_mutex_unlock(&s_fe_lock);
 }
 
 /* ============================================================
  * SGE data pointer resolution
  * ============================================================ */
 
-static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
+/* The VP has no SGE length register (NV_PAPU only has VPSGEADDR), so the only
+ * bound a caller can give is the largest page index a 32-bit linear address
+ * reaches. */
+#define VP_SGE_MAX_ENTRY (UINT32_MAX / TARGET_PAGE_SIZE)
+
+/* False, with the access refused, when the page index is past max_sge. */
+static bool get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr,
+                         hwaddr *out)
 {
     unsigned int entry = addr / TARGET_PAGE_SIZE;
-    assert(entry <= max_sge);
+    if (entry > max_sge) {
+        static volatile LONG bad_entry_count;
+        LONG n = InterlockedIncrement(&bad_entry_count);
+        if (n <= 8)
+            fprintf(stderr, "[APU] VP SGE index %u past max %u (linear 0x%08X, sge 0x%llX); access refused\n",
+                    entry, max_sge, addr, (unsigned long long)sge_base);
+        return false;
+    }
     uint32_t prd_address =
         ldl_le_phys(address_space_memory, sge_base + entry * 4 * 2);
-    return prd_address + addr % TARGET_PAGE_SIZE;
+    *out = prd_address + addr % TARGET_PAGE_SIZE;
+    return true;
 }
 
 /* ============================================================
@@ -1115,14 +1283,24 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     size_t block_size;
 
     int adpcm_block_index = -1;
-    /* Room for the largest block the MCPX accepts (see the check below). */
-    uint32_t adpcm_block[36 * ADPCM_MAX_BLOCKS / 4];
-    int16_t adpcm_decoded[65 * ADPCM_MAX_BLOCKS * 2];
+    uint32_t adpcm_block[36 * 18 / sizeof(uint32_t)];
+    int16_t adpcm_decoded[65 * 18 * 2];
 
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_NEW_VOICE, 0);
 
     if (paused) return -1;
+
+    /* The MCPX accepts 1..18 input samples per block. The source buffers
+     * above must cover the whole hardware range; accepting the 5-bit field's
+     * remaining values would let a guest descriptor overrun both arrays. */
+    if (samples_per_block > 18) {
+        static int warned = 0;
+        if (!warned++)
+            fprintf(stderr, "[APU] invalid samples-per-block value %u on voice %u\n",
+                    samples_per_block, v);
+        return -1;
+    }
 
     if (stream) {
         if (!persist) {
@@ -1193,6 +1371,15 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     }
     block_size *= samples_per_block;
 
+    static int trace = -1;
+    if (trace < 0) trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (adpcm && samples_per_block > 2 && trace) {
+        static volatile LONG reported = 0;
+        if (InterlockedCompareExchange(&reported, 1, 0) == 0)
+            fprintf(stderr, "[APU] ADPCM block exceeds old scratch capacity: voice=%u spb=%u bytes=%zu stereo=%d\n",
+                    v, samples_per_block, block_size, stereo);
+    }
+
     int sample_count = 0;
     hwaddr stat_addr = 0;
     for (; (sample_count < num_samples_requested) && (cbo <= ebo);
@@ -1217,10 +1404,13 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     linear_addr += ba;
                     for (unsigned int word_index = 0;
                          word_index < (9 * samples_per_block); word_index++) {
-                        hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
-                                                   0xFFFFFFFF, linear_addr);
-                        adpcm_block[word_index] =
-                            ldl_le_phys(address_space_memory, addr);
+                        hwaddr addr;
+                        if (get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                         VP_SGE_MAX_ENTRY, linear_addr, &addr))
+                            adpcm_block[word_index] =
+                                ldl_le_phys(address_space_memory, addr);
+                        else
+                            adpcm_block[word_index] = 0;
                         linear_addr += 4;
                     }
                 }
@@ -1236,18 +1426,24 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     adpcm_decoded[block_position * channels + 1]);
             }
         } else {
-            hwaddr addr;
+            hwaddr addr = 0;
+            bool addr_ok = true;
             if (stream) {
                 addr = segment_offset + cbo * block_size;
             } else {
                 uint32_t linear_addr = ba + cbo * (uint32_t)block_size;
-                addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
-                                    linear_addr);
+                addr_ok = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                       VP_SGE_MAX_ENTRY, linear_addr, &addr);
             }
 
             for (unsigned int channel = 0; channel < channels; channel++) {
                 uint32_t ival;
                 float fval;
+                if (!addr_ok) {
+                    /* Refused: this sample is silence. */
+                    samples[sample_count][channel] = 0.0f;
+                    continue;
+                }
                 switch (sample_size) {
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
                     ival = ldub_phys(address_space_memory, addr);
@@ -1315,94 +1511,56 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (linear interpolation in place of libsamplerate)
+ * Voice resampling (linear interpolation, no libsamplerate)
  *
- * libsamplerate is stubbed; voice_resample below interpolates linearly
- * between source frames at the pitch's ratio, keeping its position and
- * the last frame across calls in the voice's filter state.
+ * Preserve input/output rate and fractional position across VP frames.
  * ============================================================ */
+
+static int voice_resample_pull(MCPXAPUState *d, uint16_t v, float sample[2])
+{
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    if (filter->resample_read == filter->resample_count) {
+        int count = voice_get_samples(d, v, (float (*)[2])filter->resample_buf,
+                                      NUM_SAMPLES_PER_FRAME);
+        if (count <= 0) return 0;
+        filter->resample_read = 0;
+        filter->resample_count = (unsigned int)count;
+    }
+    sample[0] = filter->resample_buf[filter->resample_read * 2];
+    sample[1] = filter->resample_buf[filter->resample_read * 2 + 1];
+    filter->resample_read++;
+    return 1;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Linear interpolation in place of libsamplerate. `rate` is the output
-     * to source ratio the VP's pitch encodes (libsamplerate's src_ratio):
-     * 1.088 for 44.1 kHz material at the 48 kHz frame rate, so
-     * each output consumes 1/rate source samples. Fetching one source sample
-     * per output, as the stub before did, played everything a semitone and a
-     * half high, 8.8 % too fast -- and drained each stream buffer faster than
-     * the title filled it, which is where the periodic dropouts came from.
-     *
-     * State per voice: the two source samples the output sits between
-     * (rs_last at 0, rs_next at 1) and the output's position rs_pos in
-     * [0,1). Source samples arrive from voice_get_samples in the voice's own
-     * units; a shortfall (the voice ended or its stream ran dry) returns the
-     * outputs that could be made, and a fetch failure with nothing made is
-     * passed through as it was. */
-    MCPXAPUVoiceFilter *f = &d->vp.filters[v];
-    float src[NUM_SAMPLES_PER_FRAME * 4 + 2][2];
-    const int max_src = (int)(sizeof(src) / sizeof(src[0]));
-    float step;
-    int need, got, in, out;
-
-    if (!(rate > 0.0f)) rate = 1.0f;
-    step = 1.0f / rate;
-
-    if (!f->rs_have) {
-        got = voice_get_samples(d, v, src, 2);
-        /* A first fetch that gets one sample returns no output and drops
-         * that sample: the next call fetches two afresh. A voice whose
-         * stream starts one sample at a time loses its first sample. */
-        if (got < 2) return got < 0 ? got : 0;
-        f->rs_last[0] = src[0][0]; f->rs_last[1] = src[0][1];
-        f->rs_next[0] = src[1][0]; f->rs_next[1] = src[1][1];
-        f->rs_pos = 0.0f;
-        f->rs_have = 1;
-    }
-
-    /* Source samples the next requested_num outputs will step past, exactly:
-     * output k sits at rs_pos + k * step, and every whole unit that position
-     * reaches before the last output is a source sample consumed. The last
-     * output's own step is left pending in rs_pos for the next call, so
-     * nothing fetched here goes unused -- fetching floor(rs_pos + n * step)
-     * instead over-read by up to one sample a frame, which was dropped: the
-     * music came out 3 % fast. A step above about 4.2 (rate below 0.24, a
-     * voice pitched more than two octaves up) wants more than the 130-frame
-     * buffer holds over 31 steps; make fewer outputs rather than lose
-     * source, so such a voice comes out short (and late) each frame. */
-    for (;;) {
-        need = (int)floorf(f->rs_pos + (float)(requested_num - 1) * step);
-        if (need <= max_src || requested_num <= 1) break;
-        requested_num /= 2;
-    }
-    if (need > max_src) need = max_src;
-    if (need < 0) need = 0;
-
-    got = need > 0 ? voice_get_samples(d, v, src, need) : 0;
-    if (got < 0) got = 0;
-
-    for (in = 0, out = 0; out < requested_num; out++) {
-        while (f->rs_pos >= 1.0f) {
-            if (in >= got) goto done;
-            f->rs_last[0] = f->rs_next[0]; f->rs_last[1] = f->rs_next[1];
-            f->rs_next[0] = src[in][0];    f->rs_next[1] = src[in][1];
-            in++;
-            f->rs_pos -= 1.0f;
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    int produced = 0;
+    if (!(rate > 0.0f) || !isfinite(rate)) return -1;
+    /* rate is output/input, as in libsamplerate. Keep fractional position
+     * across VP frames: 44.1 kHz voices must not consume 48,000 samples/sec. */
+    while (produced < requested_num) {
+        while (filter->resample_valid < 2) {
+            if (!voice_resample_pull(d, v, filter->resample_pair[filter->resample_valid]))
+                return produced ? produced : -1;
+            filter->resample_valid++;
         }
-        samples[out][0] = f->rs_last[0] + f->rs_pos * (f->rs_next[0] - f->rs_last[0]);
-        samples[out][1] = f->rs_last[1] + f->rs_pos * (f->rs_next[1] - f->rs_last[1]);
-        f->rs_pos += step;
+        if (filter->resample_phase >= 1.0) {
+            memcpy(filter->resample_pair[0], filter->resample_pair[1], sizeof(filter->resample_pair[0]));
+            filter->resample_valid = 1;
+            filter->resample_phase -= 1.0;
+            continue;
+        }
+        for (int channel = 0; channel < 2; channel++) {
+            float left = filter->resample_pair[0][channel];
+            float right = filter->resample_pair[1][channel];
+            samples[produced][channel] = left + (right - left) * (float)filter->resample_phase;
+        }
+        produced++;
+        filter->resample_phase += 1.0 / rate;
     }
-done:
-    if (out == 0 && got == 0) {
-        /* Nothing new and nothing left to interpolate: the voice has stopped
-         * or its stream is empty. voice_process treats 0 as an underrun and
-         * a negative as the end; the voice's active bit says which. */
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        return active ? 0 : -1;
-    }
-    return out;
+    return produced;
 }
 
 /* ============================================================
@@ -1485,7 +1643,7 @@ static void voice_process(MCPXAPUState *d,
             if (count < 0) break;
             /* An active voice that keeps producing nothing is an underrun,
              * not a reason to spin. Asking it again at once cannot change the
-             * answer, and this loop holds d->lock: Burnout 3's vehicle select
+             * answer, and this loop holds d->lock: a title's vehicle select
              * sat here indefinitely while the title waited in voice_lock. */
             if (count == 0 && ++empty > 4) break;
             sample_count += count;
@@ -1585,7 +1743,11 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
-    /* Mix into bins */
+    /* Mix into bins. The volumes are TAR(get) registers: hardware moves the
+     * current level toward them, it does not jump. Applying each frame's
+     * level as a step every 32 samples turned a voice whose volume the title
+     * changes every frame into a buzz of
+     * clicks at the frame rate. Ramp from the last frame's gain instead. */
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
@@ -1594,31 +1756,30 @@ static void voice_process(MCPXAPUState *d,
         } else {
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
-        g *= attenuate(vol[b]) / hr;
-        /* The volumes are target registers: the hardware moves the level
-         * toward them rather than jumping. Stepping to each frame's level
-         * every 32 samples turned a voice whose volume the title changes
-         * every frame (an engine that follows the revs) into a buzz at the
-         * frame rate. Ramp from the gain the last frame ended on. */
-        MCPXAPUVoiceFilter *f = &d->vp.filters[v];
-        float g0 = f->gain_valid ? f->gain_prev[b] : g;
+        g *= attenuate(d, vol[b]) / hr;
+        /* Bin channel follows xemu (b % channels). Splitting HRTF bins into
+         * left/right ear pairs fed the GP crosstalk bins (one title: 6 8 7 9)
+         * distinct ears: gameplay went out of phase (L/R corr -0.73), +8 dB
+         * and clipped against xemu with use_dsp (+0.95). */
+        int ch = (int)(b % channels);
+        float g0 = s_gain_valid[v] ? s_gain_prev[v][b] : g;
         float step = (g - g0) / NUM_SAMPLES_PER_FRAME;
-        f->gain_prev[b] = g;
+        s_gain_prev[v][b] = g;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            mixbins[bin[b]][i] += (g0 + step * (i + 1)) * samples[i][b % channels];
+            mixbins[bin[b]][i] += (g0 + step * (i + 1)) * samples[i][ch];
         }
     }
-    d->vp.filters[v].gain_valid = true;
+    s_gain_valid[v] = 1;
 
     /* VP monitor mix */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
         float g = 0.0f;
         for (int b = 0; b < 8; b++) {
             float hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
-            float bg = attenuate(vol[b]) / hr;
+            float bg = attenuate(d, vol[b]) / hr;
             if (bg > g) g = bg;
         }
-        g *= ea_value;
+        g *= ea_value * XBOXRECOMP_APU_VP_MONITOR_GAIN;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             sample_buf[i][0] += g * samples[i][0];
             sample_buf[i][1] += g * samples[i][1];
@@ -1668,6 +1829,9 @@ static void vp_trace_positions(MCPXAPUState *d)
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    /* Initialization and mixing can run on different host threads. Match the
+     * current rounding mode once per frame, never once per bin/voice. */
+    prepare_attenuation(d);
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1690,13 +1854,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                /* One trap at a time: once the front end is trapped, a second
-                 * idle voice in the same frame would overwrite FEDECPARAM
-                 * before the ISR has read the first. The rest trap on later
-                 * frames, after the ISR has resumed the front end. */
-                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
-                        != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
-                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                /* One trap at a time, as the hardware's front end takes
+                 * them: a stopped one hears of this voice next frame. */
+                qemu_mutex_lock(&s_fe_lock);
+                if (fe_running(d)) fe_method(d, SE2FE_IDLE_VOICE, v);
+                qemu_mutex_unlock(&s_fe_lock);
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_spin_lock(d, v);
@@ -1733,8 +1895,14 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
 void mcpx_apu_vp_init(MCPXAPUState *d)
 {
-    /* Single-threaded - no worker dispatch needed */
-    (void)d;
+    /* Eight bins per voice used to repeat this powf every 32 samples, even
+     * when their volume had not changed. Calculate the finite input domain
+     * using the same expression and host math library, before the frame
+     * thread starts. The final encoding is the hardware's silence sentinel.
+     * Keeping the table in the APU avoids lazy-init races and shared state. */
+    d->vp.attenuation_rounding = -2;
+    prepare_attenuation(d);
+    qemu_mutex_init(&s_fe_lock);
 }
 
 /* Shutdown, after the frame thread has stopped: close the voice dumps, free

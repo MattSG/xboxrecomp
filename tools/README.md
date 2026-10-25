@@ -137,7 +137,8 @@ py -3 -m tools.func_id game_files/default.xbe -v
 | Flag | Description |
 |------|-------------|
 | `-v` / `--verbose` | Show identification details |
-| `--output-dir DIR` | Output directory (default: `tools/func_id/output/`) |
+| `--output DIR` | Output directory (default: `tools/func_id/output/`) |
+| `--game-keywords FILE` | Caller-owned keyword policy JSON (default: disabled) |
 
 **Classification strategies:**
 
@@ -148,19 +149,18 @@ py -3 -m tools.func_id game_files/default.xbe -v
 | **Immediate scanner** | Functions that reference known constants (vtable addresses, magic numbers) |
 | **Vtable scanner** | Virtual method tables (arrays of function pointers) |
 | **Stub classifier** | Empty/trivial functions (ret, xor eax,eax; ret) |
-| **Clustering** | Groups similar functions by instruction patterns |
+| **Clustering** | Propagates labels through call graph and address proximity |
 
-**Output:** Annotated function database with categories:
+**Output:** `identified_functions.json` records categories, confidence and
+identification methods alongside input function addresses. These are heuristic
+labels, not proof of function identity or ABI compatibility.
 
-```
-0x00011000  CRT     _mainCRTStartup
-0x00011240  GAME    resource_loader
-0x000636D0  GAME    physics_force_apply
-0x001DD910  RW      RwCameraBeginUpdate
-0x0034D530  RW      renderware_main_render (79KB!)
-```
-
-**Why this matters:** Knowing which functions are CRT vs RenderWare vs game code helps you prioritize. CRT functions usually "just work" in recompiled form. RenderWare functions may need manual overrides. Game functions need the most attention.
+Application keyword classification is disabled by default. Supply a JSON object
+mapping category names to lists of nonempty lowercase strings with
+`--game-keywords path/to/keywords.json`. For example, `{"space": ["orbit"]}`
+can label a matching referenced string as `game_space`. The Python `run` and
+`propagate_labels` APIs accept the same mapping as `game_keywords`; no policy
+persists between calls.
 
 ---
 
@@ -269,9 +269,12 @@ The generated code is intentionally verbose and mechanical — it's not meant to
 
 ## Regeneration
 
-If you regenerate the recompiled code (after fixing the recompiler or re-running with new options), you'll need to **re-apply manual patches** to the gen files. Keep a list of your patches — this is the most error-prone part of the workflow.
+Fix reusable translation errors in the lifter and regenerate the C output.
+Keep port-specific overrides and hook configuration in the port's source tree,
+separate from generated files. See [runtime integration and manual overrides](../docs/pipeline/05-runtime.md)
+for the replacement boundary.
 
-Recommended workflow:
-1. Keep manual overrides in a separate file (`recomp_manual.c`)
-2. Use `#if 0` / `#endif` to disable gen functions that have manual replacements
-3. Track gen patches in a document (see CLAUDE.md in the burnout3 repo for an example)
+Record each override's purpose and guest ABI assumptions. After regeneration,
+rebuild and rerun its focused checks to verify that the intended replacement
+is still linked and reached. A source patch or successful code generation alone
+does not establish runtime behavior.

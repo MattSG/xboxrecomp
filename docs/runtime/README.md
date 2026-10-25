@@ -1,12 +1,12 @@
 # Runtime Implementation Guide
 
-The recompiled C code needs a host environment to run. This directory documents the four major runtime subsystems you need to build for each game.
+The recompiled C code needs a host environment to run. This directory documents the runtime subsystems supplied by XboxRecomp and the boundaries a game port configures.
 
 ## The Four Pillars
 
 ### 1. Memory Layout (`xbox_memory.c`)
 
-Reproduce the Xbox's 64 MB address space at the correct virtual addresses. This is the most critical piece — get it wrong and nothing else works.
+Use `xbox_MemoryLayoutInit` from `xbox_kernel`. It parses the supplied XBE and maps its sections; do not copy another title's addresses or write a second allocator.
 
 See: [../technical/memory-layout.md](../technical/memory-layout.md)
 
@@ -14,7 +14,7 @@ Template: [../../templates/runtime/xbox_memory.h](../../templates/runtime/xbox_m
 
 ### 2. Kernel Shim (`xbox_kernel.c`)
 
-Replace the 147 Xbox kernel imports with Win32 equivalents. Most can be stubbed (return STATUS_SUCCESS). The critical ones are memory allocation and file I/O.
+Link `xbox_kernel` and initialize imports from the loaded XBE. Unsupported operations must remain observable; do not replace them with unconditional success. The legacy template include forwards to the real runtime header.
 
 See: [../technical/kernel-replacement.md](../technical/kernel-replacement.md)
 
@@ -53,47 +53,39 @@ Beyond the four pillars, each game needs:
 
 These go in the game-specific repo, not in the generic xboxrecomp toolkit.
 
-## POSIX hosts (macOS, Linux)
 
-The template's `main.c` is Win32: a vectored handler that calls
-`xbox_VehMmioFault` and a `WinMain`. A POSIX build needs the same two pieces
-in its own `main()`:
+## Guest thread startup
 
-```c
-#include <signal.h>
-#include <ucontext.h>
-#include "kernel/xbox_memory_layout.h"   /* xbox_PosixMmioFault */
-#include "video/video_player.h"          /* xbox_HostWindowMain */
+Both guest thread-create APIs default to spawned host threads with independent
+registers and guest stacks. Ports that require the legacy first-call inline
+model can call `xbox_SetThreadMode(XBOX_THREAD_MODE_INLINE)` before guest startup.
+That is an explicit compatibility choice; normal callers need no selector.
 
-/* Trapped hardware registers (APU, AC'97, USB OHCI) fault here. Return when
- * the access was serviced: the program counter has been advanced past it. */
-static void on_fault(int sig, siginfo_t *si, void *uc)
-{
-    if (xbox_PosixMmioFault(uc, (uintptr_t)si->si_addr))
-        return;
-    signal(sig, SIG_DFL);                /* a real crash: report and die */
-}
 
-static int boot_and_run(void)
-{
-    /* xbox_MemoryLayoutInit, kernel init, the guest entry point, ...,
-     * as in the template's WinMain. */
-    return 0;
-}
+Host callbacks entering guest code use `xbox_worker_stack_alloc` and
+`xbox_worker_stack_free` for a guest stack slice. The kernel's DPC/timer,
+network, USB and APU paths use this pool; it is not limited to a host-driven
+game loop. Guest-created threads use `xbox_AllocThreadStack` instead.
 
-int main(void)
-{
-    struct sigaction sa = { 0 };
-    sa.sa_sigaction = on_fault;
-    sa.sa_flags = SA_SIGINFO;
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);        /* macOS reports a protected page so */
-    /* With RECOMP_FB_WINDOW set this opens the framebuffer window on the
-     * main thread (where macOS requires it) and runs boot_and_run on a second
-     * one; otherwise it just calls boot_and_run. */
-    return xbox_HostWindowMain(boot_and_run);
-}
-```
+The loader places the callback pool after the image, page aligned, and keeps
+ordinary heap allocations outside it. Pool leases are disabled if the complete
+pool cannot fit in mapped guest RAM. Shutdown clears placement; loading another
+image computes it again. Standalone hosts with their own guest mapping can use
+`xbox_worker_stack_reset(base)` before workers start (or after they have stopped)
+to supply a mapped pool; zero disables it. Slot count and size are unchanged.
 
-`xbox_PosixMmioFault` decodes the faulting instruction on arm64 hosts only;
-on x86-64 POSIX it always returns 0, and the traps are not armed there.
+
+## Renderer policy
+
+`NvOverlayHooks.vertex_alignment` lets a port choose the existing shader's
+pixel-zero snap and screen-offset parameters from guest target dimensions.
+Without a hook, snapping is enabled and the screen offset is zero for every
+target size. Authored pass selection belongs to the port; the shared shader
+implements the coordinate operations for both renderers.
+
+
+The Windows new-game starter uses `xbox_HostHardwareInit` and
+`xbox_HostGraphicsInit`, then shuts hardware down before releasing guest memory.
+It explicitly selects INLINE for its simple guest-driven loop. A port with its
+own host loop selects SPAWN and owns worker lifetime and joining. The starter's
+VEH is diagnostic only; shared host setup owns hardware MMIO routing.

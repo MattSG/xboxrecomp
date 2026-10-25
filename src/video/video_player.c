@@ -1,18 +1,7 @@
 /**
- * Shared FMV player: Media Foundation decode onto a D3D8 texture.
- *
- * Titles whose video is an ordinary container Windows can already decode do not
- * need their in-game decoder emulated to be watchable. The recompiled title
- * still drives everything -- it opens the file when its own logic says to, and
- * the runtime plays that file -- so the video appears where the game puts it
- * rather than being replayed on a timer.
- *
- * Lifted from burnout3's player, with its boot-sequence state machine and menu
- * dependencies removed: those are title logic, and this is the decoder.
- *
- * The pump in xbox_VideoPlayRun() owns its window, its D3D8 device and its
- * Media Foundation session on one thread, so nothing here touches the guest's
- * execution or its memory.
+ * Optional host-side Media Foundation decode and D3D8 texture presentation.
+ * The port selects files and decides when to invoke playback. The pump owns
+ * its decoder/window thread; these helpers do not execute guest code.
  */
 #if defined(_WIN32)
 #define COBJMACROS
@@ -620,13 +609,8 @@ void video_close(void)
     g_vp.height = 0;
 }
 
-/* Write the frame currently decoded to a 24-bit BMP.
- *
- * The point is evidence rather than debugging: "the video played" is otherwise
- * only a log line, and a log line cannot distinguish a decoded frame that got
- * drawn from a black screen that ran for the right number of seconds. This
- * writes what was uploaded to the texture, so a non-black file means real
- * decoded pixels reached the renderer. */
+/* Write the decoded CPU frame to a 24-bit BMP. This does not read back the
+ * texture, draw result or presented window. */
 int video_dump_frame_bmp(const char *path)
 {
     FILE *f;
@@ -677,5 +661,6 @@ int  video_update(float dt)      { (void)dt; return -1; }
 void video_render(void)          {}
 int  video_is_finished(void)     { return 1; }
 void video_close(void)           {}
+int video_dump_frame_bmp(const char *p) { (void)p; return -1; }
 
 #endif /* _WIN32 */

@@ -285,9 +285,9 @@ direction.
   Shipped with `tests/d3d8_smoke`, which compiles the real `d3d8_resources.c`
   against stub device accessors so the format tables, swizzle classification
   and conversions are checkable with no D3D11 device — which is what made a
-  change this size reviewable at all. `docs/technical/gap-analysis.md` marks
-  the approximate maps that still want in-game validation rather than claiming
-  them.
+  change this size reviewable at all. Format mapping and synthetic conversion
+  checks still need in-game validation; see `docs/technical/gap-analysis.md`
+  for the distinction between support claims and their evidence.
 - **Kernel ordinal routing (#25)** — 20 more routes (SMBus, PCI config space,
   IRQL, EEPROM save, semaphores, FP-state save/restore, `KeWaitForMultiple-
   Objects`, and the rest), and more valuably the memory-model corrections

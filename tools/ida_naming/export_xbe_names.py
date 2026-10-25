@@ -1,11 +1,6 @@
 """Export an Xbox XBE's recovered names from IDA, in the shape merge_names reads.
 
-xboxrecomp already had a Ghidra path and no IDA one. The gap was never the
-analysis -- IDA's FLIRT and demangler recover the same kind of names Ghidra's
-FidDb and RTTI analyzers do -- it was that nothing wrote them out in the shape
-``tools/ghidra_naming/merge_names.py`` consumes. So this is that, and nothing
-else: the merge, the placeholder filter, the C-identifier sanitising, the
-collision handling and ``--apply`` are all the existing tool's job.
+Export database functions and symbols for the shared name-merging tool.
 
 Writes two files into an output directory:
 
@@ -19,17 +14,16 @@ then:
       --export-dir tools/ida_naming/export \
       --out tools/ida_naming/ida_names.json
 
-Addresses are absolute Xbox VAs, which is what ``functions.json`` keys on. That
-only holds if the database is based where the XBE is: load the flat image from
-``tools/ghidra_naming/extract_for_ghidra.py`` (it is a plain binary, nothing in
-it is Ghidra-specific) as x86 32-bit at 0x00010000, or use a loader that does
-the same. The script refuses to guess and says so if the base looks wrong.
+Addresses are absolute database VAs. Import the flat image at the base_address
+from its sections.json metadata. Optionally pass --image-base <address> to
+verify the database base against that expected value before exporting.
 
 Run it against an open database, from the GUI (File > Script file...) or
 headless:
 
     ida -A -S"tools/ida_naming/export_xbe_names.py <outdir> --exit" xbe_flat.idb
 """
+import argparse
 import json
 import os
 
@@ -41,8 +35,6 @@ import ida_name
 import ida_typeinf
 import idautils
 import idc
-
-XBE_BASE = 0x00010000
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUT = os.path.join(_HERE, "export")
@@ -115,20 +107,19 @@ def export_symbols(out_dir):
 
 
 def main():
-    argv = idc.ARGV[1:] if len(idc.ARGV) > 1 else []
-    argv = [a for a in argv if a != "--exit"]
-    out_dir = argv[0] if argv else DEFAULT_OUT
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("out_dir", nargs="?", default=DEFAULT_OUT)
+    parser.add_argument("--image-base", type=lambda value: int(value, 0),
+                        help="Expected database image base, from sections.json")
+    parser.add_argument("--exit", action="store_true")
+    args = parser.parse_args(idc.ARGV[1:])
+    out_dir = args.out_dir
 
     ida_auto.auto_wait()
-
     base = ida_nalt.get_imagebase()
-    if base != XBE_BASE:
-        # Worth stopping for. Names at the wrong base merge onto nothing, and
-        # the failure is silent: merge_names reports a healthy count and
-        # "0 addresses matching functions.json".
-        print("ERROR: image base is 0x%08X, expected 0x%08X." % (base, XBE_BASE))
-        print("       Rebase the database (Edit > Segments > Rebase program),")
-        print("       or load the flat image at 0x%08X." % XBE_BASE)
+    if args.image_base is not None and base != args.image_base:
+        print("ERROR: image base is 0x%08X, expected 0x%08X." %
+              (base, args.image_base))
         return 1
 
     if not os.path.isdir(out_dir):

@@ -66,6 +66,8 @@ extern "C" {
 #define PAGE_EXECUTE           0x10u
 #define PAGE_EXECUTE_READ      0x20u
 #define PAGE_EXECUTE_READWRITE 0x40u
+#define PAGE_EXECUTE_WRITECOPY 0x80u
+#define PAGE_GUARD            0x100u
 
 /* Code-page ids accepted by MultiByteToWideChar (only UTF8/ACP are honoured) */
 #define CP_ACP    0u
@@ -129,8 +131,12 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 HANDLE      w32_open_handle(int fd, const char *host_path);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
-/* After a rename: later path-based operations on h follow the file. */
-void        w32_handle_set_path(HANDLE h, const char *host_path);
+/* Same, but enforcing Win32 share modes against every other open of the file.
+ * access and share are Win32 masks. On conflict: INVALID_HANDLE_VALUE with
+ * ERROR_SHARING_VIOLATION, and the caller still owns fd. truncate_to_zero
+ * truncates only after the share check passes. */
+HANDLE      w32_open_handle_shared(int fd, const char *host_path, DWORD access,
+                                   DWORD share, int truncate_to_zero);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
@@ -180,6 +186,7 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);
 BOOL   GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
                               DWORD_PTR *system_mask);
 VOID   SwitchToThread(void);
+VOID   YieldProcessor(void);   /* spin-wait hint; sched_yield on POSIX */
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 
 /* ---- Sleep ------------------------------------------------------------ */
@@ -227,6 +234,13 @@ DWORD GetTickCount(void);
 ULONGLONG GetTickCount64(void);
 BOOL  QueryPerformanceCounter(PLARGE_INTEGER count);
 BOOL  QueryPerformanceFrequency(PLARGE_INTEGER freq);
+BOOL  GetThreadTimes(HANDLE thread, LPFILETIME created, LPFILETIME exited,
+                     LPFILETIME kernel, LPFILETIME user);
+
+/* ---- Address waits (futex on Linux; hashed condvar buckets elsewhere) -- */
+BOOL  WaitOnAddress(volatile VOID *address, PVOID compare, SIZE_T size, DWORD ms);
+VOID  WakeByAddressSingle(PVOID address);
+VOID  WakeByAddressAll(PVOID address);
 
 /* ---- Misc ------------------------------------------------------------- */
 VOID  OutputDebugStringA(LPCSTR str);
@@ -250,6 +264,12 @@ unsigned int _clearfp(void);   /* clear pending FPU exception flags */
 #define FILE_SHARE_READ          0x00000001u
 #define FILE_SHARE_WRITE         0x00000002u
 #define FILE_SHARE_DELETE        0x00000004u
+#define FILE_READ_DATA           0x00000001u
+#define FILE_WRITE_DATA          0x00000002u
+#define FILE_APPEND_DATA         0x00000004u
+#define FILE_READ_ATTRIBUTES     0x00000080u
+#define FILE_WRITE_ATTRIBUTES    0x00000100u
+#define DELETE                   0x00010000u
 #define CREATE_NEW               1
 #define CREATE_ALWAYS            2
 #define OPEN_EXISTING            3
@@ -297,6 +317,8 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
 #define VK_RBUTTON   0x02
 #define VK_CANCEL    0x03
 #define VK_MBUTTON   0x04
+#define VK_XBUTTON1  0x05
+#define VK_XBUTTON2  0x06
 #define VK_BACK      0x08
 #define VK_TAB       0x09
 #define VK_RETURN    0x0D
@@ -317,6 +339,16 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
 #define VK_DOWN      0x28
 #define VK_INSERT    0x2D
 #define VK_DELETE    0x2E
+#define VK_NUMPAD0   0x60
+#define VK_NUMPAD1   0x61
+#define VK_NUMPAD2   0x62
+#define VK_NUMPAD3   0x63
+#define VK_NUMPAD4   0x64
+#define VK_NUMPAD5   0x65
+#define VK_NUMPAD6   0x66
+#define VK_NUMPAD7   0x67
+#define VK_NUMPAD8   0x68
+#define VK_NUMPAD9   0x69
 #define VK_MULTIPLY  0x6A
 #define VK_ADD       0x6B
 #define VK_SUBTRACT  0x6D
@@ -399,6 +431,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_INVALID_PARAMETER       87u
 #define ERROR_CALL_NOT_IMPLEMENTED    120u
 #define ERROR_INSUFFICIENT_BUFFER     122u
+#define ERROR_BUFFER_OVERFLOW         111u
 #define ERROR_ALREADY_EXISTS          183u
 #define ERROR_MORE_DATA               234u
 #define ERROR_NOT_OWNER               288u
@@ -406,9 +439,13 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_INVALID_ADDRESS         487u
 #define ERROR_IO_PENDING              997u
 #define ERROR_CANCELLED               1223u
+#define ERROR_TIMEOUT                 1460u
 #define ERROR_NO_SYSTEM_RESOURCES     1450u
 #define ERROR_COMMITMENT_LIMIT        1455u
 #define ERROR_DEVICE_NOT_CONNECTED    1167u
+#define ERROR_PARTIAL_COPY            299u
+#define ERROR_BUFFER_OVERFLOW         111u
+#define ERROR_SHARING_VIOLATION       32u
 
 /* ---- COM HRESULT codes ------------------------------------------------ */
 #ifndef S_OK
@@ -444,24 +481,42 @@ VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
                PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue);
 VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args);
 
-/* Win32 VEH: opaque PEXCEPTION_POINTERS + AddVectoredExceptionHandler stub.
- * On Linux the equivalent goes through sigaction(SIGSEGV/SIGFPE) +
- * ucontext_t; for now we accept the registration and never fire. 
- * 
- * Note: GCC needs correct struct. This is from nxdk
- * */
-#ifdef __linux__
+/* Win32 VEH over signals (x86-64): SIGSEGV/SIGBUS become
+ * EXCEPTION_ACCESS_VIOLATION with ExceptionInformation[0] = 1 for a write and
+ * [1] = the address; SIGTRAP becomes EXCEPTION_SINGLE_STEP (the trap flag or
+ * a hardware watchpoint) or EXCEPTION_BREAKPOINT (int3), with the signal's
+ * si_code in ExceptionInformation[0]. Handlers run in registration order. */
 typedef struct _EXCEPTION_POINTERS
 {
     PEXCEPTION_RECORD ExceptionRecord;
     PCONTEXT ContextRecord;
 } EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;
-#else
-typedef void *PEXCEPTION_POINTERS;
-#endif
 typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
 PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
 ULONG RemoveVectoredExceptionHandler(PVOID Handle);
+/* Runs after the vectored handlers decline a fault, as on Windows. */
+typedef LONG (*LPTOP_LEVEL_EXCEPTION_FILTER)(PEXCEPTION_POINTERS info);
+LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter);
+
+/* Console control: SIGINT is CTRL_C_EVENT, SIGTERM and SIGHUP CTRL_CLOSE_EVENT. */
+#define CTRL_C_EVENT        0
+#define CTRL_BREAK_EVENT    1
+#define CTRL_CLOSE_EVENT    2
+typedef BOOL (*PHANDLER_ROUTINE)(DWORD event);
+BOOL SetConsoleCtrlHandler(PHANDLER_ROUTINE handler, BOOL add);
+
+#define SYNCHRONIZE 0x00100000u
+
+/* The executable's load address (GetModuleHandle(NULL) only). */
+HMODULE GetModuleHandleA(LPCSTR name);
+HMODULE GetModuleHandleW(LPCWSTR name);
+USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash);
+/* This process only: a read that fails instead of faulting. */
+BOOL ReadProcessMemory(HANDLE process, LPCVOID address, LPVOID buffer, SIZE_T size,
+                       SIZE_T *read);
+BOOL GetComputerNameA(LPSTR name, LPDWORD size);
+int _putenv_s(const char *name, const char *value);
+int strcpy_s(char *dst, size_t size, const char *src);
 
 #define EXCEPTION_CONTINUE_SEARCH       0
 #define EXCEPTION_EXECUTE_HANDLER       1
@@ -479,6 +534,9 @@ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
 #define EXCEPTION_FLT_DENORMAL_OPERAND   0xC000008Du
 
 /* For linux devices*/
+#ifndef EXCEPTION_BREAKPOINT
+  #define EXCEPTION_BREAKPOINT 0x80000003u
+#endif
 #ifndef EXCEPTION_SINGLE_STEP
   #define EXCEPTION_SINGLE_STEP 0x80000004u
 #endif
@@ -494,6 +552,13 @@ typedef struct _MEMORY_BASIC_INFORMATION {
     DWORD  Type;
 } MEMORY_BASIC_INFORMATION, *PMEMORY_BASIC_INFORMATION;
 SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T length);
+#if !defined(_WIN32)
+/* POSIX memory-layout support: these release only currently reserved portions
+ * of shim-owned VirtualAlloc reservations. They are not Win32 APIs. */
+uint64_t w32_reservation_id(LPVOID base);
+BOOL w32_release_reserved_region(LPVOID address, SIZE_T size);
+BOOL w32_release_reservation(uint64_t allocation_id);
+#endif
 
 typedef struct _MEMORYSTATUSEX {
     DWORD     dwLength;
@@ -507,8 +572,9 @@ typedef struct _MEMORYSTATUSEX {
     ULONGLONG ullAvailExtendedVirtual;
 } MEMORYSTATUSEX, *LPMEMORYSTATUSEX;
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX buffer);
+BOOL GetComputerNameA(LPSTR buffer, LPDWORD size);
 
-/* ---- File mapping (memfd-backed; gives true aliased mirror views) ----- */
+/* ---- File mapping (memfd-backed; the RAM view is mapped into a reserved span) */
 #define FILE_MAP_COPY        0x00000001u
 #define FILE_MAP_WRITE       0x00000002u
 #define FILE_MAP_READ        0x00000004u
@@ -551,8 +617,8 @@ BOOL SystemTimeToFileTime(const SYSTEMTIME *st, LPFILETIME ft);
 BOOL FileTimeToSystemTime(const FILETIME *ft, LPSYSTEMTIME st);
 
 /* ---- Multimedia (winmm) shim: waveOut stubs that always report failure.
- * The APU has a waveOut fallback path; on Linux it just stays inactive
- * and the (real) SDL2 audio path will replace it later. */
+ * The APU's waveOut fallback stays inactive here; its output goes through
+ * the SDL3 audio stream in apu_xaudio2.c instead. */
 typedef DWORD  MMRESULT;
 typedef void  *HWAVEOUT;
 #define MMSYSERR_NOERROR     0

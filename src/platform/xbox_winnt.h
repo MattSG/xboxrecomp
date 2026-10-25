@@ -153,35 +153,15 @@ typedef void             **PHANDLE, **LPHANDLE;
 typedef void              *HMODULE, *HINSTANCE, *HKEY, *HLOCAL, *HGLOBAL;
 typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
 
-/* PCONTEXT: Windows VEH register state. On Linux the equivalent is
- * ucontext_t*; we leave it opaque here since Linux callers don't use it. */
- 
-#ifdef __linux__
-/* On gcc these data structures are necessary  even if anyone is going to be used*/
-typedef union Register{
-	uint32_t X; // all register
-	uint8_t SR[4]; // Subregister
-} REG; 
-
-typedef uint32_t  IREG;
-
-typedef struct ProcessorCONTEXT{
-	// General
-	REG EAX;
-	REG EBX;
-	REG ECX;
-	REG EDX;
-	IREG ESI;
-	IREG EDI;
-	IREG ESP;
-	IREG EBP;
-	//  Instruction Pointer Flags
-	IREG EIP;
-	IREG EFlags;
-} *PCONTEXT;
-#else
-typedef void              *PCONTEXT;
-#endif
+/* PCONTEXT: the x86-64 registers a vectored exception handler reads and
+ * changes, with the Windows CONTEXT field names. win32_compat.c fills it from
+ * the signal's ucontext and writes it back when a handler continues. */
+typedef struct _CONTEXT {
+    uint64_t Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    uint64_t R8, R9, R10, R11, R12, R13, R14, R15;
+    uint64_t Rip;
+    uint32_t EFlags;
+} CONTEXT, *PCONTEXT;
 /* Xbox/UTF-16 wide char is 16-bit, unlike the 32-bit Linux wchar_t. */
 typedef uint16_t           WCHAR, *PWCHAR, *LPWSTR, *PWSTR;
 typedef const uint16_t    *LPCWSTR, *PCWSTR;

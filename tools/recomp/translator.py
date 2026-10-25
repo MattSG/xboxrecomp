@@ -50,7 +50,7 @@ def _merge_flag_states(states):
     Float compares join the same way (see _SSE_COMPARES). Without that, a jbe
     after "comiss xmm3, xmm0" on one edge and "comiss xmm0, xmm3" on the other
     -- MSVC's shape for a clamp whose direction depends on a sign -- fell back
-    to the never-assigned _flags, and the clamp always fired. T()NY zeroed its driven wheels' torque that way; the car crawled.
+    to the never-assigned _flags, and the clamp always fired. A title's driven wheels got zero torque that way, so the car crawled.
     """
     if not states or any(not state or not state[0] for state in states):
         return None
@@ -2443,6 +2443,9 @@ class FunctionTranslator:
                 insn.end_address for insn in instructions
                 if (insn.mnemonic == "int3"
                     and insn.end_address in instruction_starts))
+        # A resume entry starts its own block, so it has a label to jump to.
+        switch_leaders.update(
+            entry for entry in self.lifter.resume_entries if start < entry < end)
 
         return (imm_refs, computed_jump_edges, debug_slide_int3s,
                 debug_slide_bypasses, switch_leaders)
@@ -2505,6 +2508,39 @@ class FunctionTranslator:
                      instructions, start, end, coalesced)
 
         self.lifter.imm_code_refs = imm_refs
+
+        # Only a reachable edge can prove the linear decode swallowed code.
+        # Immediate code-looking values and jumps in unreachable data are not
+        # independent entry points. Preserve those bytes without inventing roots.
+        by_address = {insn.address: insn for insn in instructions}
+        pending, reached, recovery_roots = [start], set(), {start}
+        missing_direct = False
+        while pending:
+            address = pending.pop()
+            if address in reached or address not in by_address:
+                continue
+            reached.add(address)
+            insn = by_address[address]
+            if insn.jump_target is not None and start <= insn.jump_target < end:
+                missing_direct |= insn.jump_target not in by_address
+                pending.append(insn.jump_target)
+            for target in computed_jump_edges.get(address, ()):
+                recovery_roots.add(target)
+                pending.append(target)
+            bypass = debug_slide_bypasses.get(address)
+            if bypass is not None:
+                recovery_roots.add(bypass)
+                pending.append(bypass)
+            elif not insn.is_ret and not insn.is_jump and not (
+                    coalesced and insn.mnemonic in ("ud2", "hlt", "int3")):
+                pending.append(insn.end_address)
+        if missing_direct:
+            # Overlapping x86 streams are both legal; resync would delete the
+            # original fallthrough instruction, so decode both architectural paths.
+            instructions = self.disasm.disassemble_cfg(
+                raw_bytes, start, end, recovery_roots,
+                stop_mnemonics=("ud2", "hlt", "iret", "iretd")
+                if coalesced else ("iret", "iretd"))
 
         # Build basic blocks
         forced = getattr(self, "_forced_leaders", None)
@@ -2940,6 +2976,16 @@ class FunctionTranslator:
         if frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue:
             lines.append(f"    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */")
 
+        # Resume entries: a caller that set g_recomp_resume enters the body at
+        # that address, after the prologue above has set up the frame. The
+        # address is consumed on entry so ordinary calls run from the top.
+        resume = sorted(entry for entry in self.lifter.resume_entries if start < entry < end)
+        if resume:
+            lines.append("    if (g_recomp_resume) { uint32_t _resume = g_recomp_resume; g_recomp_resume = 0;")
+            for entry in resume:
+                lines.append(f"        if (_resume == 0x{entry:08X}u) goto loc_{entry:08X};")
+            lines.append("    }")
+
         lines.append(f"")
 
         # Generate code for each basic block
@@ -2982,8 +3028,8 @@ class FunctionTranslator:
                 "jmp", "ud2", "hlt", "iret", "iretd")
                       or (last.mnemonic == "int3"
                           and last.address not in debug_slide_int3s))
-            if not leaves and i + 1 < len(blocks):
-                preds[blocks[i + 1].start].add(bb.start)
+            if not leaves and last.end_address in preds:
+                preds[last.end_address].add(bb.start)
 
         # Settle the flag state before emitting anything.
         #
@@ -3040,8 +3086,9 @@ class FunctionTranslator:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
                 unseen_entries.update(self.lifter._analyze_switch_table(insn.operands))
         edge_vars, edge_sets, block_lines = [], [], {}
+        block_starts = {bb.start for bb in blocks}
 
-        for bb in blocks:
+        for block_index, bb in enumerate(blocks):
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
                 # The trailing ';' is load-bearing: C requires a statement after
@@ -3089,6 +3136,14 @@ class FunctionTranslator:
             last = bb.instructions[-1] if bb.instructions else None
             block_lines[bb.start] = (first, len(lines),
                                      bool(last and (last.is_branch or last.is_ret)))
+            # C emission order need not match either overlapping guest stream.
+            # Make the not-taken/sequential edge explicit when they differ.
+            if (last is not None and not last.is_ret and not last.is_jump
+                    and last.mnemonic not in ("ud2", "hlt", "iret", "iretd")
+                    and last.end_address in block_starts
+                    and (block_index + 1 == len(blocks)
+                         or blocks[block_index + 1].start != last.end_address)):
+                lines.append(f"    goto loc_{last.end_address:08X}; /* guest fallthrough */")
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
             if bypass is not None:
                 lines.append(
@@ -3133,23 +3188,7 @@ class FunctionTranslator:
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
 
-        # Validate: comment out goto targets that reference missing labels
-        # (dead code after unconditional jumps may reference non-existent labels)
-        import re
-        defined_labels = set()
-        goto_lines = []
-        for idx, line in enumerate(lines):
-            lbl_match = re.match(r'^(loc_[0-9A-Fa-f]+):', line)
-            if lbl_match:
-                defined_labels.add(lbl_match.group(1))
-            goto_match = re.search(r'goto (loc_[0-9A-Fa-f]+);', line)
-            if goto_match:
-                goto_lines.append((idx, goto_match.group(1)))
-        for idx, target in goto_lines:
-            if target not in defined_labels:
-                lines[idx] = lines[idx].replace(
-                    f"goto {target};",
-                    f"(void)0; /* goto {target} - dead code, label not in function */")
+        mark_missing_label_gotos(lines)
 
         # Ensure labels at end of function have a statement after them.
         # In C, a label must be followed by a statement; a comment alone is not
@@ -3214,6 +3253,32 @@ class FunctionTranslator:
                         regs.add(op.reg)
         return regs
 
+
+
+def mark_missing_label_gotos(lines):
+    """Turn each `goto loc_X;` whose label is not defined into RECOMP_DEAD_BRANCH.
+
+    Dead code after an unconditional jump can name labels that were never
+    emitted. A residual reached one reports and stops rather than falling
+    through. Edits `lines` in place and returns how many gotos were marked.
+    """
+    defined_labels = set()
+    goto_lines = []
+    for idx, line in enumerate(lines):
+        lbl_match = re.match(r'^(loc_[0-9A-Fa-f]+):', line)
+        if lbl_match:
+            defined_labels.add(lbl_match.group(1))
+        goto_match = re.search(r'goto (loc_[0-9A-Fa-f]+);', line)
+        if goto_match:
+            goto_lines.append((idx, goto_match.group(1)))
+    marked = 0
+    for idx, target in goto_lines:
+        if target not in defined_labels:
+            lines[idx] = lines[idx].replace(
+                f"goto {target};",
+                f"RECOMP_DEAD_BRANCH(0x{int(target[4:], 16):08X}u); /* goto {target} - label not in function */")
+            marked += 1
+    return marked
 
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""
@@ -3751,35 +3816,11 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
-            # A stub skips whatever code really lives at its address, so one
-            # reached at runtime is a likely cause of a silent stall or a wrong
-            # result far downstream. RECOMP_STUB_LOG=1 names each stub the
-            # first time it runs, with the return address on the guest stack
-            # (for a tail jump, that is the caller's caller). Off by default:
-            # the check is one cached getenv per stub per process.
-            stub_lines += [
-                "#include <stdio.h>",
-                "#include <stdlib.h>",
-                "",
-                "static int recomp_stub_log_on(void)",
-                "{",
-                "    static int on = -1;",
-                "    if (on < 0) {",
-                '        const char *e = getenv("RECOMP_STUB_LOG");',
-                "        on = e && *e && *e != '0';",
-                "    }",
-                "    return on;",
-                "}",
-                "",
-                "#define RECOMP_STUB_HIT(va) do { static int _seen; \\",
-                "    if (!_seen && recomp_stub_log_on()) { _seen = 1; \\",
-                '        fprintf(stderr, "[STUB] unresolved 0x%08X reached, " \\',
-                '                "return 0x%08X esp 0x%08X\\n", (unsigned)(va), \\',
-                "                (unsigned)MEM32(g_esp), (unsigned)g_esp); \\",
-                "        fflush(stderr); } } while (0)",
-                "",
-            ]
-            entry_n = 0
+            stub_lines.extend([
+                "#ifndef RECOMP_UNRESOLVED_STUB_OBSERVE",
+                "#define RECOMP_UNRESOLVED_STUB_OBSERVE(va) ((void)0)",
+                "#endif", "",
+            ])
             for addr in sorted(unresolved):
                 # --entry-stubs: re-emit the containing function from addr.
                 # Opt-in: each target is a full copy of its function, so a
@@ -3807,8 +3848,7 @@ class BatchTranslator:
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ "
-                    f"RECOMP_STUB_HIT(0x{addr:08X}u); g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ RECOMP_UNRESOLVED_STUB_OBSERVE(0x{addr:08X}u); g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")

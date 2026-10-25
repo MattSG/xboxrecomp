@@ -4,7 +4,7 @@ Xbox games do not ship HLSL. They configure the NV2A's fixed-function combiner
 pipeline, or upload raw vertex-shader microcode. Both have to become something
 D3D11 or OpenGL will accept, and both are translated at runtime and cached.
 
-This document covers the two translators. For what is and is not implemented,
+This document covers the two translators. For support-claim evidence boundaries,
 see [gap-analysis.md](gap-analysis.md); for the wider D3D8 layer, see
 [d3d-translation.md](d3d-translation.md).
 
@@ -63,7 +63,7 @@ way to get this subtly wrong.
 | Piece | File |
 |---|---|
 | Combiner → HLSL | `src/d3d/d3d8_combiners.c`, `src/d3d/d3d8_combiners.h` |
-| Vertex microcode → HLSL | `src/nv2a/nv2a_pgraph_d3d11.c` |
+| Vertex microcode → HLSL | `src/video/shaders/nv2a_vertex.hlsl`, `src/kernel/nv2a_vsh_interp.c` |
 | Texture unswizzling | `src/d3d/d3d8_swizzle.h` |
 
 `d3d8_combiners.h` and `d3d8_swizzle.h` cite xemu as a reference for the

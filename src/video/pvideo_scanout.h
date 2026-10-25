@@ -5,24 +5,14 @@
 #include <stdint.h>
 #include "../nv2a/nv2a_regs.h"
 
-/* PVIDEO is the NV2A's video overlay: a YUY2 buffer in guest memory, scaled
- * and placed over the framebuffer at scanout, optionally behind a colour key.
- * Titles play movies through it (Bink's Xbox player does), so without it the
- * screen stays on whatever the framebuffer last held. */
-
-static inline unsigned pvideo_clamp(int value)
+static unsigned pvideo_clamp(int value)
 {
     return value < 0 ? 0u : value > 255 ? 255u : (unsigned)value;
 }
 
-/* Draw bank 0 or 1 of the overlay into dst (width x height, 0xAARRGGBB).
- * regs is the PVIDEO register block indexed by byte offset / 4; source holds
- * `available` bytes of the bank's YUY2 image. Returns 0 without drawing when
- * the bank is not pending, the overlay is stopped, or the registers describe
- * anything this does not handle (only YUY2 is). */
-static inline int pvideo_scanout(const uint32_t *regs, const uint8_t *source,
-                                 size_t available, uint32_t *dst,
-                                 unsigned width, unsigned height, unsigned bank)
+static int pvideo_scanout(const uint32_t *regs, const uint8_t *source,
+                          size_t available, uint32_t *dst,
+                          unsigned width, unsigned height, unsigned bank)
 {
 #define PV(reg) regs[((reg) + bank * 4u) / 4u]
     unsigned format = PV(NV_PVIDEO_FORMAT);

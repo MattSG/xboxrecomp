@@ -92,6 +92,19 @@ int main(void)
     ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &g_device_state.default_rtv, NULL);
 
+    /* Invalid tagged programmable handles must stop every draw route. */
+    {
+        const float vertices[12] = {0};
+        const WORD indices[3] = {0, 1, 2};
+        g_device_state.vertex_shader = 0xFFFFFFFFu;
+        CHECK("reject primitive shader failure", FAILED(dev_DrawPrimitive(&g_device, D3DPT_TRIANGLELIST, 0, 1)));
+        CHECK("reject indexed shader failure", FAILED(dev_DrawIndexedPrimitive(&g_device, D3DPT_TRIANGLELIST, 0, 3, 0, 1)));
+        CHECK("reject UP shader failure", FAILED(dev_DrawPrimitiveUP(&g_device, D3DPT_TRIANGLELIST, 1, vertices, 16)));
+        CHECK("reject indexed UP shader failure", FAILED(dev_DrawIndexedPrimitiveUP(&g_device, D3DPT_TRIANGLELIST, 0, 3, 1, indices, D3DFMT_INDEX16, vertices, 16)));
+        check_pixels("failed draws preserve target", original);
+        g_device_state.vertex_shader = D3DFVF_XYZRHW | D3DFVF_DIFFUSE;
+    }
+
     for (i = 0; i < 256; i++) ramp.red[i] = ramp.green[i] = ramp.blue[i] = (WORD)(i * 257);
     memset(&got, 0, sizeof(got));
     g_device.lpVtbl->GetGammaRamp(&g_device, &got);

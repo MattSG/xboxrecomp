@@ -4,7 +4,7 @@
  * Replaces QEMU types, SDL audio, and libsamplerate functions with
  * minimal Win32 equivalents so that xemu's APU code can compile standalone.
  *
- * Copyright (c) 2026 Burnout 3 Static Recompilation Project
+ * Copyright (c) 2026 xboxrecomp project
  * Based on xemu code: Copyright (c) 2012 espes, 2018-2025 Matt Borgerson et al.
  *
  * This library is free software; you can redistribute it and/or
@@ -181,8 +181,8 @@ static inline uint8_t *memory_region_get_ram_ptr(MemoryRegion *mr) {
 /* ============================================================
  * libsamplerate stubs (SRC)
  *
- * The VP uses libsamplerate for pitch-shifted voice resampling.
- * We stub it initially; voices will play at native rate.
+ * These compatibility callbacks do not resample and return no frames.
+ * They are not a native-rate playback fallback.
  * ============================================================ */
 
 typedef void SRC_STATE;
@@ -229,8 +229,8 @@ static inline void src_float_to_short_array(const float *in, int16_t *out,
 /* ============================================================
  * SDL Audio stubs
  *
- * The monitor output uses SDL. We stub it; actual audio output
- * will be connected via WASAPI separately.
+ * These compatibility entrypoints do not open an SDL audio stream.
+ * Native output is provided by apu_xaudio2.c.
  * ============================================================ */
 
 typedef void SDL_AudioStream;
@@ -370,7 +370,7 @@ static struct {
 } g_config = {
     .audio = {
         .volume_limit = 1.0f,
-        .hrtf = true,       /* xemu's default */
+        .hrtf = true,
         .vp = { .num_workers = 1 },
     },
 };

@@ -1,27 +1,15 @@
-"""Coverage oracle: grade our function-boundary detection against Microsoft's.
+"""Compare reference symbol starts with function detection for the same donor.
 
-Microsoft's Fission PrecompiledSymbolTable gives exact (guest_start, size) for
-the library functions in a title -- ground-truth function boundaries. For a
-title we also recompile (Crimson Skies), compare our tools/disasm functions.json
-against those starts:
+The supplied module's named-library starts are reference metadata, not an
+exhaustive inventory of all guest functions or evidence of semantic correctness.
+Report exact-start hits and missed starts inside detected functions or gaps.
+Missed-inside cases are candidates for inspecting merged function boundaries.
 
-  hit      MS names a function start and we detect a function there
-  missed   MS names a start we don't detect at all (a real function boundary we
-           lack) -- split by whether it lands INSIDE a function we did detect
-           (a merge/under-segmentation error) or in no detected function (a gap)
+    python -m tools.fusion.coverage_oracle <module.dll> <our_functions.json>
 
-The missed-inside set is the actionable one: those are the tail-jump /
-mid-function-entry cases our detector still merges. Run it after detector changes
-to measure movement against ground truth.
-
-    py -3 -m tools.fusion.coverage_oracle <module.dll> <our_functions.json>
-
-`our_functions.json` is our detection for the *donor* title, so it comes from
-running the pipeline over that title's original Xbox default.xbe. Get one out
-of the package with tools/fusion/svod.py -- the SVOD container is not sealed:
-
-    py -3 -m tools.fusion.svod extract "<package>" default.xbe donor.xbe
-    py -3 -m tools.disasm donor.xbe --text-only
+Generate functions.json from the guest XBE corresponding to that module build.
+A different retail/updated build can produce address differences unrelated to
+the detector. All module, guest and detector files are caller inputs.
 """
 import bisect
 import json

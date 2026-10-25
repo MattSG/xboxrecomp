@@ -11,8 +11,8 @@
  * the xemu NV2A GPU emulation.
  */
 
-#ifndef BURNOUT3_NV2A_MMIO_HOOK_H
-#define BURNOUT3_NV2A_MMIO_HOOK_H
+#ifndef XBOXRECOMP_NV2A_MMIO_HOOK_H
+#define XBOXRECOMP_NV2A_MMIO_HOOK_H
 
 #include "platform/xbox_winnt.h"
 #include <stdint.h>
@@ -21,13 +21,13 @@
 /*
  * Initialize the NV2A GPU subsystem.
  * Call this during startup before the game code runs.
- * Allocates VRAM, RAMIN, and initializes register state, and makes the
- * PVIDEO register page fault so its accesses reach nv2a_hook_handle_mmio.
+ * Allocates VRAM/RAMIN once if no state exists. Failed initialization releases
+ * new backing. Existing caller-owned state is reused. Startup must be quiesced;
+ * the process-wide device has no teardown API. The offset is legacy/unused.
  */
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset);
 
-/* For the host scanout thread: copy the modeled PVIDEO registers (false
- * when there is no NV2A model), and mark a bank's frame as taken. */
+/* Copy modeled PVIDEO registers for the host scanout thread. */
 bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
 void nv2a_hook_pvideo_consume(unsigned bank);
 
@@ -41,20 +41,10 @@ void nv2a_hook_pvideo_consume(unsigned bank);
  * through the NV2A register handlers, updates CPU context, and
  * returns true if handled successfully.
  *
- * Returns false if the instruction couldn't be decoded (caller
- * should fall back to allocating a zero page).
+ * Returns false without emulating unsupported instructions. The caller must
+ * leave those faults unhandled rather than fabricate a register value.
  */
 bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                            uint32_t fault_xbox_va, int is_write);
 
-/*
- * Handle a GPU framebuffer/push buffer access.
- *
- * For 0xF0000000-0xFCFFFFFF range. Currently just allocates
- * pages backed by NV2A VRAM where appropriate.
- *
- * Returns true if handled.
- */
-bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va);
-
-#endif /* BURNOUT3_NV2A_MMIO_HOOK_H */
+#endif /* XBOXRECOMP_NV2A_MMIO_HOOK_H */

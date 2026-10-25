@@ -1,6 +1,7 @@
-/* Test A8 sampling and transformed-vertex interpolation on D3D11 WARP.
+/* Test alpha/palette sampling and transformed-vertex interpolation on D3D11 WARP.
  * No game data, window, or hardware adapter is needed. */
 #include "d3d8_internal.h"
+#include "d3d8_combiners.h"
 #include <d3dcompiler.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,14 +12,20 @@ static ID3D11DeviceContext *context;
 static ID3D11VertexShader *vs;
 static ID3D11Buffer *programmable_constants;
 static IDirect3DBaseTexture8 *textures[4];
-static DWORD states[512], stages[4][64];
+static DWORD states[512], stages[4][64], palette_entries[256];
 static const D3DMATRIX identity = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
 
-ID3D11Device *d3d8_GetD3D11Device(void) { return device; }
+static int fail_pixel_shader;
+static HRESULT STDMETHODCALLTYPE fail_create_ps(ID3D11Device *self, const void *code,
+    SIZE_T bytes, ID3D11ClassLinkage *linkage, ID3D11PixelShader **out)
+{ (void)self; (void)code; (void)bytes; (void)linkage; *out = NULL; return E_OUTOFMEMORY; }
+static const ID3D11DeviceVtbl failing_vtable = { .CreatePixelShader = fail_create_ps };
+static ID3D11Device failing_device = { &failing_vtable };
+ID3D11Device *d3d8_GetD3D11Device(void) { return fail_pixel_shader ? &failing_device : device; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return context; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return NULL; }
 IDirect3DDevice8 *xbox_GetD3DDevice(void) { return NULL; }
-const DWORD *d3d8_GetPalette(DWORD stage) { (void)stage; return states; }
+const DWORD *d3d8_GetPalette(DWORD stage) { (void)stage; return palette_entries; }
 const DWORD *d3d8_GetRenderStates(void) { return states; }
 const DWORD *d3d8_GetTSS(DWORD stage) { return stages[stage]; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return textures[stage]; }
@@ -32,9 +39,10 @@ UINT d3d8_GetNumLights(void) { return 0; }
 
 /* Model successful programmable-VS preparation without Xbox microcode.
  * Bind real D3D11 vertex state so pixel preparation must preserve it. */
+BOOL d3d8_vsh_is_programmable(DWORD handle) { return (handle & 1u) != 0; }
 BOOL d3d8_vsh_prepare_draw(DWORD handle)
 {
-    if (handle != 0x10000) return FALSE;
+    if (handle != 0x10001) return FALSE;
     ID3D11DeviceContext_VSSetShader(context, vs, NULL, 0);
     ID3D11DeviceContext_IASetInputLayout(context, NULL);
     ID3D11DeviceContext_VSSetConstantBuffers(context, 1, 1, &programmable_constants);
@@ -119,6 +127,50 @@ static int check_rhw(ID3D11Texture2D *target, ID3D11Texture2D *readback,
     return failures;
 }
 
+/* A failed replacement must retain every cached shader and its ownership. */
+static int check_cache_failure(void)
+{
+    NV2ACombinerState state = {0};
+    ID3D11PixelShader *held[128];
+    ULONG refs[128];
+    unsigned i;
+    d3d8_combiners_shutdown();
+    REQUIRE(d3d8_combiners_init());
+    state.num_stages = 1;
+    for (i = 0; i < 4; i++) state.tex_mode[i] = NV2A_TEXMODE_NONE;
+    for (i = 0; i < 128; i++) {
+        state.c0[0] = i;
+        held[i] = d3d8_combiners_get_shader(&state);
+        if (!held[i]) return 1;
+        ID3D11PixelShader_AddRef(held[i]);
+    }
+    for (i = 0; i < 128; i++) {
+        refs[i] = ID3D11PixelShader_AddRef(held[i]);
+        ID3D11PixelShader_Release(held[i]);
+    }
+    state.c0[0] = 128;
+    fail_pixel_shader = 1;
+    ID3D11PixelShader *failed = d3d8_combiners_get_shader(&state);
+    fail_pixel_shader = 0;
+    if (failed) return 1;
+    for (i = 0; i < 128; i++) {
+        ULONG count = ID3D11PixelShader_AddRef(held[i]);
+        ID3D11PixelShader_Release(held[i]);
+        if (count != refs[i]) {
+            fprintf(stderr, "FAIL: failed eviction changed shader ownership\n");
+            return 1; /* Held references keep the old failure path observable. */
+        }
+    }
+    for (i = 0; i < 128; i++) {
+        state.c0[0] = i;
+        if (d3d8_combiners_get_shader(&state) != held[i]) return 1;
+    }
+    state.c0[0] = 128;
+    if (!d3d8_combiners_get_shader(&state)) return 1; /* Retry can replace. */
+    for (i = 0; i < 128; i++) ID3D11PixelShader_Release(held[i]);
+    return 0;
+}
+
 int main(void)
 {
     static const char vs_source[] =
@@ -128,7 +180,7 @@ int main(void)
         "V main(uint id:SV_VertexID) { V o=(V)0;"
         " o.p=float4(id==2?3:-1,id==1?3:-1,0,1);"
         " o.c=1; o.t0=o.t1=o.t2=o.t3=float3(0.5,0.5,0.5); return o; }";
-    static const D3DFORMAT formats[] = {D3DFMT_A8, D3DFMT_LIN_A8, D3DFMT_LIN_A8R8G8B8};
+    static const D3DFORMAT formats[] = {D3DFMT_A8, D3DFMT_LIN_A8, D3DFMT_LIN_A8R8G8B8, D3DFMT_P8};
     static const BYTE alphas[] = {0, 1, 127, 255};
     ID3D11Texture2D *target, *readback;
     ID3D11RenderTargetView *rtv;
@@ -211,6 +263,10 @@ int main(void)
                 UINT face;
                 if (f == 2) {
                     expected[0] = 95; expected[1] = 63; expected[2] = 31;
+                } else if (f == 3) {
+                    pixel[0] = 1;
+                    palette_entries[1] = ((DWORD)alphas[a] << 24) | 0x005F3F1Fu;
+                    expected[0] = 95; expected[1] = 63; expected[2] = 31;
                 } else {
                     pixel[0] = alphas[a];
                 }
@@ -246,7 +302,7 @@ int main(void)
                         textures[stage] = (IDirect3DBaseTexture8 *)&previous;
                         d3d8_shaders_prepare_draw(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
                         textures[stage] = tex;
-                        d3d8_shaders_prepare_draw(0x10000);
+                        d3d8_shaders_prepare_draw(0x10001);
                         ID3D11DeviceContext_VSGetShader(context, &bound_vs, NULL, NULL);
                         ID3D11DeviceContext_VSGetConstantBuffers(context, 1, 1, &bound_cb);
                         ID3D11DeviceContext_IAGetInputLayout(context, &bound_layout);
@@ -284,6 +340,7 @@ int main(void)
         }
     }
     ID3D11DeviceContext_ClearState(context);
+    if (check_cache_failure()) return 1;
     d3d8_combiners_shutdown();
     d3d8_shaders_shutdown();
     ID3D11RasterizerState_Release(rasterizer);
@@ -295,6 +352,6 @@ int main(void)
     ID3D11Texture2D_Release(readback);
     ID3D11DeviceContext_Release(context);
     ID3D11Device_Release(device);
-    printf("d3d8_a8: %d failures (336 A8 + 4 RHW draws)\n", failures);
+    printf("d3d8_a8: %d failures (448 texture + 4 RHW draws)\n", failures);
     return failures != 0;
 }

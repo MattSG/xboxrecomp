@@ -170,13 +170,6 @@ ULONG __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pat
  * main thread now run at the same time on different host threads, and the
  * locks the title takes to keep them apart did nothing.
  *
- * The failure that produced is worth describing, because it looks like
- * anything but a lock. Half-Life 2's level load faulted intermittently -- four
- * runs, three different functions, one clean -- and any attempt to observe it
- * made it disappear, including two plain stores to globals. Registers held
- * fragments of strings where pointers belonged, which is what a half-updated
- * structure looks like from the other thread.
- *
  * The Xbox RTL_CRITICAL_SECTION is 20 bytes of 32-bit layout and a Win32
  * CRITICAL_SECTION is 40 bytes of 64-bit layout, so the guest's own structure
  * cannot back a host lock. Shadow it instead: the guest pointer is the key,
@@ -220,24 +213,49 @@ static XBOX_CS_SLOT* xbox_cs_slot_of(CRITICAL_SECTION* cs)
 static SRWLOCK      g_cs_table_lock = SRWLOCK_INIT;
 static int          g_cs_table_full;
 
+/* Shadows are never deleted or moved. Once a thread resolves one under the
+ * table lock, it can reuse that pointer without taking the global table lock
+ * in front of every guest heap/stream acquisition and release. A collision
+ * only replaces this thread's hint; it never changes the underlying lock. */
+#define XBOX_CS_CACHE_SIZE 32
+typedef struct {
+    uintptr_t key;
+    CRITICAL_SECTION *cs;
+} XBOX_CS_CACHE_ENTRY;
+static RECOMP_TLS XBOX_CS_CACHE_ENTRY t_cs_cache[XBOX_CS_CACHE_SIZE];
+
 /* RECOMP_CS_MODE=single puts every guest critical section behind one recursive
  * lock.
  *
- * Deadlock-free by construction -- there is only one lock, so there is no order
- * to invert -- and deliberately NOT the default. A title that deadlocks under
- * real locks is telling you its threads are reaching a place the console's
- * would not, and collapsing the hierarchy hides that rather than answering it.
- * What it is good for is deciding whether a lock cycle is the last thing in the
- * way: if the title still does not get further with this on, the cycle was not
- * what was stopping it.
- *
- * Safe only because guest code here never holds a lock while waiting on another
- * guest thread to make progress -- the runtime's own I/O completes
- * synchronously. That would not hold in general.
+ * This diagnostic mode can distinguish lock-order cycles from other stalls.
+ * It does not guarantee progress: waiting for another thread while holding
+ * the shared lock can deadlock. Keep normal per-address locks as the default.
  */
 static CRITICAL_SECTION g_cs_single;
 static INIT_ONCE g_cs_single_once = INIT_ONCE_STATIC_INIT;
-static int g_cs_single_mode = -1;
+static INIT_ONCE g_cs_mode_once = INIT_ONCE_STATIC_INIT;
+static int g_cs_single_mode;
+static int g_cs_counters_on;
+static volatile LONG g_cs_mode_ready;
+
+static BOOL CALLBACK xbox_cs_mode_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    const char* mode = getenv("RECOMP_CS_MODE");
+    const char* counters = getenv("RECOMP_CS_COUNTERS");
+    (void)o; (void)p; (void)c;
+    g_cs_single_mode = (mode && !strcmp(mode, "single")) ? 1 : 0;
+    /* These totals only appear in contention diagnostics. Counting every
+     * guest lock operation otherwise bounces a shared atomic cache line
+     * between worker cores millions of times during normal gameplay. */
+    g_cs_counters_on = (counters && *counters && strcmp(counters, "0")) ||
+                      getenv("RECOMP_CS_TRACE_CRT") != NULL ||
+                      getenv("RECOMP_CS_WATCH") != NULL;
+    if (g_cs_single_mode)
+        fprintf(stderr, "  [CS] RECOMP_CS_MODE=single: every guest lock "
+                        "shares one recursive lock\n");
+    InterlockedExchange(&g_cs_mode_ready, 1);
+    return TRUE;
+}
 
 static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
@@ -248,13 +266,8 @@ static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
 
 static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 {
-    if (g_cs_single_mode < 0) {
-        const char* mode = getenv("RECOMP_CS_MODE");
-        g_cs_single_mode = (mode && !strcmp(mode, "single")) ? 1 : 0;
-        if (g_cs_single_mode)
-            fprintf(stderr, "  [CS] RECOMP_CS_MODE=single: every guest lock "
-                            "shares one recursive lock\n");
-    }
+    if (!g_cs_mode_ready)
+        InitOnceExecuteOnce(&g_cs_mode_once, xbox_cs_mode_init, NULL, NULL);
     if (g_cs_single_mode) {
         if (!guest)
             return NULL;
@@ -263,10 +276,13 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
     }
     uintptr_t key = (uintptr_t)guest;
     CRITICAL_SECTION* found = NULL;
-    size_t home, i;
+    size_t home, i, cache_index;
 
     if (!key)
         return NULL;
+    cache_index = ((key >> 4) ^ (key >> 9)) & (XBOX_CS_CACHE_SIZE - 1);
+    if (t_cs_cache[cache_index].key == key)
+        return t_cs_cache[cache_index].cs;
     home = (size_t)((key >> 4) % XBOX_CS_TABLE_SIZE);
 
     /* Shared pass first: after start-up almost every call finds an existing
@@ -280,7 +296,7 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
     }
     ReleaseSRWLockShared(&g_cs_table_lock);
     if (found)
-        return found;
+        goto cache;
 
     AcquireSRWLockExclusive(&g_cs_table_lock);
     for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
@@ -303,6 +319,11 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
                  "critical-section table full at %d entries; further locks "
                  "are unprotected", XBOX_CS_TABLE_SIZE);
     }
+cache:
+    if (found) {
+        t_cs_cache[cache_index].key = key;
+        t_cs_cache[cache_index].cs = found;
+    }
     return found;
 }
 
@@ -320,6 +341,20 @@ extern ptrdiff_t g_xbox_mem_offset;
 
 extern RECOMP_TLS uint32_t g_esp;
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+
+/* Diagnostic reads must not fault or wrap back into low guest memory. */
+static int xbox_rtl_read_word(uint64_t va, uint32_t *word)
+{
+    SIZE_T copied = 0;
+    DWORD error = GetLastError();
+    BOOL ok;
+    if (!va || va > UINT32_MAX - 3u) return 0;
+    ok = ReadProcessMemory(GetCurrentProcess(),
+        (const void *)((uintptr_t)g_xbox_mem_offset + (uintptr_t)va),
+        word, sizeof(*word), &copied);
+    SetLastError(error);
+    return ok && copied == sizeof(*word);
+}
 
 /* A guest backtrace, printed where the guest is standing.
  *
@@ -339,8 +374,8 @@ static void xbox_guest_backtrace(int depth)
     if (!sp || !g_xbox_code_hi)
         return;
     for (i = 0; i < 256 && shown < depth; i++) {
-        uint32_t word = *(const uint32_t *)((uintptr_t)(sp + i * 4)
-                                            + g_xbox_mem_offset);
+        uint32_t word;
+        if (!xbox_rtl_read_word((uint64_t)sp + (unsigned)i * 4u, &word)) break;
         if (word >= g_xbox_code_lo && word < g_xbox_code_hi) {
             fprintf(stderr, "  [CS]     guest 0x%08X\n", word);
             shown++;
@@ -374,8 +409,9 @@ static int xbox_crt_lock_index(uint32_t guest_va)
     if (!g_crt_lock_table)
         return -1;
     for (i = 0; i < g_crt_lock_count; i++) {
-        uint32_t slot = *(const uint32_t *)((uintptr_t)(g_crt_lock_table + i * 8)
-                                            + g_xbox_mem_offset);
+        uint32_t slot;
+        if (!xbox_rtl_read_word((uint64_t)g_crt_lock_table + (uint64_t)i * 8u,
+                                &slot)) break;
         if (slot == guest_va)
             return (int)i;
     }
@@ -412,12 +448,7 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
     /* "all" logs by address as well as index. Whether a lock's release is
      * missing or merely unrecognised by the index lookup are different bugs,
      * and only the raw address separates them. */
-    /* One lock, both sides, with the guest stack that got there.
-     *
-     * A take at one address and a release 0x78 lower is not a lock protocol
-     * this runtime can reason about from addresses alone -- it needs the two
-     * call sites, because the question is whether the guest computed different
-     * addresses or we did. */
+    /* An explicitly watched guest lock also prints an approximate stack. */
     {
         static int watch = -1;
         static uint32_t watch_va;
@@ -475,7 +506,8 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (!cs)
         return;
-    InterlockedIncrement(&g_cs_enters);
+    if (g_cs_counters_on)
+        InterlockedIncrement(&g_cs_enters);
     crt_lock_trace("take", CriticalSection);
     if (TryEnterCriticalSection(cs)) {
         xbox_cs_note_owner(cs);
@@ -505,8 +537,9 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
                                 " 0x%08X (depth %ld)\n",
                         slot->owner_tid, slot->owner_site, slot->depth);
         }
-        fprintf(stderr, "  [CS] enters=%ld leaves=%ld (outstanding %ld)\n",
-                g_cs_enters, g_cs_leaves, g_cs_enters - g_cs_leaves);
+        if (g_cs_counters_on)
+            fprintf(stderr, "  [CS] enters=%ld leaves=%ld (outstanding %ld)\n",
+                    g_cs_enters, g_cs_leaves, g_cs_enters - g_cs_leaves);
         xbox_guest_backtrace(10);
         fflush(stderr);
     }
@@ -528,11 +561,23 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (cs) {
-        InterlockedIncrement(&g_cs_leaves);
+        if (g_cs_counters_on)
+            InterlockedIncrement(&g_cs_leaves);
         crt_lock_trace("drop", CriticalSection);
         xbox_cs_clear_owner(cs);
         LeaveCriticalSection(cs);
     }
+}
+
+BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    if (!cs || !TryEnterCriticalSection(cs))
+        return FALSE;
+    if (g_cs_counters_on)
+        InterlockedIncrement(&g_cs_enters);
+    xbox_cs_note_owner(cs);
+    return TRUE;
 }
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
@@ -557,6 +602,7 @@ ULONG __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status)
         case STATUS_OBJECT_NAME_NOT_FOUND:      return ERROR_FILE_NOT_FOUND;
         case STATUS_OBJECT_PATH_NOT_FOUND:      return ERROR_PATH_NOT_FOUND;
         case STATUS_OBJECT_NAME_COLLISION:      return ERROR_ALREADY_EXISTS;
+        case STATUS_SHARING_VIOLATION:           return 32; /* ERROR_SHARING_VIOLATION */
         case STATUS_NO_SUCH_FILE:               return ERROR_FILE_NOT_FOUND;
         case STATUS_END_OF_FILE:                return ERROR_HANDLE_EOF;
         case STATUS_INVALID_HANDLE:             return ERROR_INVALID_HANDLE;

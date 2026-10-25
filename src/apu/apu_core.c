@@ -60,75 +60,73 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
-/* Physical addresses, resolved much as the other bus masters here do it
- * (dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c), but in an
- * order of the APU's own.
- *
- * DirectSound builds its voice, SGE and notifier structures in
- * MmAllocateContiguousMemory and hands the APU their physical addresses.
- * Physical P and the contiguous window's 0x80000000 + P are the same bytes on
- * hardware; here the window is separate storage. Reading every address as low
- * RAM meant the voice processor walked zeroes and wrote each "voice done"
- * notification into ordinary RAM, where DirectSound never looked -- so a
- * buffer never reported that it had stopped, and a frontend that waits on
- * IDirectSoundBuffer::GetStatus polled forever.
- *
- * Because the window is separate storage, one physical number below 64 MB can
- * name two different pages: a window page the contiguous allocator handed out
- * and a RAM page of the image or the heap. The cases below decide which one
- * the title meant. */
+/* Resolve bus addresses through runtime physical mappings, contiguous
+ * allocations, loaded image storage, reservations and ordinary heap pages.
+ * The contiguous window has separate host storage: guest physical P must
+ * reach the same bytes as its 0x80000000 + P alias. */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
-extern uint32_t xbox_ContiguousAllocatedBytes(void);
-extern size_t g_xbox_total_ram;
-extern size_t g_xbox_map_size;     /* host mapping; 0 means same as RAM */
 
-/* How far up the host actually mapped guest RAM: the map size when it was
- * set apart from the RAM size (xbox_SetMapSize), else the RAM size. */
-static inline uint32_t apu_mapped_ram(void)
+/* An address that is none of the mappings below. Wrapping it into low RAM
+ * (the old fallback, a & 0x03FFFFFF) played whatever guest data sat there.
+ * Instead the access is refused: a read yields zeros, a write goes nowhere.
+ * The scratch page is re-zeroed on each refusal, so a stale write is not read
+ * back as data. The first few refusals are logged; then only counted. */
+static uint8_t s_unmapped_page[4096];
+static volatile LONG s_unmapped_count;
+
+static uint8_t *mcpx_apu_unmapped(uint64_t addr)
 {
-    return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
+    LONG n = InterlockedIncrement(&s_unmapped_count);
+    if (n <= 8)
+        fprintf(stderr, "[APU] unmapped physical address 0x%08llX (not contiguous, image or reservation); access refused\n",
+                (unsigned long long)addr);
+    else if (n == 9)
+        fprintf(stderr, "[APU] further unmapped physical accesses refused (counting only)\n");
+    memset(s_unmapped_page, 0, sizeof s_unmapped_page);
+    return s_unmapped_page;
 }
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
-    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
-    /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
-     * the heap sits above 0x04000000, and so do the sound buffers a title
-     * malloc()s and hands to DirectSound as plain pointers, which
-     * MmGetPhysicalAddress turns into physical addresses (the identity for
-     * RAM). Folding those into the low 64 MB, as the fallback below does,
-     * read code as PCM: full-scale white noise on every effect, and music
-     * that lost its upper half each time its ring crossed the boundary.
-     * There is no window up here, so it is RAM as far as the host mapped it;
-     * only above that does the address wrap. */
-    if (a >= (64u << 20)) {
-        if (a < apu_mapped_ram())
-            return g_apu_ram_ptr + a;
-        return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+    /* Contiguous allocations are whole pages and positive coverage is
+     * permanent (xbox_ContiguousRangeAllocated), so a page once seen allocated
+     * stays so. The voice processor resolves every voice field and sample it
+     * reads; skip the lookup for known pages. Bytes are only ever set: no lock. */
+    static uint8_t known_contig[(64u << 20) >> 12];     /* XBOX_CONTIG_SIZE (kernel.h) */
+    uint32_t raw = (uint32_t)addr, guest_va;
+    if (addr <= UINT32_MAX &&
+        xbox_PhysicalAddressResolve(raw, 1, &guest_va) == 1) {
+        /* Check the bus width before masking: otherwise a valid high runtime
+         * ID could wrap onto a cached low contiguous page. */
+        if (raw > 0x0FFFFFFFu) {
+            static volatile LONG warned;
+            if (InterlockedIncrement(&warned) == 1)
+                fprintf(stderr, "[APU] runtime physical address 0x%08X exceeds 28-bit bus; access refused\n", raw);
+            return mcpx_apu_unmapped(addr);
+        }
+        return g_apu_ram_ptr + guest_va;
     }
-    /* A heap page the title named through MmGetPhysicalAddress is RAM, even
-     * where the contiguous allocator has handed out the same number as a
-     * window page. A title that loads its effect banks and music stream into
-     * the heap puts those physical numbers in the voices' SGE lists; read
-     * from the window, effects played whatever the window held there (white
-     * noise) and the stream played zeros. Only heap pages are recorded, so
-     * the voice-array case below still holds for the image. */
-    if (xbox_PhysRamNameMap()[a >> 12])
-        return g_apu_ram_ptr + a;
-    /* A page the contiguous allocator handed out is the window, even where
-     * it overlaps the image's physical range: an image whose BSS runs past
-     * 48 MB can have DirectSound's voice array at a window address inside
-     * that range. Resolved to RAM, the VP never saw the driver take an idle
-     * voice off its list and re-trapped it every frame. (The OHCI resolves
-     * the image first: a USB driver can read its descriptors into .data on a
-     * page the boot has also allocated as contiguous memory.) */
-    if (xbox_ContiguousPageMap()[a >> 12])
+    uint32_t a = raw & 0x0FFFFFFFu;
+    if (a < (64u << 20) && a >> 12 < sizeof(known_contig) &&
+        known_contig[a >> 12])
         return g_apu_ram_ptr + 0x80000000u + a;
+    if (a < (64u << 20) && xbox_ContiguousRangeAllocated(a, 1)) {
+        known_contig[a >> 12] = 1;
+        return g_apu_ram_ptr + 0x80000000u + a;
+    }
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
-    if (a < xbox_ContiguousAllocatedBytes())
-        return g_apu_ram_ptr + 0x80000000u + a;
-    return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+    /* A large reservation is placed above RAM (kernel_bridge.c), and
+     * MmGetPhysicalAddress hands its address through unchanged. Those pages
+     * are real and distinct; wrapping them at 64 MB played whatever low RAM
+     * they aliased, turning streamed audio into full-scale noise. */
+    if (xbox_ReserveRangeAllocated(a))
+        return g_apu_ram_ptr + a;
+    /* Ordinary heap pages are identity-mapped: MmGetPhysicalAddress hands
+     * their VA through. Addresses past the guest RAM map are unmapped. */
+    if (a < XBOX_HEAP_TOP)
+        return g_apu_ram_ptr + a;
+    return mcpx_apu_unmapped(addr);
 }
 
 /* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
@@ -208,8 +206,7 @@ static void update_irq(MCPXAPUState *d)
 
 /* ---- delivering it ---------------------------------------------------- */
 
-/* HalGetInterruptVector(5) -- the APU's IRQ -- is what DirectSound connects
- * its service routine to (0x002F8E81 in Burnout 3). */
+/* DirectSound connects its APU service routine through interrupt vector 5. */
 #define APU_VECTOR 5
 
 typedef void (*apu_guest_fn)(void);
@@ -218,7 +215,6 @@ extern int  xbox_worker_stack_alloc(void);
 extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern uint32_t xbox_AllocThreadTib(void);
-extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 extern int  xbox_DispatchGateOn(void);
@@ -242,19 +238,20 @@ extern APU_TLS uint32_t g_fs_base;
 
 /* Call the connected service routine while the line is up, from the frame
  * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
- * a worker stack for the call and a TIB of this thread's own. When a guest
- * thread or DPC holds the one-CPU gate, which is when the single-CPU console
- * could not have taken the interrupt beside it, the interrupt is posted and
- * the holder runs it at its next safe point (xbox_IrqPost). The routine
- * acknowledges by writing ISTS, which drops the line through update_irq. */
-
-/* Push the routine's arguments on g_esp and call it at the device IRQL.
- * Returns what it returned, or -1 with nothing connected. */
-static int apu_call_isr(void)
+ * a worker stack for the call and a TIB of this thread's own. The routine acknowledges by
+ * writing ISTS, which drops the line through update_irq. */
+static void apu_deliver_irq(MCPXAPUState *d)
 {
+    static int tib_ready;
     uint32_t kint, routine, context;
     apu_guest_fn fn;
 
+    if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
+        return;
+    /* No hold-off for a thread at raised IRQL: the APU's interrupt preempts
+     * DISPATCH_LEVEL on the console (see xbox_IrqlEnterInterrupt), and
+     * DirectSound spins at DISPATCH_LEVEL until this routine reports a voice
+     * stopped -- held off, every stop cost that spin ~33 ms. */
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
         return -1;
@@ -420,19 +417,10 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
         qatomic_set(&d->regs[addr], (uint32_t)val);
-        /* Starting the APU has to start the frame thread.
-         *
-         * The thread idles on pause_requested, which init sets and only the
-         * test tone ever cleared -- so a title that enabled the APU through
-         * these registers got an APU that stayed asleep. Nothing then advanced
-         * the front end, and a title waiting on a notify completion (the
-         * FEMEMDATA magic write, which is how completion reaches guest memory)
-         * waited forever. Wreckless hangs exactly there during DirectSound
-         * init, and because it initialises its whole engine behind a
-         * successful DirectSound create, that hang is not confined to audio.
-         *
-         * Resume whenever the write is not switching the block off; the thread
-         * re-checks FECTL itself and idles again if it is halted or trapped. */
+        /* Register startup must resume the frame thread; initialization leaves
+         * pause_requested set. Resume when neither SECTL nor FECTL turns the
+         * block off. The frame thread rechecks FECTL and idles when halted
+         * or trapped; FEMEMDATA publishes notify completion to guest memory. */
         {
             uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
             uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -446,6 +434,8 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                                 " (SECTL=%08X FECTL=%08X)\n", sectl, fectl);
             }
         }
+        if (addr == NV_PAPU_FECTL)
+            mcpx_apu_fe_resume(d);      /* methods that waited for it */
         qemu_cond_broadcast(&d->cond);
         break;
     case NV_PAPU_FEMEMDATA:
@@ -485,7 +475,7 @@ static struct {
 
 /* Ring of waveOut buffers for double-buffering */
 #define WAVEOUT_NUM_BUFS 4
-#define WAVEOUT_BUF_SAMPLES 2048  /* ~42.7ms at 48kHz, matches 8-frame delivery rate */
+#define WAVEOUT_BUF_SAMPLES 256  /* One real DSP output frame, 5.33ms at 48kHz. */
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
 /* monitor.queued_bytes_low/high are the pacing marks in bytes of stereo
  * s16 output; pacing compares them in samples (SAMPLE_BYTES each), so a
@@ -635,82 +625,8 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 
 void apu_starve_rebase(ApuStarve *s, int64_t now_us, uint64_t played)
 {
-    s->t0_us = now_us;
-    s->played0 = played;
-    s->deficit = 0;
-    s->ref = 0;
-    s->ref_us = now_us;
-    s->dry = 0;
-}
-
-int64_t apu_starve_step(ApuStarve *s, int64_t now_us, uint64_t played,
-                        int jitter, int dry)
-{
-    int64_t deficit = (now_us - s->t0_us) * 48 / 1000
-                    - (int64_t)(played - s->played0);
-    double creep = (double)(now_us - s->ref_us) * 48e-3 * STARVE_DRIFT_PPM * 1e-6;
-
-    s->deficit = deficit;
-    s->ref_us = now_us;
-    s->dry |= dry;
-    /* Once the device has run dry, only a reported loss moves the accounted
-     * part to the deficit, so the reports add up to the inserted silence
-     * however it came. Moving it to every new high (as this did) left a run
-     * of losses each under the jitter -- twenty 5 ms gaps -- reporting
-     * nothing, while one 100 ms gap reported 100 ms. */
-    if (s->dry && deficit > s->ref + jitter) {
-        int64_t lost = deficit - (int64_t)s->ref;
-        s->ref = (double)deficit;
-        s->dry = 0;
-        return lost;
-    }
-    if (deficit > s->ref) {
-        if (!s->dry || now_us - s->t0_us < STARVE_SETTLE_US)
-            s->ref = (double)deficit;
-        else
-            s->ref = fmin((double)deficit, s->ref + creep);
-    } else if (deficit < s->ref - jitter) {
-        /* A device clock running fast pulls the band down: follow it to
-         * the top of the band. */
-        s->ref = (double)(deficit + jitter);
-    }
-    return 0;
-}
-
-static struct {
-    int      on;                /* -1 until the environment is read */
-    ApuStarve acct;             /* t0_us 0: a new baseline at the next submit */
-    uint64_t submitted;         /* samples handed to the backend (= WAV sample index) */
-    unsigned refused;           /* submits the backend refused (in the WAV, not played) */
-    unsigned underruns_seen;    /* xa2_underruns() at the last submit */
-    double   starved_ms;        /* total, all baselines */
-    unsigned starves;
-    int64_t  last_submit_us, gap_max_us;    /* gap_max: this report interval */
-    int      q_min;                         /* this report interval */
-    int64_t  trap_start_us, trap_max_us;    /* trap_max: this report interval */
-    unsigned trap_spells, trap_long;        /* long: > 20 ms */
-    int64_t  next_report_us;
-    int64_t  first_submit_us;               /* for the rate lines */
-} g_hs = { -1 };
-
-static int hs_on(void)
-{
-    if (g_hs.on < 0)
-        g_hs.on = apu_env_on("RECOMP_APU_TRACE") ||
-                  apu_env_on("RECOMP_AUDIO_HOST");
-    return g_hs.on;
-}
-
-/* Called with the frame thread's view of FECTL each loop iteration. */
-static void hs_trap(bool trapped)
-{
-    int64_t now;
-    if (!hs_on())
-        return;
-    now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-    if (trapped) {
-        if (!g_hs.trap_start_us)
-            g_hs.trap_start_us = now;
+    if (qatomic_read(&d->exiting)) return;
+    if ((d->ep_frame_div + 1) % 8) {
         return;
     }
     if (g_hs.trap_start_us) {
@@ -727,37 +643,69 @@ static void hs_trap(bool trapped)
     }
 }
 
-/* The frame thread is pausing on purpose: the device drains, which is not
- * starvation. Start a new baseline after it. */
-static void hs_rebase(void)
-{
-    g_hs.acct.t0_us = 0;
-}
+    /* Retrying a retained frame must not advance native voices again. */
+    if (!d->monitor.frame_mixed) {
+        /* Diagnostic raw s16le stereo 48kHz before native mixing. One record
+         * per newly mixed frame, never per retry; compare with submitted PCM
+         * only after verifying equal counts and no reset/output failures. */
+        static FILE *premix_dump;
+        static bool premix_initialized;
+        if (!premix_initialized) {
+            const char *path = getenv("RECOMP_APU_PREMIX_DUMP");
+            premix_initialized = true;
+            if (path && *path) {
+                premix_dump = fopen(path, "wb");
+                fprintf(stderr, "[APU] Premix PCM capture %s\n", premix_dump ? "opened" : "failed");
+            }
+        }
+        if (premix_dump &&
+            (fwrite(d->monitor.frame_buf, sizeof(d->monitor.frame_buf), 1, premix_dump) != 1 ||
+             fflush(premix_dump))) {
+            fprintf(stderr, "[APU] Premix PCM capture write failed\n");
+            fclose(premix_dump);
+            premix_dump = NULL;
+        }
 
-/* The queue is read before the submit. Both backends count an underrun
- * only when a poll sees the queue empty, and a dry spell that begins
- * partway through a period (a front-end trap, a stall) gets no other poll
- * before this one: read after the submit, the queue holds the new period
- * and the spell is never counted, so its loss would be folded into the
- * reference. It also keeps queued= and q_min meaning what was left. */
-static int hs_poll(void)
-{
-    return hs_on() && xa2_is_active() ? xa2_queued_samples() : 0;
-}
+        if (g_audio_muted) {
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        } else {
+            if (g_test_tone.active) {
+                for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                    int32_t tone = (int32_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                    int32_t left = d->monitor.frame_buf[i][0] + tone;
+                    int32_t right = d->monitor.frame_buf[i][1] + tone;
+                    if (left > 32767) left = 32767;
+                    if (left < -32768) left = -32768;
+                    if (right > 32767) right = 32767;
+                    if (right < -32768) right = -32768;
+                    d->monitor.frame_buf[i][0] = (int16_t)left;
+                    d->monitor.frame_buf[i][1] = (int16_t)right;
+                    g_test_tone.phase += g_test_tone.phase_inc;
+                    if (g_test_tone.phase >= 2.0 * M_PI)
+                        g_test_tone.phase -= 2.0 * M_PI;
+                }
+            }
+            mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
+        }
+        d->monitor.frame_mixed = true;
 
-/* After handing n samples (stereo frames) to the device; ok is what the
- * backend returned and q the queue hs_poll read just before. A refused
- * submit is in the WAV and counts in the sample index all the same, so the
- * index stays the WAV's; what was lost ends at the index on the refused
- * line (on XAudio2 the whole device buffer the period completed, on SDL2
- * the period). */
-static void hs_submit(int n, int ok, int q)
-{
-    int64_t now, gap, lost;
-    uint64_t played;
-    unsigned u;
+    }
 
-    if (!hs_on() || !xa2_is_active())
+    if (xa2_is_active()) {
+        int submitted;
+        while ((submitted = xa2_submit_samples((const int16_t *)d->monitor.frame_buf,
+                                               MIXER_FRAME_SAMPLES)) == 0) {
+            qemu_mutex_unlock(&d->lock);
+            Sleep(1);
+            qemu_mutex_lock(&d->lock);
+            if (qatomic_read(&d->exiting) || d->pause_requested) return;
+        }
+        if (submitted < 0) {
+            fprintf(stderr, "[APU] XAudio2 output submission failed\n");
+            return;
+        }
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        mcpx_apu_dsp_pcm_consumed(d);
         return;
     now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     played = xa2_samples_played();
@@ -842,89 +790,27 @@ static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
     int idx = g_waveout.next_buf;
     WAVEHDR *hdr = &g_waveout.hdrs[idx];
 
-    if (fill == 0) {
-        /* Wait if this buffer is still playing (with timeout) */
-        int wait_loops = 0;
-        while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
-            qemu_mutex_unlock(&d->lock);
-            Sleep(1);
-            qemu_mutex_lock(&d->lock);
-            if (++wait_loops > 50) break;
-        }
+    /* Keep queued storage immutable until the device completes it. */
+    while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
+        qemu_mutex_unlock(&d->lock);
+        Sleep(1);
+        qemu_mutex_lock(&d->lock);
+        if (qatomic_read(&d->exiting) || d->pause_requested) return;
     }
 
-    memcpy(g_waveout.bufs[idx][fill], period,
-           MIXER_FRAME_SAMPLES * 2 * sizeof(int16_t));
-    fill += MIXER_FRAME_SAMPLES;
-    if (fill < WAVEOUT_BUF_SAMPLES)
-        return;
-
+    memcpy(g_waveout.bufs[idx], d->monitor.frame_buf, sizeof(d->monitor.frame_buf));
+    /* Submit to waveOut; retain the output if the device rejects it. */
     hdr->dwFlags &= ~WHDR_DONE;
-    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
-    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
-    g_waveout.frames_written++;
-    fill = 0;
-}
-
-/* Called once per 32-sample frame; acts on the last frame of each EP period
- * (8 frames, 256 samples, 5.33 ms).
- *
- * frame_buf holds the period the DSP stage just wrote (mcpx_apu_dsp_frame,
- * or the VP monitor point, which accumulates). The test tone and the
- * software mixer are rendered into a scratch period and added to it, and
- * exactly that one period is handed to the device -- once.
- *
- * This used to clear frame_buf before rendering the tone and the mixer into
- * it, so whatever the VP and DSP produced never reached the device, and it
- * rendered a whole device buffer (1024 samples) per 256-sample period. */
-void mcpx_apu_monitor_frame(MCPXAPUState *d)
-{
-    int16_t period[MIXER_FRAME_SAMPLES][2];
-    int16_t extra[MIXER_FRAME_SAMPLES][2];
-
-    if ((d->ep_frame_div + 1) % 8) {
+    MMRESULT written = waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
+    if (written != MMSYSERR_NOERROR) {
+        fprintf(stderr, "[APU] waveOutWrite failed (error %u)\n", written);
         return;
     }
-
-    memcpy(period, d->monitor.frame_buf, sizeof(period));
-    /* The VP monitor point accumulates into frame_buf, so the next period
-     * has to start from silence. */
     memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
-    if (g_audio_muted) {
-        memset(period, 0, sizeof(period));
-    } else {
-        memset(extra, 0, sizeof(extra));
-        if (g_test_tone.active) {
-            for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
-                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                extra[i][0] = s;
-                extra[i][1] = s;
-                g_test_tone.phase += g_test_tone.phase_inc;
-                if (g_test_tone.phase >= 2.0 * M_PI)
-                    g_test_tone.phase -= 2.0 * M_PI;
-            }
-        }
-        mixer_render(extra, MIXER_FRAME_SAMPLES);
-        mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
-    }
-
-    /* A period dropped while pacing is stalled never reaches the device,
-     * so it stays out of the dump too. */
-    if (!(xa2_is_active() && d->pace_stalled))
-        apu_wav_write((const int16_t *)period, MIXER_FRAME_SAMPLES);
-
-    if (xa2_is_active()) {
-        if (!d->pace_stalled) {
-            int q = hs_poll();
-            hs_submit(MIXER_FRAME_SAMPLES,
-                      xa2_submit_samples((const int16_t *)period,
-                                         MIXER_FRAME_SAMPLES), q);
-        }
-        return;
-    }
-    if (g_waveout.initialized)
-        waveout_submit(d, (const int16_t (*)[2])period);
+    mcpx_apu_dsp_pcm_consumed(d);
+    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
+    g_waveout.frames_written++;
 }
 
 /* ============================================================
@@ -1018,7 +904,11 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
     }
 
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US)
+        /* Windows waits may overshoot one 5.33 ms output frame. Preserve
+         * the deadline and catch up instead of discarding that elapsed time
+         * every wake: Bink's wall-clock decoding then outruns audio playback.
+         * Rebase only after a substantial pause to bound catch-up work. */
+        now_us - d->next_frame_time_us > 250000) {
         d->next_frame_time_us = now_us;
 
     /* In the band the lead a render-ahead built is already in the queue;
@@ -1058,6 +948,48 @@ static void throttle(MCPXAPUState *d)
  * se_frame - Process one audio frame (VP -> GP -> EP pipeline)
  * ============================================================ */
 
+/* ============================================================
+ * DSP thread: the GP/EP for frame N while the voices for N+1 mix
+ * ============================================================ */
+
+/* Called with d->lock held: waits until the DSP thread has run every queued
+ * frame, with d->lock released so guest accesses meanwhile are not held up. */
+static void dsp_job_wait(MCPXAPUState *d)
+{
+    qemu_mutex_unlock(&d->lock);
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    while (d->dsp_job_count)
+        qemu_cond_wait(&d->dsp_done_cond, &d->dsp_queue_lock);
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    qemu_mutex_lock(&d->lock);
+}
+
+static void *mcpx_apu_dsp_thread(void *arg)
+{
+    MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#ifdef _WIN32
+    /* Its frames are on the output's critical path, as the frame thread's are. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    for (;;) {
+        while (!d->dsp_job_count && !qatomic_read(&d->exiting))
+            qemu_cond_wait(&d->dsp_job_cond, &d->dsp_queue_lock);
+        if (!d->dsp_job_count) break;
+        int job = d->dsp_job_head;
+        qemu_mutex_unlock(&d->dsp_queue_lock);
+        qemu_mutex_lock(&d->dsp_lock);
+        mcpx_apu_dsp_frame(d, d->dsp_job_mixbins[job], d->dsp_job_div[job]);
+        qemu_mutex_unlock(&d->dsp_lock);
+        qemu_mutex_lock(&d->dsp_queue_lock);
+        d->dsp_job_head = (job + 1) % 8;
+        d->dsp_job_count--;
+        qemu_cond_signal(&d->dsp_done_cond);
+    }
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    return NULL;
+}
+
 static void se_frame(MCPXAPUState *d)
 {
     mcpx_apu_update_dsp_preference(d);
@@ -1082,7 +1014,25 @@ static void se_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
 
     mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
+
+    /* Queue the frame for the DSP thread; the voices for the next frames mix
+     * meanwhile. The GP publishes a group of 8 frames' output on the eighth,
+     * which the monitor then consumes: wait for the queue to empty there. A
+     * full queue (the group end was skipped) is waited for the same way. */
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    bool full = d->dsp_job_count == 8;
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    if (full)
+        dsp_job_wait(d);
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    int job = (d->dsp_job_head + d->dsp_job_count) % 8;
+    memcpy(d->dsp_job_mixbins[job], mixbins, sizeof(mixbins));
+    d->dsp_job_div[job] = d->ep_frame_div;
+    if (d->dsp_job_count++ == 0)
+        qemu_cond_signal(&d->dsp_job_cond);
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    if ((d->ep_frame_div + 1) % 8 == 0)
+        dsp_job_wait(d);
     mcpx_apu_monitor_frame(d);
 
     d->ep_frame_div++;
@@ -1125,10 +1075,17 @@ static void apu_irq_stats_line(void)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#ifdef _WIN32
+    /* It sleeps between 43 ms bursts and must wake on time: a guest thread
+     * the title raised (KeSetBasePriorityThread) otherwise delays it past
+     * what the output queue holds, and the device plays a gap. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
+            dsp_job_wait(d);
             d->is_idle = true;
             if (xa2_is_active())
                 xa2_expect_drain();     /* a pause, not an underrun */
@@ -1145,19 +1102,18 @@ static void *mcpx_apu_frame_thread(void *arg)
         throttle(d);
         int div0 = d->ep_frame_div;
 
-        /* The doorbell ack stands in for the GP DSP, which on hardware runs
-         * whatever the front end is doing. Tying it to se_frame stopped it
-         * whenever FECTL was trapped or halted, and DirectSound then waits
-         * forever to post its next command: Burnout 3 stalls in
-         * sub_002F805E polling the same doorbell it was acked on at init. */
-        mcpx_apu_dsp_ack_poll(d);
-
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+        /* Only the sample counter stops the pipeline. FEMETHMODE halts or
+         * traps the front end -- the method processor -- which DirectSound
+         * does around each batch of voice commands; the voice processor runs
+         * on regardless. Gating on it (as xemu does, where a skipped frame
+         * only delays an output pulled by the audio device) turned every
+         * halt into a frame of silence here, heard as constant crackle. Methods and frames are
+         * already serialised by d->lock. */
+        (void)fectl;
+        bool apu_active = xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF;
 
         /* A bit test, so HALTED (0x80, a subset of TRAPPED's 0xE0) counts
          * too: xemu's frame thread idles in both modes. */
@@ -1187,6 +1143,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             apu_irq_stats.fe_trapped_frames++;
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            dsp_job_wait(d);
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
@@ -1227,16 +1184,9 @@ static void *mcpx_apu_frame_thread(void *arg)
         apu_deliver_irq(d);
         apu_irq_stats_line();
 
-        /* Let the guest in once per frame.
-         *
-         * The thread holds d->lock for its whole loop and only drops it inside
-         * throttle()'s wait. Once voices really play, processing can run
-         * behind real time, throttle never waits, and the lock is never
-         * released -- while every VOICE_ON/OFF/RELEASE the title writes needs
-         * it (voice_lock). A critical section is not fair, so the title's
-         * thread starved there indefinitely: Burnout 3 froze on its vehicle
-         * select, blocked in voice_lock at raised IRQL, which in turn held
-         * off every USB interrupt. */
+        /* Release the APU lock once per frame so guest voice methods can run
+         * even when processing is behind real time and throttle never waits.
+         * Critical-section scheduling does not guarantee fairness. */
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
@@ -1282,14 +1232,13 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
     memset(d->regs, 0, sizeof(d->regs));
     mcpx_apu_vp_reset(d);
 
-    if (d->gp.dsp) {
-        memset((void *)d->gp.dsp->core.pram_opcache, 0,
-               sizeof(d->gp.dsp->core.pram_opcache));
-    }
-    if (d->ep.dsp) {
-        memset((void *)d->ep.dsp->core.pram_opcache, 0,
-               sizeof(d->ep.dsp->core.pram_opcache));
-    }
+    qemu_mutex_lock(&d->dsp_lock);   /* the frame thread is idle: no frame runs */
+    if (d->gp.dsp) dsp_reset(d->gp.dsp);
+    if (d->ep.dsp) dsp_reset(d->ep.dsp);
+    memset(d->gp.regs, 0, sizeof(d->gp.regs));
+    memset(d->ep.regs, 0, sizeof(d->ep.regs));
+    d->monitor.ep_pcm_offset = 0;
+    qemu_mutex_unlock(&d->dsp_lock);
     d->set_irq = false;
 }
 
@@ -1345,11 +1294,15 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     qemu_mutex_lock(&d->lock);
     qemu_cond_init(&d->cond);
     qemu_cond_init(&d->idle_cond);
+    qemu_mutex_init(&d->dsp_lock);
+    qemu_mutex_init(&d->dsp_queue_lock);
+    qemu_cond_init(&d->dsp_job_cond);
+    qemu_cond_init(&d->dsp_done_cond);
 
     /* Init VP (voice processor) */
     mcpx_apu_vp_init(d);
 
-    /* Init DSP (GP/EP - stubbed) */
+    /* Init DSP interpreters */
     mcpx_apu_dsp_init(d);
 
     /* Init software mixer for DirectSound bridge */
@@ -1362,7 +1315,9 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
     }
 
-    /* Start background frame thread */
+    /* Start background frame and DSP threads */
+    qemu_thread_create(&d->dsp_thread, "mcpx.dsp_thread",
+                       mcpx_apu_dsp_thread, d, QEMU_THREAD_JOINABLE);
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
     mcpx_apu_wait_for_idle(d);
@@ -1383,7 +1338,7 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     fprintf(stderr, "[APU] Shutting down MCPX APU...\n");
 
     qemu_mutex_lock(&d->lock);
-    mcpx_apu_wait_for_idle(d);
+    /* Thread join below waits for exit; a running guest may never become idle. */
     qatomic_set(&d->exiting, true);
     qemu_cond_signal(&d->cond);
     qemu_mutex_unlock(&d->lock);
@@ -1393,14 +1348,18 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
      * after this point finds no instance; a play already in flight is not
      * serialised against shutdown. */
     qemu_thread_join(&d->apu_thread);
-    g_state = NULL;
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    qemu_cond_signal(&d->dsp_job_cond);
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    qemu_thread_join(&d->dsp_thread);
     mcpx_apu_vp_finalize(d);
     mcpx_apu_dsp_finalize(d);
     mcpx_apu_monitor_finalize(d);
 
-    qemu_cond_destroy(&d->idle_cond);
-    qemu_cond_destroy(&d->cond);
-    qemu_mutex_destroy(&d->lock);
+    free(d->gp.dsp);
+    free(d->ep.dsp);
+    free(d->monitor.ep_pcm_queue);
+
     free(d);
     fprintf(stderr, "[APU] Shutdown complete\n");
 }
@@ -1435,7 +1394,11 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
         if (is_write)
             mcpx_apu_dsp_gprst_write((uint32_t)val);
     }
-    /* The rest of the GP (0x30000) and EP (0x50000) regions is ignored */
+    else if (addr >= 0x30000 && addr < 0x40000 && is_write) {
+        mcpx_apu_dsp_write(d, true, (uint32_t)addr - 0x30000, val, size);
+    } else if (addr >= 0x50000 && addr < 0x60000 && is_write) {
+        mcpx_apu_dsp_write(d, false, (uint32_t)addr - 0x50000, val, size);
+    }
 }
 
 /* ============================================================
@@ -1450,6 +1413,10 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        return mcpx_apu_dsp_read(d, true, (uint32_t)addr - 0x30000, size);
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        return mcpx_apu_dsp_read(d, false, (uint32_t)addr - 0x50000, size);
     }
     return 0;
 }
@@ -1602,7 +1569,9 @@ void apu_mixer_play(int slot, int looping)
     v->active = 1;
 
     static int play_log_count = 0;
-    if (play_log_count < 20) {
+    static int play_trace = -1;
+    if (play_trace < 0) play_trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (play_trace && play_log_count < 20) {
         fprintf(stderr, "[APU-MIX] Play voice %d: %u bytes, %u ch, %u Hz, vol=%.2f, loop=%d\n",
                 slot, v->pcm_bytes, v->num_channels, v->sample_rate, v->volume, looping);
         play_log_count++;

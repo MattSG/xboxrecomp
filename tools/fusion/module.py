@@ -12,9 +12,7 @@ that name and locate *guest* functions, which are facts about the guest binary.
         ...
     m.map_entry_points()           # sorted list of guest RVAs the map covers
 
-Layout of `PrecompiledSymbolTable`, calibrated against the report ground truth
-(Crimson: version 1, 3106 records, string blob 0x1faeb) -- see
-docs/technical/ms-fusion-corpus.md:
+Layout of the exported version-1 `PrecompiledSymbolTable`:
 
     +0x00 u32 string_blob_rva  (|0x80000000 flag; rva = value & 0x0FFFFFFF)
     +0x04 u32 version          (=1)
@@ -130,7 +128,10 @@ class FusionModule:
     # ---- address map ------------------------------------------------------
     def map_pairs(self, max_delta=16):
         """The (guest_rva, host_rva) pair arrays, aligned. Returns (guest, host)
-        numpy uint32 arrays over the longest monotonic guest run in .rdata."""
+        numpy uint32 arrays over a long monotonic guest run in .rdata. This is
+        a heuristic: small tables below the existing confidence threshold are
+        not detected, and neither the complete table bounds nor correctness of
+        the foreign translation is established by this scan."""
         for s in self.pe.sections:
             if s.Name.rstrip(b"\0") != b".rdata":
                 continue
@@ -139,8 +140,11 @@ class FusionModule:
             u32 = np.frombuffer(raw, dtype=np.uint32)
             best = None
             for phase in (0, 1):
-                g = u32[phase::2]
-                inrange = (g >= 0x1000) & (g < 0x400000)
+                host = u32[phase + 1::2]
+                g = u32[phase::2][:host.size]
+                # Guest RVAs are 32-bit values, not limited to a corpus image
+                # size. Every candidate must retain its following host word.
+                inrange = g != 0
                 d = np.diff(g.astype(np.int64))
                 good = inrange[:-1] & (d >= 0) & (d <= max_delta)
                 if good.size == 0:
@@ -151,13 +155,11 @@ class FusionModule:
                 k = int(np.argmax(runs))
                 length, startp = int(runs[k]), int(bounds[k] + 1)
                 if length > 50000 and (best is None or length > best[0]):
-                    best = (length, phase, startp)
+                    best = (length, g, host, startp)
             if best:
-                length, phase, startp = best
+                length, guest, host, startp = best
                 sl = slice(startp, startp + length + 1)
-                guest = u32[phase::2][sl]
-                host = u32[1 - phase::2][sl]
-                return guest, host
+                return guest[sl], host[sl]
         return np.array([], np.uint32), np.array([], np.uint32)
 
     def host_of(self, guest_rva):
@@ -176,34 +178,10 @@ class FusionModule:
 
         Detected as the longest run in .rdata whose guest column is monotonic
         with small deltas. This is the set of addresses Microsoft treats as a
-        translation entry point -- a coverage oracle for our own detector.
+        translation entry point candidate; the heuristic does not establish exact
+        table bounds or authoritative function boundaries.
         """
-        for s in self.pe.sections:
-            if s.Name.rstrip(b"\0") != b".rdata":
-                continue
-            raw = self.img[s.VirtualAddress:s.VirtualAddress + s.Misc_VirtualSize]
-            raw = raw[:len(raw) // 4 * 4]
-            u32 = np.frombuffer(raw, dtype=np.uint32)
-            best = None
-            for phase in (0, 1):
-                g = u32[phase::2]
-                inrange = (g >= 0x1000) & (g < 0x400000)
-                d = np.diff(g.astype(np.int64))
-                good = inrange[:-1] & (d >= 0) & (d <= max_delta)
-                if good.size == 0:
-                    continue
-                idx = np.where(~good)[0]
-                bounds = np.concatenate(([-1], idx, [good.size]))
-                runs = np.diff(bounds) - 1
-                k = int(np.argmax(runs))
-                length = int(runs[k])
-                startp = int(bounds[k] + 1)
-                if length > 50000 and (best is None or length > best[0]):
-                    best = (length, phase, startp)
-            if best:
-                length, phase, startp = best
-                return u32[phase::2][startp:startp + length + 1]
-        return np.array([], dtype=np.uint32)
+        return self.map_pairs(max_delta)[0]
 
 
 if __name__ == "__main__":
