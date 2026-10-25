@@ -726,6 +726,8 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists);
 
 NTSTATUS __stdcall xbox_NtQueryInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,

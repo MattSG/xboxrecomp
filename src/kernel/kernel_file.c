@@ -24,6 +24,9 @@
 #ifndef STATUS_BUFFER_TOO_SMALL
 #define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
 #endif
+#ifndef STATUS_OBJECT_NAME_INVALID
+#define STATUS_OBJECT_NAME_INVALID ((NTSTATUS)0xC0000033L)
+#endif
 #ifndef STATUS_INFO_LENGTH_MISMATCH
 #define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
 #endif
@@ -662,6 +665,59 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     if (DeleteFileW(win_path))    return STATUS_SUCCESS;
     if (RemoveDirectoryW(win_path)) return STATUS_SUCCESS;
     return STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
+{
+    WCHAR src[MAX_PATH], dst[MAX_PATH];
+    const char *name = get_xbox_path(NewName);
+    DWORD n;
+
+    if (!name || !*name)
+        return STATUS_INVALID_PARAMETER;
+    n = GetFinalPathNameByHandleW(FileHandle, src, MAX_PATH,
+                                  FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!n || n >= MAX_PATH)
+        return STATUS_INVALID_HANDLE;
+
+    if (!NewName->RootDirectory && !strchr(name, '\\') && !strchr(name, ':')) {
+        WCHAR *slash = wcsrchr(src, L'\\');
+        size_t dir = slash ? (size_t)(slash - src) + 1 : 0;
+        memcpy(dst, src, dir * sizeof(WCHAR));
+        if (!MultiByteToWideChar(CP_ACP, 0, name, -1, dst + dir,
+                                 (int)(MAX_PATH - dir)))
+            return STATUS_OBJECT_NAME_INVALID;
+    } else if (!translate_obj_path(NewName, dst, MAX_PATH)) {
+        return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    {
+        size_t len = wcslen(dst);
+        size_t bytes = sizeof(FILE_RENAME_INFO) + len * sizeof(WCHAR);
+        FILE_RENAME_INFO *fri = (FILE_RENAME_INFO *)calloc(1, bytes);
+        BOOL ok = FALSE;
+        if (fri) {
+            fri->ReplaceIfExists = ReplaceIfExists ? TRUE : FALSE;
+            fri->RootDirectory = NULL;
+            fri->FileNameLength = (DWORD)(len * sizeof(WCHAR));
+            memcpy(fri->FileName, dst, (len + 1) * sizeof(WCHAR));
+            ok = SetFileInformationByHandle(FileHandle, FileRenameInfo, fri,
+                                            (DWORD)bytes);
+            free(fri);
+        }
+        if (!ok)
+            ok = MoveFileExW(src, dst,
+                             ReplaceIfExists ? MOVEFILE_REPLACE_EXISTING : 0);
+        if (!ok) {
+            DWORD e = GetLastError();
+            return e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS
+                 ? STATUS_OBJECT_NAME_COLLISION
+                 : e == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED
+                 : STATUS_UNSUCCESSFUL;
+        }
+    }
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS __stdcall xbox_NtQueryInformationFile(
@@ -1467,6 +1523,58 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     if (unlink(host_path) == 0) return STATUS_SUCCESS;
     if (rmdir(host_path)  == 0) return STATUS_SUCCESS;
     return STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
+{
+    char dst[MAX_PATH];
+    const char *src = w32_handle_path(FileHandle);
+    const char *name = get_xbox_path(NewName);
+    struct stat st;
+
+    if (!src)
+        return STATUS_INVALID_HANDLE;
+    if (!name || !*name)
+        return STATUS_INVALID_PARAMETER;
+
+    if (NewName->RootDirectory
+            || (!strchr(name, '\\') && !strchr(name, ':'))) {
+        const char *base = NewName->RootDirectory
+                         ? w32_handle_path(NewName->RootDirectory) : src;
+        const char *slash;
+        size_t dir;
+        char *p;
+
+        if (!base)
+            return STATUS_INVALID_HANDLE;
+        if (NewName->RootDirectory) {
+            dir = strlen(base);
+        } else {
+            slash = strrchr(base, '/');
+            dir = slash ? (size_t)(slash - base) : 0;
+        }
+        if (dir + 1 + strlen(name) >= sizeof dst)
+            return STATUS_OBJECT_NAME_INVALID;
+        memcpy(dst, base, dir);
+        dst[dir] = '/';
+        strcpy(dst + dir + 1, name[0] == '\\' ? name + 1 : name);
+        for (p = dst + dir + 1; *p; p++)
+            if (*p == '\\') *p = '/';
+    } else if (!xbox_translate_path(name, dst, MAX_PATH)) {
+        return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    if (strcmp(src, dst) != 0) {
+        if (!ReplaceIfExists && stat(dst, &st) == 0)
+            return STATUS_OBJECT_NAME_COLLISION;
+        if (rename(src, dst) != 0) {
+            int e = errno;
+            return errno_to_status(e);
+        }
+    }
+    w32_handle_set_path(FileHandle, dst);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS __stdcall xbox_NtQueryInformationFile(
