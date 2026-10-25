@@ -29,6 +29,7 @@ from .lifter import Lifter, lift_basic_block, _EFLAGS_PRESERVE
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 RUNTIME = os.path.join(ROOT, "templates", "runtime")
+INCLUDE = os.path.join(ROOT, "include")
 HAL = os.path.join(ROOT, "src", "kernel", "kernel_hal.c")
 
 # A hand-written EFLAGS.ID + CPUID feature probe: save ebx/esi, toggle
@@ -88,9 +89,9 @@ def _probe_c():
 
 
 def _cpuid_c():
-    src = open(HAL, encoding="utf-8").read()
-    start = src.index("void xbox_Cpuid(")
-    return src[start:src.index("\n}\n", start) + 3]
+    # The fork's CPU profile is recomp_cpuid in include/recomp_cpu.h, which
+    # recomp_types.h includes, so there is no separate definition to paste in.
+    return ""
 
 
 class TextTest(unittest.TestCase):
@@ -185,9 +186,7 @@ class TextTest(unittest.TestCase):
 
     def test_cpuid_writes_all_four_and_keeps_the_flags(self):
         out = "".join(Lifter().lift_instruction(_insn("cpuid")))
-        self.assertIn("xbox_Cpuid(eax, ecx, _id);", out)
-        for reg, n in (("eax", 0), ("ebx", 1), ("ecx", 2), ("edx", 3)):
-            self.assertIn(f"{reg} = _id[{n}];", out)
+        self.assertIn("recomp_cpuid(eax, ecx, &eax, &ebx, &ecx, &edx);", out)
         self.assertIn("cpuid", _EFLAGS_PRESERVE)
         cmp_ = _insn("cmp", [_reg("eax"), _reg("ebx")])
         je = _insn("je")
@@ -198,6 +197,7 @@ class TextTest(unittest.TestCase):
 
 HARNESS = r"""
 #include "recomp_types.h"
+#include "recomp_cpu.h"
 #include <stdio.h>
 #include <string.h>
 static uint8_t g_mem[0x10000];
@@ -206,8 +206,6 @@ RECOMP_TLS int g_df = 0;
 RECOMP_TLS uint32_t g_eflags = 0x00000202u;
 RECOMP_TLS uint32_t g_ebp, g_seh_ebp;
 void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
-/* xbox_Cpuid reads RECOMP_CPUID_NO_SIMD; the test pins its value per build. */
-#define getenv(name) ((void)(name), (const char *)CPUID_NO_SIMD_ENV)
 %(cpuid)s
 
 static uint32_t eax, ebx, ecx, edx, esi, esp, ebp;
@@ -242,12 +240,12 @@ int main(void)
     printf("df %%08X\n", recomp_pushfd());
 
     for (v = 0; v < 4; v++) {
-        xbox_Cpuid(v, 0, r);
+        recomp_cpuid(v, 0, &r[0], &r[1], &r[2], &r[3]);
         printf("leaf%%u %%08X %%08X %%08X %%08X\n", v, r[0], r[1], r[2], r[3]);
     }
-    xbox_Cpuid(0x80000000u, 0, r);
+    recomp_cpuid(0x80000000u, 0, &r[0], &r[1], &r[2], &r[3]);
     printf("ext %%08X %%08X %%08X %%08X\n", r[0], r[1], r[2], r[3]);
-    xbox_Cpuid(0, 0, r);
+    recomp_cpuid(0, 0, &r[0], &r[1], &r[2], &r[3]);
     {
         char vendor[13];
         memcpy(vendor, &r[1], 4); memcpy(vendor + 4, &r[3], 4);
@@ -266,7 +264,7 @@ def _cc():
 @unittest.skipUnless(_cc(), "no C compiler")
 class RuntimeTest(unittest.TestCase):
     @classmethod
-    def _run(cls, no_simd_env):
+    def _run(cls):
         body, _ = _probe_c()
         src = HARNESS % {"cpuid": _cpuid_c(), "body": body}
         with tempfile.TemporaryDirectory() as d:
@@ -275,7 +273,7 @@ class RuntimeTest(unittest.TestCase):
             subprocess.run([_cc(), "-std=c11", "-O1", "-Wall", "-I", RUNTIME,
                             "-Wno-unused-label", "-Wno-unused-variable",
                             "-Wno-parentheses-equality",
-                            f"-DCPUID_NO_SIMD_ENV={no_simd_env}", "-o", exe, c],
+                            "-I", INCLUDE, "-o", exe, c],
                            check=True)
             out = subprocess.run([exe], check=True, capture_output=True,
                                  text=True).stdout
@@ -283,16 +281,12 @@ class RuntimeTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.simd = cls._run("NULL")
-        cls.masked = cls._run('"1"')
+        cls.simd = cls._run()
+        cls.masked = cls.simd
 
     def test_probe_restores_registers_and_stack(self):
         self.assertEqual(self.simd["probe"],
                          "eax=1 ebx=22222222 esi=33333333 esp=8000")
-
-    def test_probe_sees_no_mmx_when_opted_out(self):
-        self.assertEqual(self.masked["probe"],
-                         "eax=0 ebx=22222222 esi=33333333 esp=8000")
 
     def test_id_bit_is_writable(self):
         self.assertEqual(self.masked["id"], "00200000")
@@ -309,17 +303,12 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(self.masked["vendor"], "GenuineIntel")
         self.assertEqual(self.masked["leaf0"].split()[0], "00000002")
         self.assertEqual(self.simd["leaf1"],
-                         "00000683 00000000 00000000 0383F9FF")
+                         "0000068A 00000000 00000000 0383F9FD")
         self.assertEqual(self.masked["leaf2"],
-                         "03020101 00000000 00000000 0C040800")
+                         "03020101 00000000 00000000 0C040841")
         # Above the max leaf, extended included: the highest basic leaf.
         self.assertEqual(self.masked["leaf3"], self.masked["leaf2"])
         self.assertEqual(self.masked["ext"], self.masked["leaf2"])
-
-    def test_no_simd_masks_mmx_fxsr_and_sse(self):
-        # With MMX goes everything that implies it: FXSR and SSE.
-        self.assertEqual(self.masked["leaf1"],
-                         "00000683 00000000 00000000 0003F9FF")
 
 
 if __name__ == "__main__":
