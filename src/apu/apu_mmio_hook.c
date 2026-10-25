@@ -1,10 +1,8 @@
 /*
- * MCPX APU MMIO Hook - trapped APU register access
+ * MCPX APU MMIO Hook - VEH instruction decoder for APU register access
  *
- * Decodes the faulting instruction with the shared trapped-MMIO decoders
- * (src/platform/mmio_decode.h on x86-64 under a VEH, mmio_decode_a64.h on
- * POSIX arm64 under SIGBUS/SIGSEGV) and routes reads/writes through the MCPX
- * APU register handlers.
+ * Reuses the same x86-64 instruction decoder pattern as nv2a_mmio_hook.c
+ * but routes reads/writes through the MCPX APU register handlers.
  */
 
 #include "apu.h"
@@ -34,37 +32,45 @@ static int g_apu_mmio_write_count = 0;
 static int g_apu_mmio_decode_fail = 0;
 
 /* ============================================================
- * Instruction decoding: the shared trapped-MMIO decoder
- * (src/platform/mmio_decode.h, covered by tests/mmio_decode), with the
- * APU register model behind it. It also serves the ALU and TEST-immediate
- * forms DirectSound polls with (test dword [reg+disp], imm32), which a
- * private MOV/TEST/CMP/OR/AND decoder here did not.
+ * x86-64 register access helpers (same as NV2A hook)
  * ============================================================ */
 
-/* The model's registers are 32-bit and its read/write ignore the size, so an
- * 8-byte access (the decoder emits size 8 for REX.W) is two 4-byte accesses
- * here; handing it over whole drops the high dword on a store and returns
- * zero for it on a load. The POSIX arm64 hook below splits the same way. */
-static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
+static uint64_t *ctx_reg64(PCONTEXT ctx, int reg)
 {
-    g_apu_mmio_read_count++;
-    if (size == 8) {
-        uint64_t lo = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, 4);
-        uint64_t hi = mcpx_apu_mmio_read((MCPXAPUState *)dev, off + 4, 4);
-        return lo | (hi << 32);
+    switch (reg & 0xF) {
+    case 0:  return (uint64_t*)&ctx->Rax;
+    case 1:  return (uint64_t*)&ctx->Rcx;
+    case 2:  return (uint64_t*)&ctx->Rdx;
+    case 3:  return (uint64_t*)&ctx->Rbx;
+    case 4:  return (uint64_t*)&ctx->Rsp;
+    case 5:  return (uint64_t*)&ctx->Rbp;
+    case 6:  return (uint64_t*)&ctx->Rsi;
+    case 7:  return (uint64_t*)&ctx->Rdi;
+    case 8:  return (uint64_t*)&ctx->R8;
+    case 9:  return (uint64_t*)&ctx->R9;
+    case 10: return (uint64_t*)&ctx->R10;
+    case 11: return (uint64_t*)&ctx->R11;
+    case 12: return (uint64_t*)&ctx->R12;
+    case 13: return (uint64_t*)&ctx->R13;
+    case 14: return (uint64_t*)&ctx->R14;
+    case 15: return (uint64_t*)&ctx->R15;
+    default: return NULL;
     }
-    return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
 }
 
-static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
+static int decode_modrm_len(const uint8_t *ip, int has_rex_b)
 {
-    g_apu_mmio_write_count++;
-    if (size == 8) {
-        mcpx_apu_mmio_write((MCPXAPUState *)dev, off, (uint32_t)v, 4);
-        mcpx_apu_mmio_write((MCPXAPUState *)dev, off + 4, (uint32_t)(v >> 32), 4);
-        return;
-    }
-    mcpx_apu_mmio_write((MCPXAPUState *)dev, off, v, (unsigned)size);
+    uint8_t modrm = *ip;
+    int mod = (modrm >> 6) & 3;
+    int rm = (modrm & 7) | (has_rex_b ? 8 : 0);
+    int len = 1;
+
+    if (mod == 3) return 1;
+    if ((rm & 7) == 4) len += 1; /* SIB */
+    if (mod == 0 && (rm & 7) == 5) len += 4; /* disp32 */
+    else if (mod == 1) len += 1;
+    else if (mod == 2) len += 4;
+    return len;
 }
 
 /* ============================================================
@@ -244,6 +250,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         ctx->Rip += prefix_len + 1 + modrm_len;
         g_apu_mmio_write_count++;
         return true;
+    }
 
     /* Unrecognized */
     g_apu_mmio_decode_fail++;
