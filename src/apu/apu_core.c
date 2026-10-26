@@ -60,99 +60,94 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
-/* Physical addresses, resolved much as the other bus masters here do it
- * (dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c), but in an
- * order of the APU's own.
- *
- * DirectSound builds its voice, SGE and notifier structures in
- * MmAllocateContiguousMemory and hands the APU their physical addresses.
- * Physical P and the contiguous window's 0x80000000 + P are the same bytes on
- * hardware; here the window is separate storage. Reading every address as low
- * RAM meant the voice processor walked zeroes and wrote each "voice done"
- * notification into ordinary RAM, where DirectSound never looked -- so a
- * buffer never reported that it had stopped, and a frontend that waits on
- * IDirectSoundBuffer::GetStatus polled forever.
- *
- * Because the window is separate storage, one physical number below 64 MB can
- * name two different pages: a window page the contiguous allocator handed out
- * and a RAM page of the image or the heap. The cases below decide which one
- * the title meant. */
+/* Resolve bus addresses through runtime physical mappings, contiguous
+ * allocations, loaded image storage, reservations and ordinary heap pages.
+ * The contiguous window has separate host storage: guest physical P must
+ * reach the same bytes as its 0x80000000 + P alias. */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
-extern uint32_t xbox_ContiguousAllocatedBytes(void);
-extern size_t g_xbox_total_ram;
-extern size_t g_xbox_map_size;     /* host mapping; 0 means same as RAM */
 
-/* How far up the host actually mapped guest RAM: the map size when it was
- * set apart from the RAM size (xbox_SetMapSize), else the RAM size. */
-static inline uint32_t apu_mapped_ram(void)
+/* An address that is none of the mappings below. Wrapping it into low RAM
+ * (the old fallback, a & 0x03FFFFFF) played whatever guest data sat there.
+ * Instead the access is refused: a read yields zeros, a write goes nowhere.
+ * The scratch page is re-zeroed on each refusal, so a stale write is not read
+ * back as data. The first few refusals are logged; then only counted. */
+static uint8_t s_unmapped_page[4096];
+static volatile LONG s_unmapped_count;
+
+static uint8_t *mcpx_apu_unmapped(uint64_t addr)
 {
-    return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
+    LONG n = InterlockedIncrement(&s_unmapped_count);
+    if (n <= 8)
+        fprintf(stderr, "[APU] unmapped physical address 0x%08llX (not contiguous, image or reservation); access refused\n",
+                (unsigned long long)addr);
+    else if (n == 9)
+        fprintf(stderr, "[APU] further unmapped physical accesses refused (counting only)\n");
+    memset(s_unmapped_page, 0, sizeof s_unmapped_page);
+    return s_unmapped_page;
 }
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
-    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
-    /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
-     * the heap sits above 0x04000000, and so do the sound buffers a title
-     * malloc()s and hands to DirectSound as plain pointers, which
-     * MmGetPhysicalAddress turns into physical addresses (the identity for
-     * RAM). Folding those into the low 64 MB, as the fallback below does,
-     * read code as PCM: full-scale white noise on every effect, and music
-     * that lost its upper half each time its ring crossed the boundary.
-     * There is no window up here, so it is RAM as far as the host mapped it;
-     * only above that does the address wrap. */
-    if (a >= (64u << 20)) {
-        if (a < apu_mapped_ram())
-            return g_apu_ram_ptr + a;
-        return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+    /* Contiguous allocations are whole pages and positive coverage is
+     * permanent (xbox_ContiguousRangeAllocated), so a page once seen allocated
+     * stays so. The voice processor resolves every voice field and sample it
+     * reads; skip the lookup for known pages. Bytes are only ever set: no lock. */
+    static uint8_t known_contig[(64u << 20) >> 12];     /* XBOX_CONTIG_SIZE (kernel.h) */
+    uint32_t raw = (uint32_t)addr, guest_va;
+    if (addr <= UINT32_MAX &&
+        xbox_PhysicalAddressResolve(raw, 1, &guest_va) == 1) {
+        /* Check the bus width before masking: otherwise a valid high runtime
+         * ID could wrap onto a cached low contiguous page. */
+        if (raw > 0x0FFFFFFFu) {
+            static volatile LONG warned;
+            if (InterlockedIncrement(&warned) == 1)
+                fprintf(stderr, "[APU] runtime physical address 0x%08X exceeds 28-bit bus; access refused\n", raw);
+            return mcpx_apu_unmapped(addr);
+        }
+        return g_apu_ram_ptr + guest_va;
     }
-    /* A heap page the title named through MmGetPhysicalAddress is RAM, even
-     * where the contiguous allocator has handed out the same number as a
-     * window page. A title that loads its effect banks and music stream into
-     * the heap puts those physical numbers in the voices' SGE lists; read
-     * from the window, effects played whatever the window held there (white
-     * noise) and the stream played zeros. Only heap pages are recorded, so
-     * the voice-array case below still holds for the image. */
-    if (xbox_PhysRamNameMap()[a >> 12])
-        return g_apu_ram_ptr + a;
-    /* A page the contiguous allocator handed out is the window, even where
-     * it overlaps the image's physical range: an image whose BSS runs past
-     * 48 MB can have DirectSound's voice array at a window address inside
-     * that range. Resolved to RAM, the VP never saw the driver take an idle
-     * voice off its list and re-trapped it every frame. (The OHCI resolves
-     * the image first: a USB driver can read its descriptors into .data on a
-     * page the boot has also allocated as contiguous memory.) */
-    if (xbox_ContiguousPageMap()[a >> 12])
+    uint32_t a = raw & 0x0FFFFFFFu;
+    if (a < (64u << 20) && a >> 12 < sizeof(known_contig) &&
+        known_contig[a >> 12])
         return g_apu_ram_ptr + 0x80000000u + a;
+    if (a < (64u << 20) && xbox_ContiguousRangeAllocated(a, 1)) {
+        known_contig[a >> 12] = 1;
+        return g_apu_ram_ptr + 0x80000000u + a;
+    }
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
-    if (a < xbox_ContiguousAllocatedBytes())
-        return g_apu_ram_ptr + 0x80000000u + a;
-    return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+    /* A large reservation is placed above RAM (kernel_bridge.c), and
+     * MmGetPhysicalAddress hands its address through unchanged. Those pages
+     * are real and distinct; wrapping them at 64 MB played whatever low RAM
+     * they aliased, turning streamed audio into full-scale noise. */
+    if (xbox_ReserveRangeAllocated(a))
+        return g_apu_ram_ptr + a;
+    /* Ordinary heap pages are identity-mapped: MmGetPhysicalAddress hands
+     * their VA through. Addresses past the guest RAM map are unmapped. */
+    if (a < XBOX_HEAP_TOP)
+        return g_apu_ram_ptr + a;
+    return mcpx_apu_unmapped(addr);
 }
 
 /* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
- * per-voice line and the doorbell line: "named" (a heap page
- * MmGetPhysicalAddress named), "win" (a page the contiguous allocator handed
- * out), "img" (inside the XBE image), "hiwin" (below the arena's high-water
- * mark but not a live page), "ram" (plain RAM: below 64 MB, or above it
- * where the host mapped RAM) or "wrap" (above the mapping, folded into the
- * low 64 MB). A voice reading noise from "wrap" or "hiwin" is the address
- * resolution, not the decoder. */
+ * per-voice line and the doorbell line: "rt" (a runtime physical mapping:
+ * RAM, an I/O mapping), "win" (a contiguous allocation), "img" (inside the
+ * XBE image), "res" (a reservation above RAM), "heap" (a heap page below
+ * XBOX_HEAP_TOP) or "none" (refused). A voice reading noise from "none" is
+ * the address resolution, not the decoder. */
 const char *mcpx_apu_phys_class(uint64_t addr)
 {
-    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
-    if (a >= (64u << 20))
-        return a < apu_mapped_ram() ? "ram" : "wrap";
-    if (xbox_PhysRamNameMap()[a >> 12])
-        return "named";
-    if (xbox_ContiguousPageMap()[a >> 12])
+    uint32_t raw = (uint32_t)addr, guest_va, a;
+    if (addr <= UINT32_MAX && xbox_PhysicalAddressResolve(raw, 1, &guest_va) == 1)
+        return raw > 0x0FFFFFFFu ? "none" : "rt";
+    a = raw & 0x0FFFFFFFu;
+    if (a < (64u << 20) && xbox_ContiguousRangeAllocated(a, 1))
         return "win";
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return "img";
-    if (a < xbox_ContiguousAllocatedBytes())
-        return "hiwin";
-    return "ram";
+    if (xbox_ReserveRangeAllocated(a))
+        return "res";
+    return a < XBOX_HEAP_TOP ? "heap" : "none";
 }
 
 /* A diagnostic switch is on when set to anything but empty or a leading
