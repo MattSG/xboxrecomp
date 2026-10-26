@@ -44,7 +44,7 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
         verbose: Print progress info.
         sections: Optional list of section dicts with keys:
             name, va (int), size (int), raw (int), executable (bool)
-            If None, falls back to config-based section detection.
+            If None, scans configured sections using known function bounds.
 
     Returns:
         tuple: (vtable_results, vtables)
@@ -56,18 +56,18 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
 
     # Determine code and data ranges from section info
     if sections:
-        # Code ranges: only the main .text section (where lifted functions live)
+        # Executable flags describe code; section names are caller data.
         text_ranges = [(s["va"], s["va"] + s["size"])
-                       for s in sections if s["name"] == ".text"]
+                       for s in sections if s.get("executable", False)]
         # Scan ALL sections with raw data for vtables.
         # Xbox vtables can be in ANY section (including .text itself!)
         data_sections = [{"name": s["name"], "va": s["va"],
                           "size": min(s["size"], s.get("raw_size", s["size"])),
                           "raw": s["raw"]}
                          for s in sections
-                         if s["raw"] > 0 and s.get("raw_size", s["size"]) > 0]
+                         if s["raw"] >= 0 and s.get("raw_size", s["size"]) > 0]
     else:
-        text_ranges = _get_code_ranges()
+        text_ranges = _get_code_ranges(functions)
         data_sections = _get_data_sections()
 
     # Scan all data sections for vtable structures
@@ -78,6 +78,8 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
 
     # Filter false positives
     vtables = _filter_vtables(raw_vtables)
+    for i, vt in enumerate(vtables):
+        vt["class_id"] = f"cls_{i:03d}"
 
     if verbose:
         total_entries = sum(len(vt["entries"]) for vt in vtables)
@@ -106,9 +108,8 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
 
     # Build classification results
     results = {}
-    for i, vt in enumerate(vtables):
-        cls_id = f"cls_{i:03d}"
-        vt["class_id"] = cls_id
+    for vt in vtables:
+        cls_id = vt["class_id"]
 
         for idx, entry_addr in enumerate(vt["entries"]):
             if entry_addr not in results:
@@ -140,54 +141,21 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
     return results, vtables
 
 
-def _get_code_ranges():
-    """Get all code section VA ranges from config."""
-    ranges = [(config.TEXT_VA_START, config.TEXT_VA_END)]
-
-    # Add any other code sections defined in config
-    if hasattr(config, 'SECTIONS'):
-        skip_names = {".data", ".data1", "XIPS", "EnglishXlate", "JapaneseXlate",
-                      "GermanXlate", "FrenchXlate", "SpanishXlate", "ItalianXlate"}
-        for name, va, size, _ in config.SECTIONS:
-            if name not in skip_names and name != ".text":
-                ranges.append((va, va + size))
-
-    return ranges
+def _get_code_ranges(functions):
+    """Without executable metadata, restrict candidates to known function bounds."""
+    return [(int(f["start"], 16), int(f["start"], 16) + max(f.get("size", 0), 1))
+            for f in functions]
 
 
 def _get_data_sections():
-    """Get all data sections to scan for vtables."""
-    sections = []
-
-    # Primary scan range: .rdata or .data
-    if hasattr(config, 'RDATA_RAW_ADDR'):
-        sections.append({
-            "name": "rdata",
-            "va": config.RDATA_VA_START,
-            "size": config.RDATA_VA_SIZE,
-            "raw": config.RDATA_RAW_ADDR,
-        })
-
-    # Also scan all data sections from SECTIONS list
-    if hasattr(config, 'SECTIONS'):
-        data_names = {".data", ".data1", "DOLBY"}
-        for name, va, size, raw in config.SECTIONS:
-            if name in data_names:
-                sections.append({
-                    "name": name,
-                    "va": va,
-                    "size": size,
-                    "raw": raw,
-                })
-
-    return sections
+    """Scan caller-configured sections without reference-title name lists."""
+    return [{"name": name, "va": va, "size": size, "raw": raw}
+            for name, va, size, raw in config.SECTIONS
+            if raw >= 0 and size > 0]
 
 
 def _is_code_address(va, text_ranges):
     """Check if VA falls within the .text section and looks like a valid function addr."""
-    # Reject obviously non-function addresses (misaligned or too small)
-    if va < 0x10000:
-        return False
     for lo, hi in text_ranges:
         if lo <= va < hi:
             return True
@@ -216,7 +184,7 @@ def _find_vtables(xbe_data, func_starts, text_ranges, data_sections):
         sec_bytes = xbe_data[sec_raw:sec_raw + sec_size]
 
         i = 0
-        while i < len(sec_bytes) - 4:
+        while i <= len(sec_bytes) - 4:
             # Align to 4 bytes
             if i % 4 != 0:
                 i += 4 - (i % 4)
@@ -232,7 +200,7 @@ def _find_vtables(xbe_data, func_starts, text_ranges, data_sections):
             # Found a code pointer - scan forward for more
             entries = []
             j = i
-            while j < len(sec_bytes) - 4:
+            while j <= len(sec_bytes) - 4:
                 val = struct.unpack_from('<I', sec_bytes, j)[0]
                 if _is_code_address(val, text_ranges):
                     entries.append(val)
