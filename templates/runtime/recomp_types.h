@@ -122,6 +122,8 @@ extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE g_fs_base
 
 extern RECOMP_TLS uint32_t g_seh_ebp;
+/* Resume address for a function translated with extra entry points; 0 when none. */
+extern RECOMP_TLS uint32_t g_recomp_resume;
 
 /* ---- non-local jumps (setjmp / longjmp) --------------------------------
  *

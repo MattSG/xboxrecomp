@@ -2443,6 +2443,9 @@ class FunctionTranslator:
                 insn.end_address for insn in instructions
                 if (insn.mnemonic == "int3"
                     and insn.end_address in instruction_starts))
+        # A resume entry starts its own block, so it has a label to jump to.
+        switch_leaders.update(
+            entry for entry in self.lifter.resume_entries if start < entry < end)
 
         return (imm_refs, computed_jump_edges, debug_slide_int3s,
                 debug_slide_bypasses, switch_leaders)
@@ -2939,6 +2942,16 @@ class FunctionTranslator:
         # global bridges ebp across function boundaries.
         if frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue:
             lines.append(f"    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */")
+
+        # Resume entries: a caller that set g_recomp_resume enters the body at
+        # that address, after the prologue above has set up the frame. The
+        # address is consumed on entry so ordinary calls run from the top.
+        resume = sorted(entry for entry in self.lifter.resume_entries if start < entry < end)
+        if resume:
+            lines.append("    if (g_recomp_resume) { uint32_t _resume = g_recomp_resume; g_recomp_resume = 0;")
+            for entry in resume:
+                lines.append(f"        if (_resume == 0x{entry:08X}u) goto loc_{entry:08X};")
+            lines.append("    }")
 
         lines.append(f"")
 

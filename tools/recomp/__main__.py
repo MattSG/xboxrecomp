@@ -288,6 +288,10 @@ def main():
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
+    parser.add_argument("--resume-entry", metavar="ADDR", action="append", default=[],
+                        help="An address inside a function that callers enter directly "
+                             "via g_recomp_resume. Repeatable. The containing function "
+                             "gets a label and a dispatch for it")
 
     args = parser.parse_args()
 
@@ -364,6 +368,9 @@ def main():
         back_edge_yield=args.back_edge_yield,
         entry_stubs=args.entry_stubs,
     )
+
+    for item in args.resume_entry:
+        translator.translator.lifter.resume_entries.add(int(item, 16))
 
     t_load = time.time() - t0
     print(f"Loaded {len(translator.func_db)} functions, "
