@@ -314,7 +314,7 @@ static inline int recomp_fp_trig_in_range(double value) {
         g_fp_cc |= 0x0400u;
         return 0;
     }
-    g_fp_cc &= (uint16_t)~0x0400u;
+    g_fp_cc &= 0xFBFFu;
     return 1;
 }
 
@@ -538,6 +538,26 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
 
+/* fld tbyte: a whole little-endian x87 80-bit extended operand. The x87
+ * stack is held as double, so this keeps a double's precision; reading it as
+ * MEMF took the low four bytes of the significand as a float. */
+static inline double recomp_read_fp80(uint32_t addr) {
+    const volatile uint8_t *p = (const volatile uint8_t *)XBOX_PTR(addr);
+    uint64_t significand = 0;
+    uint16_t sign_exponent = (uint16_t)(p[8] | (p[9] << 8));
+    unsigned exponent = sign_exponent & 0x7FFFu;
+    double value;
+    int i;
+    for (i = 7; i >= 0; --i)
+        significand = (significand << 8) | p[i];
+    if (exponent == 0x7FFFu)
+        value = significand << 1 ? NAN : INFINITY;
+    else
+        value = ldexp((double)significand, (exponent ? (int)exponent : 1) - 16383 - 63);
+    return sign_exponent & 0x8000u ? -value : value;
+}
+#define MEMFP80(addr) recomp_read_fp80(addr)
+
 /* ================================================================
  * SSE / XMM register state
  *
@@ -674,6 +694,8 @@ RECOMP_XMM_BITWISE(XMM_ANDN, (~a.u[i]) & b.u[i])
 RECOMP_XMM_BITWISE(XMM_CMP_EQ,  (a.f[i] == b.f[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_LT,  (a.f[i] <  b.f[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_LE,  (a.f[i] <= b.f[i]) ? 0xFFFFFFFFu : 0u)
+/* PCMPGTD: signed dword greater-than, dst = (dst > src). */
+RECOMP_XMM_BITWISE(XMM_PCMPGTD, ((int32_t)a.u[i] > (int32_t)b.u[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_NEQ, (a.f[i] == b.f[i]) ? 0u : 0xFFFFFFFFu)
 
 /* The full SSE compare predicate set, by CMPPS/CMPSS immediate:
@@ -1552,6 +1574,8 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
  * RECOMP_UNIMPL_TRAP=1 stops at the first reported site. Generated comments
  * also enumerate untranslated sites that have not executed. */
 void recomp_unimpl(const char *text, uint32_t va);
+#ifndef RECOMP_UNIMPL
 #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
+#endif
 
 #endif /* RECOMP_TYPES_H */
