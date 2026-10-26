@@ -12,6 +12,8 @@ rather than a configuration one.
 
 import os
 import sys
+import subprocess
+import importlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -97,3 +99,73 @@ if __name__ == "__main__":
     test_va_to_file_offset()
     test_classify_uses_flags_and_overrides()
     print("\nall passed")
+
+
+def test_unconfigured_layout_has_no_title_defaults():
+    subprocess.run([sys.executable, "-c", """
+from tools.recomp import config as r
+for c in (r,):
+    assert c.configured_from() is None and c.SECTIONS == []
+    assert c.TEXT_VA_START == c.TEXT_VA_END == 0
+    assert c.RDATA_VA_START == c.RDATA_VA_END == 0
+    assert c.DATA_VA_START == c.DATA_VA_END == 0
+    assert c.va_to_file_offset(0x12000) is None
+assert r.ENTRY_POINT == r.KERNEL_THUNK_ADDR == 0
+"""], check=True, cwd=os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def test_reconfiguration_clears_absent_ranges_and_entries():
+    # Independent module instances avoid changing another test's image layout.
+    for module_name in ("tools.recomp.config",):
+        module = importlib.import_module(module_name)
+        spec = importlib.util.spec_from_file_location("synthetic_layout", module.__file__)
+        c = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = c
+        try:
+            spec.loader.exec_module(c)
+            if module_name == "tools.recomp.config":
+                c._install(_halo_like(), 0x12000, 0x13000, "first")
+                c._install([c.Section(".text", 0x900000, 16, 0, 16, True)], 0, 0, "second")
+                assert c.ENTRY_POINT == c.KERNEL_THUNK_ADDR == 0
+            elif module_name == "tools.disasm.config":
+                c._install([(".data", 0x20000, 32)],0x20000,0x21000,0x30000,"first")
+                c._install([(".text",0x900000,16)],0,0,0,"second")
+                assert c.ENTRY_POINT == c.KERNEL_THUNK_ADDR == c.XBE_IMAGE_SIZE == 0
+                assert c.DATA_SECTIONS == []
+                assert c.ALL_SECTIONS == {".text":{"va":0x900000,"size":16}}
+                continue
+            else:
+                c._install([(".data", 0x20000, 32, 16)], "first")
+                c._install([(".text", 0x900000, 16, 0)], "second")
+            assert c.TEXT_VA_START == 0x900000
+            assert c.RDATA_VA_START == c.RDATA_VA_END == 0
+            assert c.DATA_VA_START == c.DATA_VA_END == 0
+            assert c.va_to_file_offset(0x900001) == 1
+            assert c.va_to_file_offset(0x20000) is None
+        finally:
+            sys.modules.pop(spec.name, None)
+
+
+
+def test_unresolved_report_uses_supplied_layout(tmp_path, monkeypatch):
+    import json
+    from tools.recomp import analyze_unresolved as a
+    def configure(path):
+        assert path == "synthetic.xbe"
+        monkeypatch.setattr(a.config, "_SECTIONS", [
+            a.config.Section(".text",0x900000,256,0,256,True),
+            a.config.Section("resource",0xA00000,32,256,32,False)])
+        monkeypatch.setattr(a.config,"TEXT_VA_START",0x900000)
+        monkeypatch.setattr(a.config,"TEXT_VA_END",0x900100)
+    monkeypatch.setattr(a.config,"configure_from_xbe",configure)
+    functions=tmp_path/"functions.json"; symbols=tmp_path/"symbols.txt"; out=tmp_path/"missing.json"
+    functions.write_text(json.dumps([{"start":"0x900010","end":"0x900020","name":"example"}]))
+    symbols.write_text("sub_00900030\nsub_00A00001\nsub_00011000\n")
+    monkeypatch.setattr(sys,"argv",["analyze_unresolved","synthetic.xbe","--functions",str(functions),
+        "--unresolved",str(symbols),"--output",str(out)])
+    a.main()
+    rows={r["address"]:r for r in json.loads(out.read_text())}
+    assert rows["0x00900030"]["type"] in ("gap","continuation")
+    assert rows["0x00900030"]["estimated_end"] == "0x00900100"
+    assert rows["0x00A00001"]["type"] == "data_section"
+    assert rows["0x00011000"]["type"] == "unknown"
