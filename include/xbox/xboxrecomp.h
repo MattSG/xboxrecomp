@@ -49,6 +49,7 @@
 #include "d3d8_xbox.h"          /* D3D8 compatibility interface */
 #include "dsound_xbox.h"        /* DirectSound compatibility */
 #include "xinput_xbox.h"        /* XInput compatibility */
+#include "xbox_host.h"          /* Shared hardware/graphics bring-up */
 #include "apu.h"                /* MCPX APU public API */
 
 /* NV2A headers */

@@ -92,6 +92,9 @@ add_subdirectory(src/net)
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
+# Host bring-up: MMIO routing to the APU/USB/NV2A models, window and device
+add_subdirectory(src/host)
+
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
@@ -105,6 +108,7 @@ set(XBOXRECOMP_LIBS
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_host
 )
 add_library(xboxrecomp INTERFACE)
 if(UNIX AND NOT APPLE)
