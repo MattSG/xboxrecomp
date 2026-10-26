@@ -467,6 +467,29 @@ void recomp_icall_fail_log(uint32_t va);
  * vtable call into an unexplained hang. */
 void recomp_icall_not_code_log(uint32_t va);
 
+/* A conditional jump whose target label is outside its function. The
+ * translator emits RECOMP_DEAD_BRANCH for it (it used to be `(void)0`), and
+ * the branch is reached only when its condition holds. A residual target is
+ * missing translated code: report it and stop rather than execute the wrong
+ * fallthrough path. Define RECOMP_DEAD_BRANCH before this header to
+ * route it elsewhere. */
+#ifndef RECOMP_DEAD_BRANCH
+#include <stdio.h>
+#include <stdlib.h>
+static inline void recomp_dead_branch_log(uint32_t target)
+{
+    fprintf(stderr, "[DEAD-BRANCH] taken jump to 0x%08X, label outside its function; stopping\n", target);
+    fflush(stderr);
+    abort();
+}
+#define RECOMP_DEAD_BRANCH(target) recomp_dead_branch_log(target)
+#endif
+
+/* Opt-in stop for an unresolved call target: reports the caller and aborts,
+ * rather than returning from a stub that never ran its body. Select with
+ * -DRECOMP_UNRESOLVED_STUB_OBSERVE=recomp_unresolved_stub_stop. */
+void recomp_unresolved_stub_stop(uint32_t va);
+
 /* Indirect-branch target feedback. The ring buffer above is crash forensics --
  * 16 entries, overwritten constantly. This is a durable, deduplicated record of
  * every target the title ever reached, for feeding back into the next codegen
