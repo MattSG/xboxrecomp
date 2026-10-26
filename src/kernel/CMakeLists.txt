@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 # Xbox Kernel Replacement Layer
-# Replaces 147 Xbox kernel imports with Win32 equivalents.
+# Host implementations and guest ABI bridges for Xbox kernel operations.
 # Memory layout, file I/O, threading, synchronization, crypto, HAL.
 
 set(KERNEL_SOURCES
@@ -34,6 +34,11 @@ set(KERNEL_SOURCES
     icall_diagnostics.c
     host_write_watch.c
     crash_report.c
+    recomp_lookup_cache.c
+    xbox_std_string.c
+    guest_call.c
+    guest_strings.c
+    guest_read.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
@@ -56,7 +61,6 @@ else()
     find_package(OpenSSL REQUIRED)
     target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
 endif()
-
 if(MSVC)
     target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
