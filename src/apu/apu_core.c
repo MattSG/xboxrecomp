@@ -203,8 +203,7 @@ static void update_irq(MCPXAPUState *d)
 
 /* ---- delivering it ---------------------------------------------------- */
 
-/* HalGetInterruptVector(5) -- the APU's IRQ -- is what DirectSound connects
- * its service routine to (0x002F8E81 in Burnout 3). */
+/* DirectSound connects its APU service routine through interrupt vector 5. */
 #define APU_VECTOR 5
 
 typedef void (*apu_guest_fn)(void);
@@ -213,7 +212,6 @@ extern int  xbox_worker_stack_alloc(void);
 extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern uint32_t xbox_AllocThreadTib(void);
-extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 extern int  xbox_DispatchGateOn(void);
@@ -326,14 +324,11 @@ static void apu_deliver_irq(MCPXAPUState *d)
             return;
         }
     } else if (!xbox_DispatchGateOn()) {
-        /* No gate (the default): a hold-off while a guest thread sits at
-         * raised IRQL, which is when the single-CPU console could not have
-         * taken the interrupt, then delivered anyway. */
-        if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
-            qemu_mutex_lock(&d->lock);
-            return;
-        }
-        held_off = 0;
+        /* No gate (the default): no hold-off for a thread at raised IRQL.
+         * The APU's interrupt preempts DISPATCH_LEVEL on the console (see
+         * xbox_IrqlEnterInterrupt), and DirectSound spins at DISPATCH_LEVEL
+         * until this routine reports a voice stopped -- held off, every stop
+         * cost that spin ~33 ms. */
         how = XBOX_IRQ_GATED;   /* an absent gate's leave takes nothing */
     } else {
         /* RECOMP_IRQ_SAFE_POINTS=0: the bounded hold-off, then beside the
@@ -415,19 +410,10 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
         qatomic_set(&d->regs[addr], (uint32_t)val);
-        /* Starting the APU has to start the frame thread.
-         *
-         * The thread idles on pause_requested, which init sets and only the
-         * test tone ever cleared -- so a title that enabled the APU through
-         * these registers got an APU that stayed asleep. Nothing then advanced
-         * the front end, and a title waiting on a notify completion (the
-         * FEMEMDATA magic write, which is how completion reaches guest memory)
-         * waited forever. Wreckless hangs exactly there during DirectSound
-         * init, and because it initialises its whole engine behind a
-         * successful DirectSound create, that hang is not confined to audio.
-         *
-         * Resume whenever the write is not switching the block off; the thread
-         * re-checks FECTL itself and idles again if it is halted or trapped. */
+        /* Register startup must resume the frame thread; initialization leaves
+         * pause_requested set. Resume when neither SECTL nor FECTL turns the
+         * block off. The frame thread rechecks FECTL and idles when halted
+         * or trapped; FEMEMDATA publishes notify completion to guest memory. */
         {
             uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
             uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -441,6 +427,8 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                                 " (SECTL=%08X FECTL=%08X)\n", sectl, fectl);
             }
         }
+        if (addr == NV_PAPU_FECTL)
+            mcpx_apu_fe_resume(d);      /* methods that waited for it */
         qemu_cond_broadcast(&d->cond);
         break;
     case NV_PAPU_FEMEMDATA:
@@ -480,7 +468,7 @@ static struct {
 
 /* Ring of waveOut buffers for double-buffering */
 #define WAVEOUT_NUM_BUFS 4
-#define WAVEOUT_BUF_SAMPLES 2048  /* ~42.7ms at 48kHz, matches 8-frame delivery rate */
+#define WAVEOUT_BUF_SAMPLES 256  /* One real DSP output frame, 5.33ms at 48kHz. */
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
 /* monitor.queued_bytes_low/high are the pacing marks in bytes of stereo
  * s16 output; pacing compares them in samples (SAMPLE_BYTES each), so a
@@ -744,7 +732,7 @@ static int hs_poll(void)
  * backend returned and q the queue hs_poll read just before. A refused
  * submit is in the WAV and counts in the sample index all the same, so the
  * index stays the WAV's; what was lost ends at the index on the refused
- * line (on XAudio2 the whole device buffer the period completed, on SDL2
+ * line (on XAudio2 the whole device buffer the period completed, on SDL
  * the period). */
 static void hs_submit(int n, int ok, int q)
 {
@@ -877,14 +865,16 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     int16_t period[MIXER_FRAME_SAMPLES][2];
     int16_t extra[MIXER_FRAME_SAMPLES][2];
 
+    if (qatomic_read(&d->exiting)) return;
     if ((d->ep_frame_div + 1) % 8) {
         return;
     }
 
     memcpy(period, d->monitor.frame_buf, sizeof(period));
     /* The VP monitor point accumulates into frame_buf, so the next period
-     * has to start from silence. */
+     * has to start from silence -- or from the EP's next queued period. */
     memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    mcpx_apu_dsp_pcm_consumed(d);
 
     if (g_audio_muted) {
         memset(period, 0, sizeof(period));
@@ -1053,6 +1043,48 @@ static void throttle(MCPXAPUState *d)
  * se_frame - Process one audio frame (VP -> GP -> EP pipeline)
  * ============================================================ */
 
+/* ============================================================
+ * DSP thread: the GP/EP for frame N while the voices for N+1 mix
+ * ============================================================ */
+
+/* Called with d->lock held: waits until the DSP thread has run every queued
+ * frame, with d->lock released so guest accesses meanwhile are not held up. */
+static void dsp_job_wait(MCPXAPUState *d)
+{
+    qemu_mutex_unlock(&d->lock);
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    while (d->dsp_job_count)
+        qemu_cond_wait(&d->dsp_done_cond, &d->dsp_queue_lock);
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    qemu_mutex_lock(&d->lock);
+}
+
+static void *mcpx_apu_dsp_thread(void *arg)
+{
+    MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#ifdef _WIN32
+    /* Its frames are on the output's critical path, as the frame thread's are. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    for (;;) {
+        while (!d->dsp_job_count && !qatomic_read(&d->exiting))
+            qemu_cond_wait(&d->dsp_job_cond, &d->dsp_queue_lock);
+        if (!d->dsp_job_count) break;
+        int job = d->dsp_job_head;
+        qemu_mutex_unlock(&d->dsp_queue_lock);
+        qemu_mutex_lock(&d->dsp_lock);
+        mcpx_apu_dsp_frame(d, d->dsp_job_mixbins[job], d->dsp_job_div[job]);
+        qemu_mutex_unlock(&d->dsp_lock);
+        qemu_mutex_lock(&d->dsp_queue_lock);
+        d->dsp_job_head = (job + 1) % 8;
+        d->dsp_job_count--;
+        qemu_cond_signal(&d->dsp_done_cond);
+    }
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    return NULL;
+}
+
 static void se_frame(MCPXAPUState *d)
 {
     mcpx_apu_update_dsp_preference(d);
@@ -1077,7 +1109,25 @@ static void se_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
 
     mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
+
+    /* Queue the frame for the DSP thread; the voices for the next frames mix
+     * meanwhile. The GP publishes a group of 8 frames' output on the eighth,
+     * which the monitor then consumes: wait for the queue to empty there. A
+     * full queue (the group end was skipped) is waited for the same way. */
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    bool full = d->dsp_job_count == 8;
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    if (full)
+        dsp_job_wait(d);
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    int job = (d->dsp_job_head + d->dsp_job_count) % 8;
+    memcpy(d->dsp_job_mixbins[job], mixbins, sizeof(mixbins));
+    d->dsp_job_div[job] = d->ep_frame_div;
+    if (d->dsp_job_count++ == 0)
+        qemu_cond_signal(&d->dsp_job_cond);
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    if ((d->ep_frame_div + 1) % 8 == 0)
+        dsp_job_wait(d);
     mcpx_apu_monitor_frame(d);
 
     d->ep_frame_div++;
@@ -1120,10 +1170,17 @@ static void apu_irq_stats_line(void)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#ifdef _WIN32
+    /* It sleeps between 43 ms bursts and must wake on time: a guest thread
+     * the title raised (KeSetBasePriorityThread) otherwise delays it past
+     * what the output queue holds, and the device plays a gap. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
+            dsp_job_wait(d);
             d->is_idle = true;
             if (xa2_is_active())
                 xa2_expect_drain();     /* a pause, not an underrun */
@@ -1140,19 +1197,18 @@ static void *mcpx_apu_frame_thread(void *arg)
         throttle(d);
         int div0 = d->ep_frame_div;
 
-        /* The doorbell ack stands in for the GP DSP, which on hardware runs
-         * whatever the front end is doing. Tying it to se_frame stopped it
-         * whenever FECTL was trapped or halted, and DirectSound then waits
-         * forever to post its next command: Burnout 3 stalls in
-         * sub_002F805E polling the same doorbell it was acked on at init. */
-        mcpx_apu_dsp_ack_poll(d);
-
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+        /* Only the sample counter stops the pipeline. FEMETHMODE halts or
+         * traps the front end -- the method processor -- which DirectSound
+         * does around each batch of voice commands; the voice processor runs
+         * on regardless. Gating on it (as xemu does, where a skipped frame
+         * only delays an output pulled by the audio device) turned every
+         * halt into a frame of silence here, heard as constant crackle. Methods and frames are
+         * already serialised by d->lock. */
+        (void)fectl;
+        bool apu_active = xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF;
 
         /* A bit test, so HALTED (0x80, a subset of TRAPPED's 0xE0) counts
          * too: xemu's frame thread idles in both modes. */
@@ -1182,6 +1238,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             apu_irq_stats.fe_trapped_frames++;
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            dsp_job_wait(d);
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
@@ -1196,12 +1253,17 @@ static void *mcpx_apu_frame_thread(void *arg)
          * routine -- dispatched on that bit, kicking the GP doorbell and
          * reposting front-end commands -- is what lets the rest of
          * DirectSound initialisation finish. Without the tick the title
-         * re-runs the sequencer setup forever and never gets past audio. */
+         * re-runs the sequencer setup forever and never gets past audio.
+         *
+         * Only with the DSP off (the VP monitor point): with the GP and EP
+         * programs running, that service routine's doorbell kicks land
+         * mid-period and a quarter of the EP's output periods came out empty,
+         * heard as constant stutter. */
         {
             uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
             uint32_t ssl = qatomic_read(&d->regs[NV_PAPU_SSL]);
             d->sample_count += NUM_SAMPLES_PER_FRAME;
-            if (ssl
+            if (ssl && d->monitor.point == MCPX_APU_DEBUG_MON_VP
                     && d->sample_count >= ssl
                     && (sectl & NV_PAPU_SECTL_XCNTMODE)
                            != NV_PAPU_SECTL_XCNTMODE_OFF) {
@@ -1222,16 +1284,9 @@ static void *mcpx_apu_frame_thread(void *arg)
         apu_deliver_irq(d);
         apu_irq_stats_line();
 
-        /* Let the guest in once per frame.
-         *
-         * The thread holds d->lock for its whole loop and only drops it inside
-         * throttle()'s wait. Once voices really play, processing can run
-         * behind real time, throttle never waits, and the lock is never
-         * released -- while every VOICE_ON/OFF/RELEASE the title writes needs
-         * it (voice_lock). A critical section is not fair, so the title's
-         * thread starved there indefinitely: Burnout 3 froze on its vehicle
-         * select, blocked in voice_lock at raised IRQL, which in turn held
-         * off every USB interrupt. */
+        /* Release the APU lock once per frame so guest voice methods can run
+         * even when processing is behind real time and throttle never waits.
+         * Critical-section scheduling does not guarantee fairness. */
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
@@ -1277,14 +1332,13 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
     memset(d->regs, 0, sizeof(d->regs));
     mcpx_apu_vp_reset(d);
 
-    if (d->gp.dsp) {
-        memset((void *)d->gp.dsp->core.pram_opcache, 0,
-               sizeof(d->gp.dsp->core.pram_opcache));
-    }
-    if (d->ep.dsp) {
-        memset((void *)d->ep.dsp->core.pram_opcache, 0,
-               sizeof(d->ep.dsp->core.pram_opcache));
-    }
+    qemu_mutex_lock(&d->dsp_lock);   /* the frame thread is idle: no frame runs */
+    if (d->gp.dsp) dsp_reset(d->gp.dsp);
+    if (d->ep.dsp) dsp_reset(d->ep.dsp);
+    memset(d->gp.regs, 0, sizeof(d->gp.regs));
+    memset(d->ep.regs, 0, sizeof(d->ep.regs));
+    d->monitor.ep_pcm_offset = 0;
+    qemu_mutex_unlock(&d->dsp_lock);
     d->set_irq = false;
 }
 
@@ -1340,11 +1394,15 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     qemu_mutex_lock(&d->lock);
     qemu_cond_init(&d->cond);
     qemu_cond_init(&d->idle_cond);
+    qemu_mutex_init(&d->dsp_lock);
+    qemu_mutex_init(&d->dsp_queue_lock);
+    qemu_cond_init(&d->dsp_job_cond);
+    qemu_cond_init(&d->dsp_done_cond);
 
     /* Init VP (voice processor) */
     mcpx_apu_vp_init(d);
 
-    /* Init DSP (GP/EP - stubbed) */
+    /* Init DSP interpreters */
     mcpx_apu_dsp_init(d);
 
     /* Init software mixer for DirectSound bridge */
@@ -1357,7 +1415,9 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
     }
 
-    /* Start background frame thread */
+    /* Start background frame and DSP threads */
+    qemu_thread_create(&d->dsp_thread, "mcpx.dsp_thread",
+                       mcpx_apu_dsp_thread, d, QEMU_THREAD_JOINABLE);
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
     mcpx_apu_wait_for_idle(d);
@@ -1378,7 +1438,7 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     fprintf(stderr, "[APU] Shutting down MCPX APU...\n");
 
     qemu_mutex_lock(&d->lock);
-    mcpx_apu_wait_for_idle(d);
+    /* Thread join below waits for exit; a running guest may never become idle. */
     qatomic_set(&d->exiting, true);
     qemu_cond_signal(&d->cond);
     qemu_mutex_unlock(&d->lock);
@@ -1388,6 +1448,10 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
      * after this point finds no instance; a play already in flight is not
      * serialised against shutdown. */
     qemu_thread_join(&d->apu_thread);
+    qemu_mutex_lock(&d->dsp_queue_lock);
+    qemu_cond_signal(&d->dsp_job_cond);
+    qemu_mutex_unlock(&d->dsp_queue_lock);
+    qemu_thread_join(&d->dsp_thread);
     g_state = NULL;
     mcpx_apu_vp_finalize(d);
     mcpx_apu_dsp_finalize(d);
@@ -1396,6 +1460,10 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     qemu_cond_destroy(&d->idle_cond);
     qemu_cond_destroy(&d->cond);
     qemu_mutex_destroy(&d->lock);
+    free(d->gp.dsp);
+    free(d->ep.dsp);
+    free(d->monitor.ep_pcm_queue);
+
     free(d);
     fprintf(stderr, "[APU] Shutdown complete\n");
 }
@@ -1426,11 +1494,11 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
         if (is_write) {
             mcpx_apu_write(d, addr, val, size);
         }
-    } else if (addr == 0x30000 + NV_PAPU_GPRST) {
-        if (is_write)
-            mcpx_apu_dsp_gprst_write((uint32_t)val);
+    } else if (addr >= 0x30000 && addr < 0x40000 && is_write) {
+        mcpx_apu_dsp_write(d, true, (uint32_t)addr - 0x30000, val, size);
+    } else if (addr >= 0x50000 && addr < 0x60000 && is_write) {
+        mcpx_apu_dsp_write(d, false, (uint32_t)addr - 0x50000, val, size);
     }
-    /* The rest of the GP (0x30000) and EP (0x50000) regions is ignored */
 }
 
 /* ============================================================
@@ -1445,6 +1513,10 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        return mcpx_apu_dsp_read(d, true, (uint32_t)addr - 0x30000, size);
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        return mcpx_apu_dsp_read(d, false, (uint32_t)addr - 0x50000, size);
     }
     return 0;
 }
@@ -1597,7 +1669,9 @@ void apu_mixer_play(int slot, int looping)
     v->active = 1;
 
     static int play_log_count = 0;
-    if (play_log_count < 20) {
+    static int play_trace = -1;
+    if (play_trace < 0) play_trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (play_trace && play_log_count < 20) {
         fprintf(stderr, "[APU-MIX] Play voice %d: %u bytes, %u ch, %u Hz, vol=%.2f, loop=%d\n",
                 slot, v->pcm_bytes, v->num_channels, v->sample_rate, v->volume, looping);
         play_log_count++;

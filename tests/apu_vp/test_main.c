@@ -172,6 +172,7 @@ static void gain_ramps_across_a_frame(void)
 
     memset(s_ram, 0, RAM_SIZE);
     memset(&d, 0, sizeof(d));
+    mcpx_apu_vp_init(&d);                     /* the volume table */
     d.regs[NV_PAPU_VPVADDR] = VOICE_BASE;
     set_voice_reg(v, NV_PAVS_VOICE_CFG_FMT,
                   NV_PAVS_VOICE_CFG_FMT_MULTIPASS | (20u << 16));

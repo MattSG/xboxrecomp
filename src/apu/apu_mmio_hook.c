@@ -17,11 +17,10 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
-/* Windows: a VEH hands over the CONTEXT. POSIX arm64: a SIGBUS/SIGSEGV
- * handler hands over the ucontext (apu_hook_handle_mmio_posix, at the end).
- * x86-64 Linux has no trap yet. */
-#if defined(_WIN32)
-#include <windows.h>
+/* The MMIO hook decodes x86-64 instructions from a vectored exception
+ * handler's CONTEXT: Win32 VEH, or win32_compat's SIGSEGV dispatch. */
+#if defined(_WIN32) || defined(__x86_64__)
+#include "platform/xbox_winnt.h"
 #include "../platform/mmio_decode.h"
 
 /* APU MMIO base in Xbox VA space */
@@ -34,6 +33,9 @@ MCPXAPUState *g_apu_state = NULL;
 static int g_apu_mmio_read_count = 0;
 static int g_apu_mmio_write_count = 0;
 static int g_apu_mmio_decode_fail = 0;
+/* The value the last access read or wrote, for RECOMP_APU_TRACE: tracing
+ * must not perform device reads of its own. */
+static uint64_t g_apu_mmio_last;
 
 /* ============================================================
  * Instruction decoding: the shared trapped-MMIO decoder
@@ -53,14 +55,15 @@ static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
     if (size == 8) {
         uint64_t lo = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, 4);
         uint64_t hi = mcpx_apu_mmio_read((MCPXAPUState *)dev, off + 4, 4);
-        return lo | (hi << 32);
+        return g_apu_mmio_last = lo | (hi << 32);
     }
-    return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
+    return g_apu_mmio_last = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
 }
 
 static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
 {
     g_apu_mmio_write_count++;
+    g_apu_mmio_last = v;
     if (size == 8) {
         mcpx_apu_mmio_write((MCPXAPUState *)dev, off, (uint32_t)v, 4);
         mcpx_apu_mmio_write((MCPXAPUState *)dev, off + 4, (uint32_t)(v >> 32), 4);
@@ -96,29 +99,29 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
-    bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+    static int trace = -1;
+    bool ok;
 
-    /* What the title actually asks the APU for. The DSPs are stubbed here, so
-     * a title that waits on one waits forever, and the only way to work out
-     * what it is waiting for is to see the register traffic that precedes the
-     * wait. */
-    if (apu_env_on("RECOMP_APU_TRACE")) {
+    g_apu_mmio_last = 0;
+    ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+
+    /* What the title actually asks the APU for: the register traffic that
+     * precedes a wait says what the title is waiting for. Read once: every
+     * access passes here. */
+    if (trace < 0)
+        trace = apu_env_on("RECOMP_APU_TRACE");
+    if (trace) {
         static unsigned n;
         if (n++ < 400) {
-            /* The value as well as the offset: finding which register carries
-             * the command-block address means recognising the address when it
-             * goes past, and an offset alone never shows it. */
-            uint64_t v = g_apu_state
-                       ? mcpx_apu_mmio_read(g_apu_state, mmio_offset, 4) : 0;
             fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X%s\n",
                     is_write ? "write" : "read ", mmio_offset,
-                    (uint32_t)v, ok ? "" : "  (decode failed)");
+                    (uint32_t)g_apu_mmio_last, ok ? "" : "  (decode failed)");
         }
     }
     return ok;
 }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || __x86_64__ */
 
 #if !defined(_WIN32) && defined(__aarch64__)
 /* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
