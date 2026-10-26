@@ -3,6 +3,7 @@
 add_library(xbox_input STATIC
     xinput_device.c
     keyboard.c          # the key table and the one key map (every host)
+    keymap_spec.c       # RECOMP_KEYMAP's NAME:VK format
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -24,10 +25,9 @@ if(WIN32)
     target_link_libraries(xbox_input PUBLIC platform
         $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>)
 else()
-    find_package(SDL2 REQUIRED)
-    # The SDL window's key and focus events into that table.
-    target_sources(xbox_input PRIVATE keyboard_sdl.c)
-    target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)
+    # SDL3 gamepads; the SDL window (video/fb_window_sdl.c) records the keys.
+    include(Sdl3)
+    target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3)
 endif()
 
 if(MSVC)

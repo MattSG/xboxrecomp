@@ -7,7 +7,7 @@ project(input_keyboard_map_regression C)
 set(CMAKE_C_STANDARD 11)
 enable_testing()
 add_executable(input_keyboard_map_test test_main.c
-    ../../src/input/keyboard.c ../../src/input/input_map.c)
+    ../../src/input/keyboard.c ../../src/input/keymap_spec.c ../../src/input/input_map.c)
 target_include_directories(input_keyboard_map_test PRIVATE ../../src/input ../../src)
 if(NOT MSVC)
     target_link_libraries(input_keyboard_map_test PRIVATE m)

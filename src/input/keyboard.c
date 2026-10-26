@@ -18,6 +18,7 @@
  */
 #include "keyboard.h"
 #include "input_map.h"
+#include "keymap_spec.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -147,8 +148,27 @@ static int row_control(const xbox_key_row *r)
     return -1;
 }
 
+/* RECOMP_KEYMAP=NAME:VK,... (VK in hex, keymap_spec.h) binds a control to
+ * that one key instead of the map's; 0 leaves it unbound. Mouse buttons are
+ * virtual keys too (1 left, 2 right, 4 middle, 5/6 side). */
+static const struct { const char *name; uint8_t control; } s_keymap_names[] = {
+    { "A", INPUT_A }, { "B", INPUT_B }, { "X", INPUT_X }, { "Y", INPUT_Y },
+    { "WHITE", INPUT_WHITE }, { "BLACK", INPUT_BLACK },
+    { "LT", INPUT_LEFT_TRIGGER }, { "RT", INPUT_RIGHT_TRIGGER },
+    { "START", INPUT_START }, { "BACK", INPUT_BACK },
+    { "UP", INPUT_DPAD_UP }, { "DOWN", INPUT_DPAD_DOWN },
+    { "LEFT", INPUT_DPAD_LEFT }, { "RIGHT", INPUT_DPAD_RIGHT },
+    { "LS", INPUT_LEFT_THUMB }, { "RS", INPUT_RIGHT_THUMB },
+    { "LX-", INPUT_LSTICK_LEFT }, { "LX+", INPUT_LSTICK_RIGHT },
+    { "LY-", INPUT_LSTICK_DOWN }, { "LY+", INPUT_LSTICK_UP },
+    { "RX-", INPUT_RSTICK_LEFT }, { "RX+", INPUT_RSTICK_RIGHT },
+    { "RY-", INPUT_RSTICK_DOWN }, { "RY+", INPUT_RSTICK_UP },
+};
+
 void xbox_InputKeyboardBindings(InputBindings *b)
 {
+    const char *spec = getenv("RECOMP_KEYMAP");
+
     memset(b, 0, sizeof *b);
     /* Full deflection on a diagonal, as this map has always given. */
     b->diagonal = INPUT_DIAGONAL_FULL;
@@ -159,24 +179,93 @@ void xbox_InputKeyboardBindings(InputBindings *b)
             if (c >= 0 && r->vk[k] && b->count[c] < INPUT_BINDINGS_PER_CONTROL)
                 b->key[c][b->count[c]++] = r->vk[k];
     }
+    for (size_t i = 0; spec && i < sizeof s_keymap_names / sizeof s_keymap_names[0]; i++) {
+        unsigned vk;
+        int c = s_keymap_names[i].control;
+        if (!keymap_spec_find(spec, s_keymap_names[i].name, &vk))
+            continue;
+        b->count[c] = 0;
+        if (vk & 0xFF)
+            b->key[c][b->count[c]++] = (uint8_t)vk;
+    }
+}
+
+/* RECOMP_MENU_KEYS=1: while the title reports a menu (xbox_InputSetMenuProbe;
+ * with no probe, always) the arrows, W/A/S/D and the left-stick keys move
+ * the D-pad, Space is A and Esc or a right click is B. Those keys leave their
+ * own bindings alone meanwhile, so A in a menu is left, not a stick. */
+static int (*s_in_menu)(void);
+static volatile int s_menu;
+
+void xbox_InputSetMenuProbe(int (*in_menu)(void))
+{
+    s_in_menu = in_menu;
+}
+
+int xbox_InputKeyboardMenu(void)
+{
+    return s_menu;
+}
+
+static int menu_keys_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_MENU_KEYS");
+        on = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return on;
 }
 
 void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
 {
+    static const struct { uint8_t arrow, letter, stick; uint16_t bit; } dirs[4] = {
+        { XBOX_VK_UP, 'W', INPUT_LSTICK_UP, XBOX_GAMEPAD_DPAD_UP },
+        { XBOX_VK_DOWN, 'S', INPUT_LSTICK_DOWN, XBOX_GAMEPAD_DPAD_DOWN },
+        { XBOX_VK_LEFT, 'A', INPUT_LSTICK_LEFT, XBOX_GAMEPAD_DPAD_LEFT },
+        { XBOX_VK_RIGHT, 'D', INPUT_LSTICK_RIGHT, XBOX_GAMEPAD_DPAD_RIGHT } };
     static DWORD packet;
     InputBindings b;
     uint8_t down[INPUT_KEY_COUNT];
+    uint16_t nav = 0;
+    int menu, menu_a = 0, menu_b = 0;
 
     /* One snapshot of the table, so a poll sees one set of keys. */
     for (int vk = 0; vk < INPUT_KEY_COUNT; vk++)
         down[vk] = s_key_down[vk];
     xbox_InputKeyboardBindings(&b);
 
+    menu = menu_keys_enabled() && (!s_in_menu || s_in_menu());
+    if (menu) {
+        for (int i = 0; i < 4; i++) {
+            const uint8_t *keys = b.key[dirs[i].stick];
+            int held = down[dirs[i].arrow] || down[dirs[i].letter];
+            for (int k = 0; k < b.count[dirs[i].stick]; k++)
+                held |= down[keys[k]];
+            if (held)
+                nav |= dirs[i].bit;
+        }
+        menu_a = down[XBOX_VK_SPACE];
+        menu_b = down[XBOX_VK_ESCAPE] || down[XBOX_VK_RBUTTON];
+        /* The menu keys drive only the menu. */
+        for (int i = 0; i < 4; i++) {
+            down[dirs[i].arrow] = down[dirs[i].letter] = 0;
+            for (int k = 0; k < b.count[dirs[i].stick]; k++)
+                down[b.key[dirs[i].stick][k]] = 0;
+        }
+        down[XBOX_VK_SPACE] = down[XBOX_VK_LBUTTON] = 0;
+        down[XBOX_VK_ESCAPE] = down[XBOX_VK_RBUTTON] = 0;
+    }
+    s_menu = menu;
+
     memset(out, 0, sizeof *out);
     /* Buttons set their bit, analog keys read 255 (a title that reads
      * these as a pressure never sees a press if they are 1), stick keys
      * are full deflection and opposite keys cancel. */
     xbox_InputMap_KeysResolve(&b, down, &out->Gamepad);
+    out->Gamepad.wButtons |= nav;
+    if (menu_a) out->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+    if (menu_b) out->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
 
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */
