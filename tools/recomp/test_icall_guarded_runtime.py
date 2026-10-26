@@ -26,7 +26,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tools.recomp.disasm import Instruction, Operand  # noqa: E402
-from tools.recomp.icall_feedback import parse_sites_dump  # noqa: E402
+from tools.recomp.icall_feedback import parse_sites_dump, parse_dump  # noqa: E402
 from tools.recomp.lifter import Lifter  # noqa: E402
 from tools.recomp.translator import _fixup_icall_esp_save  # noqa: E402
 
@@ -82,6 +82,7 @@ uint32_t g_esp, eax;
 #define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
 #define RECOMP_ICALL_OBSERVE_SITE(site, va) ((void)0)
 #define RECOMP_ABI_CALL(va, fn) (fn)()
+#define RECOMP_ICALL_INVOKE(va, fn) RECOMP_ABI_CALL((va), (fn))
 static int hits, misses, lookups, fails, called_a, called_b, called_c;
 #define RECOMP_ICALL_GUARD_HIT()  ((void)hits++)
 #define RECOMP_ICALL_GUARD_MISS() ((void)misses++)
@@ -187,3 +188,44 @@ def test_runtime_site_dump_round_trips_through_the_merge_parser():
         targets, saturated = sites[0x000100C0]
         assert saturated and len(targets) < 9
         assert len(sites) == 3
+
+
+WINDOW_RECORDER = r"""
+#include <stdint.h>
+#include <assert.h>
+#include "recomp_icall_feedback.h"
+int main(void) {
+    RECOMP_ICALL_OBSERVE(0x12300004u, 1); /* unconfigured is harmless */
+    assert(recomp_icall_feedback_configure(0x12300000u,16));
+    RECOMP_ICALL_OBSERVE(0x12300000u,1);
+    RECOMP_ICALL_OBSERVE(0x1230000Fu,2);
+    RECOMP_ICALL_OBSERVE(0x122FFFFFu,1); /* below */
+    RECOMP_ICALL_OBSERVE(0x12300010u,1); /* exclusive end */
+    assert(!recomp_icall_feedback_configure(0xFFFFFFF0u,32));
+    recomp_icall_feedback_dump("first.dump");
+    assert(recomp_icall_feedback_configure(0x9000u,8));
+    RECOMP_ICALL_OBSERVE(0x9004u,1);
+    RECOMP_ICALL_OBSERVE(0x9004u,2);
+    RECOMP_ICALL_OBSERVE(0x12300000u,1); /* previous image */
+    recomp_icall_feedback_dump("second.dump");
+    assert(recomp_icall_feedback_configure(0,0));
+    RECOMP_ICALL_OBSERVE(0x9004u,1);
+    recomp_icall_feedback_dump("empty.dump");
+    return 0;
+}
+"""
+
+
+def test_runtime_target_window_has_no_title_address_limit():
+    if not _cc():
+        pytest.skip("no C compiler on PATH")
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp,"window.c")
+        with open(p,"w") as f:
+            f.write(WINDOW_RECORDER)
+        r = _run(tmp, [p, FEEDBACK_C], defines=("RECOMP_ICALL_FEEDBACK",),
+                 include_dirs=(FEEDBACK_H_DIR,))
+        assert r.returncode == 0,r.stdout+r.stderr
+        assert parse_dump(os.path.join(tmp,"first.dump")) == {0x12300000:1,0x1230000F:2}
+        assert parse_dump(os.path.join(tmp,"second.dump")) == {0x9004:3}
+        assert parse_dump(os.path.join(tmp,"empty.dump")) == {}

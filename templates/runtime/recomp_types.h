@@ -1167,10 +1167,15 @@ void xbox_GuestCpuPreempt(uint32_t va);
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
+
+/* Calls a resolved target. A kernel thunk (0xFE000000 and up) is host code that
+ * may clobber the guest's callee-saved registers; the guest's ebx/esi/edi must
+ * survive the call, so restore them after thunks. */
+#define RECOMP_ICALL_INVOKE(va, fn) do {     uint32_t _kebx = g_ebx, _kesi = g_esi, _kedi = g_edi;     RECOMP_ABI_CALL((va), (fn));     if ((va) >= 0xFE000000u) { g_ebx = _kebx; g_esi = _kesi; g_edi = _kedi; } } while (0)
 
 /**
  * RECOMP_ICALL_SAFE - Stack-safe indirect call.
@@ -1193,7 +1198,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
@@ -1213,7 +1218,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
@@ -1240,7 +1245,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
@@ -1261,7 +1266,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
@@ -1279,7 +1284,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
-               RECOMP_ABI_CALL(_va, _fn); } \
+               RECOMP_ICALL_INVOKE(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
