@@ -217,7 +217,7 @@ def main():
                         help="Split output into files of N functions each")
     parser.add_argument("--gen-dir",
                         help="Output dir for split generated files "
-                             "(default: src/game/recomp/gen)")
+                             "(default: src/recomp/gen)")
     parser.add_argument("--disasm-dir",
                         help="Directory holding tools.disasm output "
                              "(default: tools/disasm/output)")
@@ -247,7 +247,7 @@ def main():
                              "hand. Their bodies are not generated, so the "
                              "hand-written definition links instead")
     parser.add_argument("--exclude-manual", metavar="FILE",
-                        nargs="?", const="src/game/recomp/recomp_manual.c",
+                        nargs="?", const="src/recomp_manual.c",
                         help="Scan a C file (default recomp_manual.c) for the "
                              "functions it defines by hand and skip generating "
                              "their bodies -- the same effect as listing them in "
@@ -433,7 +433,7 @@ def main():
         # Split output mode: multiple .c files + header + dispatch table
         gen_dir = args.gen_dir or os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "src", "game", "recomp", "gen")
+            "src", "recomp", "gen")
 
         if args.max_funcs:
             funcs = funcs[:args.max_funcs]

@@ -50,7 +50,7 @@ def _merge_flag_states(states):
     Float compares join the same way (see _SSE_COMPARES). Without that, a jbe
     after "comiss xmm3, xmm0" on one edge and "comiss xmm0, xmm3" on the other
     -- MSVC's shape for a clamp whose direction depends on a sign -- fell back
-    to the never-assigned _flags, and the clamp always fired. T()NY zeroed its driven wheels' torque that way; the car crawled.
+    to the never-assigned _flags, and the clamp always fired. A title's driven wheels got zero torque that way, so the car crawled.
     """
     if not states or any(not state or not state[0] for state in states):
         return None
