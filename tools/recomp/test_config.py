@@ -104,7 +104,8 @@ if __name__ == "__main__":
 def test_unconfigured_layout_has_no_title_defaults():
     subprocess.run([sys.executable, "-c", """
 from tools.recomp import config as r
-for c in (r,):
+from tools.func_id import config as f
+for c in (r, f):
     assert c.configured_from() is None and c.SECTIONS == []
     assert c.TEXT_VA_START == c.TEXT_VA_END == 0
     assert c.RDATA_VA_START == c.RDATA_VA_END == 0
@@ -119,7 +120,7 @@ assert d.ENTRY_POINT == d.KERNEL_THUNK_ADDR == d.XBE_IMAGE_SIZE == 0
 
 def test_reconfiguration_clears_absent_ranges_and_entries():
     # Independent module instances avoid changing another test's image layout.
-    for module_name in ("tools.recomp.config", "tools.disasm.config"):
+    for module_name in ("tools.recomp.config", "tools.func_id.config", "tools.disasm.config"):
         module = importlib.import_module(module_name)
         spec = importlib.util.spec_from_file_location("synthetic_layout", module.__file__)
         c = importlib.util.module_from_spec(spec)
@@ -147,6 +148,19 @@ def test_reconfiguration_clears_absent_ranges_and_entries():
             assert c.va_to_file_offset(0x20000) is None
         finally:
             sys.modules.pop(spec.name, None)
+
+
+def test_identification_api_configures_its_image(monkeypatch):
+    from tools.func_id import identify
+    calls = []
+    monkeypatch.setattr(identify.config, "configure_from_xbe", lambda path: calls.append(path))
+    def stop(path):
+        assert calls == [path]
+        raise RuntimeError("configured before binary use")
+    monkeypatch.setattr(identify, "_load_binary", stop)
+    import pytest
+    with pytest.raises(RuntimeError, match="configured before binary use"):
+        identify.run("synthetic.xbe")
 
 
 def test_unresolved_report_uses_supplied_layout(tmp_path, monkeypatch):

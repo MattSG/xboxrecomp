@@ -2,11 +2,11 @@
 CLI entry point for the function identification tool.
 
 Usage:
-    py -3 -m tools.func_id "Burnout 3 Takedown/default.xbe" [-v]
     py -3 -m tools.func_id path/to/default.xbe --functions path/to/functions.json -v
 """
 
 import argparse
+import json
 import sys
 
 from .identify import run
@@ -42,14 +42,16 @@ def main():
         help="Print detailed progress"
     )
 
+    parser.add_argument(
+        "--game-keywords", help="Caller-owned JSON category-to-lowercase-keyword lists (default: disabled)"
+    )
     args = parser.parse_args()
 
     try:
-        # Derive address ranges from the XBE being analyzed so classification
-        # is per-title, not tied to the reference fallback layout.
-        from . import config
-        config.configure_from_xbe(args.xbe_path)
-
+        game_keywords = None
+        if args.game_keywords:
+            with open(args.game_keywords, encoding="utf-8") as source:
+                game_keywords = json.load(source)
         summary = run(
             xbe_path=args.xbe_path,
             functions_path=args.functions,
@@ -57,6 +59,7 @@ def main():
             xrefs_path=args.xrefs,
             output_dir=args.output,
             verbose=args.verbose,
+            game_keywords=game_keywords,
         )
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
