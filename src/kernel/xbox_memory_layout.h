@@ -296,9 +296,6 @@ BOOL xbox_ConfigureKernelData(uint32_t base);
 #define KDATA_XE_PUBLIC_KEY     0x300  /* XePublicKeyData (284 bytes) */
 /* Guest counted-string descriptors: two 16-bit counts and a 32-bit buffer VA.
  * Bytes/capacity are owned guest heap copies of port-supplied native exports. */
-#define KDATA_DISK_MODEL_BUF    0x430
-#define KDATA_DISK_SERIAL_BUF   0x470
-#define KDATA_XE_IMAGE_BUF      0x4B0
 #define KDATA_DISK_MODEL_STR    0x420
 #define KDATA_DISK_SERIAL_STR   0x460
 #define KDATA_DISK_CACHE_PARTS  0x4A0
