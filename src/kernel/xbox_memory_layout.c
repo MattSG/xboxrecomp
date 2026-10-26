@@ -3030,6 +3030,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     (sec_raw_size < sec_vsize) ? " (zero-filled tail)" : "");
         }
 
+        if (!RECOMP_ICALL_FEEDBACK_CONFIGURE(g_xbox_code_lo, g_xbox_code_hi - g_xbox_code_lo)) {
+            (void)RECOMP_ICALL_FEEDBACK_CONFIGURE(0, 0);
+            fprintf(stderr, "  ICALL feedback: executable window allocation failed\n");
+        }
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
 
