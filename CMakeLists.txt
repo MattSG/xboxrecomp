@@ -86,6 +86,9 @@ add_subdirectory(src/usb)
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
 
+# Network: Ethernet controller, NAT and peer tunnel
+add_subdirectory(src/net)
+
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
@@ -98,6 +101,7 @@ set(XBOXRECOMP_LIBS
     xbox_dsound
     xbox_input
     xbox_usb
+    xbox_net
     xbox_apu
     xbox_nv2a
     xbox_video
