@@ -111,12 +111,15 @@ for c in (r,):
     assert c.DATA_VA_START == c.DATA_VA_END == 0
     assert c.va_to_file_offset(0x12000) is None
 assert r.ENTRY_POINT == r.KERNEL_THUNK_ADDR == 0
+from tools.disasm import config as d
+assert d.EXECUTABLE_SECTIONS == d.DATA_SECTIONS == [] and d.ALL_SECTIONS == {}
+assert d.ENTRY_POINT == d.KERNEL_THUNK_ADDR == d.XBE_IMAGE_SIZE == 0
 """], check=True, cwd=os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 def test_reconfiguration_clears_absent_ranges_and_entries():
     # Independent module instances avoid changing another test's image layout.
-    for module_name in ("tools.recomp.config",):
+    for module_name in ("tools.recomp.config", "tools.disasm.config"):
         module = importlib.import_module(module_name)
         spec = importlib.util.spec_from_file_location("synthetic_layout", module.__file__)
         c = importlib.util.module_from_spec(spec)
@@ -144,7 +147,6 @@ def test_reconfiguration_clears_absent_ranges_and_entries():
             assert c.va_to_file_offset(0x20000) is None
         finally:
             sys.modules.pop(spec.name, None)
-
 
 
 def test_unresolved_report_uses_supplied_layout(tmp_path, monkeypatch):

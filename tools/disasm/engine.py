@@ -1168,7 +1168,7 @@ class DisasmEngine:
                     # sweep already decoded and stops at ret/jmp, so it seldom
                     # walks into a hole in the first place -- the call-target
                     # path in _pass_call_targets already catches the cases that
-                    # matter. See docs/technical/ms-fusion-adoption-plan.md.
+                    # matter. See docs/pipeline/02-disassembly.md.
                     break
 
                 reachable.add(addr)
@@ -1235,7 +1235,6 @@ class DisasmEngine:
     def get_instructions_in_range(self, start: int, end: int) -> List[Instruction]:
         """Get all instructions in address range [start, end), sorted."""
         self._ensure_sorted_addrs()
-        import bisect
         lo = bisect.bisect_left(self._sorted_addrs, start)
         hi = bisect.bisect_left(self._sorted_addrs, end)
         return [self.instructions[self._sorted_addrs[i]]
