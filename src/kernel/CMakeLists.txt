@@ -31,9 +31,11 @@ set(KERNEL_SOURCES
     nv2a_flip_hold.c
     nv2a_vsh_interp.c
     nv2a_combiner.c
+    nv2a_wbc_flush.c
     icall_diagnostics.c
     host_write_watch.c
     crash_report.c
+    nv2a_pb_recovery.c
     recomp_lookup_cache.c
     xbox_std_string.c
     guest_call.c
@@ -61,8 +63,15 @@ else()
     find_package(OpenSSL REQUIRED)
     target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
 endif()
+# Kernel GPU execution and memory-layout scanout use the video backend.
+# The two libraries need each other; CMake repeats such a cycle on the link
+# line, which single-pass linkers (GNU ld) need.
+target_link_libraries(xbox_kernel PUBLIC xbox_video)
+
 if(MSVC)
-    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
+    # RelWithDebInfo defaults to /Ob1. The optimized software rasterizer needs
+    # normal automatic inlining of small per-pixel helpers as well.
+    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /Ob2 /GS- /Gy)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)

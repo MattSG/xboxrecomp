@@ -21,10 +21,14 @@
  * method = w & 0x1FFC.
  */
 #include <stdio.h>
+#include "platform/recomp_profile.h"
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include "kernel.h"
+#include "nv2a_pb.h"
+#include "xbox_memory_layout.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -39,10 +43,13 @@ static int s_seen_count;
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 static uint32_t s_tot_calls;
+/* Walks that stopped short of PUT; counted even after log throttling. */
+static uint32_t s_tot_stops;
+/* Segments refused at entry because GET or PUT is outside the window. */
+static uint32_t s_tot_refused;
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
-extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
@@ -69,6 +76,78 @@ static int pb_walk_enabled(void)
  * pushbuffer word, so a linear search here was the executor's largest cost
  * (about 40% of its thread in X-Men Legends' levels). */
 static uint16_t s_seen_slot[8][0x2000 / 4];
+
+/* Diagnostic timing stays outside the executor: a packet still reaches the
+ * same decoder and methods, in the same order. Time a header's whole payload
+ * rather than every vertex parameter, so tracing does not add two clocks per
+ * attribute. Only a slow submission (or gap between submissions) is printed. */
+typedef struct {
+    int64_t started, cpu_started, packet_ticks;
+    int64_t max_ticks, max_started, flip_ticks;
+    uint32_t packets, max_va, max_method, max_subch, max_count, max_param;
+} PB_HITCH;
+static int64_t s_hitch_frequency, s_hitch_previous_end;
+
+/* QueryPerformanceCounter and GetThreadTimes come from win32_compat on POSIX
+ * (CLOCK_MONOTONIC and CLOCK_THREAD_CPUTIME_ID there). */
+static int pb_hitch_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("RECOMP_HITCH_TRACE");
+        enabled = setting && *setting && strcmp(setting, "0") != 0;
+        if (enabled) {
+            LARGE_INTEGER frequency;
+            QueryPerformanceFrequency(&frequency);
+            s_hitch_frequency = frequency.QuadPart;
+        }
+    }
+    return enabled;
+}
+
+static int64_t pb_hitch_clock(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+static int64_t pb_hitch_cpu(void)
+{
+    FILETIME created, exited, kernel, user;
+    if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user))
+        return (((int64_t)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime)
+             + (((int64_t)user.dwHighDateTime << 32) | user.dwLowDateTime);
+    return 0;
+}
+
+static void pb_hitch_report(PB_HITCH *hitch, uint32_t start, uint32_t end,
+                            uint32_t words)
+{
+    int64_t finished = pb_hitch_clock();
+    int64_t cpu = pb_hitch_cpu() - hitch->cpu_started;
+    double ms = 1000.0 / (double)s_hitch_frequency;
+    double wall = (finished - hitch->started) * ms;
+    double gap = s_hitch_previous_end
+        ? (hitch->started - s_hitch_previous_end) * ms : 0;
+    unsigned long thread = 0;
+#ifdef _WIN32
+    thread = (unsigned long)GetCurrentThreadId();
+#endif
+    s_hitch_previous_end = finished;
+    if (wall < 33.0 && gap < 33.0) return;
+    fprintf(stderr,
+        "[HITCH] phase=pb_submission qpc_ms=%.3f start_qpc_ms=%.3f "
+        "duration_ms=%.3f thread=%lu span=%08X-%08X cpu_ms=%.3f "
+        "gap_ms=%.3f words=%u packets=%u packet_ms=%.3f flip_ms=%.3f "
+        "max_ms=%.3f max_qpc_ms=%.3f va=%08X method=%04X subch=%u "
+        "count=%u param=%08X\n",
+        finished * ms, hitch->started * ms, wall, thread, start, end,
+        cpu / 10000.0, gap, words,
+        hitch->packets, hitch->packet_ticks * ms, hitch->flip_ticks * ms,
+        hitch->max_ticks * ms, hitch->max_started * ms, hitch->max_va,
+        hitch->max_method, hitch->max_subch, hitch->max_count, hitch->max_param);
+}
 
 static void note(uint32_t subch, uint32_t method)
 {
@@ -152,6 +231,25 @@ static const char *nv097_name(uint32_t m)
     return "";
 }
 
+/* Every word the walk reads must lie in the 64 MB contiguous window. A real
+ * stream lives in RAM, so a JUMP or CALL target above it is a parameter read
+ * as a command after a desync. Wrapping it would execute whatever sits at the
+ * wrapped address and corrupt GPU state quietly; the walk stops there
+ * instead, as PFIFO does at its DMA limit (xemu's pfifo.c raises a protection
+ * error; it never wraps). apexJCL's walker (blinx2-v0.4.0) made the same
+ * bounded-walk choice. */
+static int pb_in_window(uint32_t va)
+{
+    return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;
+}
+
+static NV2A_PB_STOP_HANDLER s_stop_handler;
+
+void nv2a_pb_set_stop_handler(NV2A_PB_STOP_HANDLER handler)
+{
+    s_stop_handler = handler;
+}
+
 void nv2a_pb_scan_report(void)
 {
     int i;
@@ -159,6 +257,10 @@ void nv2a_pb_scan_report(void)
     if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
+        fprintf(stderr, "[PB] %u walks stopped short of PUT\n", s_tot_stops);
+        if (s_tot_refused)
+            fprintf(stderr, "[PB] %u segments refused: GET or PUT outside the"
+                            " contiguous window\n", s_tot_refused);
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
@@ -450,97 +552,480 @@ int nv2a_pb_dma_walk(void)
     return on;
 }
 
-/* The segment scan: walk commands from va to end_va. Returns the words
- * consumed.
- *
- * A CALL runs a subroutine -- a pushbuffer somewhere else in memory -- up to
- * its RETURN, then carries on after the CALL. RenderWare on the Xbox compiles
- * static geometry into pushbuffers and draws it with a CALL, so skipping CALLs
- * loses whole meshes. The NV2A has one level of subroutine, so a CALL inside a
- * call is not followed. A JUMP outside a call ends the segment: the ring's
- * wrap is handled by the caller, which scans the two pieces separately.
- * Addresses are physical, like PUT's, and reach guest memory through the
- * contiguous window. */
 /* Whether the walk is inside a pushbuffer CALL, for the executor: a flip
- * hold is only armed at the top level (nv2a_pb_exec.c). */
-static int s_in_call;
+ * hold is only armed at the top level (nv2a_pb_exec.c). Both walks keep it. */
 int nv2a_pb_scan_in_call(void) { return s_in_call; }
 
-static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
-                                uint32_t *jumps, uint32_t *unknown)
+
+/* DMA_PUT may expose only part of a method packet. PFIFO resumes the
+ * remaining parameters rather than interpreting them as new headers.
+ * The same PUT boundary applies while a subroutine is active: CALL saves
+ * one return address, not a separate FIFO with an invented four-MiB end. */
+typedef struct {
+    uint32_t next_va, packet_va, subch, method, remaining;
+    int active, noninc;
+} PB_PACKET_CONTINUATION;
+static PB_PACKET_CONTINUATION s_packet;
+typedef struct {
+    uint32_t next_start, pc, return_va, last_control, last_target;
+    int active, in_call;
+} PB_FIFO_CONTINUATION;
+static PB_FIFO_CONTINUATION s_fifo;
+static unsigned s_parse_split_reports, s_parse_limit_reports;
+
+/* An isolated parser capture records the bytes actually fetched, before GPU
+ * callbacks can change RAM. Keep the complete bounded pass, not just its last
+ * headers: a bogus control address can lead to a million empty words. Nothing
+ * allocates, reads extra RAM, timestamps or performs I/O when disabled. */
+typedef struct {
+    uint32_t va, word, method, remaining, flags, return_va;
+} PB_CAPTURE_READ;
+static struct {
+    const char *prefix;
+    PB_CAPTURE_READ *first, recent[256];
+    uint8_t *ring;
+    uint32_t ring_va, ring_bytes, ring_capacity;
+    XBOX_NV2A_CAPTURE_STATE initial_state;
+    uint32_t first_count, recent_count, recent_next, start, end, pc;
+    PB_PACKET_CONTINUATION packet;
+    PB_FIFO_CONTINUATION fifo;
+    int configured, recording, done;
+} s_capture;
+
+static void pb_capture_begin(uint32_t start, uint32_t end, uint32_t pc)
+{
+    if (!s_capture.configured) {
+        const char *setting = getenv("RECOMP_PB_CAPTURE");
+        s_capture.configured = 1;
+        if (setting && *setting) {
+            s_capture.first = malloc(0x100000u * sizeof *s_capture.first);
+            if (s_capture.first) s_capture.prefix = setting;
+        }
+    }
+    s_capture.recording = s_capture.prefix && !s_capture.done;
+    if (!s_capture.recording) return;
+    s_capture.first_count = 0;
+    s_capture.start = start; s_capture.end = end; s_capture.pc = pc;
+    s_capture.packet = s_packet; s_capture.fifo = s_fifo;
+    /* This is evidence only: execution continues reading live guest RAM.
+     * Preserve a bounded copy of the producer's configured ring before any
+     * executor callbacks, to distinguish stale submissions from later reuse. */
+    xbox_Nv2aCaptureSnapshot(&s_capture.initial_state);
+    s_capture.ring_bytes = 0;
+    for (uint32_t i = 0; i < s_capture.initial_state.mirror_count &&
+                         i < XBOX_NV2A_CAPTURE_MIRRORS; i++) {
+        const XBOX_NV2A_CAPTURE_MIRROR *m = &s_capture.initial_state.mirrors[i];
+        uint32_t low, high, bytes;
+        uint8_t *copy;
+        if (!m->ring_valid) continue;
+        low = m->ring_first; high = m->ring_last;
+        if (low < XBOX_CONTIG_BASE || high < low ||
+            high > XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - 4u) continue;
+        bytes = high - low + 4u; /* Include the boundary's possible JUMP word. */
+        if (bytes > 4u * 1024u * 1024u) continue;
+        if (s_capture.ring_capacity < bytes) {
+            copy = realloc(s_capture.ring, bytes);
+            if (!copy) continue;
+            s_capture.ring = copy; s_capture.ring_capacity = bytes;
+        }
+        memcpy(s_capture.ring, (const uint8_t *)xbox_GetMemoryOffset() + low, bytes);
+        s_capture.ring_va = low; s_capture.ring_bytes = bytes;
+        break;
+    }
+}
+
+static void pb_capture_read(uint32_t va, uint32_t word, uint32_t method,
+                            uint32_t remaining, int payload, int in_call,
+                            uint32_t return_va)
+{
+    PB_CAPTURE_READ entry;
+    entry.va = va; entry.word = word; entry.method = method;
+    entry.remaining = remaining;
+    entry.flags = (payload ? 1u : 0u) | (in_call ? 2u : 0u);
+    entry.return_va = return_va;
+    if (s_capture.first_count < 0x100000u)
+        s_capture.first[s_capture.first_count++] = entry;
+    s_capture.recent[s_capture.recent_next] = entry;
+    s_capture.recent_next = (s_capture.recent_next + 1) & 255u;
+    if (s_capture.recent_count < 256) s_capture.recent_count++;
+}
+
+static int pb_capture_write(const char *suffix, const void *data, size_t size)
+{
+    char path[4096];
+    FILE *file;
+    int result, length = snprintf(path, sizeof path, "%s%s", s_capture.prefix, suffix);
+    if (length < 0 || length >= (int)sizeof path) return 0;
+    file = fopen(path, "wb");
+    if (!file) return 0;
+    result = fwrite(data, 1, size, file) == size;
+    if (fclose(file) != 0) result = 0;
+    return result;
+}
+
+static int pb_capture_state_json(char *buffer, size_t capacity,
+                                 const XBOX_NV2A_CAPTURE_STATE *state)
+{
+    int n, used = 0;
+#define PB_CAPTURE_JSON(...) do { \
+    n = snprintf(buffer + used, capacity - (size_t)used, __VA_ARGS__); \
+    if (n < 0 || (size_t)n >= capacity - (size_t)used) return 0; \
+    used += n; \
+} while (0)
+    PB_CAPTURE_JSON("{\"version\":%u,\"bytes\":%u,\"mmio_valid\":%u,"
+        "\"user_put\":%u,\"user_get\":%u,\"pfifo_put\":%u,\"pfifo_get\":%u,"
+        "\"pfifo_subroutine\":%u,\"get_held\":%u,\"get_held_value\":%u,"
+        "\"scan_incomplete\":%u,\"notify_count\":%u,\"notify_param\":%u,"
+        "\"notify_device_ptr\":%u,\"notify_event_offset\":%u,"
+        "\"counter_mirrors\":%u,\"frame_counters\":%u,\"mirrors\":[",
+        state->version, state->bytes, state->mmio_valid, state->user_put,
+        state->user_get, state->pfifo_put, state->pfifo_get, state->pfifo_subroutine,
+        state->get_held, state->get_held_value, state->scan_incomplete,
+        state->notify_count, state->notify_param, state->notify_device_ptr,
+        state->notify_event_offset, state->counter_mirrors, state->frame_counters);
+    for (uint32_t i = 0; i < state->mirror_count && i < XBOX_NV2A_CAPTURE_MIRRORS; i++) {
+        const XBOX_NV2A_CAPTURE_MIRROR *m = &state->mirrors[i];
+        PB_CAPTURE_JSON("%s{\"device_ptr_va\":%u,\"device_va\":%u,"
+            "\"device_valid\":%u,\"device_bytes\":%u,\"put_offset\":%u,"
+            "\"get_ptr_offset\":%u,\"put_value\":%u,\"fence_va\":%u,"
+            "\"fence_value\":%u,\"fence_valid\":%u,\"channel_va\":%u,"
+            "\"channel_valid\":%u,\"channel_put\":%u,\"channel_get\":%u,"
+            "\"pfifo_va\":%u,\"pfifo_valid\":%u,\"pfifo_subroutine\":%u,"
+            "\"command_mode\":%u,\"command_dma\":%u,\"command_offset\":%u,"
+            "\"command_pending\":%u,\"command_value\":%u,"
+            "\"command_fence_va\":%u,\"command_queue_count\":%u,"
+            "\"ring_first\":%u,\"ring_last\":%u,\"ring_valid\":%u}", i ? "," : "",
+            m->device_ptr_va, m->device_va, m->device_valid, m->device_bytes,
+            m->put_offset, m->get_ptr_offset, m->put_value, m->fence_va,
+            m->fence_value, m->fence_valid, m->channel_va, m->channel_valid,
+            m->channel_put, m->channel_get, m->pfifo_va, m->pfifo_valid,
+            m->pfifo_subroutine, m->command_mode, m->command_dma, m->command_offset,
+            m->command_pending, m->command_value, m->command_fence_va,
+            m->command_queue_count, m->ring_first, m->ring_last, m->ring_valid);
+    }
+    PB_CAPTURE_JSON("]}");
+#undef PB_CAPTURE_JSON
+    return used;
+}
+
+static void pb_capture_limit(uint32_t words)
+{
+    char metadata[3072];
+    PB_CAPTURE_READ recent[256];
+    XBOX_NV2A_CAPTURE_STATE final_state;
+    char producer[16384];
+    const uint8_t *mem;
+    int ram_ok, first_ok, recent_ok, json_ok, length;
+    int ring_ok, initial_state_ok, final_state_ok, producer_ok;
+#ifdef _WIN32
+    DWORD previous_error;
+#endif
+    if (!s_capture.recording || s_capture.done) return;
+#ifdef _WIN32
+    previous_error = GetLastError();
+#endif
+    s_capture.done = 1; s_capture.recording = 0;
+    xbox_Nv2aCaptureSnapshot(&final_state);
+    mem = (const uint8_t *)xbox_GetMemoryOffset();
+    for (uint32_t i = 0; i < s_capture.recent_count; i++)
+        recent[i] = s_capture.recent[(s_capture.recent_next + 256u -
+                                     s_capture.recent_count + i) & 255u];
+    ram_ok = pb_capture_write(".ram.bin", mem + XBOX_CONTIG_BASE, XBOX_CONTIG_SIZE);
+    first_ok = pb_capture_write(".reads.bin", s_capture.first,
+                               s_capture.first_count * sizeof *s_capture.first);
+    recent_ok = pb_capture_write(".recent.bin", recent,
+                                s_capture.recent_count * sizeof *recent);
+    ring_ok = s_capture.ring_bytes && pb_capture_write(".initial-ring.bin",
+                                  s_capture.ring, s_capture.ring_bytes);
+    initial_state_ok = pb_capture_write(".state-initial.bin",
+                    &s_capture.initial_state, sizeof s_capture.initial_state);
+    final_state_ok = pb_capture_write(".state-final.bin", &final_state, sizeof final_state);
+    memcpy(producer, "{\"initial\":", 11);
+    length = pb_capture_state_json(producer + 11, sizeof producer - 11,
+                                   &s_capture.initial_state);
+    producer_ok = 0;
+    if (length && 11u + (size_t)length + 11u < sizeof producer) {
+        size_t used = 11u + (size_t)length;
+        memcpy(producer + used, ",\"final\":", 9); used += 9;
+        length = pb_capture_state_json(producer + used, sizeof producer - used - 2,
+                                       &final_state);
+        if (length) {
+            used += (size_t)length;
+            memcpy(producer + used, "}\n", 2); used += 2;
+            producer_ok = pb_capture_write(".producer.json", producer, used);
+        }
+    }
+    length = snprintf(metadata, sizeof metadata,
+        "{\n\"version\":1,\"contiguous_base\":%u,\"ram_bytes\":%u,"
+        "\"record_bytes\":%u,\"record_fields\":[\"va\",\"word\",\"method\","
+        "\"remaining\",\"flags\",\"return_va\"],\"payload_flag\":1,\"in_call_flag\":2,\n"
+        "\"start\":%u,\"end\":%u,\"initial_pc\":%u,\"words\":%u,"
+        "\"first_reads\":%u,\"recent_reads\":%u,\n"
+        "\"initial_fifo\":{\"active\":%d,\"in_call\":%d,\"return_va\":%u,"
+        "\"last_control\":%u,\"last_target\":%u},\n"
+        "\"initial_packet\":{\"active\":%d,\"noninc\":%d,\"packet_va\":%u,"
+        "\"method\":%u,\"subch\":%u,\"remaining\":%u},\n"
+        "\"final_fifo\":{\"pc\":%u,\"in_call\":%d,\"return_va\":%u,"
+        "\"last_control\":%u,\"last_target\":%u},\n"
+        "\"final_packet\":{\"active\":%d,\"noninc\":%d,\"packet_va\":%u,"
+        "\"method\":%u,\"subch\":%u,\"remaining\":%u},\n"
+        "\"ram_ok\":%d,\"first_ok\":%d,\"recent_ok\":%d,\n"
+        "\"initial_ring_va\":%u,\"initial_ring_bytes\":%u,\"initial_ring_ok\":%d,"
+        "\"state_bytes\":%u,\"initial_state_ok\":%d,\"final_state_ok\":%d,"
+        "\"producer_ok\":%d\n}\n",
+        (unsigned)XBOX_CONTIG_BASE, (unsigned)XBOX_CONTIG_SIZE,
+        (unsigned)sizeof(PB_CAPTURE_READ), s_capture.start, s_capture.end, s_capture.pc,
+        words, s_capture.first_count, s_capture.recent_count,
+        s_capture.fifo.active, s_capture.fifo.in_call, s_capture.fifo.return_va,
+        s_capture.fifo.last_control, s_capture.fifo.last_target,
+        s_capture.packet.active, s_capture.packet.noninc, s_capture.packet.packet_va,
+        s_capture.packet.method, s_capture.packet.subch, s_capture.packet.remaining,
+        s_fifo.pc, s_fifo.in_call, s_fifo.return_va, s_fifo.last_control, s_fifo.last_target,
+        s_packet.active, s_packet.noninc, s_packet.packet_va,
+        s_packet.method, s_packet.subch, s_packet.remaining, ram_ok, first_ok, recent_ok,
+        s_capture.ring_va, s_capture.ring_bytes, ring_ok, (unsigned)sizeof final_state,
+        initial_state_ok, final_state_ok, producer_ok);
+    json_ok = length >= 0 && length < (int)sizeof metadata &&
+              pb_capture_write(".json", metadata, (size_t)length);
+    fprintf(stderr, "[PB_CAPTURE] prefix=%s words=%u reads=%u ram_ok=%d "
+                    "first_ok=%d recent_ok=%d json_ok=%d\n",
+            s_capture.prefix, words, s_capture.first_count,
+            ram_ok, first_ok, recent_ok, json_ok);
+    free(s_capture.first); s_capture.first = NULL;
+    free(s_capture.ring); s_capture.ring = NULL; s_capture.ring_capacity = 0;
+#ifdef _WIN32
+    SetLastError(previous_error);
+#endif
+}
+
+/* Walk one PFIFO, including its single-level CALL/RETURN state. The work cap
+ * is a host scheduling bound, not an acknowledgment of unexecuted commands.
+ * A caller must retry the saved PC until it reaches the actual DMA_PUT. */
+static uint32_t pb_walk(uint32_t va, uint32_t end_va,
+                        uint32_t *jumps, uint32_t *unknown, PB_HITCH *hitch)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
+    uint32_t last_control = s_fifo.last_control, last_target = s_fifo.last_target;
+    uint32_t return_va = s_fifo.return_va;
+    int in_call = s_in_call = s_fifo.in_call;
+    const char *why = NULL;
+    uint32_t at = va, word = 0;
 
-    while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
-        va += 4;
-        words++;
-
-        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
-            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
-                                             : (w & 0x1FFFFFFCu);
-            (*jumps)++;
-            if (!in_call)
-                break;                        /* the ring: a jump ends it */
-            va = 0x80000000u | (target & 0x0FFFFFFFu);
-            end_va = va + 0x400000u;
-            continue;
-        }
-        if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN */
-            if (in_call)
-                break;
-            continue;
-        }
-        if ((w & 3u) == 2u) {                    /* CALL */
-            if (!in_call) {
-                uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
-                s_tot_calls++;
-                s_in_call = 1;
-                words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
-                s_in_call = 0;
+    while (va != end_va && words < 0x100000u) {
+        uint32_t count, subch, method, packet_va;
+        int noninc;
+        if (s_packet.active) {
+            count = s_packet.remaining; subch = s_packet.subch;
+            method = s_packet.method; noninc = s_packet.noninc;
+            packet_va = s_packet.packet_va;
+            s_packet.active = 0;
+        } else {
+            uint32_t w;
+            if (!pb_in_window(va)) {
+                why = "outside the contiguous window"; at = va;
+                goto stop;
             }
-            continue;
-        }
-        if ((w & 0x00030003u) == 0u) {
-            uint32_t count  = (w >> 18) & 0x7FFu;
-            uint32_t subch  = (w >> 13) & 7u;
-            uint32_t method =  w & 0x1FFCu;
-            int noninc = (w & 0xE0000000u) == 0x40000000u;
+            w = *(const uint32_t *)(mem + va);
+            if (s_capture.recording)
+                pb_capture_read(va, w, 0, 0, 0, in_call, return_va);
+            packet_va = va;
+            va += 4;
+            words++;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
-                uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
-                if (s_exec_enabled)
-                    nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
+            if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+                uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                                 : (w & 0x1FFFFFFCu);
+                if (target >= XBOX_CONTIG_SIZE) {
+                    why = "jump outside the window"; at = packet_va; word = w;
+                    goto stop;
+                }
+                last_control = w; last_target = XBOX_CONTIG_BASE | target;
+                (*jumps)++;
+                va = last_target;
+                continue;
+            }
+            if (w == 0x00020000u) {                 /* exact RETURN */
+                if (in_call) {
+                    va = return_va;
+                    in_call = s_in_call = 0;
+                }
+                continue;
+            }
+            if ((w & 3u) == 2u) {                    /* CALL */
+                if ((w & 0xFFFFFFFCu) >= XBOX_CONTIG_SIZE) {
+                    why = "call outside the window"; at = packet_va; word = w;
+                    goto stop;
+                }
+                last_control = w; last_target = XBOX_CONTIG_BASE | (w & 0xFFFFFFFCu);
+                if (!in_call) {
+                    s_tot_calls++;
+                    return_va = va;
+                    in_call = s_in_call = 1;
+                    va = last_target;
+                }
+                continue;
+            }
+            if ((w & 0xE0030003u) != 0u &&
+                (w & 0xE0030003u) != 0x40000000u) {
+                (*unknown)++;
+                continue;
+            }
+            count = (w >> 18) & 0x7FFu;
+            subch = (w >> 13) & 7u;
+            method = w & 0x1FFCu;
+            noninc = (w & 0xE0000000u) == 0x40000000u;
+        }
+        {
+            uint32_t first_param = 0, i;
+            int64_t packet_start = hitch && count ? pb_hitch_clock() : 0;
+            int contains_flip = 0;
+
+            for (i = 0; i < count && va != end_va && words < 0x100000u; i++) {
+                uint32_t m = noninc ? method : (method + i * 4) & 0x1FFCu;
+                if (hitch && m == 0x0130) contains_flip = 1;
+                if (s_scan_enabled)  /* the inventory is a linear search: survey runs only */
+                    note(subch, m);
+                /* Same walk, two consumers: the survey counts, the executor
+                 * acts. Keeping them on one decode means they can never
+                 * disagree about what the stream said. */
+                if (!pb_in_window(va)) {
+                    why = "outside the contiguous window"; at = va;
+                    goto stop;
+                }
+                if (s_exec_enabled || s_capture.recording) {
+                    uint32_t param = *(const uint32_t *)(mem + va);
+                    if (hitch && !i) first_param = param;
+                    if (s_capture.recording)
+                        pb_capture_read(va, param, m, count - i, 1, in_call, return_va);
+                    if (s_exec_enabled) nv2a_pb_exec_method(subch, m, param);
+                }
                 va += 4;
                 words++;
             }
-            continue;
+            if (i < count) {
+                s_packet.active = 1; s_packet.next_va = va;
+                s_packet.packet_va = packet_va; s_packet.subch = subch;
+                s_packet.method = noninc ? method : (method + i * 4) & 0x1FFCu;
+                s_packet.remaining = count - i; s_packet.noninc = noninc;
+                if (hitch && s_parse_split_reports++ < 64) {
+                    int64_t now = pb_hitch_clock();
+                    fprintf(stderr, "[PB_PARSE] phase=packet_split qpc_ms=%.3f "
+                        "packet_va=%08X next_va=%08X method=%04X subch=%u remaining=%u\n",
+                        now * 1000.0 / s_hitch_frequency, packet_va, va,
+                        s_packet.method, subch, s_packet.remaining);
+                }
+            }
+            if (hitch) {
+                int64_t ticks = count ? pb_hitch_clock() - packet_start : 0;
+                hitch->packets++;
+                hitch->packet_ticks += ticks;
+                /* FLIP_STALL includes normal vblank pacing. Keep it separate
+                 * so a paced flip cannot hide a slow draw/visibility packet. */
+                if (contains_flip) {
+                    hitch->flip_ticks += ticks;
+                } else if (ticks > hitch->max_ticks) {
+                    hitch->max_ticks = ticks;
+                    hitch->max_started = packet_start;
+                    hitch->max_va = packet_va;
+                    hitch->max_method = method;
+                    hitch->max_subch = subch;
+                    hitch->max_count = count;
+                    hitch->max_param = first_param;
+                }
+            }
         }
-        (*unknown)++;
+    }
+    if (0) {
+stop:   /* Discard malformed work. Recovery is explicit caller policy. */
+        {
+            static unsigned said;
+            if (s_exec_enabled && s_stop_handler)
+                s_stop_handler(at, end_va, why);
+            s_packet.active = 0; in_call = s_in_call = 0;
+            s_tot_stops++;
+            if (said++ < 8)
+                fprintf(stderr, "[PB] walk stopped at 0x%08X (word 0x%08X) after %u"
+                        " words, PUT 0x%08X (%s)\n",
+                        at, word, words, end_va, why);
+            va = end_va;
+        }
+    }
+    s_fifo.pc = va; s_fifo.in_call = in_call; s_fifo.return_va = return_va;
+    s_fifo.last_control = last_control; s_fifo.last_target = last_target;
+    if (va != end_va && words >= 0x100000u) pb_capture_limit(words);
+    if (hitch && va != end_va && words >= 0x100000u &&
+        s_parse_limit_reports++ < 16) {
+        int64_t now = pb_hitch_clock();
+        fprintf(stderr, "[PB_PARSE] phase=parse_limit qpc_ms=%.3f pc=%08X "
+            "end_va=%08X in_call=%d words=%u last_control=%08X target=%08X\n",
+            now * 1000.0 / s_hitch_frequency, va, end_va, in_call, words,
+            last_control, last_target);
     }
     return words;
 }
 
-void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+int nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
 {
     uint32_t words, jumps = 0, unknown = 0;
+    uint32_t pc;
+    int completed;
+    PB_HITCH trace, *hitch = NULL;
 
-    if (!pb_walk_enabled() || end_va <= start_va)
-        return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
+    /* GET and PUT must lie in the contiguous window. A value past it is not
+     * an alias of a low address: the walk cannot read it (see pb_in_window),
+     * and wrapping it would run whatever sits at the wrapped address. Refuse
+     * the segment and log the first few. Report it consumed, not incomplete:
+     * an incomplete scan is retried every tick with the same refusal and
+     * holds back every fence publish, which is the silent stall. */
+    if (!pb_in_window(start_va) || end_va - XBOX_CONTIG_BASE > XBOX_CONTIG_SIZE) {
+        s_tot_refused++;
+        if (s_tot_refused <= 8)
+            fprintf(stderr, "[PB] refused segment GET 0x%08X PUT 0x%08X: outside"
+                            " the 64 MB contiguous window (%u refused so far)\n",
+                    start_va, end_va, s_tot_refused);
+        return 1;
+    }
+
+    if (!pb_walk_enabled() || end_va == start_va)
+        return 1;
 
     if (s_exec_enabled) {
         extern void nv2a_pb_exec_walk_begin(void);
         nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
     }
-    words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
+    /* A fresh/discontinuous scan does not inherit another FIFO's fragment. */
+    if (s_fifo.active && s_fifo.next_start == start_va) {
+        pc = s_fifo.pc;
+    } else {
+        pc = start_va;
+        s_packet.active = 0;
+        memset(&s_fifo, 0, sizeof s_fifo);
+    }
+    pb_capture_begin(start_va, end_va, pc);
+
+    if (pb_hitch_enabled()) {
+        hitch = &trace;
+        memset(&trace, 0, sizeof trace);
+        trace.cpu_started = pb_hitch_cpu();
+        trace.started = pb_hitch_clock();
+    }
+
+    {
+        extern void nv2a_d3d_kick(void);
+        nv2a_d3d_kick();
+    }
+    RECOMP_PROFILE_BEGIN("GPU submission");
+    words = pb_walk(pc, end_va, &jumps, &unknown, hitch);
+    RECOMP_PROFILE_END();
+    if (hitch) pb_hitch_report(hitch, start_va, end_va, words);
 
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+    completed = s_fifo.pc == end_va;
+    s_fifo.next_start = completed ? end_va : start_va;
+    s_fifo.active = !completed || s_fifo.in_call || s_packet.active;
+    return completed;
 }

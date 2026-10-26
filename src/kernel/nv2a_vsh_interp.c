@@ -22,10 +22,7 @@
  * an ILU op, the ILU's temp write goes to R1 whatever the temp field says,
  * and both units read their sources before either writes.
  *
- * The layout is checked against real programs rather than taken on trust:
- * RECOMP_VSH_DUMP disassembles each program the title uploads, and an Xbox
- * D3D program is recognisable -- DP4s against the matrix constants, ending in
- * the runtime's screen-space epilogue (RCC of R12.w, then a MAD into oPos).
+ * Uploaded programs can be disassembled with RECOMP_VSH_DUMP for diagnosis.
  */
 #include "nv2a_vsh_interp.h"
 
@@ -38,6 +35,9 @@ static uint32_t s_program[NV2A_VSH_SLOTS][4];
 static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
+/* Bumped on every change, so a consumer that caches a translation of the
+ * program or a copy of the constants knows when to refresh it. */
+static uint32_t s_program_version = 1, s_const_version = 1;
 static uint32_t s_cxt_write;
 static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
 
@@ -63,6 +63,7 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
 
 void nv2a_vsh_program_word(uint32_t word)
 {
+    s_program_version++;
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
     if (++s_load_word == 4) {
@@ -71,7 +72,7 @@ void nv2a_vsh_program_word(uint32_t word)
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; s_program_version++; }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -84,6 +85,7 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 
 void nv2a_vsh_constant_word(uint32_t word)
 {
+    s_const_version++;
     if (s_const_load < NV2A_VSH_CONSTANTS)
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
     else if (vsh_dump_enabled()) {
@@ -106,14 +108,43 @@ void nv2a_vsh_constant_word(uint32_t word)
     }
 }
 
+/* Everything uploaded, for a caller that runs another frame in between
+ * and must hand back the one in progress as it was. */
+typedef struct {
+    uint32_t program[NV2A_VSH_SLOTS][4];
+    float    c[NV2A_VSH_CONSTANTS][4];
+    uint32_t load_slot, load_word, start_slot, const_load, const_word, cxt_write;
+} VshState;
+size_t nv2a_vsh_state_size(void) { return sizeof(VshState); }
+void nv2a_vsh_state_save(void *out)
+{
+    VshState *v = (VshState *)out;
+    memcpy(v->program, s_program, sizeof s_program);
+    memcpy(v->c, s_const, sizeof s_const);
+    v->load_slot = s_load_slot; v->load_word = s_load_word; v->start_slot = s_start_slot;
+    v->const_load = s_const_load; v->const_word = s_const_word; v->cxt_write = s_cxt_write;
+}
+void nv2a_vsh_state_restore(const void *in)
+{
+    const VshState *v = (const VshState *)in;
+    memcpy(s_program, v->program, sizeof s_program);
+    memcpy(s_const, v->c, sizeof s_const);
+    s_load_slot = v->load_slot; s_load_word = v->load_word; s_start_slot = v->start_slot;
+    s_const_load = v->const_load; s_const_word = v->const_word; s_cxt_write = v->cxt_write;
+    s_program_version++;
+    s_const_version++;
+}
+
 void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
+    s_const_version++;
     if (index < NV2A_VSH_CONSTANTS)
         memcpy(s_const[index], v, sizeof s_const[index]);
 }
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
+    s_program_version++;
     if (slot < NV2A_VSH_SLOTS)
         memcpy(s_program[slot], words, sizeof s_program[slot]);
 }
@@ -188,8 +219,22 @@ const float *nv2a_vsh_constant(uint32_t index)
     return s_const[index < NV2A_VSH_CONSTANTS ? index : 0];
 }
 
+const uint32_t (*nv2a_vsh_program(uint32_t *start, uint32_t *version))[4]
+{
+    *start = s_start_slot;
+    *version = s_program_version;
+    return (const uint32_t (*)[4])s_program;
+}
+
+const float (*nv2a_vsh_constants(uint32_t *version))[4]
+{
+    *version = s_const_version;
+    return (const float (*)[4])s_const;
+}
+
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
+    s_const_version++;
     if (index < NV2A_VSH_CONSTANTS && comp < 4)
         memcpy(&s_const[index][comp], &word, 4);
 }
@@ -329,6 +374,15 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     return r;
 }
 
+void nv2a_vsh_debug_dump(void)
+{
+    uint32_t c;
+    dump_program(s_start_slot);
+    for (c = 0; c < NV2A_VSH_CONSTANTS; ++c)
+        fprintf(stderr, "[VSH_CONST] c%u %g %g %g %g\n", c,
+                s_const[c][0], s_const[c][1], s_const[c][2], s_const[c][3]);
+}
+
 int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
     static int dump = -1;
@@ -384,25 +438,28 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         if (ilu)
             ires = run_ilu(ilu, c);
 
-        if (mac && mac != 13 && mac_mask) {
+        /* Paired with an ILU op the MAC cannot write R1 -- the ILU owns
+         * it (xemu vsh-prog.c decode_opcode). */
+        if (mac && mac != 13 && mac_mask && !(ilu && tdst == 1)) {
             float *d = tdst == 12 ? opos.v : (tdst < 12 ? temp[tdst].v : NULL);
             if (d) write_masked(d, &mres, mac_mask);
         }
         if (ilu && ilu_mask) {
-            /* Paired with any MAC op, the ILU can only write R1 -- even when
-             * the MAC half writes no temp at all. The D3D epilogue is exactly
-             * that: `mul o[0].xyz` beside `rcc R1.x`, then `mad` with R1.x.
-             * Sending the rcc to the temp field (R7 there) left R1.x at 0 and
-             * put every vertex of every 3D batch at c[59]. */
+            /* With any MAC op, the ILU temp destination is R1, even if
+             * the MAC half has no temp destination. */
             uint32_t it = mac ? 1u : tdst;
             float *d = it == 12 ? opos.v : (it < 12 ? temp[it].v : NULL);
             if (d) write_masked(d, &ires, ilu_mask);
         }
-        if (omask) {
+        /* An output comes only from a unit that ran: a NOP half writes
+         * nothing, not zeros (xemu decode_token). */
+        if (omask && (field(ins, 3, 2, 1) ? ilu : mac)) {
             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
                     write_masked(s_const[oaddr], src, omask);
+                    s_const_version++;
+                }
             } else if (oaddr == 0) {
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {

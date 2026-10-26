@@ -49,6 +49,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 void nv2a_pb_exec_report(void) {}
 void xbox_Nv2aAckBusyBits(void) {}
 void nv2a_pb_exec_walk_begin(void) {}       /* the flip hold's vblank sample */
+/* The default segment walk's backend; this test drives the DMA walk. */
+void nv2a_d3d_kick(void) {}
+typedef struct XBOX_NV2A_CAPTURE_STATE XBOX_NV2A_CAPTURE_STATE;
+void xbox_Nv2aCaptureSnapshot(XBOX_NV2A_CAPTURE_STATE *out) { (void)out; }
 
 void nv2a_pb_resync(uint32_t get_phys);
 void nv2a_pb_scan(uint32_t put_phys);
