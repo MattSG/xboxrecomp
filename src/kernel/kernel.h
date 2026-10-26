@@ -387,8 +387,9 @@ struct _XBOX_KINTERRUPT {
     BOOLEAN Connected;
 };
 
-/* Thread start routine (Xbox uses __stdcall) */
-typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
+/* Native callbacks; guest addresses are dispatched by kernel_bridge.c. */
+typedef VOID (__stdcall *PXBOX_START_ROUTINE)(PVOID StartContext);
+typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PXBOX_START_ROUTINE StartRoutine, PVOID StartContext);
 
 /* Pool types */
 #define NonPagedPool    0
@@ -762,13 +763,21 @@ NTSTATUS __stdcall xbox_NtQuerySymbolicLinkObject(HANDLE LinkHandle, PXBOX_ANSI_
  * Threading (kernel_thread.c)
  * ============================================================================ */
 
+/* Native host callback facade: correct callback positions/arity and optional
+ * system routine. Guest CPU/TLS/object extension/debugger setup belongs to the
+ * guest path; nonzero extension/TLS or debugger requests return NOT_SUPPORTED.
+ * Zero stack bytes selects the host default; suspension uses host primitives.
+ * On failure supplied handle/ID outputs are cleared. */
 NTSTATUS __stdcall xbox_PsCreateSystemThreadEx(
     PHANDLE ThreadHandle, ULONG ThreadExtraSize, ULONG KernelStackSize,
-    ULONG TlsDataSize, PULONG ThreadId, PVOID StartContext1, PVOID StartContext2,
-    BOOLEAN CreateSuspended, BOOLEAN DebugStack,
-    PXBOX_SYSTEM_ROUTINE StartRoutine);
+    ULONG TlsDataSize, PULONG ThreadId, PXBOX_START_ROUTINE StartRoutine, PVOID StartContext,
+    BOOLEAN CreateSuspended, BOOLEAN DebuggerThread,
+    PXBOX_SYSTEM_ROUTINE SystemRoutine);
+NTSTATUS __stdcall xbox_PsCreateSystemThread(
+    PHANDLE ThreadHandle, PULONG ThreadId, PXBOX_START_ROUTINE StartRoutine,
+    PVOID StartContext, BOOLEAN DebuggerThread);
 
-NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus);
+VOID __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus);
 
 NTSTATUS __stdcall xbox_KeDelayExecutionThread(KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Interval);
 LONG     __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment);

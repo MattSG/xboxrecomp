@@ -214,7 +214,7 @@ int main(void)
         tick_busy = 1;
         pcrtc |= PCRTC_VBLANK;
         pmc |= PMC_PCRTC;
-        /* kernel_raise_interrupt: declined, nothing written */
+        /* kernel_call_isr: declined, nothing written */
         xbox_VblankArmBits(&pcrtc, &tick_busy, 1);  /* the tick's own bit */
         t = CreateThread(NULL, 0, dpc_thread, &d, 0, NULL);
         r = xbox_VblankAckWait(&pcrtc, &pmc, &tick_busy, rearm, &late);

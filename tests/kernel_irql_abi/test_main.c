@@ -32,6 +32,7 @@ int main(void) {
     memory=VirtualAlloc(NULL,16*1024*1024,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
     if(!memory) return 10;
     g_xbox_mem_offset=(ptrdiff_t)memory;
+    g_xbox_kernel_data_base=0x80000;   /* the layout's kernel data area */
     uint32_t *imports=(uint32_t *)(memory+0x10000);
     imports[0]=0x800000A0; imports[1]=0x800000A1;
     xbox_kernel_set_thunk_address(0x10000,2); xbox_kernel_bridge_init();
