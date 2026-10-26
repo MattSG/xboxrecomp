@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static HRESULT com_result, create_result, master_result, source_result;
+static HRESULT com_result, create_result, callback_result, master_result, source_result;
 static HRESULT start_result, submit_result;
 static int com_refs, releases, master_destroys, source_destroys, failures;
 static IXAudio2 engine;
@@ -93,6 +93,8 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
 #define CoInitializeEx(...) fake_com_init()
 #define CoUninitialize() ((void)--com_refs)
 #define XAudio2Create(out, ...) fake_create(out)
+#undef IXAudio2_RegisterForCallbacks
+#define IXAudio2_RegisterForCallbacks(...) callback_result
 #undef IXAudio2_CreateMasteringVoice
 #define IXAudio2_CreateMasteringVoice(engine, out, ...) fake_master(out)
 #undef IXAudio2_CreateSourceVoice
@@ -109,6 +111,7 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
 #define IXAudio2SourceVoice_GetState(source, state, ...) fake_state(state)
 #undef IXAudio2SourceVoice_SubmitSourceBuffer
 #define IXAudio2SourceVoice_SubmitSourceBuffer(source, buffer, ...) fake_submit(buffer)
+int xbox_FramebufferPaused(void) { return 0; }   /* never paused here */
 #include "../../src/apu/apu_xaudio2.c"
 
 /* xa2_init reads the buffer variables on each call. */
@@ -129,14 +132,14 @@ static void reset(void)
     g_xa2_dry = 0;
     com_refs = releases = master_destroys = source_destroys = 0;
     queue_count = 0;
-    com_result = create_result = master_result = source_result = S_OK;
+    com_result = create_result = callback_result = master_result = source_result = S_OK;
     start_result = submit_result = S_OK;
 }
 
 static void check_init_failures(HRESULT com_hr)
 {
-    HRESULT *stages[] = { &create_result, &master_result, &source_result, &start_result };
-    for (int stage = 0; stage < 4; stage++) {
+    HRESULT *stages[] = { &create_result, &callback_result, &master_result, &source_result, &start_result };
+    for (int stage = 0; stage < 5; stage++) {
         reset();
         com_result = com_hr;
         *stages[stage] = E_FAIL;
@@ -144,8 +147,8 @@ static void check_init_failures(HRESULT com_hr)
         CHECK(!xa2_is_active());
         CHECK(com_refs == 0);
         CHECK(releases == (stage >= 1));
-        CHECK(master_destroys == (stage >= 2));
-        CHECK(source_destroys == (stage >= 3));
+        CHECK(master_destroys == (stage >= 3));
+        CHECK(source_destroys == (stage >= 4));
         CHECK(!g_xa2 && !g_xa2_master && !g_xa2_source);
         xa2_shutdown();
         CHECK(releases == (stage >= 1));
@@ -224,11 +227,11 @@ int main(void)
     }
     xa2_shutdown();
 
-    /* Buffer size and count: defaults 512 x 4, overrides reach the
+    /* Buffer size and count: defaults 1024 x 8, overrides reach the
      * submitted buffers and the queue limit, out-of-range values clamp. */
     {
         struct { const char *samples, *count; UINT32 want_s, want_n; } c[] = {
-            { "RECOMP_AUDIO_BUF_SAMPLES=",     "RECOMP_AUDIO_BUF_COUNT=",   512, 4 },
+            { "RECOMP_AUDIO_BUF_SAMPLES=",     "RECOMP_AUDIO_BUF_COUNT=",  1024, 8 },
             { "RECOMP_AUDIO_BUF_SAMPLES=256",  "RECOMP_AUDIO_BUF_COUNT=6",  256, 6 },
             { "RECOMP_AUDIO_BUF_SAMPLES=9999", "RECOMP_AUDIO_BUF_COUNT=1", 4096, 2 },
             { "RECOMP_AUDIO_BUF_SAMPLES=16",   "RECOMP_AUDIO_BUF_COUNT=99", 128, 8 },
@@ -260,8 +263,8 @@ int main(void)
     {
         static int16_t period[256][2];
         int high, refused = 0;
-        put_env("RECOMP_AUDIO_BUF_SAMPLES=");
-        put_env("RECOMP_AUDIO_BUF_COUNT=");
+        put_env("RECOMP_AUDIO_BUF_SAMPLES=512");   /* the marks below are for 512 x 4 */
+        put_env("RECOMP_AUDIO_BUF_COUNT=4");
         reset();
         max_queue = 4;
         CHECK(xa2_init() == 1);

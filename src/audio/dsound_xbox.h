@@ -9,12 +9,12 @@
  * - WMA decoding integration
  * - I3DL2 environmental reverb
  *
- * The game uses 40 DirectSound entry points with 68 total calls.
- * This layer translates those calls to XAudio2.
+ * PCM buffers use the shared APU mixer. Stream and spatial methods are
+ * partial compatibility stubs; this is not a complete DirectSound API.
  */
 
-#ifndef BURNOUT3_DSOUND_XBOX_H
-#define BURNOUT3_DSOUND_XBOX_H
+#ifndef XBOXRECOMP_DSOUND_XBOX_H
+#define XBOXRECOMP_DSOUND_XBOX_H
 
 #include <stdint.h>
 #include "platform/xbox_winnt.h"
@@ -186,4 +186,4 @@ HRESULT xbox_DirectSoundCreate(void *pGuid, IDirectSound8 **ppDS, void *pUnkOute
 }
 #endif
 
-#endif /* BURNOUT3_DSOUND_XBOX_H */
+#endif /* XBOXRECOMP_DSOUND_XBOX_H */

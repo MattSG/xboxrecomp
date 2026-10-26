@@ -13,7 +13,7 @@ add_library(xbox_apu STATIC
     dsp/interp/dsp_cpu.c
     apu_mmio_hook.c
     apu_xaudio2.c
-    apu_sdl2.c
+    apu_sdl.c
     apu_wav.c
 )
 

@@ -12,8 +12,8 @@
 #include <string.h>
 #include "apu_xaudio2.h"
 
-/* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl2.c provides
- * the same xa2_* functions over SDL2. */
+/* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl.c provides
+ * the same xa2_* functions over SDL3. */
 #if defined(_WIN32)
 
 #define COBJMACROS
@@ -25,11 +25,14 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-/* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
- * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
- * override them at xa2_init, clamped to the static storage below. */
-#define XA2_BUF_SAMPLES_DEFAULT 512
-#define XA2_NUM_BUFS_DEFAULT    4
+/* Device buffer size and count. Defaults 1024 x 8 (21.3 ms each, 171 ms
+ * worst case queued): the DSP runs on its own thread and hands over whole
+ * periods, and in a driving run 43 ms ran dry hundreds of times and 85 ms
+ * on disc-streaming hitches. RECOMP_AUDIO_BUF_SAMPLES and
+ * RECOMP_AUDIO_BUF_COUNT override them at xa2_init, clamped to the static
+ * storage below. */
+#define XA2_BUF_SAMPLES_DEFAULT 1024
+#define XA2_NUM_BUFS_DEFAULT    8
 #define XA2_BUF_SAMPLES_MIN     128
 #define XA2_BUF_SAMPLES_MAX     4096
 #define XA2_NUM_BUFS_MIN        2
@@ -65,8 +68,26 @@ static int                     g_xa2_fill = 0;  /* samples staged in bufs[next_b
 static unsigned  g_xa2_underruns;
 static int       g_xa2_dry;
 static ULONGLONG g_xa2_underrun_logged;
+static float                   g_xa2_gain = 1.0f;  /* 0 under RECOMP_AUDIO_MUTE */
+static int                     g_xa2_muted;        /* pause state last applied */
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
+static volatile LONG g_xa2_error;
+static int g_xa2_error_reported;
+
+/* Endpoint loss otherwise looks like a permanently full queue. Keep the
+ * callback small; destruction/recovery must happen outside the audio thread. */
+static void STDMETHODCALLTYPE xa2_processing_start(IXAudio2EngineCallback *self) { (void)self; }
+static void STDMETHODCALLTYPE xa2_processing_end(IXAudio2EngineCallback *self) { (void)self; }
+static void STDMETHODCALLTYPE xa2_critical_error(IXAudio2EngineCallback *self, HRESULT error)
+{
+    (void)self;
+    InterlockedExchange(&g_xa2_error, (LONG)error);
+}
+static struct IXAudio2EngineCallbackVtbl g_xa2_callback_vtable = {
+    xa2_processing_start, xa2_processing_end, xa2_critical_error
+};
+static IXAudio2EngineCallback g_xa2_callback = { &g_xa2_callback_vtable };
 
 int xa2_init(void)
 {
@@ -95,11 +116,25 @@ int xa2_init(void)
         goto fail;
     }
 
+    hr = IXAudio2_RegisterForCallbacks(g_xa2, &g_xa2_callback);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[XA2] RegisterForCallbacks failed: 0x%08lX\n", hr);
+        goto fail;
+    }
+
     hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
         XA2_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
     if (FAILED(hr)) {
         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
         goto fail;
+    }
+    {   /* RECOMP_AUDIO_MUTE=1: the device runs and paces as usual, at volume 0
+         * (scripted runs). */
+        const char *mute = getenv("RECOMP_AUDIO_MUTE");
+        g_xa2_gain = (mute && *mute && *mute != '0') ? 0.0f : 1.0f;
+        g_xa2_muted = 0;
+        if (g_xa2_gain == 0.0f)
+            IXAudio2MasteringVoice_SetVolume(g_xa2_master, 0.0f, XAUDIO2_COMMIT_NOW);
     }
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -125,6 +160,8 @@ int xa2_init(void)
     g_xa2_next_buf = 0;
     g_xa2_fill = 0;
     g_xa2_dry = 0;
+    InterlockedExchange(&g_xa2_error, 0);
+    g_xa2_error_reported = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
 
@@ -180,7 +217,28 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     int idx, n, ok = 1;
     HRESULT hr;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    if (!samples || num_samples <= 0 || !g_xa2_initialized || !g_xa2_source)
+        return 0;
+    /* A lost endpoint stops consuming; pacing sees the queue stall and the
+     * host clock takes over (mcpx_apu_pace_step). */
+    LONG engine_error = InterlockedCompareExchange(&g_xa2_error, 0, 0);
+    if (engine_error) {
+        if (!g_xa2_error_reported) {
+            fprintf(stderr, "[XA2] Critical engine error: 0x%08lX\n", engine_error);
+            g_xa2_error_reported = 1;
+        }
+        return 0;
+    }
+    {   /* Paused in the background (fb_present.c): quiet, not a held note. */
+        extern int xbox_FramebufferPaused(void);
+        int paused = xbox_FramebufferPaused();
+        if (paused != g_xa2_muted) {
+            /* Back to the configured gain, not to 1: a muted run stays muted. */
+            IXAudio2MasteringVoice_SetVolume(g_xa2_master, paused ? 0.0f : g_xa2_gain,
+                                             XAUDIO2_COMMIT_NOW);
+            g_xa2_muted = paused;
+        }
+    }
 
     while (num_samples > 0) {
         idx = g_xa2_next_buf;
@@ -270,7 +328,7 @@ uint64_t xa2_samples_played(void)
     return state.SamplesPlayed;
 }
 
-#else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */
+#else /* !_WIN32: apu_sdl.c implements the same contract over SDL3 */
 
 /* ISO C wants at least one declaration in a translation unit. */
 typedef int apu_xaudio2_posix_unused;
