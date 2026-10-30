@@ -389,30 +389,36 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     return (ULONG)ref;
 }
 
+/* The one factory object, created by xbox_Direct3DCreate8 below. */
+static IDirect3D8 g_d3d8;
+
 static HRESULT __stdcall dev_GetDirect3D(IDirect3DDevice8 *self, IDirect3D8 **ppD3D8)
 {
-    (void)self; (void)ppD3D8;
-    /* TODO: return the factory */
-    return E_NOTIMPL;
+    (void)self;
+    if (!ppD3D8) return E_POINTER;
+    g_d3d8.lpVtbl->AddRef(&g_d3d8);
+    *ppD3D8 = &g_d3d8;
+    return S_OK;
 }
 
+/* Not filled in: reporting success without writing the caller's structure would
+ * hand back whatever was in it, so these say so. Nothing in the host calls them. */
 static HRESULT __stdcall dev_GetDeviceCaps(IDirect3DDevice8 *self, void *pCaps)
 {
     (void)self; (void)pCaps;
-    /* TODO: fill with Xbox NV2A capabilities */
-    return S_OK;
+    return E_NOTIMPL;
 }
 
 static HRESULT __stdcall dev_GetDisplayMode(IDirect3DDevice8 *self, void *pMode)
 {
     (void)self; (void)pMode;
-    return S_OK;
+    return E_NOTIMPL;
 }
 
 static HRESULT __stdcall dev_GetCreationParameters(IDirect3DDevice8 *self, void *pParams)
 {
     (void)self; (void)pParams;
-    return S_OK;
+    return E_NOTIMPL;
 }
 
 static HRESULT __stdcall dev_Reset(IDirect3DDevice8 *self, D3DPRESENT_PARAMETERS *pPP)
