@@ -114,6 +114,15 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
  */
 BOOL xbox_InputIsConnected(DWORD dwPort);
 
+/* The host pad on a port, as the XInput layout (wButtons are the XINPUT_GAMEPAD_*
+ * bits, triggers 0-255, sticks up-positive), without the keyboard and mouse the
+ * title's state merges in. For launchers and overlays that need the raw pad
+ * through the same SDL3 path. Returns 0 when read, ERROR_DEVICE_NOT_CONNECTED
+ * (1167) when the port has no pad. Starts SDL's gamepad subsystem on first use. */
+uint32_t xbox_InputHostPad(uint32_t port, uint16_t *buttons,
+                           uint8_t *left_trigger, uint8_t *right_trigger,
+                           int16_t *lx, int16_t *ly, int16_t *rx, int16_t *ry);
+
 /**
  * Get controller capabilities.
  */

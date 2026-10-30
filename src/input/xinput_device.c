@@ -48,6 +48,26 @@ static SDL_Gamepad *g_sdl_pads[XBOX_MAX_CONTROLLERS];
 static XINPUT_GAMEPAD g_sdl_last[XBOX_MAX_CONTROLLERS];
 static DWORD g_sdl_packet[XBOX_MAX_CONTROLLERS];
 
+/* The pads are read from the title's threads and from launchers and overlays
+ * (xbox_InputHostPad), so the open handles and the packet counters sit behind
+ * one lock. SDL mutexes are recursive. */
+static SDL_InitState s_pad_lock_state;
+static SDL_Mutex *s_pad_lock;
+
+static void pad_lock(void)
+{
+    if (SDL_ShouldInit(&s_pad_lock_state)) {
+        s_pad_lock = SDL_CreateMutex();
+        SDL_SetInitialized(&s_pad_lock_state, true);
+    }
+    SDL_LockMutex(s_pad_lock);
+}
+
+static void pad_unlock(void)
+{
+    SDL_UnlockMutex(s_pad_lock);
+}
+
 static SDL_Gamepad *sdl_pad(DWORD port)
 {
     static Uint64 next_scan[XBOX_MAX_CONTROLLERS];
@@ -83,7 +103,7 @@ static SDL_Gamepad *sdl_pad(DWORD port)
     return g_sdl_pads[port];
 }
 
-static DWORD host_pad_state(DWORD port, XINPUT_STATE *state)
+static DWORD host_pad_state_locked(DWORD port, XINPUT_STATE *state)
 {
     static const struct { SDL_GamepadButton b; WORD bit; } k_buttons[] = {
         { SDL_GAMEPAD_BUTTON_DPAD_UP, XINPUT_GAMEPAD_DPAD_UP },
@@ -127,17 +147,33 @@ static DWORD host_pad_state(DWORD port, XINPUT_STATE *state)
     return ERROR_SUCCESS;
 }
 
+static DWORD host_pad_state(DWORD port, XINPUT_STATE *state)
+{
+    DWORD result;
+    pad_lock();
+    result = host_pad_state_locked(port, state);
+    pad_unlock();
+    return result;
+}
+
 static int host_pad_present(DWORD port)
 {
-    return sdl_pad(port) != NULL;
+    int present;
+    pad_lock();
+    present = sdl_pad(port) != NULL;
+    pad_unlock();
+    return present;
 }
 
 static void host_pad_rumble(DWORD port, WORD left, WORD right)
 {
-    SDL_Gamepad *pad = sdl_pad(port);
+    SDL_Gamepad *pad;
+    pad_lock();
+    pad = sdl_pad(port);
     /* SDL rumble runs for a duration; titles resend it continuously. */
     if (pad)
         SDL_RumbleGamepad(pad, left, right, 1000);
+    pad_unlock();
 }
 #else
 static int host_pad_present(DWORD port)
@@ -407,6 +443,27 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     }
 
     return finish_state(dwPort, pState);
+}
+
+uint32_t xbox_InputHostPad(uint32_t port, uint16_t *buttons,
+                           uint8_t *left_trigger, uint8_t *right_trigger,
+                           int16_t *lx, int16_t *ly, int16_t *rx, int16_t *ry)
+{
+    XINPUT_STATE state;
+#ifndef XBOX_INPUT_HOST_PAD
+    if (!SDL_WasInit(SDL_INIT_GAMEPAD))
+        SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+#endif
+    if (port >= XBOX_MAX_CONTROLLERS || host_pad_state(port, &state) != ERROR_SUCCESS)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    if (buttons) *buttons = state.Gamepad.wButtons;
+    if (left_trigger) *left_trigger = state.Gamepad.bLeftTrigger;
+    if (right_trigger) *right_trigger = state.Gamepad.bRightTrigger;
+    if (lx) *lx = state.Gamepad.sThumbLX;
+    if (ly) *ly = state.Gamepad.sThumbLY;
+    if (rx) *rx = state.Gamepad.sThumbRX;
+    if (ry) *ry = state.Gamepad.sThumbRY;
+    return ERROR_SUCCESS;
 }
 
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
