@@ -30,6 +30,12 @@ int main(void)
     CHECK(recomp_frame_limit_parse("") == 60);
     CHECK(recomp_frame_limit_parse("invalid") == 60);
     CHECK(recomp_frame_limit_parse("91") == 91);
+    /* The monitor's refresh rate is used when it is a real panel rate. */
+    CHECK(recomp_frame_limit_from_refresh(144) == 144);
+    CHECK(recomp_frame_limit_from_refresh(59) == 59);
+    CHECK(recomp_frame_limit_from_refresh(0) == 60);
+    CHECK(recomp_frame_limit_from_refresh(1) == 60);
+    CHECK(recomp_frame_limit_from_refresh(100000) == 60);
     for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
         int actual = recomp_frame_limit_parse(cases[i].value);
         if (actual != cases[i].expected) {
