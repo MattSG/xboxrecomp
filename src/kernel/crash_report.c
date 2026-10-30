@@ -3,8 +3,51 @@
 #include "xbox_memory_layout.h"
 #include <stdint.h>
 #include <stdio.h>
+#include <wchar.h>
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_ebx, g_esp, g_esi, g_edi, g_ebp, g_seh_ebp, g_fs_base;
+
+#if defined(_WIN32)
+/* A minidump beside the executable (CrashDumps/crash-<time>.dmp) for a debugger:
+ * threads, stacks, loaded modules and the memory the stacks point to. The guest
+ * heap is not in it; the report below has the guest's registers. dbghelp is
+ * loaded on demand so the executable does not depend on it. */
+static void crash_write_dump(EXCEPTION_POINTERS *info)
+{
+    typedef BOOL (WINAPI *WriteDump)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+    /* dbghelp declares MINIDUMP_EXCEPTION_INFORMATION packed to 4 bytes */
+#pragma pack(push, 4)
+    typedef struct { DWORD thread; EXCEPTION_POINTERS *ptrs; BOOL client; } DumpException;
+#pragma pack(pop)
+    wchar_t path[MAX_PATH + 40];
+    SYSTEMTIME t;
+    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+    HMODULE dbghelp;
+    WriteDump write;
+    HANDLE file;
+    while (n && path[n - 1] != L'\\' && path[n - 1] != L'/') --n;
+    if (!n) return;
+    path[n] = 0;
+    wcscat(path, L"CrashDumps");
+    CreateDirectoryW(path, NULL);
+    GetLocalTime(&t);
+    n = (DWORD)wcslen(path);
+    swprintf(path + n, 40, L"\\crash-%04u%02u%02u-%02u%02u%02u.dmp",
+             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    dbghelp = LoadLibraryW(L"dbghelp.dll");
+    write = dbghelp ? (WriteDump)GetProcAddress(dbghelp, "MiniDumpWriteDump") : NULL;
+    file = write ? CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+                 : INVALID_HANDLE_VALUE;
+    if (file != INVALID_HANDLE_VALUE) {
+        DumpException ex = { GetCurrentThreadId(), info, FALSE };
+        /* MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo */
+        BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), file, 0x40 | 0x1000,
+                        info ? &ex : NULL, NULL, NULL);
+        CloseHandle(file);
+        fprintf(stderr, "[CRASH] minidump %s: %ls\n", ok ? "written" : "failed", path);
+    }
+}
+#endif
 
 /* Reads a guest word, or returns 0 when the address is not guest memory. */
 static uint32_t crash_guest32(uint32_t va)
@@ -54,5 +97,9 @@ LONG xbox_CrashReport(EXCEPTION_POINTERS *info)
     fprintf(stderr, "[CRASH] stack=0x%08X +4=0x%08X +8=0x%08X\n",
             crash_guest32(g_esp), crash_guest32(g_esp + 4), crash_guest32(g_esp + 8));
     fflush(stderr);
+#if defined(_WIN32)
+    crash_write_dump(info);
+    fflush(stderr);
+#endif
     return EXCEPTION_CONTINUE_SEARCH;
 }

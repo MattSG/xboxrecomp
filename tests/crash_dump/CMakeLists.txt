@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(recomp_crash_dump C)
+set(CMAKE_C_STANDARD 11)
+add_executable(recomp_crash_dump test_crash_dump.c)
+target_include_directories(recomp_crash_dump PRIVATE ../../src ../../src/kernel ../../templates/runtime ../../include)
+enable_testing()
+add_test(NAME recomp_crash_dump COMMAND recomp_crash_dump)
