@@ -7,10 +7,10 @@
  * (digital face buttons, trigger axes).
  *
  * The keyboard (keyboard.c), mouse (mkb_input.c), RECOMP_PADMAP and packet
- * logic are shared; only reading
- * the host pad differs:
- *   _WIN32 -> Windows XInput
- *   other  -> SDL3 gamepads, read into the same XINPUT_STATE
+ * logic are shared. The host pad is read through SDL3 gamepads on every
+ * platform, into an XINPUT_STATE: Xbox, PlayStation and Switch pads, hot
+ * plugging and rumble from one code path (on Windows SDL talks XInput to
+ * Xbox pads itself).
  */
 
 #include "xinput_xbox.h"
@@ -33,10 +33,12 @@ void xbox_InputSetKeyboardHook(XBOX_KEYBOARD_HOOK hook)
 }
 
 #if defined(_WIN32)
-#include <xinput.h>
-#pragma comment(lib, "xinput.lib")
-#define host_pad_state XInputGetState
-#else
+#include <xinput.h>   /* only the XINPUT_STATE types: nothing links against XInput */
+#endif
+
+/* A contract test defines XBOX_INPUT_HOST_PAD and supplies host_pad_state itself;
+ * everything else is the production SDL3 code. */
+#ifndef XBOX_INPUT_HOST_PAD
 #include <SDL3/SDL.h>
 
 /* SDL3 gamepads as XInput ports: port n is the n-th gamepad SDL lists. The
@@ -49,6 +51,18 @@ static DWORD g_sdl_packet[XBOX_MAX_CONTROLLERS];
 static SDL_Gamepad *sdl_pad(DWORD port)
 {
     static Uint64 next_scan[XBOX_MAX_CONTROLLERS];
+#if defined(_WIN32) && !defined(XBOXRECOMP_SDL3)
+    /* The Direct3D 11 window is a Win32 one, so nothing pumps SDL events:
+     * refresh the pad state here, at most once a millisecond. */
+    {
+        static Uint64 last_update;
+        Uint64 now = SDL_GetTicksNS();
+        if (now - last_update >= 1000000u) {
+            last_update = now;
+            SDL_UpdateGamepads();
+        }
+    }
+#endif
     SDL_Gamepad *pad = g_sdl_pads[port];
     if (pad && SDL_GamepadConnected(pad))
         return pad;
@@ -111,6 +125,30 @@ static DWORD host_pad_state(DWORD port, XINPUT_STATE *state)
     }
     state->dwPacketNumber = g_sdl_packet[port];
     return ERROR_SUCCESS;
+}
+
+static int host_pad_present(DWORD port)
+{
+    return sdl_pad(port) != NULL;
+}
+
+static void host_pad_rumble(DWORD port, WORD left, WORD right)
+{
+    SDL_Gamepad *pad = sdl_pad(port);
+    /* SDL rumble runs for a duration; titles resend it continuously. */
+    if (pad)
+        SDL_RumbleGamepad(pad, left, right, 1000);
+}
+#else
+static int host_pad_present(DWORD port)
+{
+    XINPUT_STATE state;
+    return host_pad_state(port, &state) == ERROR_SUCCESS;
+}
+
+static void host_pad_rumble(DWORD port, WORD left, WORD right)
+{
+    (void)port; (void)left; (void)right;
 }
 #endif
 
@@ -301,7 +339,7 @@ static void pad_buttons(const XINPUT_GAMEPAD *g, XBOX_GAMEPAD *out)
 
 void xbox_InputInit(void)
 {
-#if !defined(_WIN32)
+#ifndef XBOX_INPUT_HOST_PAD
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD))
         fprintf(stderr, "[INPUT] SDL gamepad init failed: %s\n", SDL_GetError());
 #endif
@@ -375,23 +413,10 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
-#if defined(_WIN32)
-    {
-        XINPUT_VIBRATION xi_vib;
-        xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
-        xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-        return XInputSetState(dwPort, &xi_vib);
-    }
-#else
-    {
-        SDL_Gamepad *pad = sdl_pad(dwPort);
-        if (!pad)
-            return ERROR_DEVICE_NOT_CONNECTED;
-        /* SDL rumble runs for a duration; titles resend it continuously. */
-        SDL_RumbleGamepad(pad, pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed, 1000);
-        return ERROR_SUCCESS;
-    }
-#endif
+    if (!host_pad_present(dwPort))
+        return ERROR_DEVICE_NOT_CONNECTED;
+    host_pad_rumble(dwPort, pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
+    return ERROR_SUCCESS;
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
@@ -404,23 +429,11 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
-#if defined(_WIN32)
-    {
-        XINPUT_CAPABILITIES xi_caps;
-        DWORD result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
-        if (result != ERROR_SUCCESS) return result;
-        memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
-        pCaps->Type = xi_caps.Type;
-        pCaps->SubType = xi_caps.SubType;
-        pCaps->Flags = xi_caps.Flags;
-    }
-#else
     (void)dwFlags;
-    if (!sdl_pad(dwPort))
+    if (!host_pad_present(dwPort))
         return ERROR_DEVICE_NOT_CONNECTED;
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
     pCaps->Type = 1;      /* XINPUT_DEVTYPE_GAMEPAD */
     pCaps->SubType = 1;   /* XINPUT_DEVSUBTYPE_GAMEPAD */
-#endif
     return ERROR_SUCCESS;
 }

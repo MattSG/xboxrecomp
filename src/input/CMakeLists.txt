@@ -16,19 +16,15 @@ target_link_libraries(xbox_input PUBLIC xbox_input_map)
 if(WIN32)
     # Mouse+keyboard pad (RECOMP_MKB) reads Win32 raw input.
     target_sources(xbox_input PRIVATE mkb_input.c)
-    # mingw-w64's libxinput.a imports XINPUT1_3.dll, the DirectX June 2010
-    # redistributable: stock Windows 10/11 lacks it and the exe dies with
-    # 0xC0000135 before main. Proton ships it, so only native Windows shows
-    # this. XINPUT1_4.dll is part of Windows since 8. The Windows SDK's
-    # xinput.lib already imports 1_4 and the SDK has no xinput1_4.lib, so
-    # MSVC keeps the plain name. tests/input_xinput_imports checks the result.
-    target_link_libraries(xbox_input PUBLIC platform
-        $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>)
-else()
-    # SDL3 gamepads; the SDL window (video/fb_window_sdl.c) records the keys.
-    include(Sdl3)
-    target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3)
 endif()
+
+# One host pad path everywhere: SDL3 gamepads (Xbox, PlayStation and Switch
+# pads, hot plugging, rumble). On Windows SDL reaches Xbox pads through XInput
+# itself, so nothing here links xinput. With the SDL3 renderer the window
+# (video/fb_window_sdl.c) pumps the events that keep their state current and
+# records the keys; with Direct3D 11 xinput_device.c refreshes the pads itself.
+include(Sdl3)
+target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3)
 
 if(MSVC)
     target_compile_options(xbox_input PRIVATE /W4 /O2)

@@ -4,12 +4,12 @@
 #include <stdio.h>
 static XINPUT_STATE physical;
 static int connected, captured;
-static DWORD WINAPI fixture_get_state(DWORD port, XINPUT_STATE *out)
+#define XBOX_INPUT_HOST_PAD 1
+static DWORD host_pad_state(DWORD port, XINPUT_STATE *out)
 {
     if (port || !connected) return ERROR_DEVICE_NOT_CONNECTED;
     *out = physical; return ERROR_SUCCESS;
 }
-#define XInputGetState fixture_get_state
 #include "../../src/input/xinput_device.c"
 int xbox_FramebufferHostInputCaptured(void) { return captured; }
 int xbox_FramebufferMouse(float *x, float *y) { *x = *y = 0; return 0; }
