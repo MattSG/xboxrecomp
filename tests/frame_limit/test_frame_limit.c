@@ -36,6 +36,8 @@ int main(void)
     CHECK(recomp_frame_limit_from_refresh(0) == 60);
     CHECK(recomp_frame_limit_from_refresh(1) == 60);
     CHECK(recomp_frame_limit_from_refresh(100000) == 60);
+    CHECK(recomp_frame_limit_parse("auto") == recomp_display_refresh());
+    CHECK(recomp_frame_limit_parse("Auto") == 60);   /* only the lower-case word; others are invalid */
     for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
         int actual = recomp_frame_limit_parse(cases[i].value);
         if (actual != cases[i].expected) {
