@@ -396,7 +396,6 @@ typedef struct _XINPUT_STATE {
     DWORD          dwPacketNumber;
     XINPUT_GAMEPAD Gamepad;
 } XINPUT_STATE;
-DWORD XInputGetState(DWORD idx, XINPUT_STATE *state);
 
 #define XINPUT_GAMEPAD_DPAD_UP        0x0001
 #define XINPUT_GAMEPAD_DPAD_DOWN      0x0002

@@ -2591,10 +2591,6 @@ BOOL    PeekMessageA(LPMSG m, HWND w, UINT a, UINT b, UINT f)
 BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
 LRESULT DispatchMessageA(const MSG *m) { (void)m; return 0; }
 
-/* XInput stub: real gamepads come through src/input (SDL3 gamepads). */
-DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
-{ (void)idx; if (state) memset(state, 0, sizeof(*state)); return ERROR_DEVICE_NOT_CONNECTED; }
-
 BOOL TerminateProcess(HANDLE process, UINT exitCode)
 {
     (void)process;

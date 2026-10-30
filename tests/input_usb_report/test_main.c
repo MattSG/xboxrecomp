@@ -1,9 +1,8 @@
 /* Host gamepad to USB report contract, without a game or a physical controller.
  *
- * Build and run from a VS developer prompt, from this folder:
- *   cl /nologo /W3 /WX /std:c11 /I ../../src /I ../../src/input /I ../../src/usb /I ../../include test_main.c
+ * Build with the CMakeLists beside this file (cmake -S . -B build; cmake --build build; ctest).
  *
- * XInput is fixed through the fixture below. The report encoder and its
+ * The host pad is fixed through the fixture below. The report encoder and its
  * trigger, button, stick and short-buffer rules are the production code. */
 #include <windows.h>
 #include <xinput.h>
@@ -16,35 +15,19 @@
 static XINPUT_STATE host_state;
 static BOOL host_connected;
 
-static DWORD WINAPI fixture_get_state(DWORD port, XINPUT_STATE *state)
+/* The production pad merge reads its host pad through host_pad_state; here the test supplies it. */
+#define XBOX_INPUT_HOST_PAD 1
+static DWORD host_pad_state(DWORD port, XINPUT_STATE *state)
 {
     if (!host_connected || port != 0) return ERROR_DEVICE_NOT_CONNECTED;
     *state = host_state;
     return ERROR_SUCCESS;
 }
 
-static DWORD WINAPI fixture_set_state(DWORD port, XINPUT_VIBRATION *vibration)
-{
-    (void)port; (void)vibration;
-    return ERROR_SUCCESS;
-}
-
-static DWORD WINAPI fixture_get_caps(DWORD port, DWORD flags,
-                                    XINPUT_CAPABILITIES *caps)
-{
-    (void)port; (void)flags;
-    memset(caps, 0, sizeof(*caps));
-    return ERROR_SUCCESS;
-}
-
-#define XInputGetState fixture_get_state
-#define XInputSetState fixture_set_state
-#define XInputGetCapabilities fixture_get_caps
 #include "input/xinput_device.c"
 #include "usb/usb_gamepad.c"
 
 /* The framebuffer window is outside this fixture: no keys, no mouse, no capture. */
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 int xbox_FramebufferHostInputCaptured(void) { return 0; }
 int xbox_FramebufferMouse(float *x, float *y) { (void)x; (void)y; return 0; }
 void xbox_FramebufferSetMousePressHandler(int (*handler)(float x, float y)) { (void)handler; }
