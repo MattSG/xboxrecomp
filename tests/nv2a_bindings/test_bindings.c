@@ -608,6 +608,26 @@ static void test_host_draw(void)
     puts("PASS: native target callback ordering, metadata, rejection and guest binding restoration");
 }
 
+/* A small pass bound at the scene's depth address (a 40x30-style brightness
+ * probe) must not take the scene depth's place for a later Y16 read of it. */
+static void test_depth_texture(void)
+{
+    NvD3DState st = draw_state(), probe = st;
+    uint32_t p = phys(st.zeta_addr);
+    Depth *scene, *little;
+    nv2a_d3d_clear(&st,0xF3,0xFF000000,0x80000000u,0,0,63,63);
+    scene = depth_find(p); CHECK(scene && scene->w == 64 && scene->h == 64);
+    probe.color_addr = 0x60000; probe.color_pitch = 8*4;
+    probe.clip_w = 8; probe.clip_h = 6; probe.stencil_test = 1;
+    nv2a_d3d_clear(&probe,0x02,0,0,0,0,7,5);
+    little = depth_find(p); CHECK(little && little != scene && little->w == 8 && little->h == 6);
+    CHECK(depth_find_texture(p,128,64) == scene);      /* each depth pixel is two texels */
+    CHECK(depth_find_texture(p,16,6) == little);        /* both cover it: the last bound */
+    CHECK(depth_find_texture(p,256,128) == little);     /* none covers it: the last bound */
+    CHECK(depth_find_texture(p+0x1000,128,64) == NULL);
+    puts("PASS: a Y16 read of the scene depth skips a smaller depth buffer bound at its address since");
+}
+
 int main(int argc,char **argv)
 {
     CHECK(argc==2);
@@ -631,6 +651,7 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[1],"ps_failure")) test_ps_failure();
     else if(!strcmp(argv[1],"ps_reset")) test_ps_reset();
     else if(!strcmp(argv[1],"overlay_upload")) test_overlay_upload();
+    else if(!strcmp(argv[1],"depth_texture")) test_depth_texture();
     else if(!strcmp(argv[1],"benchmark")) benchmark();
     else CHECK(0);
     return 0;

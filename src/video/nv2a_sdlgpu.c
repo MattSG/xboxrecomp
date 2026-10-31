@@ -1548,6 +1548,23 @@ static Depth *depth_find(uint32_t p)
     return best;
 }
 
+/* The depth buffer a depth-format (Y16) texture at p reads: the one bound
+ * there most recently that covers it, each Z24S8 pixel being two texels.
+ * As in nv2a_d3d11.c: a small pass bound at the scene's depth address must
+ * not take the place of the scene depth a later draw samples. */
+static Depth *depth_find_texture(uint32_t p, uint32_t width, uint32_t height)
+{
+    Depth *best = NULL, *last = depth_find(p);
+    int i;
+    for (i = 0; i < MAX_DEPTHS; i++) {
+        Depth *d = &s_depth[i];
+        if (d->tex && d->phys == p && d->zf != 1 && 2 * d->w >= width && d->h >= height &&
+            (!best || d->seq > best->seq))
+            best = d;
+    }
+    return best ? best : last;
+}
+
 static Depth *depth_get(uint32_t va, uint32_t iw, uint32_t ih)
 {
     uint32_t p = phys(va);
@@ -2071,7 +2088,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         Surface *rt;
         Depth *zt;
         if (t->color != 0x35 || t->cube || !t->addr) continue;
-        if ((zt = depth_find(phys(t->addr))) != NULL) { if (!depth_y16(zt)) return 0; continue; }
+        if ((zt = depth_find_texture(phys(t->addr), t->width, t->height)) != NULL) { if (!depth_y16(zt)) return 0; continue; }
         rt = surface_find(phys(t->addr));
         if (rt && rt->bpp == 4) { surface_sync(rt, 0); surface_y16(rt); }
     }
@@ -2105,7 +2122,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         s_draw_textured = 1;
         if (!s_draw_tex_addr) s_draw_tex_addr = t->addr;
         if (rt && rt->sx > rt->sy * 1.001f) s_draw_reads_wide = 1;
-        zt = t->color == 0x35 && !t->cube ? depth_find(phys(t->addr)) : NULL;
+        zt = t->color == 0x35 && !t->cube ? depth_find_texture(phys(t->addr), t->width, t->height) : NULL;
         if (zt && zt->y16) {
             view = zt->y16;
             pc.tex_scale[n][0] = 1.0f / (float)(2 * zt->w);
