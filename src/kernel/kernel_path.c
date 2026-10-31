@@ -44,6 +44,8 @@ typedef struct {
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
+    /* The bare device, for a title that opens the volume itself. */
+    { "\\Device\\CdRom0",                     0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
      * Without these the path layer reported "Unrecognized Xbox path" and
