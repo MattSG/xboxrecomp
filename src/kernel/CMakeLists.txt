@@ -22,6 +22,7 @@ set(KERNEL_SOURCES
     xbox_memory_layout.c
     icall_feedback.c
     recomp_trace.c
+    recomp_diff.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
 )
