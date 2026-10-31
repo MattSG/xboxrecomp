@@ -108,4 +108,21 @@ void xgpu_clear_backbuffer(XGpu *g, float r, float g_, float b, float a);
 /* Blits the backbuffer to the window and presents. */
 void xgpu_present(XGpu *g);
 
+/* A reference-counted GPU texture. SDL_GPU textures have no refcount, but D3D8
+ * surfaces keep their parent texture alive, so the D3D8 layer holds these. */
+typedef struct XGpuTex {
+    SDL_GPUTexture        *tex;
+    int                    refs;
+    SDL_GPUTextureType     type;
+    SDL_GPUTextureFormat   format;
+    Uint32                 width, height, depth_or_layers, levels;
+} XGpuTex;
+
+/* Returns NULL on failure. The caller owns one reference. */
+XGpuTex *xgputex_create(XGpu *g, SDL_GPUTextureType type, SDL_GPUTextureFormat format,
+                        Uint32 w, Uint32 h, Uint32 depth_or_layers, Uint32 levels,
+                        SDL_GPUTextureUsageFlags usage);
+XGpuTex *xgputex_ref(XGpuTex *t);
+void     xgputex_unref(XGpu *g, XGpuTex *t);
+
 #endif

@@ -340,3 +340,52 @@ void xgpu_present(XGpu *g)
     }
     g->in_frame = 0;
 }
+
+XGpuTex *xgputex_create(XGpu *g, SDL_GPUTextureType type, SDL_GPUTextureFormat format,
+                        Uint32 w, Uint32 h, Uint32 depth_or_layers, Uint32 levels,
+                        SDL_GPUTextureUsageFlags usage)
+{
+    SDL_GPUTextureCreateInfo ti;
+    XGpuTex *t;
+
+    SDL_zero(ti);
+    ti.type = type;
+    ti.format = format;
+    ti.usage = usage;
+    ti.width = w;
+    ti.height = h;
+    ti.layer_count_or_depth = depth_or_layers;
+    ti.num_levels = levels;
+    t = (XGpuTex *)SDL_calloc(1, sizeof(*t));
+    if (!t)
+        return NULL;
+    t->tex = SDL_CreateGPUTexture(g->device, &ti);
+    if (!t->tex) {
+        fprintf(stderr, "[gpu] texture create failed (fmt=%d %ux%u): %s\n",
+                (int)format, w, h, SDL_GetError());
+        SDL_free(t);
+        return NULL;
+    }
+    t->refs = 1;
+    t->type = type;
+    t->format = format;
+    t->width = w; t->height = h;
+    t->depth_or_layers = depth_or_layers;
+    t->levels = levels;
+    return t;
+}
+
+XGpuTex *xgputex_ref(XGpuTex *t)
+{
+    if (t)
+        t->refs++;
+    return t;
+}
+
+void xgputex_unref(XGpu *g, XGpuTex *t)
+{
+    if (t && --t->refs <= 0) {
+        SDL_ReleaseGPUTexture(g->device, t->tex);
+        SDL_free(t);
+    }
+}
