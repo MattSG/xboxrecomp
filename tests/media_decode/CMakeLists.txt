@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(media_decode_test C)
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Standalone, or part of a combined tree that already has the runtime.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(media_decode_test test_main.c)
 target_link_libraries(media_decode_test PRIVATE xbox_video xbox_dsound)
 if(XBOX_FFMPEG_ROOT)

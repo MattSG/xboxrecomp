@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_object_paths_test C)
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Standalone, or part of a combined tree that already has the runtime.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(kernel_object_paths_test test_main.c)
 target_include_directories(kernel_object_paths_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_object_paths_test PRIVATE xboxrecomp)

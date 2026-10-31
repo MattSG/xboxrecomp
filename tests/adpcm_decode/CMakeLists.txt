@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(adpcm_decode_test C)
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Standalone, or part of a combined tree that already has the runtime.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(adpcm_decode_test test_main.c)
 target_include_directories(adpcm_decode_test PRIVATE ../../src ../../src/apu)
 target_link_libraries(adpcm_decode_test PRIVATE xbox_apu)
