@@ -1,14 +1,17 @@
 /**
- * SDL_GPU device, window and swapchain for the D3D8 layer.
+ * SDL_GPU device, window and backbuffer for the D3D8 layer.
  *
- * One window, one device. A frame is: xgpu_begin_frame() acquires a command
- * buffer and the swapchain image, draws go through that command buffer, and
- * xgpu_present() submits and presents it. D3D8 has no frame boundary until
- * Present, so this is the only place that decides when a command buffer ends.
+ * One window, one device. The D3D8 backbuffer is an offscreen texture owned
+ * here, not the swapchain image: that keeps GetBackBuffer/LockRect/CopyRects
+ * working and lets a readback in the middle of a frame submit and restart the
+ * command buffer without touching the swapchain. Present blits the backbuffer
+ * to the swapchain and presents.
  *
  * SDL_GPU does not allow copy passes inside render passes (or the reverse), but
  * D3D8 interleaves uploads and draws freely. Everything therefore goes through
  * xgpu_copy_pass() / xgpu_render_pass(), which end the other kind first.
+ *
+ * Uploads and downloads work with or without a frame in progress.
  */
 #ifndef XBOX_GPU_DEVICE_H
 #define XBOX_GPU_DEVICE_H
@@ -19,7 +22,7 @@
 /* The attachments a render pass draws into. Passes are reused while the
  * targets stay the same; any change ends the pass and starts a new one. */
 typedef struct XGpuTargets {
-    SDL_GPUTexture *color;               /* NULL = the swapchain image */
+    SDL_GPUTexture *color;               /* NULL = the backbuffer */
     SDL_GPUTexture *depth;               /* may be NULL */
 } XGpuTargets;
 
@@ -33,19 +36,21 @@ typedef struct XGpuClear {
 typedef struct XGpu {
     SDL_Window            *window;
     SDL_GPUDevice         *device;
-    SDL_GPUCommandBuffer  *cmd;          /* current frame, NULL between frames */
-    SDL_GPUTexture        *backbuffer;   /* swapchain image for this frame */
+    SDL_GPUCommandBuffer  *cmd;          /* NULL until something needs it */
+    SDL_GPUTexture        *backbuffer;   /* owned, BGRA8, color target + sampler */
     SDL_GPUTextureFormat   swap_format;
-    Uint32                 width, height;
+    Uint32                 width, height;    /* backbuffer size */
 
     SDL_GPURenderPass     *render;
     SDL_GPUCopyPass       *copy;
     XGpuTargets            targets;      /* of the open render pass */
 
-    /* Per-frame upload ring, persistently mapped between begin and present. */
+    /* Upload ring: mapped for as long as a command buffer is open. */
     SDL_GPUTransferBuffer *ring;
     Uint8                 *ring_ptr;
     Uint32                 ring_size, ring_used;
+
+    int                    in_frame;     /* between xgpu_begin_frame and present */
 } XGpu;
 
 /* hidden != 0 creates the window without showing it (tests, headless runs).
@@ -53,9 +58,11 @@ typedef struct XGpu {
 int  xgpu_init(XGpu *g, const char *title, int width, int height, int hidden);
 void xgpu_shutdown(XGpu *g);
 
-/* Starts a frame. Returns 0 if the swapchain image is not available this
- * frame (minimised window): the caller should skip drawing but still present. */
+/* Marks the start of a frame. Always succeeds once xgpu_init has. */
 int  xgpu_begin_frame(XGpu *g);
+
+/* The current command buffer, opening one if needed. */
+SDL_GPUCommandBuffer *xgpu_cmd(XGpu *g);
 
 /* Ends whichever pass is open. */
 void xgpu_end_passes(XGpu *g);
@@ -74,10 +81,31 @@ SDL_GPURenderPass *xgpu_render_pass(XGpu *g, XGpuTargets t, const XGpuClear *cle
  * Returns NULL on failure. */
 void *xgpu_stage(XGpu *g, Uint32 size, SDL_GPUTransferBuffer **tb, Uint32 *offset);
 
-/* Clears the swapchain image. */
+/* Copies `size` bytes into a GPU buffer at `offset`. */
+int xgpu_upload_buffer(XGpu *g, SDL_GPUBuffer *buf, Uint32 offset,
+                       const void *data, Uint32 size);
+
+/* Copies a w*h*d block of texels into mip level `mip` of `layer`. `row_bytes`
+ * is the source row pitch in bytes; for block-compressed formats w/h are the
+ * block-aligned texel size and rows are block rows (the caller passes the
+ * number of rows in `rows`). */
+int xgpu_upload_texture(XGpu *g, SDL_GPUTexture *tex, Uint32 mip, Uint32 layer,
+                        Uint32 x, Uint32 y, Uint32 z, Uint32 w, Uint32 h, Uint32 d,
+                        const void *data, Uint32 row_bytes, Uint32 rows);
+
+/* Submits what is recorded so far. wait != 0 blocks until the GPU finishes. */
+void xgpu_flush(XGpu *g, int wait);
+
+/* Synchronous readback of a w*h region of one mip/layer into `out`
+ * (tightly packed rows of `row_bytes`). Ends the open passes and flushes. */
+int xgpu_download_texture(XGpu *g, SDL_GPUTexture *tex, Uint32 mip, Uint32 layer,
+                          Uint32 x, Uint32 y, Uint32 w, Uint32 h,
+                          void *out, Uint32 row_bytes);
+
+/* Clears the backbuffer. */
 void xgpu_clear_backbuffer(XGpu *g, float r, float g_, float b, float a);
 
-/* Submits the frame and presents. Safe to call after a failed begin. */
+/* Blits the backbuffer to the window and presents. */
 void xgpu_present(XGpu *g);
 
 #endif
