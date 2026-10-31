@@ -1,4 +1,5 @@
 # SDL3 for every host-facing module (window, input, audio, graphics).
+include(FetchContent)
 # Prefer an installed SDL3; otherwise build the pinned release statically.
 if(NOT TARGET SDL3::SDL3)
     find_package(SDL3 CONFIG QUIET)
@@ -13,4 +14,22 @@ if(NOT TARGET SDL3::SDL3)
         GIT_TAG release-3.4.18
         GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(SDL3)
+endif()
+
+# SDL_shadercross: the games' shaders are generated as HLSL while they run,
+# and SDL_GPU only takes SPIR-V / DXIL / MSL, so the HLSL is compiled and
+# cross-compiled at run time (DXC + SPIRV-Cross, built from the vendored
+# submodules; the first build is long).
+if(NOT TARGET SDL3_shadercross::SDL3_shadercross-static)
+    set(SDLSHADERCROSS_VENDORED ON CACHE BOOL "" FORCE)
+    set(SDLSHADERCROSS_CLI OFF CACHE BOOL "" FORCE)
+    set(SDLSHADERCROSS_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDLSHADERCROSS_STATIC ON CACHE BOOL "" FORCE)
+    set(SDLSHADERCROSS_SPIRVCROSS_SHARED OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(shadercross
+        GIT_REPOSITORY https://github.com/libsdl-org/SDL_shadercross.git
+        GIT_TAG 1ff05bec573988a98ef9e0260b4da44f512b8367
+        GIT_SHALLOW TRUE
+        GIT_SUBMODULES_RECURSE TRUE)
+    FetchContent_MakeAvailable(shadercross)
 endif()
