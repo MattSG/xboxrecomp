@@ -1,7 +1,7 @@
 /**
  * D3D8 draw dispatch on SDL_GPU: pipeline cache, uniforms, textures, draw.
  *
- * D3D11 let the layer set shaders, input layout and state objects one at a
+ * The previous backend let the layer set shaders, input layout and state objects one at a
  * time. SDL_GPU bakes all of that into a graphics pipeline, so the other
  * modules now only *describe* what is bound (shaders, vertex layout, uniform
  * data, render states, textures) and d3d8_pipe_draw() finds or builds the

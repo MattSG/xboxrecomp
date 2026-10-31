@@ -1,5 +1,5 @@
 # Xbox DirectSound Compatibility Layer
-# Software mixer with waveOut/XAudio2 backend
+# Software mixer; output through the APU monitor (SDL3 audio)
 
 add_library(xbox_dsound STATIC
     dsound_device.c

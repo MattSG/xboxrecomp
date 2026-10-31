@@ -10,11 +10,11 @@ only about building and running the *game*:
 
 | | Pipeline | Game build | Graphics backend |
 |---|---|---|---|
-| **Windows 10/11** | yes | MSVC | D3D11, the complete path |
+| **Windows 10/11** | yes | MSVC | SDL_GPU (Direct3D 12 or Vulkan), the most-exercised path |
 | **Linux** | yes | GCC/Clang | OpenGL 3.3 (`d3d8_gl.c`), less complete |
 | **macOS** | yes | Clang | OpenGL 3.3, least exercised |
 
-Start on Windows if you have the choice — the D3D11 backend is six files of
+Start on Windows if you have the choice — the graphics backend is a handful of files of
 translation against one for OpenGL, so a title that renders there may not
 render elsewhere yet. If you are on Linux or macOS you can still do the whole
 analysis half, and reports of what breaks on the OpenGL path are welcome.

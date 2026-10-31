@@ -168,7 +168,7 @@ static volatile LONG g_nv2a_ack_stop = 0;
  * Clearing those bits from a thread is not a hack around the handshake, it is
  * the handshake: on hardware the GPU clears them asynchronously, which is
  * exactly what this does. Work that would have been submitted is being done by
- * the D3D11 layer instead, so acknowledging immediately is honest.
+ * the D3D8 layer instead, so acknowledging immediately is honest.
  *
  * Only registers listed here are touched. Blanket-zeroing the aperture would
  * also wipe registers holding real state.
@@ -228,7 +228,7 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  * [dev+0x2304] is 0xFD800000, so the channel's USER area sits at aperture
  * offset 0x800000 and the two pointers are at +0x40 / +0x44. Copying PUT to
  * GET is the acknowledgement; the commands are not executed from the push
- * buffer here -- the D3D11 layer draws -- so reporting them consumed is the
+ * buffer here -- the D3D8 layer draws -- so reporting them consumed is the
  * truthful answer.
  *
  * This was written once, removed, and restored. It was removed because

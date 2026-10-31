@@ -20,15 +20,15 @@ See: [../technical/kernel-replacement.md](../technical/kernel-replacement.md)
 
 Template: [../../templates/runtime/kernel_stubs.h](../../templates/runtime/kernel_stubs.h)
 
-### 3. Graphics Translation (`d3d8_to_d3d11.c`)
+### 3. Graphics Translation (`src/d3d/`)
 
-The Xbox uses a modified Direct3D 8. You need a translation layer to D3D11 (or D3D12, Vulkan, etc.). This is the largest runtime component.
+The Xbox uses a modified Direct3D 8. You need a translation layer to a modern API; this repo targets SDL_GPU (Direct3D 12, Vulkan, Metal). This is the largest runtime component.
 
 See: [../technical/d3d-translation.md](../technical/d3d-translation.md)
 
 ### 4. Input System (`xbox_input.c`)
 
-Map Xbox controller input to Windows XInput. This is usually the simplest piece — Xbox controllers on Windows are nearly 1:1.
+Map Xbox controller input to SDL3 gamepads. This is usually the simplest piece — Xbox controllers on Windows are nearly 1:1.
 
 ## Build System
 

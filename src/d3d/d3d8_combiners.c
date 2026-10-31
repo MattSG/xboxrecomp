@@ -2,7 +2,7 @@
  * NV2A Register Combiner to HLSL Pixel Shader Translator - Implementation
  *
  * Translates Xbox NV2A register combiner configurations into HLSL pixel
- * shaders compiled for D3D11. See d3d8_combiners.h for the full model
+ * shaders compiled at run time. See d3d8_combiners.h for the full model
  * description.
  *
  * Implementation overview:
@@ -23,22 +23,19 @@
  *
  * 3. SHADER CACHE
  *    We hash the full NV2ACombinerState and maintain a fixed-size cache
- *    (128 entries) of compiled ID3D11PixelShader objects. Most Xbox games
+ *    (128 entries) of compiled pixel shaders. Most Xbox games
  *    use fewer than 20 unique combiner configurations, so this is ample.
  *
  * 4. DRAW INTEGRATION
  *    d3d8_combiners_prepare_draw() is called before each draw. It checks
  *    if state is dirty, rebuilds/looks up the shader, uploads constants,
- *    and binds everything to the D3D11 pipeline.
+ *    and hands everything to the pipeline module.
  */
 
 #include "d3d8_internal.h"
 #include "d3d8_combiners.h"
-#include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
-
-#pragma comment(lib, "d3dcompiler.lib")
 
 /* ================================================================
  * Internal State

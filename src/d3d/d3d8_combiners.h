@@ -29,7 +29,7 @@
  * The sum V1+R0 is also available (V1R0_SUM / SPARE0).
  *
  * This module translates the combiner configuration into HLSL source,
- * compiles it to a D3D11 pixel shader, and caches the result.
+ * compiles it to a pixel shader, and caches the result.
  *
  * References:
  *   - NV_register_combiners / NV_register_combiners2 GL extensions
@@ -258,7 +258,7 @@ typedef struct NV2APSConstants {
 /**
  * Initialize the combiner translator system.
  * Allocates the PS constant buffer and sets up the shader cache.
- * Must be called after D3D11 device creation.
+ * Must be called after the GPU device is created.
  */
 HRESULT d3d8_combiners_init(void);
 

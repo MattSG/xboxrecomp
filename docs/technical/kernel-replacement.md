@@ -199,7 +199,7 @@ The recompiled game runs single-threaded. The first PsCreateSystemThreadEx call 
 
 | Xbox Function | Implementation |
 |---------------|---------------|
-| AvSetDisplayMode | Sets resolution (stored for D3D11 init) |
+| AvSetDisplayMode | Sets resolution (stored for GPU device init) |
 | AvGetSavedDataAddress | Returns pointer to AV data area |
 | D3DDevice_CreateXXX | Routed through D3D8 compatibility layer |
 
@@ -220,11 +220,11 @@ Allocating the NV2A register page via VEH prevents the access violation, but the
 
 | Xbox Function | Win32 Equivalent |
 |---------------|-----------------|
-| XInputGetState | XInputGetState (almost identical API) |
-| XInputGetCapabilities | XInputGetCapabilities |
-| XInputSetState | XInputSetState (rumble) |
+| XInputGetState | SDL_GetGamepadButton / SDL_GetGamepadAxis (via xbox_InputGetState) |
+| XInputGetCapabilities | SDL_GetGamepads (device present) |
+| XInputSetState | SDL_RumbleGamepad |
 
-Xbox input is nearly 1:1 with the Win32 XInput API. The main difference is the Xbox controller struct layout.
+Xbox input maps almost 1:1 onto SDL3 gamepads. The main difference is the Xbox controller struct layout.
 
 ### Audio (~5 ordinals)
 
@@ -236,7 +236,7 @@ Xbox input is nearly 1:1 with the Win32 XInput API. The main difference is the X
 
 These rows describe the HLE path only. Most titles link the XDK's own
 DirectSound, which is ordinary recompiled code driving the AC'97 and MCPX APU
-directly; `src/apu/` emulates the APU (XAudio2 output). A title whose codec
+directly; `src/apu/` emulates the APU (SDL3 audio output). A title whose codec
 probe fails there can skip its whole engine init -- see "Runs, Never Draws a
 Frame" in `docs/pipeline/06-debugging.md` and `RECOMP_AC97_READY`.
 

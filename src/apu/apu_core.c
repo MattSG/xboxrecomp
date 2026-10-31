@@ -21,7 +21,7 @@
 
 #include "apu_state.h"
 #include "apu.h"
-#include "apu_xaudio2.h"
+#include "apu_audio_out.h"
 #include "fpconv.h"
 
 /* ============================================================
@@ -177,7 +177,7 @@ static struct {
 } g_test_tone = { false, 0.0, 0.0, 0 };
 
 /* ============================================================
- * Monitor - Audio output (SDL3 stream, see apu_xaudio2.c)
+ * Monitor - Audio output (SDL3 stream, see apu_audio_out.c)
  * ============================================================ */
 
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
@@ -189,7 +189,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
-    if (xa2_init())
+    if (apu_out_init())
         fprintf(stderr, "[APU] Using SDL3 audio backend\n");
     else
         fprintf(stderr, "[APU] SDL3 audio unavailable, running silent\n");
@@ -198,8 +198,8 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 {
     (void)d;
-    if (xa2_is_active())
-        xa2_shutdown();
+    if (apu_out_is_active())
+        apu_out_shutdown();
 }
 
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
@@ -208,9 +208,9 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
+    if (apu_out_is_active()) {
+        int buf_size = apu_out_get_buffer_size();
+        int16_t apu_out_tmp[1024][2];  /* matches APU_OUT_BUF_SAMPLES max */
         int remaining = buf_size;
         int out_offset = 0;
 
@@ -232,12 +232,12 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             if (!g_audio_muted)
                 mixer_render(d->monitor.frame_buf, chunk);
 
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
+            memcpy(apu_out_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
             out_offset += chunk;
             remaining -= chunk;
         }
 
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        apu_out_submit_samples((const int16_t *)apu_out_tmp, buf_size);
     }
 }
 

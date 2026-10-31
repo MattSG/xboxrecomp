@@ -98,12 +98,12 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | Library | Source | What It Does |
 |---------|--------|-------------|
 | **xbox_kernel** | Custom | Xbox kernel → Win32 (170 of the kernel's 371 ordinals routed, 169 with dedicated bridge functions: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
-| **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
+| **xbox_d3d8** | Custom | D3D8 → SDL_GPU graphics (Direct3D 12, Vulkan or Metal through SDL3): **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL → SPIR-V/DXIL/MSL at run time), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
-| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
-| **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
-| **xbox_input** | Custom | Xbox gamepad → XInput |
-| **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture, plus a window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
+| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, SDL3 audio output) |
+| **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D8 translation) |
+| **xbox_input** | Custom | Xbox gamepad → SDL3 gamepads |
+| **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture (SDL3 has no video decoder, so decoding stays host-specific), plus an SDL3 window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
 
 ### Building the Libraries
 
@@ -152,10 +152,10 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 │  │xbox_  │ │xbox_  │ │xbox_   │ │xbox_ │ │xbox_││
 │  │d3d8   │ │dsound │ │apu     │ │nv2a  │ │input││
 │  │D3D8→  │ │DSound→│ │MCPX APU│ │NV2A  │ │XPP→ ││
-│  │D3D11  │ │mixer  │ │(xemu)  │ │(xemu)│ │XInput│
+│  │SDL_GPU│ │mixer  │ │(xemu)  │ │(xemu)│ │SDL3  │
 │  └───────┘ └───────┘ └────────┘ └──────┘ └─────┘│
 ├──────────────────────────────────────────────────┤
-│  Windows 11: D3D11, XInput, waveOut, Win32 API   │
+│  SDL3: GPU, audio, gamepads, windowing           │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -163,7 +163,7 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 
 ### Prerequisites
 
-- **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
+- **Windows 11/10** (SDL_GPU: Direct3D 12 or Vulkan) — or **Linux** (SDL_GPU: Vulkan; `tools/linux/install_deps.sh`)
 - **macOS**: homebrew, docker `tools/macos/setup.sh`
 - **Python 3.10+** with `capstone` (`pip install capstone`)
 - **Visual Studio 2022** (MSVC compiler)
@@ -278,11 +278,11 @@ xboxrecomp/
 │   └── fusion/                  # MS Ficl/Fission study tooling
 ├── src/                         # Runtime libraries (C, link-time)
 │   ├── kernel/                  # xbox_kernel - Xbox kernel → Win32
-│   ├── d3d/                     # xbox_d3d8   - D3D8 → D3D11 graphics
+│   ├── d3d/                     # xbox_d3d8   - D3D8 → SDL_GPU graphics
 │   ├── audio/                   # xbox_dsound - DirectSound compat
 │   ├── apu/                     # xbox_apu    - MCPX APU emulation (xemu)
 │   ├── nv2a/                    # xbox_nv2a   - NV2A GPU emulation (xemu)
-│   ├── input/                   # xbox_input  - Gamepad → XInput
+│   ├── input/                   # xbox_input  - Gamepad → SDL3
 │   └── video/                   # xbox_video  - FMV playback + framebuffer window
 ├── include/xbox/                # Public umbrella header (xboxrecomp.h)
 ├── templates/                   # Starter templates for new projects
@@ -313,7 +313,7 @@ xboxrecomp/
 - [xbox_d3d8](src/d3d/README.md) — D3D8 interface, register combiners, vertex shaders, texture unswizzle (8,838 LOC)
 - [xbox_dsound](src/audio/README.md) — DirectSound buffers, 3D audio, mixbins (573 LOC)
 - [xbox_apu](src/apu/README.md) — MCPX APU voice processor, mixer, MMIO (4,168 LOC)
-- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH→D3D11 (4,892 LOC)
+- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH→D3D8 (4,892 LOC)
 - [xbox_input](src/input/README.md) — Gamepad state, vibration, button mapping (360 LOC)
 
 ### Pipeline Guides
@@ -328,7 +328,7 @@ xboxrecomp/
 - [The Register Model](docs/technical/register-model.md) — Why global registers work and how the stack is simulated
 - [Memory Layout Reproduction](docs/technical/memory-layout.md) — CreateFileMapping, mirror views, and address space tricks
 - [Indirect Call Dispatch](docs/technical/indirect-calls.md) — The RECOMP_ICALL problem and how to solve it
-- [D3D8 to D3D11 Translation](docs/technical/d3d-translation.md) — Bridging Xbox's graphics API to modern DirectX
+- [D3D8 on SDL_GPU](docs/technical/d3d-translation.md) — Bridging Xbox's graphics API to modern GPU APIs
 - [NV2A Shader Translation](docs/technical/nv2a-shaders.md) — Register combiners and vertex microcode to HLSL
 - [D3D8LTCG Device Context](docs/technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions
 - [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping Xbox kernel ordinals to Win32
@@ -470,9 +470,9 @@ If you fix a lift, add the case.
 
 The runtime libraries (C) use:
 - MSVC (Visual Studio 2022) or MinGW-w64
-- Windows SDK (D3D11, DXGI, XInput, waveOut)
-- CMake 3.20+
-- No external dependencies — all hardware emulation code is self-contained
+- CMake 3.20+ and git (SDL3 and SDL_shadercross, with the DXC and SPIRV-Cross it builds, are fetched by CMake; the first build is long)
+- A GPU driver for Direct3D 12 or Vulkan (Metal on macOS)
+- All hardware emulation code is otherwise self-contained
 
 ## FAQ
 

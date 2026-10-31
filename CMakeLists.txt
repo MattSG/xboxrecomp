@@ -7,9 +7,9 @@ project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
 #
 # Libraries:
 #   xbox_kernel    - Xbox kernel replacement layer (147 imports → Win32)
-#   xbox_d3d8      - D3D8 → D3D11 graphics compatibility
+#   xbox_d3d8      - D3D8 → SDL_GPU graphics compatibility (D3D12 / Vulkan / Metal)
 #   xbox_dsound    - DirectSound → software mixer compatibility
-#   xbox_input     - Xbox gamepad → XInput compatibility
+#   xbox_input     - Xbox gamepad → SDL3 gamepad compatibility
 #   xbox_apu       - MCPX APU audio emulation (extracted from xemu)
 #   xbox_nv2a      - NV2A GPU emulation (extracted from xemu)
 
@@ -36,7 +36,7 @@ add_subdirectory(src/platform)
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 
-# Graphics: D3D8 → D3D11 compatibility layer
+# Graphics: D3D8 → SDL_GPU compatibility layer
 add_subdirectory(src/d3d)
 
 # Audio: DirectSound → software mixer compatibility
@@ -52,7 +52,7 @@ add_subdirectory(src/nv2a)
 # drives these registers directly, so a pad only exists if they do.
 add_subdirectory(src/usb)
 
-# Input: Xbox gamepad → XInput
+# Input: Xbox gamepad → SDL3 gamepads
 add_subdirectory(src/input)
 
 # Shared FMV player (Media Foundation -> D3D8 texture)

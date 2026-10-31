@@ -32,7 +32,7 @@ static void d3d8_upload_mip_level(SDL_GPUTexture *gpu_texture, D3DFORMAT fmt,
  * Format conversion: Xbox D3DFORMAT → SDL_GPUTextureFormat
  *
  * Xbox binary format constants follow the packed XDK layout above.
- * Formats that need a different D3D11 storage (YUV, P8, AL8) are
+ * Formats that need a different GPU storage (YUV, P8, AL8) are
  * converted in software during LockRect upload.
  * ================================================================ */
 
@@ -92,7 +92,7 @@ SDL_GPUTextureFormat d3d8_to_gpu_format(D3DFORMAT fmt)
 
     /* Compressed */
     case D3DFMT_DXT1:
-    case D3DFMT_CTX1:           /* no real D3D11 equiv; approximate as BC1 */
+    case D3DFMT_CTX1:           /* no real GPU equiv; approximate as BC1 */
     case D3DFMT_LIN_CTX1:
         return SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM;
     case D3DFMT_DXT3:
@@ -153,7 +153,7 @@ SDL_GPUTextureFormat d3d8_to_gpu_format(D3DFORMAT fmt)
     case D3DFMT_D16:
     case D3DFMT_LIN_D16:
         return SDL_GPU_TEXTUREFORMAT_D16_UNORM;
-    case D3DFMT_F16:            /* no float depth in D3D11; sample as R16 */
+    case D3DFMT_F16:            /* no float depth format; sample as R16 */
     case D3DFMT_LIN_F16:
         return SDL_GPU_TEXTUREFORMAT_R16_FLOAT;
     case D3DFMT_D32:
@@ -438,7 +438,7 @@ UINT d3d8_row_pitch(D3DFORMAT fmt, UINT width)
     return (width * d3d8_format_bpp(fmt)) / 8;
 }
 
-/* Bits per pixel of the data uploaded to the D3D11 texture
+/* Bits per pixel of the data uploaded to the GPU texture
  * (after any software format conversion). */
 UINT d3d8_upload_bpp(D3DFORMAT fmt)
 {
@@ -495,7 +495,7 @@ BOOL d3d8_format_is_palettized(D3DFORMAT fmt)
 }
 
 /* Convert width*height texels of a linear (unswizzled) Xbox layout into
- * the layout the D3D11 texture expects. src uses d3d8_format_bpp()/8,
+ * the layout the GPU texture expects. src uses d3d8_format_bpp()/8,
  * dst uses d3d8_upload_bpp()/8 bytes per pixel. `palette` selects the
  * palette P8 indices are expanded through (the texture's stage). */
 void d3d8_convert_linear_pixels(D3DFORMAT fmt, UINT width, UINT height,
@@ -997,7 +997,7 @@ void d3d8_ib_sync(IDirect3DIndexBuffer8 *iface)
  * "Surface Implementation (offscreen render targets, texture levels)"
  * section. Surface LockRect uses a staging readback round-trip and covers
  * palette/P8, MSAA and sub-rect locks. xbox_d3d8_surface_wrap() is provided
- * for wrapping a raw D3D11 texture (e.g. a back buffer) as a surface and is
+ * for wrapping a raw GPU texture (e.g. a back buffer) as a surface and is
  * implemented on top of d3d8_surface_create() below.
  * ================================================================ */
 

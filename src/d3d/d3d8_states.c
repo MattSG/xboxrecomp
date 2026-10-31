@@ -40,7 +40,7 @@ static Uint8 blend_factor(DWORD b)
 }
 
 /* Colour factors are not meaningful in the alpha channel; use their alpha
- * components, as the D3D11 backend did. */
+ * components, as the previous backend did. */
 static Uint8 blend_alpha_factor(Uint8 f)
 {
     switch (f) {
@@ -127,12 +127,12 @@ void d3d8_states_get_key(D3D8StateKey *k)
     k->stencil_zfail = stencil_op(rs[D3DRS_STENCILZFAIL]);
     k->stencil_pass = stencil_op(rs[D3DRS_STENCILPASS]);
 
-    /* SDL_GPU has no point fill; wireframe stands in as it did under D3D11. */
+    /* SDL_GPU has no point fill; wireframe stands in as before. */
     k->fill = (rs[D3DRS_FILLMODE] == D3DFILL_POINT || rs[D3DRS_FILLMODE] == D3DFILL_WIREFRAME)
                   ? SDL_GPU_FILLMODE_LINE : SDL_GPU_FILLMODE_FILL;
     switch (rs[D3DRS_CULLMODE]) {
     case D3DCULL_NONE: k->cull = SDL_GPU_CULLMODE_NONE; break;
-    case D3DCULL_CW:   k->cull = SDL_GPU_CULLMODE_FRONT; break;  /* as the D3D11 layer mapped it */
+    case D3DCULL_CW:   k->cull = SDL_GPU_CULLMODE_FRONT; break;  /* as the D3D8 layer mapped it */
     default:           k->cull = SDL_GPU_CULLMODE_BACK; break;
     }
 }

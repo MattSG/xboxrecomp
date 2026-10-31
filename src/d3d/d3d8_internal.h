@@ -1,7 +1,7 @@
 /**
  * D3D8 Compatibility Layer - Internal Header
  *
- * Shared types and declarations for the D3D8→D3D11 implementation.
+ * Shared types and declarations for the D3D8→SDL_GPU implementation.
  * Not part of the public API - only included by d3d8_*.c files.
  */
 

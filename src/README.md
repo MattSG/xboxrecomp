@@ -27,10 +27,10 @@ The `src/` directory contains 6 static libraries that provide the Xbox hardware 
 │  │d3d8    │ │dsound   │ │apu       │ │nv2a   │ │input ││
 │  │        │ │         │ │          │ │       │ │      ││
 │  │D3D8→   │ │DSound→  │ │MCPX APU │ │NV2A   │ │XPP→  ││
-│  │D3D11   │ │mixer    │ │(xemu)   │ │(xemu) │ │XInput││
+│  │SDL_GPU │ │mixer    │ │(xemu)   │ │(xemu) │ │SDL3  ││
 │  └────────┘ └─────────┘ └──────────┘ └───────┘ └──────┘│
 ├──────────────────────────────────────────────────────────┤
-│    Windows: D3D11, DXGI, XInput, waveOut, Win32 API      │
+│   SDL3: GPU (D3D12 / Vulkan / Metal), audio, gamepads   │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -39,11 +39,11 @@ The `src/` directory contains 6 static libraries that provide the Xbox hardware 
 | Library | Dir | LOC | Origin | Description |
 |---------|-----|-----|--------|-------------|
 | **xbox_kernel** | `kernel/` | 7,935 | Custom | Xbox kernel → Win32 replacement (147 imports) |
-| **xbox_d3d8** | `d3d/` | 3,372 | Custom | D3D8 → D3D11 graphics compatibility layer |
+| **xbox_d3d8** | `d3d/` | 3,372 | Custom | D3D8 → SDL_GPU graphics compatibility layer |
 | **xbox_dsound** | `audio/` | 573 | Custom | DirectSound → software mixer |
 | **xbox_apu** | `apu/` | 3,918 | xemu | MCPX APU audio emulation (256 voices) |
 | **xbox_nv2a** | `nv2a/` | 3,761 | xemu | NV2A GPU register handlers + MMIO |
-| **xbox_input** | `input/` | 212 | Custom | Xbox gamepad → XInput mapping |
+| **xbox_input** | `input/` | 212 | Custom | Xbox gamepad → SDL3 gamepad mapping |
 
 ## Building
 

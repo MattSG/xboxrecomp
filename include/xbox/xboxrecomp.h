@@ -13,11 +13,11 @@
  *
  * Libraries provided:
  *   xbox_kernel  - Xbox kernel → Win32 (memory, file I/O, threading, sync, crypto)
- *   xbox_d3d8    - D3D8 → D3D11 graphics
+ *   xbox_d3d8    - D3D8 → SDL_GPU graphics (Direct3D 12, Vulkan, Metal)
  *   xbox_dsound  - DirectSound → software mixer
  *   xbox_apu     - MCPX APU audio emulation (from xemu)
  *   xbox_nv2a    - NV2A GPU emulation (from xemu)
- *   xbox_input   - Xbox gamepad → XInput
+ *   xbox_input   - Xbox gamepad → SDL3 gamepads
  *
  * ═══════════════════════════════════════════════════════════════
  * Game Integration Points (YOU must implement these)
@@ -47,7 +47,7 @@
 #include "xbox_memory_layout.h" /* Memory layout API */
 #include "d3d8_xbox.h"          /* D3D8 compatibility interface */
 #include "dsound_xbox.h"        /* DirectSound compatibility */
-#include "xinput_xbox.h"        /* XInput compatibility */
+#include "xinput_xbox.h"        /* Xbox gamepad API (SDL3 backend) */
 #include "apu.h"                /* MCPX APU public API */
 
 /* NV2A headers */

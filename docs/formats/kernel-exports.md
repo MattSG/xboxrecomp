@@ -277,7 +277,7 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 | 3 | `VOID AvSetDisplayMode(PVOID RegisterBase, ULONG Step, ULONG Mode, ULONG Format, ULONG Pitch, ULONG FrameBuffer)` | Set display mode. |
 | 4 | `VOID AvSetSavedDataAddress(ULONG Address)` | Save display configuration. |
 
-**Win32 replacement**: All display/AV functions should be no-ops. Display mode is handled by your D3D backend (D3D11 or D3D12 window creation).
+**Win32 replacement**: All display/AV functions should be no-ops. Display mode is handled by your graphics backend (window and device creation).
 
 ## Port I/O
 

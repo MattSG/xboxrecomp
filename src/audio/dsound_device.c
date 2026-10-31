@@ -7,8 +7,8 @@
  * crashing, while actual audio playback is deferred to a later phase.
  *
  * Architecture:
- * - XAudio2 mastering voice for output (future)
- * - Each DirectSound buffer maps to an XAudio2 source voice (future)
+ * - SDL3 audio stream for output (via the APU monitor)
+ * - Each DirectSound buffer is mixed in software by the APU mixer
  * - 3D audio emulated using X3DAudio (future)
  */
 

@@ -3,26 +3,26 @@
  *
  * Low-latency stereo output through an SDL3 audio stream on the default
  * playback device, on every host. Called from the APU monitor frame to submit
- * mixed samples. The xa2_* names are kept from the XAudio2 backend this
- * replaced so the callers did not change.
+ * mixed samples. The apu_out_* functions are the APU monitor's output path; they replace the
+ * XAudio2 and waveOut backends.
  */
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <SDL3/SDL.h>
-#include "apu_xaudio2.h"
+#include "apu_audio_out.h"
 
-#define XA2_SAMPLE_RATE   48000
-#define XA2_CHANNELS      2
-#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+#define APU_OUT_SAMPLE_RATE   48000
+#define APU_OUT_CHANNELS      2
+#define APU_OUT_BUF_SAMPLES   1024   /* ~21ms per submission */
+#define APU_OUT_NUM_BUFS      3
 
 static SDL_AudioStream *g_stream = NULL;
 static int              g_initialized = 0;
 static int              g_frames_written = 0;
 
-int xa2_init(void)
+int apu_out_init(void)
 {
     SDL_AudioSpec spec;
 
@@ -34,8 +34,8 @@ int xa2_init(void)
     }
 
     spec.format   = SDL_AUDIO_S16;
-    spec.channels = XA2_CHANNELS;
-    spec.freq     = XA2_SAMPLE_RATE;
+    spec.channels = APU_OUT_CHANNELS;
+    spec.freq     = APU_OUT_SAMPLE_RATE;
     g_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
                                          &spec, NULL, NULL);
     if (!g_stream) {
@@ -50,11 +50,11 @@ int xa2_init(void)
     g_initialized = 1;
     g_frames_written = 0;
     fprintf(stderr, "[AUDIO] SDL3 audio initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
-            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
+            APU_OUT_SAMPLE_RATE, APU_OUT_NUM_BUFS, APU_OUT_BUF_SAMPLES);
     return 1;
 }
 
-void xa2_shutdown(void)
+void apu_out_shutdown(void)
 {
     if (g_stream) {
         SDL_DestroyAudioStream(g_stream);   /* also closes the device */
@@ -67,33 +67,33 @@ void xa2_shutdown(void)
     g_initialized = 0;
 }
 
-int xa2_is_active(void)
+int apu_out_is_active(void)
 {
     return g_initialized;
 }
 
 /* Submit a buffer of mixed samples. Called from the APU frame thread.
  * Returns 1 if the buffer was queued, 0 if the queue is already full. */
-int xa2_submit_samples(const int16_t *samples, int num_samples)
+int apu_out_submit_samples(const int16_t *samples, int num_samples)
 {
     int copy_samples;
 
     if (!g_initialized || !g_stream) return 0;
 
     if (SDL_GetAudioStreamQueued(g_stream) >=
-        XA2_NUM_BUFS * XA2_BUF_SAMPLES * XA2_CHANNELS * (int)sizeof(int16_t))
+        APU_OUT_NUM_BUFS * APU_OUT_BUF_SAMPLES * APU_OUT_CHANNELS * (int)sizeof(int16_t))
         return 0;
 
-    copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
+    copy_samples = (num_samples > APU_OUT_BUF_SAMPLES) ? APU_OUT_BUF_SAMPLES : num_samples;
     if (!SDL_PutAudioStreamData(g_stream, samples,
-                                copy_samples * XA2_CHANNELS * (int)sizeof(int16_t)))
+                                copy_samples * APU_OUT_CHANNELS * (int)sizeof(int16_t)))
         return 0;
 
     g_frames_written++;
     return 1;
 }
 
-int xa2_get_buffer_size(void)
+int apu_out_get_buffer_size(void)
 {
-    return XA2_BUF_SAMPLES;
+    return APU_OUT_BUF_SAMPLES;
 }
