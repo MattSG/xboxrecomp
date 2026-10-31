@@ -353,6 +353,13 @@ void    d3d8_pipe_set_uniforms(int fragment, Uint32 slot, const void *data, Uint
 int     d3d8_pipe_stream(const void *data, Uint32 size, SDL_GPUBuffer **buf, Uint32 *offset);
 int     d3d8_pipe_draw(const D3D8Draw *draw);
 
+/* Partial clears (d3d8_clear.c): colour, depth and stencil inside one rectangle. */
+int  d3d8_clear_rect(XGpuTargets t, SDL_GPUTextureFormat cf, SDL_GPUTextureFormat df,
+                     Uint32 target_w, Uint32 target_h, const SDL_Rect *r,
+                     int do_color, const float rgba[4], int do_depth, float z,
+                     int do_stencil, Uint8 stencil);
+void d3d8_clear_shutdown(void);
+
 /* Supplied by d3d8_device.c: what the next draw renders into, and the viewport. */
 void    d3d8_GetCurrentTargets(XGpuTargets *t, SDL_GPUTextureFormat *color_fmt,
                                SDL_GPUTextureFormat *depth_fmt, Uint32 *w, Uint32 *h);

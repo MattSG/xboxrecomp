@@ -311,6 +311,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     LONG ref = InterlockedDecrement(&g_device_state.ref_count);
     if (ref <= 0) {
         /* Cleanup subsystems first */
+        d3d8_clear_shutdown();
         d3d8_pipe_shutdown();
         d3d8_gamma_shutdown();
         d3d8_vsh_shutdown();
@@ -432,30 +433,74 @@ static HRESULT __stdcall dev_EndScene(IDirect3DDevice8 *self)
 
 static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
 {
-    (void)self; (void)Count; (void)pRects; (void)Stencil;
+    (void)self;
     g_d3d_clear_count++;
 
-    /* Clear the currently bound targets (default if none set). Rectangles are
-     * not honoured: the whole attachment is cleared. */
+    /* Clear the currently bound targets (default if none set). D3D8 clears the
+     * viewport, or the rectangles given inside it. A clear that covers the whole
+     * target is a render-pass clear; anything smaller is a scissored draw
+     * (d3d8_clear.c), because a pass can only clear a whole attachment. */
     {
         XGpuTargets t;
         XGpuClear cl;
         SDL_GPUTextureFormat cf, df;
-        Uint32 tw, th;
+        Uint32 tw, th, i;
+        SDL_Rect clip, rects[64];
+        int nrects = 0;
+        int do_color = (Flags & D3DCLEAR_TARGET) != 0;
+        int do_depth, do_stencil;
+        float rgba[4];
 
         d3d8_GetCurrentTargets(&t, &cf, &df, &tw, &th);
-        memset(&cl, 0, sizeof(cl));
-        if (Flags & D3DCLEAR_TARGET) {
-            cl.color = 1;
-            cl.rgba[0] = ((Color >> 16) & 0xFF) / 255.0f;   /* R */
-            cl.rgba[1] = ((Color >>  8) & 0xFF) / 255.0f;   /* G */
-            cl.rgba[2] = ((Color >>  0) & 0xFF) / 255.0f;   /* B */
-            cl.rgba[3] = ((Color >> 24) & 0xFF) / 255.0f;   /* A */
+        do_depth = (Flags & D3DCLEAR_ZBUFFER) && t.depth;
+        do_stencil = (Flags & D3DCLEAR_STENCIL) && t.depth;
+        if (!do_color && !do_depth && !do_stencil)
+            return S_OK;
+        rgba[0] = ((Color >> 16) & 0xFF) / 255.0f;   /* R */
+        rgba[1] = ((Color >>  8) & 0xFF) / 255.0f;   /* G */
+        rgba[2] = ((Color >>  0) & 0xFF) / 255.0f;   /* B */
+        rgba[3] = ((Color >> 24) & 0xFF) / 255.0f;   /* A */
+
+        /* The area D3D8 clears: the viewport, clipped to the target. */
+        clip.x = (int)g_device_state.viewport.X;
+        clip.y = (int)g_device_state.viewport.Y;
+        clip.w = (int)(g_device_state.viewport.Width ? g_device_state.viewport.Width : tw);
+        clip.h = (int)(g_device_state.viewport.Height ? g_device_state.viewport.Height : th);
+        if (clip.x < 0) { clip.w += clip.x; clip.x = 0; }
+        if (clip.y < 0) { clip.h += clip.y; clip.y = 0; }
+        if (clip.x + clip.w > (int)tw) clip.w = (int)tw - clip.x;
+        if (clip.y + clip.h > (int)th) clip.h = (int)th - clip.y;
+
+        if (Count == 0 || !pRects) {
+            rects[nrects++] = clip;
+        } else {
+            for (i = 0; i < Count && nrects < 64; i++) {
+                SDL_Rect r;
+                int x1 = (int)pRects[i].x1, y1 = (int)pRects[i].y1;
+                int x2 = (int)pRects[i].x2, y2 = (int)pRects[i].y2;
+                if (x1 < clip.x) x1 = clip.x;
+                if (y1 < clip.y) y1 = clip.y;
+                if (x2 > clip.x + clip.w) x2 = clip.x + clip.w;
+                if (y2 > clip.y + clip.h) y2 = clip.y + clip.h;
+                if (x2 <= x1 || y2 <= y1) continue;
+                r.x = x1; r.y = y1; r.w = x2 - x1; r.h = y2 - y1;
+                rects[nrects++] = r;
+            }
         }
-        if ((Flags & D3DCLEAR_ZBUFFER) && t.depth) { cl.depth = 1; cl.z = Z; }
-        if ((Flags & D3DCLEAR_STENCIL) && t.depth) { cl.stencil = 1; cl.stencil_value = (Uint8)Stencil; }
-        if (cl.color || cl.depth || cl.stencil) {
+        if (nrects == 0 || clip.w <= 0 || clip.h <= 0)
+            return S_OK;
+
+        if (nrects == 1 && rects[0].x == 0 && rects[0].y == 0 &&
+            rects[0].w == (int)tw && rects[0].h == (int)th) {
+            memset(&cl, 0, sizeof(cl));
+            if (do_color) { cl.color = 1; memcpy(cl.rgba, rgba, sizeof(rgba)); }
+            if (do_depth) { cl.depth = 1; cl.z = Z; }
+            if (do_stencil) { cl.stencil = 1; cl.stencil_value = (Uint8)Stencil; }
             xgpu_render_pass(&g_device_state.gpu, t, &cl);
+        } else {
+            for (i = 0; i < (Uint32)nrects; i++)
+                d3d8_clear_rect(t, cf, df, tw, th, &rects[i], do_color, rgba,
+                                do_depth != 0, Z, do_stencil != 0, (Uint8)Stencil);
         }
     }
 

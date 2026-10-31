@@ -1,9 +1,0 @@
-C:/Users/Matt/Source/repos/xboxrecomp/build-tooling/CMakeFiles/ALL_BUILD.dir
-C:/Users/Matt/Source/repos/xboxrecomp/build-tooling/CMakeFiles/ZERO_CHECK.dir
-C:/Users/Matt/Source/repos/xboxrecomp/build-tooling/src/platform/CMakeFiles/ALL_BUILD.dir
-C:/Users/Matt/Source/repos/xboxrecomp/build-tooling/src/kernel/CMakeFiles/xbox_kernel.dir
-C:/Users/Matt/Source/repos/xboxrecomp/build-tooling/src/d3d/CMakeFiles/xbox_d3d8.dir
-C:/Users/Matt/Source/repos/xboxrecomp/build-tooling/src/audio/CMakeFiles/xbox_dsound.dir
-C:/Users/Matt/Source/repos/xboxrecomp/build-tooling/src/apu/CMakeFiles/xbox_apu.dir
-C:/Users/Matt/Source/repos/xboxrecomp/build-tooling/src/nv2a/CMakeFiles/xbox_nv2a.dir
-C:/Users/Matt/Source/repos/xboxrecomp/build-tooling/src/input/CMakeFiles/xbox_input.dir

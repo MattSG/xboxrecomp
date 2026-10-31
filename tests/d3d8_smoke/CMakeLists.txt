@@ -9,6 +9,7 @@ endif()
 #   d3d8_smoke         pure format layer (d3d8_resources.c with accessor stubs, no GPU)
 #   d3d8_states_smoke  render-state -> pipeline-key translation (d3d8_states.c, no GPU)
 #   d3d8_gamma         gamma ramp round trip and the present-time pass (needs a GPU device)
+#   d3d8_clear         Clear: rectangles, viewport limit, partial depth (needs a GPU device)
 #   d3d8_a8            A8 textures through the fixed-function path (needs a GPU device)
 # The GPU tests use a hidden window (RECOMP_HIDE_WINDOW=1).
 
@@ -36,6 +37,9 @@ target_link_libraries(d3d8_states_smoke PRIVATE platform SDL3::SDL3)
 add_executable(d3d8_gamma test_gamma.c)
 target_link_libraries(d3d8_gamma PRIVATE xbox_d3d8)
 
+add_executable(d3d8_clear test_clear.c)
+target_link_libraries(d3d8_clear PRIVATE xbox_d3d8)
+
 add_executable(d3d8_a8 test_a8.c)
 target_link_libraries(d3d8_a8 PRIVATE xbox_d3d8)
 
@@ -43,8 +47,10 @@ xbox_copy_runtime_dlls(d3d8_smoke)
 xbox_copy_runtime_dlls(d3d8_states_smoke)
 xbox_copy_runtime_dlls(d3d8_gamma)
 xbox_copy_runtime_dlls(d3d8_a8)
+xbox_copy_runtime_dlls(d3d8_clear)
 enable_testing()
 add_test(NAME d3d8_smoke COMMAND d3d8_smoke)
 add_test(NAME d3d8_states_smoke COMMAND d3d8_states_smoke)
 add_test(NAME d3d8_gamma COMMAND d3d8_gamma)
 add_test(NAME d3d8_a8 COMMAND d3d8_a8)
+add_test(NAME d3d8_clear COMMAND d3d8_clear)

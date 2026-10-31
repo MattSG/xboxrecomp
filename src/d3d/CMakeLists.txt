@@ -12,6 +12,7 @@ add_library(xbox_d3d8 STATIC
     d3d8_combiners.c
     d3d8_vsh.c
     d3d8_pipeline.c
+    d3d8_clear.c
     ../gfx/gpu_device.c
     ../gfx/gpu_shader.c
     ../gfx/sdl_events.c
