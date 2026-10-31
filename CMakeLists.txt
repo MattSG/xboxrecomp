@@ -30,6 +30,7 @@ add_compile_definitions(
 # Win32 host primitives. Carries no Xbox semantics; provides the foundation
 # the kernel HLE and the graphics/audio/input layers build on.
 include(cmake/xbox_sdl3.cmake)
+include(cmake/xbox_ffmpeg.cmake)
 
 add_subdirectory(src/platform)
 
@@ -55,7 +56,7 @@ add_subdirectory(src/usb)
 # Input: Xbox gamepad → SDL3 gamepads
 add_subdirectory(src/input)
 
-# Shared FMV player (Media Foundation -> D3D8 texture)
+# Shared FMV player (FFmpeg decode -> D3D8 texture)
 add_subdirectory(src/video)
 
 # ── Umbrella target ───────────────────────────────────────────

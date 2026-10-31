@@ -1,0 +1,5 @@
+C:\Users\Matt\Source\repos\xboxrecomp\src\apu\apu_core.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\apu\xbox_apu.dir\Release\apu_core.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\apu\apu_vp.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\apu\xbox_apu.dir\Release\apu_vp.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\apu\apu_dsp.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\apu\xbox_apu.dir\Release\apu_dsp.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\apu\apu_mmio_hook.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\apu\xbox_apu.dir\Release\apu_mmio_hook.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\apu\apu_xaudio2.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\apu\xbox_apu.dir\Release\apu_xaudio2.obj

@@ -1,0 +1,15 @@
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_path.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_path.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_pool.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_pool.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_rtl.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_rtl.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_memory.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_memory.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_file.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_file.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_thread.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_thread.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_sync.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_sync.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_hal.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_hal.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_xbox.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_xbox.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_ob.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_ob.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_io.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_io.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_crypto.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_crypto.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_thunks.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_thunks.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\kernel_bridge.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\kernel_bridge.obj
+C:\Users\Matt\Source\repos\xboxrecomp\src\kernel\xbox_memory_layout.c;C:\Users\Matt\Source\repos\xboxrecomp\build-tooling\src\kernel\xbox_kernel.dir\Release\xbox_memory_layout.obj

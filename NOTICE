@@ -68,6 +68,24 @@ Derived algorithms — credited, independently implemented
   label.
 
 
+Libraries linked, not included
+------------------------------
+
+  These are downloaded or found by CMake and linked; no source is copied into
+  this repository.
+
+  SDL3 (zlib licence), SDL_shadercross (zlib), DirectXShaderCompiler (UIUC /
+  LLVM-with-exceptions), SPIRV-Cross (Apache-2.0) and SPIRV-Tools
+  (Apache-2.0): graphics, audio, input and run-time shader compilation.
+
+  FFmpeg (LGPL-2.1-or-later / LGPL-3.0 builds): video and WMA decoding. On
+  Windows the CMake build downloads the pinned LGPL shared build from
+  BtbN/FFmpeg-Builds (https://github.com/BtbN/FFmpeg-Builds) and loads its
+  DLLs dynamically, so users can replace them; elsewhere the system FFmpeg is
+  used. Do not substitute a GPL build (--enable-gpl) if you redistribute
+  binaries.
+
+
 Reference material (no code taken)
 -----------------------------------
 

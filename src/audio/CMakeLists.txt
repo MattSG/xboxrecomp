@@ -15,11 +15,8 @@ target_link_libraries(xbox_dsound PUBLIC xbox_apu)
 # primitives), so both hosts need it for "platform/xbox_winnt.h".
 target_link_libraries(xbox_dsound PUBLIC platform)
 
-# Windows uses the same Media Foundation stack as xbox_video so ordinary WMA
-# assets can be decoded to PCM without adding another codec dependency.
-if(WIN32)
-    target_link_libraries(xbox_dsound PUBLIC mfplat mfreadwrite mfuuid mf ole32)
-endif()
+# WMA assets are decoded to PCM with FFmpeg (SDL3 has no decoder).
+target_link_libraries(xbox_dsound PRIVATE xbox::ffmpeg)
 
 if(MSVC)
     target_compile_options(xbox_dsound PRIVATE /W4 /O2)

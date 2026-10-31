@@ -1,5 +1,5 @@
 /**
- * Shared FMV player: Media Foundation decode onto a D3D8 texture.
+ * Shared FMV player: FFmpeg decode onto a D3D8 texture.
  *
  * For a title whose video is a container Windows can already decode, the
  * decoder does not have to be emulated for the video to be watchable. The
@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-/* Initialize/shutdown Media Foundation (call once at app start/end) */
+/* Initialize/shutdown the decoder (call once at app start/end) */
 int  video_init(void);
 void video_shutdown(void);
 

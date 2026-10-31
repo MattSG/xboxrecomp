@@ -103,7 +103,7 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, SDL3 audio output) |
 | **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D8 translation) |
 | **xbox_input** | Custom | Xbox gamepad → SDL3 gamepads |
-| **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture (SDL3 has no video decoder, so decoding stays host-specific), plus an SDL3 window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
+| **xbox_video** | Custom | FMV playback: FFmpeg decode onto a D3D8 texture (SDL3 has no video decoder), plus an SDL3 window on the guest framebuffer. For titles whose video is a container FFmpeg decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
 
 ### Building the Libraries
 
@@ -470,7 +470,7 @@ If you fix a lift, add the case.
 
 The runtime libraries (C) use:
 - MSVC (Visual Studio 2022) or MinGW-w64
-- CMake 3.20+ and git (SDL3 and SDL_shadercross, with the DXC and SPIRV-Cross it builds, are fetched by CMake; the first build is long)
+- CMake 3.20+ and git (SDL3 and SDL_shadercross, with the DXC and SPIRV-Cross it builds, are fetched by CMake; the first build is long). FFmpeg decodes video and WMA: the system FFmpeg on Linux/macOS, a pinned LGPL download on Windows
 - A GPU driver for Direct3D 12 or Vulkan (Metal on macOS)
 - All hardware emulation code is otherwise self-contained
 
