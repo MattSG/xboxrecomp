@@ -7,8 +7,8 @@ The lifted C code from Step 4 is just one piece of the puzzle. It expects to run
 The runtime has four major subsystems:
 1. **Memory Layout** -- map Xbox virtual addresses into Windows process space
 2. **Kernel Shim** -- replace 147+ Xbox kernel functions with Win32 equivalents
-3. **D3D8-to-SDL_GPU Bridge** -- translate Direct3D 8 calls to SDL3's GPU API (Direct3D 12, Vulkan or Metal)
-4. **Input** -- map Xbox controller input to SDL3 gamepads
+3. **D3D8-to-D3D11 Bridge** -- translate Direct3D 8 calls to modern Direct3D 11
+4. **Input** -- map Xbox controller input to XInput
 
 ## Memory Layout
 
@@ -220,7 +220,7 @@ MEM32(KDATA_TICK_COUNT) = GetTickCount();
 
 The kernel data area is a 4 KB block at `0x00740000` that holds all data exports.
 
-## D3D8-to-SDL_GPU Bridge
+## D3D8-to-D3D11 Bridge
 
 ### The Problem
 
@@ -235,12 +235,14 @@ mov eax, [esi]           ; load vtable pointer
 call [eax + 0x88]        ; Device->SetRenderState (vtable slot 34)
 ```
 
-The bridge creates fake COM objects with vtables that point to our SDL_GPU wrapper functions:
+The bridge creates fake COM objects with vtables that point to our D3D11 wrapper functions:
 
 ```c
 typedef struct {
     void **vtable;                     // points to d3d8_device_vtable[]
-    XGpu gpu;                          // SDL window, SDL_GPU device, backbuffer
+    ID3D11Device *d3d11_device;
+    ID3D11DeviceContext *d3d11_context;
+    IDXGISwapChain *swap_chain;
     // ... state tracking ...
 } D3D8Device;
 
@@ -256,7 +258,7 @@ static void *d3d8_device_vtable[] = {
 
 ### Fixed-Function to Programmable Pipeline
 
-D3D8 uses a fixed-function pipeline (SetTextureStageState, SetTransform, etc.). SDL_GPU requires programmable shaders (generated as HLSL and compiled at run time through DXC and SPIRV-Cross). The bridge translates:
+D3D8 uses a fixed-function pipeline (SetTextureStageState, SetTransform, etc.). D3D11 requires programmable shaders. The bridge translates:
 
 - **Vertex transforms**: the bridge captures the World/View/Projection matrices from `SetTransform` calls and passes them to an HLSL vertex shader as constant buffers
 - **Texture stage states**: COLOROP, COLORARG1/2, ALPHAOP translate to pixel shader state
@@ -270,25 +272,37 @@ A small set of HLSL shaders handles the common cases:
 
 ### Vertex and Index Buffers
 
-The bridge keeps a system-memory copy that Lock hands out. Unlock marks it dirty and the next draw that uses the buffer uploads it through a transfer buffer (SDL_GPU requires uploads in a copy pass, outside render passes):
+The bridge implements the Lock/Unlock staging pattern:
 
 ```c
-HRESULT d3d8_VertexBuffer_Lock(/* ... */)   { *ppData = vb->sys_mem + offset; return D3D_OK; }
-HRESULT d3d8_VertexBuffer_Unlock(/* ... */) { vb->dirty = TRUE; return D3D_OK; }  // d3d8_vb_sync() uploads at draw time
+HRESULT d3d8_VertexBuffer_Lock(/* ... */) {
+    // Create a CPU-accessible staging buffer
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    context->Map(staging_buffer, 0, D3D11_MAP_WRITE, 0, &mapped);
+    *ppData = mapped.pData;
+    return D3D_OK;
+}
+
+HRESULT d3d8_VertexBuffer_Unlock(/* ... */) {
+    context->Unmap(staging_buffer, 0);
+    // Copy staging to GPU buffer
+    context->CopyResource(gpu_buffer, staging_buffer);
+    return D3D_OK;
+}
 ```
 
 ### Texture Formats
 
-Xbox textures use DXT compression (DXT1, DXT3, DXT5), which SDL_GPU supports natively as BC1/BC2/BC3. The bridge maps D3D8 format constants to SDL_GPU texture formats:
+Xbox textures use DXT compression (DXT1, DXT3, DXT5), which D3D11 supports natively as BC1/BC2/BC3. The bridge maps D3D8 format constants to DXGI format constants:
 
-| D3D8 (Xbox) | SDL_GPU |
+| D3D8 (Xbox) | DXGI (D3D11) |
 |-------------|-------------|
-| D3DFMT_DXT1 | SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM |
-| D3DFMT_DXT3 | SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM |
-| D3DFMT_DXT5 | SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM |
-| D3DFMT_A8R8G8B8 | SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM |
-| D3DFMT_X8R8G8B8 | SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM (alpha forced opaque) |
-| D3DFMT_R5G6B5 | SDL_GPU_TEXTUREFORMAT_B5G6R5_UNORM |
+| D3DFMT_DXT1 | DXGI_FORMAT_BC1_UNORM |
+| D3DFMT_DXT3 | DXGI_FORMAT_BC2_UNORM |
+| D3DFMT_DXT5 | DXGI_FORMAT_BC3_UNORM |
+| D3DFMT_A8R8G8B8 | DXGI_FORMAT_B8G8R8A8_UNORM |
+| D3DFMT_X8R8G8B8 | DXGI_FORMAT_B8G8R8X8_UNORM |
+| D3DFMT_R5G6B5 | DXGI_FORMAT_B5G6R5_UNORM |
 
 Xbox textures may also be **swizzled** (Morton/Z-order layout instead of linear). The bridge detects swizzled textures and unswizzles them during upload.
 
@@ -296,19 +310,19 @@ Xbox textures may also be **swizzled** (Morton/Z-order layout instead of linear)
 
 ### Xbox Controller Mapping
 
-The Xbox controller is accessed through the XPP (Xbox Peripheral Port) library. Game code reads controller state from memory-mapped addresses. The runtime intercepts these reads and provides SDL3 gamepad data:
+The Xbox controller is accessed through the XPP (Xbox Peripheral Port) library. Game code reads controller state from memory-mapped addresses. The runtime intercepts these reads and provides XInput data:
 
 ```c
-// Map Xbox gamepad state from an SDL3 gamepad
-XBOX_INPUT_STATE state;
-xbox_InputGetState(0, &state);      // SDL_GetGamepadButton / SDL_GetGamepadAxis inside
+// Map Xbox gamepad state to XInput
+XINPUT_STATE xi_state;
+XInputGetState(0, &xi_state);
 
 // Write to Xbox controller memory addresses
-MEM16(XBOX_GAMEPAD_BUTTONS) = state.Gamepad.wButtons;
-MEM8(XBOX_GAMEPAD_LEFT_TRIGGER) = state.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER];
-MEM8(XBOX_GAMEPAD_RIGHT_TRIGGER) = state.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER];
-MEM16(XBOX_GAMEPAD_THUMB_LX) = state.Gamepad.sThumbLX;
-MEM16(XBOX_GAMEPAD_THUMB_LY) = state.Gamepad.sThumbLY;
+MEM16(XBOX_GAMEPAD_BUTTONS) = xi_state.Gamepad.wButtons;
+MEM8(XBOX_GAMEPAD_LEFT_TRIGGER) = xi_state.Gamepad.bLeftTrigger;
+MEM8(XBOX_GAMEPAD_RIGHT_TRIGGER) = xi_state.Gamepad.bRightTrigger;
+MEM16(XBOX_GAMEPAD_THUMB_LX) = xi_state.Gamepad.sThumbLX;
+MEM16(XBOX_GAMEPAD_THUMB_LY) = xi_state.Gamepad.sThumbLY;
 ```
 
 Keyboard input is also mapped for testing: WASD for movement, Shift for boost, etc.
@@ -337,6 +351,33 @@ Manual overrides are the primary debugging tool. When a function crashes or prod
 
 For Burnout 3, approximately 33 functions have manual overrides, including the physics engine, frame pump, resource loader, and several RenderWare initialization functions.
 
+### Registers in recomp_manual.c
+
+The registers are thread-local (`RECOMP_TLS` in `recomp_types.h`), and an
+override has to see them that way. The template `recomp_manual.c` declares
+`extern uint32_t g_eax;` — a plain global, a different variable — and does not
+include `recomp_types.h`, so the compiler cannot see the mismatch. It links, and
+an override that sets `g_eax` sets nothing the caller reads: return values that
+"don't stick", arguments that read as garbage. Include the header and drop the
+hand-written `extern`s:
+
+```c
+#include "recomp_types.h"   /* thread-local register declarations */
+```
+
+### Replace, Don't Wrap
+
+`--exclude-manual` recognises two shapes. A function `recomp_manual.c`
+*defines* as `sub_X` is a **replacement**: the generator skips its body and
+every caller — direct calls in generated code and the dispatch table — reaches
+yours. A function it calls as `sub_X_gen` is a **wrapper**: the body is emitted
+as `sub_X_gen`, and so is every call to it. Only code that names `sub_X` by
+hand reaches the wrapper; generated code never does, so logging or a fix
+placed there silently never runs.
+
+To change behaviour for every caller, replace. Clean up the stack the way the
+original did (`g_esp += 12` for a `ret 8`).
+
 ## Build System
 
 The entire project is built with CMake:
@@ -350,12 +391,37 @@ The output is a single executable (`bin/burnout3.exe`) that links:
 - The auto-generated recompiled code (static library)
 - The manual overrides
 - The kernel shim (static library)
-- The D3D8-to-SDL_GPU bridge (static library)
+- The D3D8-to-D3D11 bridge (static library)
 - The audio stubs (static library)
 - The input layer (static library)
 - The main scaffold (entry point, window creation, game loop)
 
-Dependencies: SDL3 and SDL_shadercross (fetched and built by CMake), `ws2_32.lib` on Windows.
+System dependencies: `d3d11.lib`, `dxgi.lib`, `d3dcompiler.lib`, `xinput.lib`, `ws2_32.lib`.
+
+### RECOMP_ABI_CHECK Needs Both Halves
+
+The stack-balance checker is split: the check (`RECOMP_ABI_CALL`) is compiled
+into generated code through `recomp_types.h`, and the logger it calls,
+`recomp_abi_violation_log()`, into `xbox_kernel`. Defining the switch with
+`target_compile_definitions(<game> PRIVATE ...)` reaches only the first, and
+the link fails once per generated file:
+
+```
+recomp_0024.obj : error LNK2001: unresolved external symbol recomp_abi_violation_log
+```
+
+Define it for both, before the toolkit is added:
+
+```cmake
+option(RECOMP_ABI_CHECK "Log callee ABI violations at every lifted call" OFF)
+if(RECOMP_ABI_CHECK)
+    add_compile_definitions(RECOMP_ABI_CHECK=1)
+endif()
+add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+```
+
+What it reports on every title, and why those reports are correct, is in
+[Iterative Debugging](06-debugging.md#reports-recomp_abi_check-always-gives).
 
 ## Startup Sequence
 
@@ -364,6 +430,6 @@ Dependencies: SDL3 and SDL_shadercross (fetched and built by CMake), `ws2_32.lib
 3. Call `xbox_kernel_init()` to fill the kernel thunk table
 4. Call `xbox_kernel_bridge_init()` to wire synthetic VAs
 5. Initialize g_esp to XBOX_STACK_TOP
-6. Create the window and GPU device (the D3D8 layer's CreateDevice does this)
+6. Create the window and D3D11 device
 7. Call the decoded entry point function: `sub_001D2807()`
 8. Enter the Windows message loop, calling the game's frame function each tick

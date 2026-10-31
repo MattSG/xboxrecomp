@@ -10,11 +10,11 @@ only about building and running the *game*:
 
 | | Pipeline | Game build | Graphics backend |
 |---|---|---|---|
-| **Windows 10/11** | yes | MSVC | SDL_GPU (Direct3D 12 or Vulkan), the most-exercised path |
+| **Windows 10/11** | yes | MSVC | D3D11, the complete path |
 | **Linux** | yes | GCC/Clang | OpenGL 3.3 (`d3d8_gl.c`), less complete |
 | **macOS** | yes | Clang | OpenGL 3.3, least exercised |
 
-Start on Windows if you have the choice — the graphics backend is a handful of files of
+Start on Windows if you have the choice — the D3D11 backend is six files of
 translation against one for OpenGL, so a title that renders there may not
 render elsewhere yet. If you are on Linux or macOS you can still do the whole
 analysis half, and reports of what breaks on the OpenGL path are welcome.
@@ -300,6 +300,11 @@ cmake -S . -B build
 cmake --build build --config Release
 build\Release\my_game.exe 2>stderr.txt      # named after project() in your CMakeLists
 ```
+
+From Git Bash, pass MSBuild's parallel flag through CMake (`--parallel`), not as
+`-- /m`: Git Bash rewrites arguments that look like paths, `/m` arrives as `M:/`,
+and MSBuild stops with `MSB1008: Only one project can be specified`
+(`MSYS_NO_PATHCONV=1` also works).
 
 This configure step builds the toolkit's libraries as a subdirectory *and* links
 them into your `.exe`. If you get libraries and no `.exe`, you are building the

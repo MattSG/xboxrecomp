@@ -30,6 +30,7 @@ class Instruction:
     mnemonic: str
     op_str: str
     bytes_hex: str
+    groups: tuple = ()
 
     # Operand details (populated from Capstone)
     operands: list = field(default_factory=list)
@@ -162,6 +163,7 @@ class Disassembler:
             mnemonic=cs_insn.mnemonic,
             op_str=cs_insn.op_str,
             bytes_hex=cs_insn.bytes.hex(),
+            groups=tuple(cs_insn.groups),
         )
 
         try:
@@ -231,8 +233,26 @@ class Disassembler:
                 del decoded[addr]
             for cs_insn in self._cs.disasm(raw_bytes[point - start_va:size],
                                            point):
-                if cs_insn.address in decoded:
+                rejoined = cs_insn.address in decoded
+                # Discard every overlapping instruction from the old stream,
+                # including bogus starts inside this corrected instruction.
+                for addr in [a for a, i in decoded.items()
+                             if a != cs_insn.address
+                             and a < cs_insn.address + cs_insn.size
+                             and cs_insn.address < a + i.size]:
+                    del decoded[addr]
+                if rejoined:
                     break          # rejoined a stream we already have
+                # The misaligned stream did not only straddle `point`: until
+                # it rejoins, every instruction it decoded starts *inside* one
+                # of the real ones being decoded here. Those are gone too, or
+                # they are lifted beside the real ones. In MechAssault's CRT
+                # memcpy the `44` inside `mov [edi+ecx*4-0x1C], eax` survived
+                # as `inc esp`, so every short copy returned with esp one byte
+                # off and popped garbage into the caller's esi and edi.
+                for inner in range(cs_insn.address + 1,
+                                   cs_insn.address + cs_insn.size):
+                    decoded.pop(inner, None)
                 decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
         return [decoded[a] for a in sorted(decoded)]
@@ -310,16 +330,16 @@ class Disassembler:
         blocks = []
         for i, leader in enumerate(sorted_leaders):
             bb = BasicBlock(start=leader)
-            idx = addr_to_idx[leader]
+            address = leader
 
-            # Add instructions until next leader or terminator
-            next_leader = sorted_leaders[i + 1] if i + 1 < len(sorted_leaders) else func_end
-            while idx < len(instructions):
-                insn = instructions[idx]
-                if insn.address >= next_leader and insn.address != leader:
+            # Overlapping x86 streams have interleaved instruction starts.
+            # Follow the encoded length, never the next sorted instruction.
+            while address in addr_to_idx:
+                if address != leader and address in leaders:
                     break
+                insn = instructions[addr_to_idx[address]]
                 bb.instructions.append(insn)
-                idx += 1
+                address = insn.end_address
 
                 # Block ends at terminators
                 if insn.is_ret or insn.is_jump or insn.mnemonic in stop_mnemonics:

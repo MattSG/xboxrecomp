@@ -4,17 +4,14 @@ project(memory_layout_posix_test C)
 # exists to pin down what the Xbox memory model must do on a host whose page
 # size is not 4 KB and whose low address space is not available.
 if(WIN32)
-    message(FATAL_ERROR "This regression covers the POSIX mapping path")
+    message(STATUS "memory_layout_posix: covers the POSIX mapping path; skipped on Windows")
+    return()
 endif()
 set(CMAKE_C_STANDARD 11)
-# Standalone, or part of a combined tree that already has the runtime.
-if(NOT TARGET xboxrecomp)
-    add_subdirectory(../.. runtime)
-endif()
+add_subdirectory(../.. runtime)
 add_executable(memory_layout_posix_test test_main.c)
 target_include_directories(memory_layout_posix_test PRIVATE ../../src/kernel)
 target_link_libraries(memory_layout_posix_test PRIVATE xboxrecomp)
-xbox_copy_runtime_dlls(memory_layout_posix_test)
 enable_testing()
 add_test(NAME memory_layout_posix_test
          COMMAND memory_layout_posix_test

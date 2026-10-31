@@ -8,16 +8,16 @@
  *   1. Build xboxrecomp as a static library (cmake --build)
  *   2. Link against the 'xboxrecomp' umbrella target (or individual libs)
  *   3. Implement the required callbacks (see "Game Integration Points" below)
- *   4. Call xbox_memory_init() to set up the 64MB Xbox address space
+ *   4. Call xbox_MemoryLayoutInit() with the original XBE to load its memory image
  *   5. Call xbox_kernel_init() / xbox_kernel_bridge_init() to wire up kernel imports
  *
  * Libraries provided:
  *   xbox_kernel  - Xbox kernel → Win32 (memory, file I/O, threading, sync, crypto)
- *   xbox_d3d8    - D3D8 → SDL_GPU graphics (Direct3D 12, Vulkan, Metal)
+ *   xbox_d3d8    - D3D8 → D3D11 graphics
  *   xbox_dsound  - DirectSound → software mixer
  *   xbox_apu     - MCPX APU audio emulation (from xemu)
  *   xbox_nv2a    - NV2A GPU emulation (from xemu)
- *   xbox_input   - Xbox gamepad → SDL3 gamepads
+ *   xbox_input   - Xbox gamepad → XInput
  *
  * ═══════════════════════════════════════════════════════════════
  * Game Integration Points (YOU must implement these)
@@ -34,9 +34,9 @@
  *
  * Global state (defined in xbox_memory_layout.c):
  *   extern ptrdiff_t g_xbox_mem_offset;  // Native-to-Xbox VA offset
- *   extern uint32_t  g_eax, g_ecx, g_edx, g_esp;  // Volatile registers
- *   extern uint32_t  g_ebx, g_esi, g_edi;          // Callee-saved registers
- *   extern uint32_t  g_seh_ebp;                      // SEH frame pointer
+ *   extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;  // Volatile registers
+ *   extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;          // Callee-saved registers
+ *   extern RECOMP_TLS uint32_t g_seh_ebp;                      // SEH frame pointer
  */
 
 #ifndef XBOXRECOMP_H
@@ -44,10 +44,12 @@
 
 /* Individual module headers */
 #include "kernel.h"             /* Xbox kernel types and functions */
+#include "nv2a_pb.h"            /* Pushbuffer integration */
 #include "xbox_memory_layout.h" /* Memory layout API */
 #include "d3d8_xbox.h"          /* D3D8 compatibility interface */
 #include "dsound_xbox.h"        /* DirectSound compatibility */
-#include "xinput_xbox.h"        /* Xbox gamepad API (SDL3 backend) */
+#include "xinput_xbox.h"        /* XInput compatibility */
+#include "xbox_host.h"          /* Shared hardware/graphics bring-up */
 #include "apu.h"                /* MCPX APU public API */
 
 /* NV2A headers */

@@ -108,7 +108,7 @@ When adding instruction support:
 
 The runtime libraries are where most per-game work happens. Key areas:
 
-- **D3D8 render states** (`src/d3d/`) -- Xbox D3D8 has many states not yet translated to SDL_GPU. Each game tends to hit different subsets.
+- **D3D8 render states** (`src/d3d/`) -- Xbox D3D8 has many states not yet translated to D3D11. Each game tends to hit different subsets.
 - **Audio** (`src/audio/`, `src/apu/`) -- DirectSound buffer management, 3D audio positioning, ADPCM decoding.
 - **NV2A GPU** (`src/nv2a/`) -- push buffer command parsing, texture formats, vertex shader microcode.
 - **Input** (`src/input/`) -- rumble/vibration, multiple controllers, keyboard/mouse for debug builds.

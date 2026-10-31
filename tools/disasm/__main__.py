@@ -5,9 +5,9 @@ Usage:
     py -3 -m tools.disasm <path_to_xbe> [options]
 
 Examples:
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" --text-only --stats-only -v
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" --text-only
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" -o output/
+    py -3 -m tools.disasm "game_files/default.xbe" --text-only --stats-only -v
+    py -3 -m tools.disasm "game_files/default.xbe" --text-only
+    py -3 -m tools.disasm "game_files/default.xbe" -o output/
 """
 
 import argparse
@@ -42,7 +42,7 @@ def main():
     parser.add_argument(
         "--text-only",
         action="store_true",
-        help="Only disassemble the .text section (faster, ~2.73 MB)",
+        help="Only disassemble the .text section (faster)",
     )
     parser.add_argument(
         "--stats-only",
@@ -86,6 +86,15 @@ def main():
              "into each other.",
     )
 
+    parser.add_argument(
+        "--skip-library-immediates",
+        action="store_true",
+        help="An immediate in a library section (D3D, DSOUND, XPP, ...) never "
+             "starts a function in .text. For titles whose XDK code holds "
+             "register constants equal to .text addresses (NFSU1). Off by "
+             "default.",
+    )
+
     args = parser.parse_args()
 
     try:
@@ -95,8 +104,9 @@ def main():
 
         extra = [s.strip() for s in args.extra_sections.split(",")] if args.extra_sections else []
         seed_funcs = []
+        observed = set()
         for _seed_path in (args.seed_functions or []):
-            _got = _load_seed_functions(_seed_path)
+            _got = _load_seed_functions(_seed_path, observed)
             seed_funcs.extend(_got)
             if args.verbose:
                 print(f"  Seed file {_seed_path}: {len(_got)} addresses")
@@ -111,6 +121,8 @@ def main():
             force=args.force,
             extra_sections=extra,
             seed_functions=seed_funcs,
+            observed_seeds=observed,
+            skip_library_immediates=args.skip_library_immediates,
         )
         success = disassembler.run()
         sys.exit(0 if success else 1)
@@ -131,15 +143,26 @@ def main():
         sys.exit(2)
 
 
-def _load_seed_functions(path):
-    """Load seed function addresses from a JSON file."""
+def _load_seed_functions(path, observed=None):
+    """Load seed function addresses from a JSON file.
+
+    Entries marked "observed" (tools.seed_from_log writes them: a run
+    actually called or started a thread there) are also added to `observed`.
+    Entries written by seed_from_log before it set the field say so in their
+    note, and count too.
+    """
     import json
     with open(path) as f:
         data = json.load(f)
     addrs = []
     for entry in data:
         if isinstance(entry, dict) and "start" in entry:
-            addrs.append(int(entry["start"], 16))
+            addr = int(entry["start"], 16)
+            addrs.append(addr)
+            if observed is not None and (
+                    entry.get("observed")
+                    or "observed at runtime" in entry.get("note", "")):
+                observed.add(addr)
         elif isinstance(entry, int):
             addrs.append(entry)
     return addrs

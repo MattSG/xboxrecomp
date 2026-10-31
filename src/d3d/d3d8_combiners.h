@@ -29,7 +29,7 @@
  * The sum V1+R0 is also available (V1R0_SUM / SPARE0).
  *
  * This module translates the combiner configuration into HLSL source,
- * compiles it to a pixel shader, and caches the result.
+ * compiles it to a D3D11 pixel shader, and caches the result.
  *
  * References:
  *   - NV_register_combiners / NV_register_combiners2 GL extensions
@@ -40,7 +40,7 @@
 #ifndef XBOXRECOMP_D3D8_COMBINERS_H
 #define XBOXRECOMP_D3D8_COMBINERS_H
 
-#include "gfx/gpu_shader.h"
+#include <d3d11.h>
 #include <stdint.h>
 #include <windows.h>
 
@@ -258,7 +258,7 @@ typedef struct NV2APSConstants {
 /**
  * Initialize the combiner translator system.
  * Allocates the PS constant buffer and sets up the shader cache.
- * Must be called after the GPU device is created.
+ * Must be called after D3D11 device creation.
  */
 HRESULT d3d8_combiners_init(void);
 
@@ -316,7 +316,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
  * @return       Compiled pixel shader, or NULL on failure.
  *               The shader is owned by the cache - do NOT release it.
  */
-const XGpuShader *d3d8_combiners_get_shader(const NV2ACombinerState *state);
+ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state);
 
 /**
  * Prepare for a draw call using register combiners.

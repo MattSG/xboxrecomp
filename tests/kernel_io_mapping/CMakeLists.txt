@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.20)
+project(kernel_io_mapping_test C)
+set(CMAKE_C_STANDARD 11)
+find_package(Threads REQUIRED)
+add_subdirectory(../.. runtime)
+add_executable(kernel_io_mapping_test test_main.c)
+target_include_directories(kernel_io_mapping_test PRIVATE ../../src/kernel)
+target_link_libraries(kernel_io_mapping_test PRIVATE xboxrecomp Threads::Threads)
+enable_testing()
+add_test(NAME kernel_io_mapping COMMAND kernel_io_mapping_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
+set_tests_properties(kernel_io_mapping PROPERTIES TIMEOUT 30)

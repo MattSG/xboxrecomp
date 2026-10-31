@@ -2,8 +2,8 @@
  * d3d8_smoke - smoke-test harness for the xbox_d3d8 pure format layer.
  *
  * Exercises the real format tables, predicates, swizzle classification and
- * software conversions without needing a GPU device:
- *   - d3d8_to_gpu_format, d3d8_format_bpp, d3d8_format_is_*
+ * software conversions without needing a D3D11 device:
+ *   - d3d8_to_dxgi_format, d3d8_format_bpp, d3d8_format_is_*
  *   - d3d8_format_is_swizzled / unswizzle round-trip (d3d8_swizzle.h)
  *   - swizzle_offset agreeing with xbox_swizzle_rect, texel for texel
  *   - DXT1/3/5 block decode (d3d8_dxt_decode_texel)
@@ -24,7 +24,9 @@
 
 /* ---- Stub accessors referenced by d3d8_resources.c (not used by the
  *      pure functions under test, but must link). ---- */
-XGpu *d3d8_GetGpu(void) { static XGpu g; return &g; }
+ID3D11Device        *d3d8_GetD3D11Device(void)   { return NULL; }
+ID3D11DeviceContext *d3d8_GetD3D11Context(void)  { return NULL; }
+ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return NULL; }
 IDirect3DDevice8      *xbox_GetD3DDevice(void)  { return NULL; }
 
 static DWORD g_palette[256];
@@ -41,41 +43,41 @@ static int failures = 0;
 #define CHECK_FMT(name, got, expected) \
     do { if ((got) == (expected)) { } else { printf("FAIL: %s (got %d, want %d)\n", name, (int)(got), (int)(expected)); failures++; } } while (0)
 
-static void test_to_gpu_format(void)
+static void test_to_dxgi(void)
 {
-    printf("test_to_gpu_format\n");
-    CHECK_FMT("R16F",      d3d8_to_gpu_format(D3DFMT_R16F),          SDL_GPU_TEXTUREFORMAT_R16_FLOAT);
-    CHECK_FMT("R32F",      d3d8_to_gpu_format(D3DFMT_R32F),          SDL_GPU_TEXTUREFORMAT_R32_FLOAT);
-    CHECK_FMT("G16R16F",   d3d8_to_gpu_format(D3DFMT_G16R16F),       SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT);
-    CHECK_FMT("G32R32F",   d3d8_to_gpu_format(D3DFMT_G32R32F),       SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT);
-    CHECK_FMT("A16B16G16R16F", d3d8_to_gpu_format(D3DFMT_A16B16G16R16F), SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT);
-    CHECK_FMT("A32B32G32R32F", d3d8_to_gpu_format(D3DFMT_A32B32G32R32F), SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT);
-    CHECK_FMT("G16R16",    d3d8_to_gpu_format(D3DFMT_G16R16),        SDL_GPU_TEXTUREFORMAT_R16G16_UNORM);
-    CHECK_FMT("A16L16",    d3d8_to_gpu_format(D3DFMT_A16L16),        SDL_GPU_TEXTUREFORMAT_R16G16_UNORM);
-    CHECK_FMT("A16B16G16R16", d3d8_to_gpu_format(D3DFMT_A16B16G16R16), SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM);
-    CHECK_FMT("A32B32G32R32", d3d8_to_gpu_format(D3DFMT_A32B32G32R32), SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT);
-    CHECK_FMT("G32R32",    d3d8_to_gpu_format(D3DFMT_G32R32),        SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT);
-    CHECK_FMT("L32",       d3d8_to_gpu_format(D3DFMT_L32),           SDL_GPU_TEXTUREFORMAT_R32_FLOAT);
-    CHECK_FMT("A32L32",    d3d8_to_gpu_format(D3DFMT_A32L32),        SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT);
-    CHECK_FMT("V32U32",    d3d8_to_gpu_format(D3DFMT_V32U32),        SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT);
-    CHECK_FMT("Q16W16V16U16", d3d8_to_gpu_format(D3DFMT_Q16W16V16U16), SDL_GPU_TEXTUREFORMAT_R16G16B16A16_SNORM);
-    CHECK_FMT("Q32W32V32U32", d3d8_to_gpu_format(D3DFMT_Q32W32V32U32), SDL_GPU_TEXTUREFORMAT_R32G32B32A32_INT);
-    CHECK_FMT("A2R10G10B10", d3d8_to_gpu_format(D3DFMT_A2R10G10B10), SDL_GPU_TEXTUREFORMAT_R10G10B10A2_UNORM);
-    CHECK_FMT("X2R10G10B10", d3d8_to_gpu_format(D3DFMT_X2R10G10B10), SDL_GPU_TEXTUREFORMAT_R10G10B10A2_UNORM);
-    CHECK_FMT("A2B10G10R10", d3d8_to_gpu_format(D3DFMT_A2B10G10R10), SDL_GPU_TEXTUREFORMAT_R10G10B10A2_UNORM);
-    CHECK_FMT("A2W10V10U10", d3d8_to_gpu_format(D3DFMT_A2W10V10U10), SDL_GPU_TEXTUREFORMAT_R10G10B10A2_UNORM);
-    CHECK_FMT("R11G11B10", d3d8_to_gpu_format(D3DFMT_R11G11B10),     SDL_GPU_TEXTUREFORMAT_R11G11B10_UFLOAT);
-    CHECK_FMT("D24X8",     d3d8_to_gpu_format(D3DFMT_D24X8),         SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT);
-    CHECK_FMT("D24FS8",    d3d8_to_gpu_format(D3DFMT_D24FS8),        SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT);
-    CHECK_FMT("D32",       d3d8_to_gpu_format(D3DFMT_D32),           SDL_GPU_TEXTUREFORMAT_D32_FLOAT);
-    CHECK_FMT("DXN",       d3d8_to_gpu_format(D3DFMT_DXN),           SDL_GPU_TEXTUREFORMAT_BC5_RG_UNORM);
-    CHECK_FMT("DXT3A",     d3d8_to_gpu_format(D3DFMT_DXT3A),         SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM);
-    CHECK_FMT("DXT5A",     d3d8_to_gpu_format(D3DFMT_DXT5A),         SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM);
-    CHECK_FMT("CTX1",      d3d8_to_gpu_format(D3DFMT_CTX1),          SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM);
+    printf("test_to_dxgi\n");
+    CHECK_FMT("R16F",      d3d8_to_dxgi_format(D3DFMT_R16F),          DXGI_FORMAT_R16_FLOAT);
+    CHECK_FMT("R32F",      d3d8_to_dxgi_format(D3DFMT_R32F),          DXGI_FORMAT_R32_FLOAT);
+    CHECK_FMT("G16R16F",   d3d8_to_dxgi_format(D3DFMT_G16R16F),       DXGI_FORMAT_R16G16_FLOAT);
+    CHECK_FMT("G32R32F",   d3d8_to_dxgi_format(D3DFMT_G32R32F),       DXGI_FORMAT_R32G32_FLOAT);
+    CHECK_FMT("A16B16G16R16F", d3d8_to_dxgi_format(D3DFMT_A16B16G16R16F), DXGI_FORMAT_R16G16B16A16_FLOAT);
+    CHECK_FMT("A32B32G32R32F", d3d8_to_dxgi_format(D3DFMT_A32B32G32R32F), DXGI_FORMAT_R32G32B32A32_FLOAT);
+    CHECK_FMT("G16R16",    d3d8_to_dxgi_format(D3DFMT_G16R16),        DXGI_FORMAT_R16G16_UNORM);
+    CHECK_FMT("A16L16",    d3d8_to_dxgi_format(D3DFMT_A16L16),        DXGI_FORMAT_R16G16_UNORM);
+    CHECK_FMT("A16B16G16R16", d3d8_to_dxgi_format(D3DFMT_A16B16G16R16), DXGI_FORMAT_R16G16B16A16_UNORM);
+    CHECK_FMT("A32B32G32R32", d3d8_to_dxgi_format(D3DFMT_A32B32G32R32), DXGI_FORMAT_R32G32B32A32_FLOAT);
+    CHECK_FMT("G32R32",    d3d8_to_dxgi_format(D3DFMT_G32R32),        DXGI_FORMAT_R32G32_FLOAT);
+    CHECK_FMT("L32",       d3d8_to_dxgi_format(D3DFMT_L32),           DXGI_FORMAT_R32_FLOAT);
+    CHECK_FMT("A32L32",    d3d8_to_dxgi_format(D3DFMT_A32L32),        DXGI_FORMAT_R32G32_FLOAT);
+    CHECK_FMT("V32U32",    d3d8_to_dxgi_format(D3DFMT_V32U32),        DXGI_FORMAT_R32G32_FLOAT);
+    CHECK_FMT("Q16W16V16U16", d3d8_to_dxgi_format(D3DFMT_Q16W16V16U16), DXGI_FORMAT_R16G16B16A16_SNORM);
+    CHECK_FMT("Q32W32V32U32", d3d8_to_dxgi_format(D3DFMT_Q32W32V32U32), DXGI_FORMAT_R32G32B32A32_SINT);
+    CHECK_FMT("A2R10G10B10", d3d8_to_dxgi_format(D3DFMT_A2R10G10B10), DXGI_FORMAT_R10G10B10A2_UNORM);
+    CHECK_FMT("X2R10G10B10", d3d8_to_dxgi_format(D3DFMT_X2R10G10B10), DXGI_FORMAT_R10G10B10A2_UNORM);
+    CHECK_FMT("A2B10G10R10", d3d8_to_dxgi_format(D3DFMT_A2B10G10R10), DXGI_FORMAT_R10G10B10A2_UNORM);
+    CHECK_FMT("A2W10V10U10", d3d8_to_dxgi_format(D3DFMT_A2W10V10U10), DXGI_FORMAT_R10G10B10A2_UNORM);
+    CHECK_FMT("R11G11B10", d3d8_to_dxgi_format(D3DFMT_R11G11B10),     DXGI_FORMAT_R11G11B10_FLOAT);
+    CHECK_FMT("D24X8",     d3d8_to_dxgi_format(D3DFMT_D24X8),         DXGI_FORMAT_D24_UNORM_S8_UINT);
+    CHECK_FMT("D24FS8",    d3d8_to_dxgi_format(D3DFMT_D24FS8),        DXGI_FORMAT_D24_UNORM_S8_UINT);
+    CHECK_FMT("D32",       d3d8_to_dxgi_format(D3DFMT_D32),           DXGI_FORMAT_D32_FLOAT);
+    CHECK_FMT("DXN",       d3d8_to_dxgi_format(D3DFMT_DXN),           DXGI_FORMAT_BC5_UNORM);
+    CHECK_FMT("DXT3A",     d3d8_to_dxgi_format(D3DFMT_DXT3A),         DXGI_FORMAT_BC2_UNORM);
+    CHECK_FMT("DXT5A",     d3d8_to_dxgi_format(D3DFMT_DXT5A),         DXGI_FORMAT_BC3_UNORM);
+    CHECK_FMT("CTX1",      d3d8_to_dxgi_format(D3DFMT_CTX1),          DXGI_FORMAT_BC1_UNORM);
     /* LIN variants */
-    CHECK_FMT("LIN_R16F",  d3d8_to_gpu_format(D3DFMT_LIN_R16F),      SDL_GPU_TEXTUREFORMAT_R16_FLOAT);
-    CHECK_FMT("LIN_A16B16G16R16", d3d8_to_gpu_format(D3DFMT_LIN_A16B16G16R16), SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM);
-    CHECK_FMT("LIN_Q16W16V16U16", d3d8_to_gpu_format(D3DFMT_LIN_Q16W16V16U16), SDL_GPU_TEXTUREFORMAT_R16G16B16A16_SNORM);
+    CHECK_FMT("LIN_R16F",  d3d8_to_dxgi_format(D3DFMT_LIN_R16F),      DXGI_FORMAT_R16_FLOAT);
+    CHECK_FMT("LIN_A16B16G16R16", d3d8_to_dxgi_format(D3DFMT_LIN_A16B16G16R16), DXGI_FORMAT_R16G16B16A16_UNORM);
+    CHECK_FMT("LIN_Q16W16V16U16", d3d8_to_dxgi_format(D3DFMT_LIN_Q16W16V16U16), DXGI_FORMAT_R16G16B16A16_SNORM);
 }
 
 static void test_bpp(void)
@@ -176,7 +178,7 @@ static void test_unswizzle_roundtrip(void)
 /* swizzle_offset must land on the same byte that xbox_swizzle_rect wrote.
  *
  * The two are separate implementations of Morton order: xbox_swizzle_rect
- * walks rows and is what unswizzling (and therefore the upload path) trusts,
+ * walks rows and is what unswizzling (and therefore the D3D11 path) trusts,
  * while swizzle_offset computes one texel's address and is what the software
  * sampler calls per pixel. If they disagree, a texture decodes correctly in
  * one path and wrongly in the other -- which is how this was found: the
@@ -360,6 +362,22 @@ static void test_convert_linear(void)
     (void)src; (void)dst;
 }
 
+static void test_palette_argb(void)
+{
+    const BYTE indices[] = {1, 7, 128, 255};
+    const BYTE expected[] = {0,0,255,255, 255,0,0,255, 16,32,64,128, 3,2,1,0};
+    BYTE guarded[18];
+    memset(guarded, 0xA5, sizeof(guarded));
+    g_palette[1] = 0xFFFF0000u;
+    g_palette[7] = 0xFF0000FFu;
+    g_palette[128] = 0x80402010u;
+    g_palette[255] = 0x00010203u;
+    CHECK_FMT("P8 host layout", d3d8_to_dxgi_format(D3DFMT_P8), DXGI_FORMAT_B8G8R8A8_UNORM);
+    d3d8_convert_linear_pixels(D3DFMT_P8, 4, 1, indices, guarded + 1, 0);
+    CHECK("P8 ARGB palette to BGRA bytes", memcmp(guarded + 1, expected, sizeof(expected)) == 0);
+    CHECK("P8 conversion boundaries", guarded[0] == 0xA5 && guarded[17] == 0xA5);
+}
+
 static void test_fvf_position(void)
 {
     static const struct { DWORD position; UINT bytes; int transformed; } cases[] = {
@@ -386,7 +404,7 @@ int main(void)
     printf("d3d8_smoke: running\n");
     for (i = 0; i < 256; i++) g_palette[i] = 0xFF000000u | i;
 
-    test_to_gpu_format();
+    test_to_dxgi();
     test_bpp();
     test_predicates();
     test_swizzle_classification();
@@ -395,6 +413,7 @@ int main(void)
     test_dxt_decode();
     test_convert_linear();
     test_fvf_position();
+    test_palette_argb();
 
     if (failures == 0) {
         printf("d3d8_smoke: ALL PASS\n");

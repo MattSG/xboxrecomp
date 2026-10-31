@@ -1,15 +1,13 @@
 /*
  * kernel_memory.c - Xbox Memory Management
  *
- * Implements Mm* and NtAllocateVirtualMemory/NtFreeVirtualMemory/NtQueryVirtualMemory
- * using Win32 VirtualAlloc/VirtualFree/VirtualQuery.
- *
- * Xbox contiguous memory (MmAllocateContiguousMemory) is used for GPU-accessible
- * buffers. On Windows, actual GPU resources are handled by the D3D8 layer;
- * these allocations just need to return valid CPU-accessible memory.
+ * Native host allocation, mapping and query helpers. Guest ABI marshaling and
+ * owned guest allocation paths are handled separately by kernel_bridge.c.
+ * Several native wrappers below remain partial; see their implementation.
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* xbox_PhysNoteRamName */
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -52,14 +50,9 @@ PVOID __stdcall xbox_MmAllocateContiguousMemoryEx(
     ULONG Alignment,
     ULONG Protect)
 {
-    /*
-     * Xbox requests physically contiguous, aligned memory for GPU use.
-     * We can't guarantee physical contiguity on Windows, but the game's
-     * CPU-side code just needs a valid pointer. GPU resources are handled
-     * separately by the D3D8 layer.
-     *
-     * Use _aligned_malloc for alignment, then VirtualAlloc for a fallback.
-     */
+    /* Partial native helper: low/high bounds are not enforced. The aligned
+     * heap path does not apply Protect, and page allocation fallback does not
+     * guarantee a larger caller-requested alignment. */
     PVOID p = NULL;
 
     if (Alignment > 0 && (Alignment & (Alignment - 1)) == 0) {
@@ -138,9 +131,10 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
     memset(MemoryStatistics, 0, sizeof(XBOX_MM_STATISTICS));
     MemoryStatistics->Length = sizeof(XBOX_MM_STATISTICS);
 
-    /* Xbox has 64MB RAM. Report plausible values. */
+    /* Installed guest RAM follows the caller's memory-layout configuration.
+     * Availability below remains a host estimate, not guest allocation accounting. */
     ULONG page_size = 4096;
-    MemoryStatistics->TotalPhysicalPages = 64 * 1024 * 1024 / page_size; /* 16384 pages */
+    MemoryStatistics->TotalPhysicalPages = (ULONG)(g_xbox_total_ram / page_size);
     MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
     if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
         MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;
@@ -150,38 +144,42 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
 
 PVOID __stdcall xbox_MmMapIoSpace(ULONG_PTR PhysicalAddress, ULONG NumberOfBytes, ULONG Protect)
 {
-    /* GPU register access - handled by the D3D8 layer. Return a dummy buffer. */
-    PVOID p = VirtualAlloc(NULL, NumberOfBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    XBOX_TRACE(XBOX_LOG_MEM, "MmMapIoSpace(0x%08X, %u) = %p (stub)", (ULONG)PhysicalAddress, NumberOfBytes, p);
+    PVOID p = PhysicalAddress <= UINT32_MAX
+        ? xbox_MapPhysicalMemory((uint32_t)PhysicalAddress, NumberOfBytes, Protect) : NULL;
+    XBOX_TRACE(XBOX_LOG_MEM, "MmMapIoSpace(0x%08X, %u) = %p", (ULONG)PhysicalAddress, NumberOfBytes, p);
     return p;
 }
 
 VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
 {
     XBOX_TRACE(XBOX_LOG_MEM, "MmUnmapIoSpace(%p, %u)", BaseAddress, NumberOfBytes);
-    if (BaseAddress)
-        VirtualFree(BaseAddress, 0, MEM_RELEASE);
+    if (BaseAddress && !xbox_UnmapPhysicalMemory(BaseAddress, NumberOfBytes))
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM, "MmUnmapIoSpace: %p/%u is not an owned I/O mapping",
+                  BaseAddress, NumberOfBytes);
 }
 
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
 {
-    /*
-     * The contiguous arena is the virtual window onto physical RAM, so an
-     * address inside it is its physical offset plus XBOX_CONTIG_BASE. Anything
-     * outside passes through unchanged.
-     *
-     * The only implementation. bridge_MmGetPhysicalAddress calls this rather
-     * than repeating the arithmetic: the two used to disagree, with the bridge
-     * translating and this returning its argument unchanged as a placeholder,
-     * so the answer a title got depended on which dispatch path it took. A
-     * title writes the result into a pushbuffer, the NV2A reads an address
-     * with bit 31 set, and the corruption surfaces as wrong geometry with
-     * nothing naming this function.
-     */
-    uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    uint32_t physical;
+    uintptr_t address = (uintptr_t)BaseAddress;
+    uintptr_t ram = (uintptr_t)xbox_GetMemoryBase();
+    if (xbox_IoMappingQuery(BaseAddress, &physical, NULL, NULL))
+        return physical;
+    if (xbox_IsContiguousMemoryAvailable() &&
+        address >= (uintptr_t)xbox_GetMemoryOffset() &&
+        address - (uintptr_t)xbox_GetMemoryOffset() <= UINT32_MAX) {
+        uint32_t va = (uint32_t)(address - (uintptr_t)xbox_GetMemoryOffset());
+        if (va >= XBOX_CONTIG_BASE &&
+            (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+            return va - XBOX_CONTIG_BASE;
+    }
+    if (ram && address >= ram && address - ram < xbox_GetMappedSize()) {
+        uint32_t base = xbox_GetRamPhysicalBase();
+        if (base) return (ULONG_PTR)(base + (uint32_t)(address - ram));
+    }
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
+        "MmGetPhysicalAddress: unsupported native address %p; returning 0", BaseAddress);
+    return 0;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)
@@ -192,6 +190,9 @@ VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfB
 
 ULONG __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress)
 {
+    uint32_t protect;
+    if (xbox_IoMappingQuery(VirtualAddress, NULL, &protect, NULL))
+        return protect;
     MEMORY_BASIC_INFORMATION mbi;
     if (VirtualQuery(VirtualAddress, &mbi, sizeof(mbi))) {
         /* Return the Xbox-equivalent protection */
@@ -202,7 +203,13 @@ ULONG __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress)
 
 VOID __stdcall xbox_MmSetAddressProtect(PVOID BaseAddress, ULONG NumberOfBytes, ULONG NewProtect)
 {
+    int mapped = xbox_IoMappingSetProtect(BaseAddress, NumberOfBytes, NewProtect);
     DWORD old_protect;
+    if (mapped) {
+        if (mapped < 0) xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
+            "MmSetAddressProtect: rejected I/O mapping range/protection at %p", BaseAddress);
+        return;
+    }
     VirtualProtect(BaseAddress, NumberOfBytes, xbox_protect_to_win32(NewProtect), &old_protect);
     XBOX_TRACE(XBOX_LOG_MEM, "MmSetAddressProtect(%p, %u, 0x%X)", BaseAddress, NumberOfBytes, NewProtect);
 }
@@ -218,7 +225,7 @@ ULONG __stdcall xbox_MmQueryAllocationSize(PVOID BaseAddress)
 
 PVOID __stdcall xbox_MmClaimGpuInstanceMemory(ULONG NumberOfBytes, PULONG NumberOfPaddingBytes)
 {
-    /* GPU instance memory - handled by the D3D8 layer */
+    /* GPU instance memory - handled by D3D11 layer */
     if (NumberOfPaddingBytes)
         *NumberOfPaddingBytes = 0;
     PVOID p = VirtualAlloc(NULL, NumberOfBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);

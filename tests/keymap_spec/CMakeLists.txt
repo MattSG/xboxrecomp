@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(recomp_keymap_spec C)
+set(CMAKE_C_STANDARD 11)
+add_executable(recomp_keymap_spec test_keymap_spec.c ../../src/input/keymap_spec.c)
+target_include_directories(recomp_keymap_spec PRIVATE ../../src/input)
+enable_testing()
+add_test(NAME recomp_keymap_spec COMMAND recomp_keymap_spec)

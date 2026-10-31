@@ -106,11 +106,17 @@ enum {
 #ifndef STATUS_NO_MEMORY
 #define STATUS_NO_MEMORY                ((NTSTATUS)0xC0000017L)
 #endif
+#ifndef STATUS_CONFLICTING_ADDRESSES
+#define STATUS_CONFLICTING_ADDRESSES    ((NTSTATUS)0xC0000018L)
+#endif
 #ifndef STATUS_ALREADY_COMMITTED
 #define STATUS_ALREADY_COMMITTED        ((NTSTATUS)0xC0000021L)
 #endif
 #ifndef STATUS_ACCESS_DENIED
 #define STATUS_ACCESS_DENIED            ((NTSTATUS)0xC0000022L)
+#endif
+#ifndef STATUS_OBJECT_NAME_INVALID
+#define STATUS_OBJECT_NAME_INVALID      ((NTSTATUS)0xC0000033L)
 #endif
 #ifndef STATUS_OBJECT_NAME_NOT_FOUND
 #define STATUS_OBJECT_NAME_NOT_FOUND    ((NTSTATUS)0xC0000034L)
@@ -120,6 +126,9 @@ enum {
 #endif
 #ifndef STATUS_OBJECT_PATH_NOT_FOUND
 #define STATUS_OBJECT_PATH_NOT_FOUND    ((NTSTATUS)0xC000003AL)
+#endif
+#ifndef STATUS_SHARING_VIOLATION
+#define STATUS_SHARING_VIOLATION        ((NTSTATUS)0xC0000043L)
 #endif
 #ifndef STATUS_MUTANT_NOT_OWNED
 #define STATUS_MUTANT_NOT_OWNED         ((NTSTATUS)0xC0000046L)
@@ -381,8 +390,9 @@ struct _XBOX_KINTERRUPT {
     BOOLEAN Connected;
 };
 
-/* Thread start routine (Xbox uses __stdcall) */
-typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
+/* Native callbacks; guest addresses are dispatched by kernel_bridge.c. */
+typedef VOID (__stdcall *PXBOX_START_ROUTINE)(PVOID StartContext);
+typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PXBOX_START_ROUTINE StartRoutine, PVOID StartContext);
 
 /* Pool types */
 #define NonPagedPool    0
@@ -465,11 +475,7 @@ typedef VOID (*PIO_APC_ROUTINE)(
  * The kernel thunk table is an array of function pointers at a game-specific VA.
  * The address is parsed from the XBE header at runtime. Game code calls kernel
  * functions via: call [thunk_addr]. We fill this table with our xbox_* implementations.
- *
- * Legacy define for backward compatibility (Burnout 3 address).
- * New code should use xbox_kernel_set_thunk_address() instead.
  */
-#define XBOX_KERNEL_THUNK_TABLE_BASE  0x0036B7C0  /* default; overridden at runtime */
 /* The real kernel's export directory has 378 slots, of which 371 are exported
  * (ordinals 367-373 are null). Verified identical in xboxkrnl.exe from builds
  * 3944, 4039 and 5455, so this is stable across the console's life. The old
@@ -486,13 +492,20 @@ typedef VOID (*PIO_APC_ROUTINE)(
  * Set the kernel thunk table address for the current game.
  * Call this BEFORE xbox_kernel_bridge_init(). The address is parsed
  * from the XBE header's KernelImageThunkAddress field.
- * If not called, the default (a legacy title's 0x0036B7C0) is used.
+ * If not configured, bridge initialization refuses to patch guest memory.
+ * The count selects an exact span (NULL gaps are allowed), at most
+ * XBOX_KERNEL_THUNK_TABLE_SIZE slots. Zero address/count clears selection.
+ * Invalid alignment/range/count clears selection rather than guessing or
+ * clamping. Configured runtime backing is checked when available; standalone
+ * hosts remain responsible for mapping their selected guest span.
+ * Neighboring words are never treated as undeclared imports. Configure only
+ * while guest execution is quiesced; the getter reports the accepted range.
  */
 void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
 
 /**
  * Get the kernel thunk table address and entry count currently in effect.
- * Set during memory layout init from the XBE header. *xbox_va/*count are
+ * Set during memory layout init from the XBE header. Both outputs are
  * zeroed if never configured.
  */
 void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count);
@@ -508,25 +521,45 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
+/* Optional port replacement for a supported canonical function bridge.
+ * Configure before bridge initialization while guest execution is quiesced.
+ * Returns 0, or -1 for invalid/data/unrouted ordinals without changing policy.
+ * NULL restores the shared route on the next initialization. Policy persists
+ * across memory generations until changed. Native resolution is unaffected.
+ * The host callback reads/writes shared guest registers/memory; it owns pointer
+ * validation and semantics. ESP points to argument 0 (return slot already
+ * consumed), or register arguments retain their fastcall locations. Leave ESP
+ * at callback entry value on normal return: the
+ * dispatcher applies the original export's ABI cleanup exactly once. */
+int xbox_kernel_set_bridge_override(ULONG ordinal, void (*callback)(void));
 
-/**
- * Per-title kernel ordinal remap.
- *
- * The bridge routes ordinals with one hardcoded table -- the ordinal ABI of the
- * XDK it was written against (Halo's 3911 / Crimson's 5659). A title built with
- * a different XDK numbers the same kernel functions differently: Burnout 3's
- * XDK 5849 has HalRequestSoftwareInterrupt at 49 where the older XDKs have
- * HalReturnToFirmware. Without this, swapping such a title onto the shared kernel
- * misroutes it (Burnout 3 exited via HalReturnToFirmware during engine setup).
- *
- * `map[title_ordinal] = canonical_ordinal` translates a title's ordinals into
- * the kernel's canonical space before every routing decision. An entry of 0
- * (or a title_ordinal past `count`) means identity -- no title needs a real
- * ordinal 0. Call BEFORE xbox_kernel_bridge_init. A title whose XDK already
- * matches the kernel calls nothing and gets identity, so existing titles are
- * unaffected. Generate the map with tools/kernel_audit/gen_ordinal_remap.py.
- */
+
+/* Authorize inline Type 0/1, Size 4 KEVENT handling only at these guest kernel
+ * return PCs. Register both setter and wait sites before starting guest code;
+ * the bridge copies at most 16 callers. NULL/0 clears the list. Returns 0 on
+ * success, -1 for an invalid list. RECOMP_TITLE_KEVENTS remains independently
+ * opt-in; titles registering nothing retain the original behavior. */
+int xbox_kernel_set_inline_event_callers(const uint32_t *callers, unsigned count);
+
+/* Answers SCSI pass-through requests on the DVD device (IOCTLs whose input is
+ * a SCSI_PASS_THROUGH_DIRECT block). Return 1 after filling the request in guest
+ * memory and storing the IOSB Information value in *information; return 0 for
+ * the default answer, STATUS_SUCCESS with a zeroed output buffer. Startup-only. */
+typedef int (*xbox_dvd_scsi_hook_fn)(uint32_t scsi_va, uint32_t scsi_len,
+                                     uint32_t *information);
+void xbox_kernel_set_dvd_scsi_hook(xbox_dvd_scsi_hook_fn hook);
+
+/* Optional port-supplied source-to-canonical ordinal policy. Configure before
+ * both xbox_kernel_init and xbox_kernel_bridge_init, while execution is
+ * quiesced. The borrowed table must stay alive and unchanged until replaced
+ * or cleared. NULL or count <= 0 selects identity; a zero entry or source ID
+ * outside count also selects identity. Mapping is applied once, never chained.
+ * Derive port policy from independently verified import names/IDs rather than
+ * assuming an XDK version implies different kernel numbering. */
 void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
+/* Translate one source ID for native pointer-table and bridge initialization.
+ * xbox_resolve_ordinal always takes a canonical ID and does not remap it. */
+ULONG xbox_kernel_canonical_ordinal(ULONG source_ordinal);
 
 /* ============================================================================
  * Path Translation (kernel_path.c)
@@ -534,6 +567,8 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
 
 /* Initialize path translation with base directories */
 void xbox_path_init(const char* game_dir, const char* save_dir);
+
+
 
 /*
  * Character type of a translated host path. The Win32 file APIs take wide
@@ -555,6 +590,34 @@ typedef char  xbox_host_char;
 const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
+/* Native save root for host-owned persistent console state, not guest assets. */
+BOOL xbox_get_save_directory(xbox_host_char* buffer, DWORD capacity);
+
+/* Optional: a project sets this to see the guest paths the kernel translates
+ * (for example to print who opened a file). NULL by default; called before the
+ * path is translated, on the calling guest thread. Only paths a drive or
+ * device rule matches reach it: partition images and unrecognised paths
+ * do not. */
+extern void (*g_xbox_path_hook)(const char *xbox_path);
+
+/*
+ * Which tree a guest path lands in, from the same rule that translates it
+ * (after the title's own drive links). Prints nothing and creates nothing,
+ * so the missing-file report can ask without side effects. A name that is
+ * not absolute (relative to a RootDirectory handle) is UNKNOWN: no rule
+ * translates it.
+ */
+enum {
+    XBOX_TREE_UNKNOWN = 0,
+    XBOX_TREE_GAME,     /* the game files directory: D:, CdRom0, E:, C:, Y: */
+    XBOX_TREE_HDD,      /* the HDD root: T:, U:, Z:, the cache partitions   */
+    XBOX_TREE_USER,     /* the UDATA/TDATA saves and the E:\CACHE scratch   */
+    XBOX_TREE_DEVICE,   /* a bare device: CdRom0, a PartitionN image        */
+};
+int xbox_path_tree(const char *xbox_path);
+
+/* 1 when the directory holding host_path exists (kernel_file.c, per backend). */
+int xbox_host_parent_exists(const xbox_host_char *host_path);
 
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
@@ -588,8 +651,17 @@ ULONG   __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG P
 /* Name contended CRT locks by index instead of by address. */
 void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count);
 
+/* Deliver file I/O APCs (ReadFileEx/WriteFileEx completions) at the issuing
+ * thread's next alertable wait, which then returns STATUS_USER_APC, instead of
+ * inline at the request. That is what the hardware does, and a title whose
+ * completion routine clears a flag it sets *after* issuing the read needs it.
+ * Off by default: the inline path is what every other title was brought up
+ * on. Call before the guest runs. */
+void xbox_SetDeferredIoApc(int on);
+
 VOID    __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
+BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 
 ULONG   __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status);
@@ -640,6 +712,11 @@ NTSTATUS __stdcall xbox_NtQueryVirtualMemory(PVOID BaseAddress, PVOID MemoryInfo
  * File I/O (kernel_file.c)
  * ============================================================================ */
 
+/* Configure before file operations/worker startup. Default FALSE preserves
+ * caller ShareAccess. TRUE additionally shares read-only host opens for read;
+ * write-capable opens and existing incompatible handles remain exclusive. */
+void xbox_SetReadOnlyFileSharing(BOOLEAN enabled);
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -662,7 +739,6 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     PLARGE_INTEGER ByteOffset);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
-
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 
 NTSTATUS __stdcall xbox_NtQueryInformationFile(
@@ -676,6 +752,13 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass);
+
+/* NtSetInformationFile(FileRenameInformation), with the guest's
+ * FILE_RENAME_INFORMATION already unpacked: its FileName is a guest pointer,
+ * so only the bridge can read it. NewName->RootDirectory is a host HANDLE or
+ * NULL; a bare name with no root renames within the file's own directory. */
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists);
 
 NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
 
@@ -714,13 +797,21 @@ NTSTATUS __stdcall xbox_NtQuerySymbolicLinkObject(HANDLE LinkHandle, PXBOX_ANSI_
  * Threading (kernel_thread.c)
  * ============================================================================ */
 
+/* Native host callback facade: correct callback positions/arity and optional
+ * system routine. Guest CPU/TLS/object extension/debugger setup belongs to the
+ * guest path; nonzero extension/TLS or debugger requests return NOT_SUPPORTED.
+ * Zero stack bytes selects the host default; suspension uses host primitives.
+ * On failure supplied handle/ID outputs are cleared. */
 NTSTATUS __stdcall xbox_PsCreateSystemThreadEx(
     PHANDLE ThreadHandle, ULONG ThreadExtraSize, ULONG KernelStackSize,
-    ULONG TlsDataSize, PULONG ThreadId, PVOID StartContext1, PVOID StartContext2,
-    BOOLEAN CreateSuspended, BOOLEAN DebugStack,
-    PXBOX_SYSTEM_ROUTINE StartRoutine);
+    ULONG TlsDataSize, PULONG ThreadId, PXBOX_START_ROUTINE StartRoutine, PVOID StartContext,
+    BOOLEAN CreateSuspended, BOOLEAN DebuggerThread,
+    PXBOX_SYSTEM_ROUTINE SystemRoutine);
+NTSTATUS __stdcall xbox_PsCreateSystemThread(
+    PHANDLE ThreadHandle, PULONG ThreadId, PXBOX_START_ROUTINE StartRoutine,
+    PVOID StartContext, BOOLEAN DebuggerThread);
 
-NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus);
+VOID __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus);
 
 NTSTATUS __stdcall xbox_KeDelayExecutionThread(KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Interval);
 LONG     __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment);
@@ -728,6 +819,60 @@ LONG     __stdcall xbox_KeQueryBasePriorityThread(PVOID Thread);
 NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode);
 NTSTATUS __stdcall xbox_NtYieldExecution(void);
 NTSTATUS __stdcall xbox_NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHandle, ULONG Options);
+
+/* RECOMP_GUEST_CPUS=one or =<n>: the title's threads share one host core,
+ * as they shared the console's one CPU (kernel_thread.c). xbox_GuestCpuMask
+ * is the core as a mask, 0 when unset or =all leaves them on every core;
+ * xbox_GuestThreadPin puts the calling thread on it. */
+DWORD_PTR xbox_GuestCpuMask(void);
+void      xbox_GuestThreadPin(const char *role);
+
+/* The guest CPU (kernel_guest_cpu.c, RECOMP_GUEST_LOCK=1): one guest thread
+ * runs guest code at a time, as on the console. A guest thread joins before
+ * its first guest instruction and parts at its end; the kernel thunk
+ * dispatch releases it for the length of every kernel call and takes it
+ * back (a call that returns at once switches nobody; one past the thread's
+ * quantum, a yield or a blocking call hands over); a loop back edge hands
+ * it over when a waiter has waited its quantum (RECOMP_BACK_EDGE); a bridge
+ * that runs guest code on a guest thread takes it around the call. ISRs and
+ * DPCs never take it. Off, every call is a no-op. */
+enum {
+    XBOX_GUEST_CPU_KERNEL,      /* released at a kernel call: where = ordinal */
+    XBOX_GUEST_CPU_CALLBACK,    /* the end of a bridge-run guest routine */
+    XBOX_GUEST_CPU_PREEMPT,     /* a loop back edge past the quantum with a waiter: where = the jump's VA */
+    XBOX_GUEST_CPU_EXIT         /* the thread ended */
+};
+int      xbox_GuestCpuOn(void);
+void     xbox_GuestCpuReloadConfig(void);       /* tests, after changing the environment */
+void     xbox_GuestCpuJoin(void);
+void     xbox_GuestCpuPart(void);
+int      xbox_GuestCpuHeld(void);
+int      xbox_GuestCpuIsGuestThread(void);
+int      xbox_GuestCpuRelease(int kind, uint32_t where);   /* 1 if it was held */
+void     xbox_GuestCpuAcquire(void);
+void     xbox_GuestCpuBlocked(void);   /* a bridge blocks inside a non-blocking ordinal */
+void     xbox_GuestCpuPreempt(uint32_t va); /* RECOMP_BACK_EDGE with the flag set */
+int      xbox_GuestCpuEnterCallback(void);      /* 1 when it took the CPU */
+void     xbox_GuestCpuLeaveCallback(int took);
+unsigned long xbox_GuestCpuOwner(void);         /* the holder's tid, 0 when free */
+int      xbox_GuestCpuWaiting(void);            /* threads queued for it */
+/* Read by RECOMP_BACK_EDGE: a waiter has waited its quantum; the holder
+ * hands over at its next loop back edge. Only ever accessed atomically: a
+ * relaxed load in lifted code (templates/runtime/recomp_types.h), the
+ * Interlocked calls here. */
+extern int32_t g_xbox_guest_cpu_preempt;
+typedef struct {
+    long turns;         /* turns ended by a hand-off or by another thread taking the CPU */
+    long releases;      /* kernel calls that let go (soft) */
+    long switches;      /* of those, ones a waiter took the CPU at */
+    long waits;
+    long preempts;      /* turns ended at a loop back edge (RECOMP_BACK_EDGE) */
+    long max_turn_us, max_wait_us;
+    int max_turn_kind;                  /* XBOX_GUEST_CPU_* */
+    uint32_t max_turn_where;
+} XboxGuestCpuStats;
+void     xbox_GuestCpuStatsGet(XboxGuestCpuStats *out, int reset);
+void     xbox_GuestCpuReport(void);     /* the [GUEST] line, once per 600 vblanks */
 
 /* ============================================================================
  * Synchronization (kernel_sync.c)
@@ -780,7 +925,93 @@ KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
  * Device models ask before delivering an interrupt; raising IRQL masks the
  * line for the whole processor on hardware, not just for one thread. */
 int     xbox_IrqlBlocksInterrupts(void);
+int     xbox_IrqlCurrent(void);
 int     xbox_IrqlRaisedCount(void);
+int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
+/* The one-CPU DISPATCH gate (kernel_hal.c), on under RECOMP_DISPATCH_GATE=1.
+ * Off (the default) the entries below succeed and take nothing. */
+int     xbox_DispatchGateOn(void);
+int     xbox_DispatchGateTryEnter(void);       /* the one-CPU gate: ISR delivery */
+void    xbox_DispatchGateEnter(void);
+void    xbox_DispatchGateLeave(void);
+void    xbox_IrqlLeaveInterrupt(int saved);
+/* This thread is at DISPATCH_LEVEL or above, or holds the one-CPU gate. */
+int     xbox_IrqlThisThreadBlocksDpcs(void);
+/* This thread's IRQL (KPCR.Irql), for tests and reports. */
+int     xbox_IrqlCurrent(void);
+
+/* Device interrupts on the one-CPU gate holder (kernel_hal.c).
+ *
+ * A device model whose interrupt finds the gate held posts it; the holder
+ * runs it on its own thread at its next safe point (a kernel call or the
+ * gate's release), never alongside. */
+enum {
+    XBOX_IRQ_VBLANK,
+    XBOX_IRQ_APU,
+    XBOX_IRQ_OHCI,
+    XBOX_IRQ_LINES
+};
+/* What xbox_IrqPost tells the device model to do. */
+enum {
+    XBOX_IRQ_POSTED   = 0,  /* left for the holder (or already run) */
+    XBOX_IRQ_GATED    = 1,  /* the caller has the gate: deliver, then
+                               xbox_DispatchGateLeave */
+    XBOX_IRQ_UNGATED  = 2   /* deliver without the gate (RECOMP_IRQ_SAFE_FORCE,
+                               or RECOMP_IRQ_SAFE_POINTS=0) */
+};
+/* 1 only with the gate on and RECOMP_IRQ_SAFE_POINTS not 0. 0: the models'
+ * hold-off, keyed on the gate when it is on and on the raised-IRQL count
+ * (xbox_IrqlBlocksInterrupts) when it is off. */
+int     xbox_IrqSafePointsOn(void);
+/* The routine the holder runs for a line: it finds the connected ISR and
+ * calls it on g_esp (a worker stack the caller set up) at the device IRQL. */
+void    xbox_IrqSetHandler(int line, void (*run)(void));
+int     xbox_IrqPost(int line);
+void    xbox_IrqSafePoint(void);
+/* The [IRQ] summary line, once per 600 vblanks when anything was posted. */
+void    xbox_IrqReport(void);
+/* The thread holding the gate (0 when free), for the ungated-delivery logs. */
+unsigned long xbox_DispatchGateOwner(void);
+/* A model is about to run an ISR without the gate (RECOMP_IRQ_SAFE_POINTS=0,
+ * or RECOMP_IRQ_SAFE_FORCE): one line naming the holder it runs beside (the
+ * first 20 per line), and a count in the [IRQ] summary. */
+void    xbox_IrqNoteUngated(int line);
+
+/* DPCs queued by an interrupt (the queue in kernel_bridge.c). On the console
+ * one runs when the processor drops below DISPATCH, before the interrupted
+ * thread resumes; here a guest thread runs the queue on its raise to
+ * DISPATCH and at its gate release (kernel_hal.c), and the timer thread
+ * drains what no guest thread took, woken by KeInsertQueueDpc. */
+int     xbox_DpcQueue(uint32_t dpc_va, uint32_t arg1, uint32_t arg2);
+int     xbox_DpcPending(void);          /* an unlocked look */
+int     xbox_DpcDrainHere(void);        /* the caller holds the gate; DPCs run */
+/* The timer thread's drain: takes the gate only when it is free, never
+ * waits; 1 when DPCs stayed queued on a busy gate. *ran counts what ran. */
+int     xbox_DpcDrainTimer(int *ran);
+void    xbox_DpcMarkGuestThread(void);  /* this thread runs guest code */
+int     xbox_DpcOnRaise(void);  /* gate on and RECOMP_DPC_ON_RAISE not 0 */
+
+typedef struct {
+    long posted[XBOX_IRQ_LINES];       /* posts that found the gate held */
+    long on_holder[XBOX_IRQ_LINES];    /* run by the holder at a safe point */
+    long second_try[XBOX_IRQ_LINES];   /* taken back by the poster's retry */
+    long forced[XBOX_IRQ_LINES];       /* RECOMP_IRQ_SAFE_FORCE deliveries */
+    long ungated[XBOX_IRQ_LINES];      /* run beside a holder (any mode) */
+    long max_wait_us[XBOX_IRQ_LINES];  /* longest post-to-run wait */
+    long wait_logs;                    /* holder-without-safe-point lines */
+    long refused;                      /* safe points that could not run */
+} XboxIrqStats;
+void    xbox_IrqStatsGet(XboxIrqStats *out, int reset);
+/* Tests: re-read RECOMP_DISPATCH_GATE, RECOMP_IRQ_SAFE_* and
+ * RECOMP_DPC_ON_RAISE after changing the environment, and a
+ * hook run between the poster's first try and its post (the lost-post
+ * window). */
+void    xbox_IrqReloadConfig(void);
+void    xbox_IrqSetPostHook(void (*hook)(int line));
+/* Tests: a hook run inside the lower that gives the gate back, after its
+ * safe point and before the leave (the window the release point covers). */
+void    xbox_IrqSetReleaseHook(void (*hook)(void));
+void    xbox_IrqlSyncInterrupts(void);
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */
@@ -813,15 +1044,26 @@ extern volatile ULONG xbox_KeTickCount;
 extern XBOX_HARDWARE_INFO      xbox_HardwareInfo;
 extern XBOX_KRNL_VERSION       xbox_KrnlVersion;
 
-/* Override the reported kernel version (ordinal 324). */
+/* Port-owned identity/credential exports. Configure before initialization,
+ * while quiesced; bridge initialization copies the current values to guest
+ * storage. Zero defaults mean unconfigured, not a verified console identity.
+ * Reported version does not change canonical ordinal numbering or emulation. */
 void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qfe);
 extern UCHAR                   xbox_EEPROMKey[16];
 extern UCHAR                   xbox_HDKey[16];
 extern UCHAR                   xbox_SignatureKey[16];
 extern UCHAR                   xbox_LANKey[16];
 extern UCHAR                   xbox_AlternateSignatureKeys[16][16];
+/* Counted host string: caller backs Length bytes and retains Buffer while
+ * native consumers use it. Bridge init copies bytes and MaximumLength capacity
+ * into guest storage; it does not assume a terminator. Invalid counts/pointers
+ * or allocation failure leave an empty guest descriptor. */
 extern XBOX_ANSI_STRING        xbox_XeImageFileName;
 extern UCHAR                   xbox_XePublicKeyData[284];
+/* Optional boot input, NULL for no launch page. Set before initialization,
+ * keep alive while native exports can use it, and change only while quiesced.
+ * Bridge initialization copies the full page into owned guest heap storage.
+ * Port supplies all fields and payload; runtime does not read environment. */
 extern XBOX_LAUNCH_DATA_PAGE*  xbox_LaunchDataPage;
 
 NTSTATUS __stdcall xbox_XeLoadSection(PXBE_SECTION_HEADER Section);
@@ -854,13 +1096,14 @@ extern PVOID xbox_IoCompletionObjectType;
 extern PVOID xbox_IoFileObjectType;
 
 VOID    __stdcall xbox_IoInitializeIrp(PVOID Irp, USHORT PacketSize, CCHAR StackSize);
-VOID    __stdcall xbox_IoStartNextPacket(PVOID DeviceObject, BOOLEAN Cancelable);
-VOID    __stdcall xbox_IoStartNextPacketByKey(PVOID DeviceObject, BOOLEAN Cancelable, ULONG Key);
-VOID    __stdcall xbox_IoStartPacket(PVOID DeviceObject, PVOID Irp, PULONG Key, PVOID CancelFunction);
+VOID    __stdcall xbox_IoStartNextPacket(PVOID DeviceObject);
+VOID    __stdcall xbox_IoStartNextPacketByKey(PVOID DeviceObject, ULONG Key);
+VOID    __stdcall xbox_IoStartPacket(PVOID DeviceObject, PVOID Irp, PULONG Key);
 NTSTATUS __stdcall xbox_IoSetIoCompletion(PVOID IoCompletion, PVOID KeyContext, PVOID ApcContext, NTSTATUS IoStatus, ULONG_PTR IoStatusInformation);
 VOID    __stdcall xbox_IoMarkIrpMustComplete(PVOID Irp);
 NTSTATUS __stdcall xbox_IoSynchronousDeviceIoControlRequest(ULONG IoControlCode, PVOID DeviceObject, PVOID InputBuffer, ULONG InputBufferLength, PVOID OutputBuffer, ULONG OutputBufferLength, PULONG ReturnedOutputBufferLength, BOOLEAN InternalDeviceIoControl);
-NTSTATUS __stdcall xbox_IoBuildDeviceIoControlRequest(ULONG IoControlCode, PVOID DeviceObject, PVOID InputBuffer, ULONG InputBufferLength, PVOID OutputBuffer, ULONG OutputBufferLength, BOOLEAN InternalDeviceIoControl, HANDLE Event, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
+PVOID   __stdcall xbox_IoBuildDeviceIoControlRequest(ULONG IoControlCode, PVOID DeviceObject, PVOID InputBuffer, ULONG InputBufferLength, PVOID OutputBuffer, ULONG OutputBufferLength, BOOLEAN InternalDeviceIoControl, PVOID Event, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
+PVOID   __stdcall xbox_IoBuildAsynchronousFsdRequest(ULONG MajorFunction, PVOID DeviceObject, PVOID Buffer, ULONG Length, PLARGE_INTEGER StartingOffset, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
 NTSTATUS __stdcall xbox_IoSynchronousFsdRequest(ULONG MajorFunction, PVOID DeviceObject, PVOID Buffer, ULONG Length, PLARGE_INTEGER StartingOffset);
 PVOID   __stdcall xbox_IoBuildSynchronousFsdRequest(ULONG MajorFunction, PVOID DeviceObject, PVOID Buffer, ULONG Length, PLARGE_INTEGER StartingOffset, HANDLE Event, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
 NTSTATUS __stdcall xbox_IoInvalidDeviceRequest(PVOID DeviceObject, PVOID Irp);
@@ -891,7 +1134,7 @@ VOID    __stdcall xbox_XcHMAC(const UCHAR* Key, ULONG KeyLength, const UCHAR* Da
 ULONG   __stdcall xbox_XcPKGetKeyLen(PVOID PublicKey);
 ULONG   __stdcall xbox_XcPKDecPrivate(PVOID PrivateKey, PVOID Input, PVOID Output);
 ULONG   __stdcall xbox_XcPKEncPublic(PVOID PublicKey, PVOID Input, PVOID Output);
-BOOLEAN __stdcall xbox_XcVerifyPKCS1Signature(PVOID Hash, PVOID PublicKey, PVOID Signature);
+BOOLEAN __stdcall xbox_XcVerifyPKCS1Signature(PVOID Signature, PVOID PublicKey, PVOID Hash);
 ULONG   __stdcall xbox_XcModExp(PULONG Result, PULONG Base, PULONG Exponent, PULONG Modulus, ULONG ModulusLength);
 
 VOID    __stdcall xbox_XcDESKeyParity(PUCHAR Key, ULONG KeyLength);
@@ -914,6 +1157,8 @@ ULONG   __stdcall xbox_AvGetSavedDataAddress(void);
 VOID    __stdcall xbox_AvSendTVEncoderOption(PVOID RegisterBase, ULONG Option, ULONG Param, PULONG Result);
 VOID    __stdcall xbox_AvSetSavedDataAddress(ULONG Address);
 VOID    __stdcall xbox_AvSetDisplayMode(PVOID RegisterBase, ULONG Step, ULONG Mode, ULONG Format, ULONG Pitch, ULONG FrameBuffer);
+/* Pitch, bytes per pixel and width/height of the last AvSetDisplayMode; 0 if none was set or it is undecodable. */
+int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp, uint32_t *w, uint32_t *h);
 
 /* SMBus (HalReadSMBusValue / HalWriteSMBusValue) */
 NTSTATUS __stdcall xbox_HalReadSMBusValue(UCHAR SlaveAddress, UCHAR CommandCode, BOOLEAN ReadWordValue, PULONG DataValue);
@@ -925,10 +1170,14 @@ ULONGLONG  __stdcall xbox_KeQueryInterruptTime(void);
 BOOLEAN __stdcall xbox_KeDisconnectInterrupt(PXBOX_KINTERRUPT Interrupt);
 
 /* HAL data exports -- ordinals 40/41/42 and 356/357 are variables, not calls. */
+/* Port-owned topology and counted strings, with the same lifetime/copy
+ * contract as xbox_XeImageFileName. Zero defaults mean unconfigured. */
 extern ULONG            xbox_HalDiskCachePartitionCount;
 extern XBOX_ANSI_STRING xbox_HalDiskModelNumber;
 extern XBOX_ANSI_STRING xbox_HalDiskSerialNumber;
 extern ULONG            xbox_HalBootSMCVideoMode;
+/* Native host-owned channel, NULL until supplied. No native IDE implementation
+ * or host-to-guest object marshaling is implied; guest bridge storage is separate. */
 extern PVOID            xbox_IdexChannelObject;
 
 /* EEPROM / Non-Volatile Settings */
@@ -1080,8 +1329,67 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
 #define XBOX_LOG_THUNK   "THUNK"
 #define XBOX_LOG_PATH    "PATH"
 
+/* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off):
+ * the clock a held flip waits on (nv2a_flip_hold.h). Interlaced output shows
+ * one field per vblank, so its low bit is the field parity that the field pin
+ * (port 0x80C0) reports. */
+uint32_t xbox_VblankCount(void);
+
+/* cpuid for lifted code (kernel_hal.c): the Xbox's Pentium III. Also declared
+ * in templates/runtime/recomp_types.h for generated code. */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+/* RECOMP_VBLANK's mode (kernel_bridge.c): off when unset; the tick v0.14.0
+ * had when set; the 60 Hz schedule with the vblank-ack thread when it is
+ * "paced" or paced_wanted (the gate or the flip hold is on). Pure,
+ * for tests/vblank_ack. */
+enum { XBOX_VBLANK_OFF, XBOX_VBLANK_TICK, XBOX_VBLANK_PACED };
+int xbox_VblankMode(const char *env, int paced_wanted);
+
+/* One vblank's acknowledgement (kernel_bridge.c, the vblank-ack thread):
+ * waits for the DPC's write of the PCRTC_INTR_0 vblank bit and clears it and
+ * PMC_INTR_0's PCRTC bit. Yields for 2 ms, then waits on `rearm` in 1 ms
+ * steps, and past a second in 16 ms ones, for as long as the PMC bit is up.
+ * While *tick_busy is set the PCRTC bit is a vblank being raised, not an
+ * ack, and is left. late_ms is how late a late ack came. Not static so
+ * tests/vblank_ack can drive it against plain words. */
+enum { XBOX_VBL_ACK_ON_TIME, XBOX_VBL_ACK_LATE, XBOX_VBL_ACK_REARMED,
+       XBOX_VBL_ACK_NONE };
+int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
+                       volatile LONG *tick_busy, HANDLE rearm, long *late_ms);
+/* One vblank's status bits (kernel_bridge.c, kernel_vblank_raise): latches
+ * PMC_INTR_0's PCRTC bit and returns whether the NV2A's interrupt line goes
+ * up. With PMC_INTR_EN_0 at 0 (the XDK ISR's mask while its DPC is queued or
+ * running) it stays down: 0, PCRTC_INTR_0 and *tick_busy are left, and no
+ * ISR is to be posted. Otherwise 1, with PCRTC_INTR_0's bit and *tick_busy
+ * set for the ISR. Not static so tests/vblank_ack can drive it. */
+int xbox_VblankRaiseBits(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
+                         volatile uint32_t *pmc_intr_en, volatile LONG *tick_busy);
+/* The bits half of arming the vblank ack watch (kernel_bridge.c): with
+ * `raised` (this tick set PCRTC_INTR_0's vblank bit for the ISR) the bit is
+ * cleared, then *tick_busy is dropped. A masked tick passes 0: it set no
+ * PCRTC bit, so one that is up is the DPC's ack, and it is left for the
+ * watch. Not static so tests/vblank_ack can drive it. */
+void xbox_VblankArmBits(volatile uint32_t *pcrtc_intr, volatile LONG *tick_busy,
+                        int raised);
+/* Whether the nv2a-ack thread should leave PMC_INTR_0's PCRTC bit and
+ * PCRTC_INTR_0's vblank bit to the vblank-ack thread: it runs, and an ack
+ * has come (or a vblank is being raised) within the last second. */
+int xbox_VblankAckHeld(void);
+
 #ifdef __cplusplus
 }
 #endif
+
+#include <stdlib.h>
+/* Per-operation file/event lines ([PATH], [FILE], [READ], NtCreateEvent):
+ * RECOMP_IO_TRACE=1. Off by default: stderr is the console when the game is
+ * played, and a synchronous write (and flush) per disc read and file probe
+ * stalled the game thread while it streamed the city. */
+static inline int xbox_io_trace(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_IO_TRACE") != NULL;
+    return on;
+}
 
 #endif /* XBOX_KERNEL_H */

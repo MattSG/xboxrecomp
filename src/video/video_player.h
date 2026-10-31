@@ -1,10 +1,10 @@
 /**
- * Shared FMV player: FFmpeg decode onto a D3D8 texture.
+ * Shared FMV player: Media Foundation decode onto a D3D8 texture.
  *
  * For a title whose video is a container Windows can already decode, the
  * decoder does not have to be emulated for the video to be watchable. The
- * recompiled title still decides when: it opens the file as its own logic
- * dictates, and the runtime plays the file it opened.
+ * port decides whether and when to use this host-side presentation substitute.
+ * Opening a guest file does not start playback in the generic runtime.
  */
 
 #ifndef XBOXRECOMP_VIDEO_PLAYER_H
@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-/* Initialize/shutdown the decoder (call once at app start/end) */
+/* Initialize/shutdown Media Foundation (call once at app start/end) */
 int  video_init(void);
 void video_shutdown(void);
 
@@ -33,38 +33,34 @@ int  video_is_finished(void);
 /* Close the current video and release resources. */
 void video_close(void);
 
-/* === Boot sequence state machine === */
-
-/* Boot phases */
-
-/* Get current boot phase */
-
-/* Advance boot state machine. Call once per frame.
- * skip=1 if user pressed a button to skip current video.
- * Returns the new phase. */
-
-/* Render current boot phase (video frame or press-start screen). */
-
-
-/* Play one video file, start to finish, in its own window on its own thread.
+/* Play one UTF-8 host path, start to finish, in its own window/thread.
  * Returns 0 if the pump started. Blocking work happens on that thread, so the
  * guest carries on running while the video plays. */
 int  xbox_VideoPlayFile(const char *host_path);
 int  xbox_VideoIsPlaying(void);
+/* Optional pump presentation notification, 1-based and reset for each playback.
+ * Register/clear only while playback is stopped and callers are quiesced.
+ * Called on the playback thread after Present returns; it does not prove the
+ * presentation succeeded or that a new frame decoded. May inspect/dump the
+ * current decoded frame; must not run guest code, restart playback or shut down
+ * the decoder. */
+void xbox_VideoSetPresentHandler(void (*handler)(unsigned frame));
 
-/* Write the current decoded frame to a 24-bit BMP -- evidence that real
- * pixels reached the renderer, which a log line cannot give. */
+/* Write the current decoded CPU frame to a 24-bit BMP.
+ * This is not a readback of the rendered window or proof of presentation. */
 int  video_dump_frame_bmp(const char *path);
 
 /* Show the guest framebuffer in its own window (RECOMP_FB_WINDOW). Whatever
  * the title renders into guest RAM appears there; nothing else scans it out. */
-/* Non-zero while that virtual key is held in the framebuffer window. Always
- * zero when there is no window, which is the right answer: with nothing to
- * focus there is nothing to type into. */
-int xbox_FramebufferKeyDown(int vk);
-
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+/* Rows per displayed row: 2 for a 2x2 anti-aliased surface, else 1. */
+void xbox_FramebufferWindowSetAA(uint32_t sy);
+void xbox_FramebufferWindowScanout(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
+/* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
+ * UTF-16 title (40 chars max); the stats come from each flip. */
+void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
+void xbox_FramebufferWindowFrameStats(uint32_t draws);
 
-#endif /* BURNOUT3_VIDEO_PLAYER_H */
+#endif /* XBOXRECOMP_VIDEO_PLAYER_H */

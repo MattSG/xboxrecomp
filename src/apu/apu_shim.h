@@ -4,7 +4,7 @@
  * Replaces QEMU types, SDL audio, and libsamplerate functions with
  * minimal Win32 equivalents so that xemu's APU code can compile standalone.
  *
- * Copyright (c) 2026 Burnout 3 Static Recompilation Project
+ * Copyright (c) 2026 xboxrecomp project
  * Based on xemu code: Copyright (c) 2012 espes, 2018-2025 Matt Borgerson et al.
  *
  * This library is free software; you can redistribute it and/or
@@ -48,7 +48,11 @@ static inline int64_t qemu_clock_get_us(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000LL / freq.QuadPart);
+    /* Split, not count * 1e6 / freq: on POSIX the counter is CLOCK_MONOTONIC
+     * in nanoseconds (freq 1e9), and the product overflows int64 after about
+     * 2.5 hours of host uptime and the clock jumps. */
+    return (int64_t)(count.QuadPart / freq.QuadPart) * 1000000LL +
+           (int64_t)(count.QuadPart % freq.QuadPart) * 1000000LL / freq.QuadPart;
 }
 #endif
 
@@ -94,33 +98,37 @@ static inline void qemu_thread_join(QemuThread *t) {
  * ============================================================ */
 
 extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+/* Where a physical address the title handed the APU lives. See apu_core.c. */
+uint8_t *mcpx_apu_phys(uint64_t addr);
+/* Which case of mcpx_apu_phys resolved an address, for trace lines. */
+const char *mcpx_apu_phys_class(uint64_t addr);
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint32_t *)mcpx_apu_phys(addr);
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint16_t *)mcpx_apu_phys(addr);
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint8_t *)mcpx_apu_phys(addr);
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint32_t *)mcpx_apu_phys(addr) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint16_t *)mcpx_apu_phys(addr) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint8_t *)mcpx_apu_phys(addr) = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */
@@ -173,8 +181,8 @@ static inline uint8_t *memory_region_get_ram_ptr(MemoryRegion *mr) {
 /* ============================================================
  * libsamplerate stubs (SRC)
  *
- * The VP uses libsamplerate for pitch-shifted voice resampling.
- * We stub it initially; voices will play at native rate.
+ * These compatibility callbacks do not resample and return no frames.
+ * They are not a native-rate playback fallback.
  * ============================================================ */
 
 typedef void SRC_STATE;
@@ -221,8 +229,8 @@ static inline void src_float_to_short_array(const float *in, int16_t *out,
 /* ============================================================
  * SDL Audio stubs
  *
- * The monitor output uses SDL. We stub it; actual audio output
- * will be connected via WASAPI separately.
+ * These compatibility entrypoints do not open an SDL audio stream.
+ * Native output is provided by apu_xaudio2.c.
  * ============================================================ */
 
 typedef void SDL_AudioStream;
@@ -362,7 +370,7 @@ static struct {
 } g_config = {
     .audio = {
         .volume_limit = 1.0f,
-        .hrtf = false,
+        .hrtf = true,       /* xemu's default */
         .vp = { .num_workers = 1 },
     },
 };

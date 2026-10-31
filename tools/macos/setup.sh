@@ -5,7 +5,7 @@
 #
 # By default it sets up the Python side, which is quick:
 #
-#   1. SDL3 via Homebrew (optional: CMake builds SDL3 itself if it is missing)
+#   1. SDL2 and libepoxy via Homebrew, which the OpenGL video backend links
 #   2. a virtualenv in .venv with the suite's Python dependencies
 #   3. a `py` shell function, so Windows' `py -3` works here too
 #
@@ -51,14 +51,14 @@ echo "python3: $(python3 --version 2>&1)"
 # ----------------------------------------------------------------------- venv
 step "Native libraries"
 
-# SDL3 is what the runtime links against (the SDL_GPU Metal backend). It is
+# SDL2 and libepoxy are what the OpenGL video backend links against. They are
 # not needed for the test suite, so a missing Homebrew is a warning rather than
 # a failure -- someone setting up only to run the tests should not be stopped by
 # a dependency they will not reach.
-BREW_FORMULAE="sdl3"
+BREW_FORMULAE="sdl2 libepoxy"
 if ! command -v brew >/dev/null 2>&1; then
     echo "Homebrew not found; skipping $BREW_FORMULAE."
-    echo "The test suite does not need it, and CMake builds SDL3 if it is missing."
+    echo "The test suite does not need them, but the OpenGL video backend does."
     echo "Install Homebrew from https://brew.sh, or install them another way."
 else
     missing=""

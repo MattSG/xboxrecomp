@@ -17,6 +17,7 @@ implementation = core[core.index("static void mixer_init(void)\n{"):]
 source = """
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "platform/xbox_winnt.h"
 #include "apu/apu.h"

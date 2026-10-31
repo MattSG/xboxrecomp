@@ -13,6 +13,9 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* ============================================================================
  * Thread Start Wrapper
@@ -23,106 +26,55 @@
  * ============================================================================ */
 
 typedef struct _XBOX_THREAD_START_INFO {
-    PXBOX_SYSTEM_ROUTINE StartRoutine;
-    PVOID                StartContext;
+    PXBOX_START_ROUTINE StartRoutine;
+    PXBOX_SYSTEM_ROUTINE SystemRoutine;
+    PVOID StartContext;
 } XBOX_THREAD_START_INFO;
 
-static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
+static DWORD WINAPI xbox_thread_wrapper(LPVOID parameter)
 {
-    XBOX_THREAD_START_INFO info = *(XBOX_THREAD_START_INFO*)lpParameter;
-
-    /* Free the start info before calling the routine - the routine may
-     * never return (calling PsTerminateSystemThread instead) */
-    HeapFree(GetProcessHeap(), 0, lpParameter);
-
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u starting at %p",
-        GetCurrentThreadId(), info.StartRoutine);
-
-    info.StartRoutine(info.StartContext);
-
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u returned normally",
-        GetCurrentThreadId());
-
+    XBOX_THREAD_START_INFO info=*(XBOX_THREAD_START_INFO *)parameter;
+    /* Both callbacks may terminate the host thread without returning. */
+    HeapFree(GetProcessHeap(),0,parameter);
+    if (info.SystemRoutine) info.SystemRoutine(info.StartRoutine,info.StartContext);
+    else info.StartRoutine(info.StartContext);
     return 0;
 }
 
-/* ============================================================================
- * PsCreateSystemThreadEx
- *
- * Xbox signature:
- *   PsCreateSystemThreadEx(
- *     OUT PHANDLE ThreadHandle,
- *     IN ULONG ThreadExtraSize,      // extra bytes in thread object (ignored)
- *     IN ULONG KernelStackSize,      // stack size (0 = default)
- *     IN ULONG TlsDataSize,          // TLS data size (Xbox-specific, ignored)
- *     OUT PULONG ThreadId,           // optional thread ID
- *     IN PVOID StartContext1,        // context passed to StartRoutine
- *     IN PVOID StartContext2,        // alternate context (unused by game code)
- *     IN BOOLEAN CreateSuspended,
- *     IN BOOLEAN DebugStack,         // debug stack (ignored)
- *     IN PXBOX_SYSTEM_ROUTINE StartRoutine
- *   )
- *
- * Maps to: CreateThread with a wrapper for calling convention adaptation.
- * ============================================================================ */
-
 NTSTATUS __stdcall xbox_PsCreateSystemThreadEx(
-    PHANDLE ThreadHandle,
-    ULONG ThreadExtraSize,
-    ULONG KernelStackSize,
-    ULONG TlsDataSize,
-    PULONG ThreadId,
-    PVOID StartContext1,
-    PVOID StartContext2,
-    BOOLEAN CreateSuspended,
-    BOOLEAN DebugStack,
-    PXBOX_SYSTEM_ROUTINE StartRoutine)
+    PHANDLE ThreadHandle, ULONG ThreadExtraSize, ULONG KernelStackSize,
+    ULONG TlsDataSize, PULONG ThreadId, PXBOX_START_ROUTINE StartRoutine,
+    PVOID StartContext, BOOLEAN CreateSuspended, BOOLEAN DebuggerThread,
+    PXBOX_SYSTEM_ROUTINE SystemRoutine)
 {
-    XBOX_THREAD_START_INFO* info;
-    HANDLE hThread;
-    DWORD dwThreadId;
-    DWORD dwCreationFlags;
-
-    (void)ThreadExtraSize;
-    (void)TlsDataSize;
-    (void)StartContext2;
-    (void)DebugStack;
-
-    if (!ThreadHandle || !StartRoutine)
-        return STATUS_INVALID_PARAMETER;
-
-    /* Allocate start info - freed by the wrapper thread */
-    info = (XBOX_THREAD_START_INFO*)HeapAlloc(GetProcessHeap(), 0, sizeof(XBOX_THREAD_START_INFO));
-    if (!info)
-        return STATUS_NO_MEMORY;
-
-    info->StartRoutine = StartRoutine;
-    info->StartContext = StartContext1;
-
-    dwCreationFlags = CreateSuspended ? CREATE_SUSPENDED : 0;
-
-    /* Use default stack size if 0 (Xbox default is 64KB) */
-    if (KernelStackSize == 0)
-        KernelStackSize = 65536;
-
-    hThread = CreateThread(NULL, KernelStackSize, xbox_thread_wrapper, info,
-                           dwCreationFlags, &dwThreadId);
-    if (!hThread) {
-        HeapFree(GetProcessHeap(), 0, info);
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
-            "PsCreateSystemThreadEx: CreateThread failed (error %u)", GetLastError());
+    XBOX_THREAD_START_INFO *info;
+    DWORD id=0;
+    HANDLE thread;
+    if (ThreadHandle) *ThreadHandle=NULL;
+    if (ThreadId) *ThreadId=0;
+    if (!ThreadHandle || !StartRoutine) return STATUS_INVALID_PARAMETER;
+    if (ThreadExtraSize || TlsDataSize || DebuggerThread) return STATUS_NOT_SUPPORTED;
+    info=HeapAlloc(GetProcessHeap(),0,sizeof(*info));
+    if (!info) return STATUS_NO_MEMORY;
+    info->StartRoutine=StartRoutine; info->SystemRoutine=SystemRoutine;
+    info->StartContext=StartContext;
+    thread=CreateThread(NULL,KernelStackSize,xbox_thread_wrapper,info,
+                        CreateSuspended?CREATE_SUSPENDED:0,&id);
+    if (!thread) {
+        HeapFree(GetProcessHeap(),0,info);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-
-    *ThreadHandle = hThread;
-    if (ThreadId)
-        *ThreadId = dwThreadId;
-
-    xbox_log(XBOX_LOG_INFO, XBOX_LOG_THREAD,
-        "PsCreateSystemThreadEx: created thread %u (handle=%p, routine=%p, suspended=%d)",
-        dwThreadId, hThread, StartRoutine, CreateSuspended);
-
+    *ThreadHandle=thread;
+    if (ThreadId) *ThreadId=id;
     return STATUS_SUCCESS;
+}
+
+NTSTATUS __stdcall xbox_PsCreateSystemThread(
+    PHANDLE ThreadHandle, PULONG ThreadId, PXBOX_START_ROUTINE StartRoutine,
+    PVOID StartContext, BOOLEAN DebuggerThread)
+{
+    return xbox_PsCreateSystemThreadEx(ThreadHandle,0,0,0,ThreadId,
+                                     StartRoutine,StartContext,FALSE,DebuggerThread,NULL);
 }
 
 /* ============================================================================
@@ -132,7 +84,7 @@ NTSTATUS __stdcall xbox_PsCreateSystemThreadEx(
  * system threads to exit. Maps directly to ExitThread.
  * ============================================================================ */
 
-NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus)
+VOID __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus)
 {
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD,
         "PsTerminateSystemThread: thread %u exiting with status 0x%08X",
@@ -140,8 +92,6 @@ NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus)
 
     ExitThread((DWORD)ExitStatus);
 
-    /* ExitThread never returns, but the compiler needs this */
-    return STATUS_SUCCESS;
 }
 
 /* ============================================================================
@@ -400,17 +350,13 @@ NTSTATUS __stdcall xbox_NtResumeThread(
  * Worker stack slices + game-thread tracking (host-tick-driven titles)
  * ================================================================
  *
- * Ported from the Burnout 3 fork as the runtimes reunite. A host-driven title
- * returns from its entry after spawning an init thread and expects the host's
- * own thread to drive the per-frame tick; to call recompiled code from there it
- * needs a guest stack, which a worker slice provides. Additive: a default-model
- * title never calls any of this, so it is inert for Halo, Crimson Skies, etc.
- * See docs/technical/burnout3-reunification.md and XBOX_WORKER_STACK_* in
- * xbox_memory_layout.h.
+ * Optional guest stack slices for host threads entering recompiled code,
+ * plus a handle to the latest spawned guest thread for host diagnostics.
+ * See XBOX_WORKER_STACK_* in xbox_memory_layout.h.
  */
 
 /* The game's own thread, kept so a wedged boot can be inspected from the host
- * watchdog. Set when a title's game thread is spawned; NULL under the default
+ * watchdog. Set when a title's game thread is spawned; NULL under the explicitly selected
  * inline model, where there is no separate thread to sample. */
 static HANDLE g_game_thread = NULL;
 
@@ -421,10 +367,34 @@ void *xbox_thread_debug_handle(void) { return (void *)g_game_thread; }
  * allocate a slice from the host thread while recompiled code allocates one for
  * a spawned worker, so the allocator itself must be thread-safe. */
 static volatile LONG g_worker_stack_used[XBOX_WORKER_STACK_COUNT];
+/* No slices are owned until the loader or standalone host supplies a range. */
+uint32_t g_xbox_worker_stack_base;
+
+void xbox_worker_stack_reset(uint32_t base)
+{
+    g_xbox_worker_stack_base = base;
+    for (int i = 0; i < XBOX_WORKER_STACK_COUNT; i++)
+        g_worker_stack_used[i] = 0;
+}
+
+/* Internal bounds lookup for a retained callback lease. Reset is quiesced. */
+BOOL xbox_worker_stack_bounds(uint32_t address, uint32_t *low, uint32_t *high)
+{
+    uint32_t base=g_xbox_worker_stack_base;
+    uint64_t end=(uint64_t)base+XBOX_WORKER_STACK_SIZE*XBOX_WORKER_STACK_COUNT;
+    unsigned slot;
+    if (!base || address<base || address>=end || end>UINT32_MAX) return FALSE;
+    slot=(address-base)/XBOX_WORKER_STACK_SIZE;
+    if (!InterlockedCompareExchange(&g_worker_stack_used[slot],0,0)) return FALSE;
+    *low=base+slot*XBOX_WORKER_STACK_SIZE;
+    *high=*low+XBOX_WORKER_STACK_SIZE;
+    return TRUE;
+}
 
 int xbox_worker_stack_alloc(void)
 {
     int i;
+    if (!g_xbox_worker_stack_base) return -1;
     for (i = 0; i < XBOX_WORKER_STACK_COUNT; i++) {
         if (InterlockedCompareExchange(&g_worker_stack_used[i], 1, 0) == 0)
             return i;
@@ -436,4 +406,86 @@ void xbox_worker_stack_free(int slot)
 {
     if (slot >= 0 && slot < XBOX_WORKER_STACK_COUNT)
         InterlockedExchange(&g_worker_stack_used[slot], 0);
+}
+
+/* ============================================================================
+ * One host core for the title's threads
+ *
+ * The console has one CPU, and titles lean on it: two threads of equal
+ * priority only interleave at a quantum boundary or a wait, so a short
+ * read-modify-write on a shared global never sees the other thread's half.
+ * A title's level load can spawn a loader thread that, with the main
+ * thread, adds entries to one global pool with "slot = count; fill; count =
+ * slot + 1". On two host cores the two loops run at the same time and lose
+ * each other's entries. Pinning every guest thread to one core gives the
+ * console's interleaving back: the host still preempts at its tick, but
+ * inside a window of a few instructions that is as rare as it was on the
+ * hardware.
+ *
+ * Pinned: the main guest thread and every PsCreateSystemThreadEx worker,
+ * the threads the title schedules. Not pinned: the kernel timer thread,
+ * which runs the title's DPCs and timer routines, and the device models'
+ * threads (APU, OHCI, nv2a), which deliver ISRs while the one-CPU gate is
+ * free. They do run lifted code, but they stand in for interrupts, which
+ * on the console ran between any two instructions of the thread they
+ * interrupted; the gate already orders them against guest code at
+ * DISPATCH_LEVEL, and putting them on the guest core would queue a DPC
+ * behind a main thread spinning in its frame wait. The GPU and the audio
+ * keep their cores for the same reason.
+ *
+ * Opt-in, like the one-CPU gate it was made beside: RECOMP_GUEST_CPUS=one
+ * pins to the lowest core the process may use, =<n> picks the core (cpu 0
+ * takes most of the IRQ work on Linux). Unset or =all, the title's threads
+ * go wherever the host scheduler puts them, as before.
+ */
+DWORD_PTR xbox_GuestCpuMask(void)
+{
+    const char *mode = getenv("RECOMP_GUEST_CPUS");
+    DWORD_PTR proc = 0, sys = 0;
+
+    if (!mode || !*mode || !strcmp(mode, "all"))
+        return 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc)
+        return 0;
+    if (*mode >= '0' && *mode <= '9') {
+        long n = strtol(mode, NULL, 10);
+        if (n >= 0 && n < (long)(8 * sizeof proc) && (proc & ((DWORD_PTR)1 << n)))
+            return (DWORD_PTR)1 << n;
+        fprintf(stderr, "  [KERNEL] RECOMP_GUEST_CPUS=%s: not a core the process"
+                        " may use (mask %#lx); taking the lowest\n", mode,
+                (unsigned long)proc);
+    }
+    /* The lowest core the process may use: fixed, so every thread lands
+     * on the same one whatever core it was created from. */
+    return proc & (DWORD_PTR)(-(intptr_t)proc);
+}
+
+void xbox_GuestThreadPin(const char *role)
+{
+    static int announced, failed;
+    DWORD_PTR mask = xbox_GuestCpuMask();
+    int core = 0;
+
+    if (!mask)
+        return;
+    while (!((mask >> core) & 1))
+        core++;
+    if (!SetThreadAffinityMask(GetCurrentThread(), mask)) {
+        if (!failed) {
+            failed = 1;
+            fprintf(stderr, "  [KERNEL] guest threads: this host sets no thread"
+                            " affinity; the title's threads stay on every core\n");
+            fflush(stderr);
+        }
+        return;
+    }
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "  [KERNEL] guest threads on one host core (cpu %d),"
+                        " as on the console (RECOMP_GUEST_CPUS=%s)\n",
+                core, getenv("RECOMP_GUEST_CPUS"));
+        fflush(stderr);
+    }
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "guest thread %s on cpu %d",
+             role ? role : "?", core);
 }

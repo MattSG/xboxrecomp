@@ -1,39 +1,30 @@
-# xbox_d3d8 — D3D8 on SDL_GPU
+# xbox_d3d8 — D3D8 to D3D11 Graphics Compatibility
 
-Implements the Xbox's modified Direct3D 8 interface on SDL3's GPU API (SDL_GPU), so the same code path renders through Direct3D 12, Vulkan or Metal. The Xbox D3D8 API is similar to PC D3D8 but has Xbox-specific extensions (push buffers, swizzled textures, pixel shader combiners, etc.).
-
-Shaders are generated as HLSL while the game runs (fixed-function emulation, NV2A register combiners, translated NV2A vertex programs). SDL_GPU only takes SPIR-V / DXIL / MSL, so `src/gfx/gpu_shader.c` compiles the HLSL with DXC and cross-compiles it with SPIRV-Cross through SDL_shadercross. DXC loads `dxcompiler.dll` / `dxil.dll` at run time; executables that use this layer call `xbox_copy_dxc(<target>)` from `cmake/xbox_sdl3.cmake` to put them beside the binary.
+Implements the Xbox's modified Direct3D 8 interface backed by a Direct3D 11 device. The Xbox D3D8 API is similar to PC D3D8 but has Xbox-specific extensions (push buffers, swizzled textures, pixel shader combiners, etc.).
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `d3d8_xbox.h` | Public header — all D3D8 types, enums, COM interfaces |
-| `d3d8_internal.h` | Internal wrapper structs (D3D8 interface → SDL_GPU resource) and cross-module declarations |
-| `d3d8_device.c` | Device creation, render/texture state, draw entry points, render targets, present |
-| `d3d8_pipeline.c` | Pipeline cache, uniform data, texture/sampler binding, draw dispatch |
-| `d3d8_resources.c` | Vertex/index buffers, textures, surfaces, format conversion |
-| `d3d8_shaders.c` | Fixed-function vertex/pixel shader generation and constants |
-| `d3d8_combiners.c` | NV2A register-combiner pixel shaders |
-| `d3d8_vsh.c` | NV2A vertex-program translator |
-| `d3d8_states.c` | Render state → pipeline key; sampler cache |
-| `d3d8_gamma.c` | Gamma ramp, applied when the backbuffer is presented |
-| `../gfx/gpu_device.c` | SDL window, GPU device, pass manager, upload ring, offscreen backbuffer |
-| `../gfx/gpu_shader.c` | HLSL → SDL_GPU shader compilation |
-| `../gfx/sdl_events.c` | The one place SDL events are pumped; held-key state |
+| File | LOC | Purpose |
+|------|-----|---------|
+| `d3d8_xbox.h` | 716 | Public header — all D3D8 types, enums, COM interfaces |
+| `d3d8_internal.h` | 129 | Internal wrapper structs (D3D8 interface → D3D11 resource) |
+| `d3d8_device.c` | 1,107 | Device creation, render state, draw calls, frame present |
+| `d3d8_resources.c` | 541 | Vertex/index buffers, textures, format conversion |
+| `d3d8_shaders.c` | 529 | Shader compilation, input layout, constant buffers |
+| `d3d8_states.c` | 350 | Render state translation (D3D8 → D3D11), sampler states |
 
 ## Quick Start
 
 ```c
 #include "d3d8_xbox.h"
 
-// Create D3D8 interface
+// Create D3D8 interface (creates D3D11 device internally)
 IDirect3D8 *d3d = xbox_Direct3DCreate8(0);
 
-// Create device (creates the SDL window and GPU device; hDeviceWindow is ignored)
+// Create device (creates window, swap chain, render targets)
 IDirect3DDevice8 *dev;
-D3DPRESENT_PARAMETERS pp = { .BackBufferWidth = 640, .BackBufferHeight = 480, .Windowed = TRUE };
-d3d->lpVtbl->CreateDevice(d3d, 0, 0, NULL, 0, &pp, &dev);
+D3DPRESENT_PARAMETERS pp = { .BackBufferWidth = 640, .BackBufferHeight = 480 };
+d3d->lpVtbl->CreateDevice(d3d, 0, 0, hwnd, 0, &pp, &dev);
 
 // Standard D3D8 rendering
 dev->lpVtbl->BeginScene(dev);
@@ -42,28 +33,31 @@ dev->lpVtbl->SetTexture(dev, 0, texture);
 dev->lpVtbl->DrawPrimitive(dev, D3DPT_TRIANGLELIST, 0, tri_count);
 dev->lpVtbl->EndScene(dev);
 
-// Present (also pumps SDL events)
+// Present (also pumps Win32 message loop)
 d3d8_PresentFrame();
 ```
 
-`RECOMP_HIDE_WINDOW=1` creates the window hidden (tests, headless runs).
-
 ## How It Works
 
-The layer keeps the D3D8 state the game set (render states, textures, transforms, stream bindings). SDL_GPU bakes shaders, vertex layout, blend, depth/stencil and raster state into a *graphics pipeline*, so nothing is applied when the game sets it; at each draw:
+The layer maintains two parallel states:
+
+1. **D3D8 state** — what the game thinks is set (render states, textures, transforms)
+2. **D3D11 state** — the actual GPU state (constant buffers, shader resource views, etc.)
+
+On each draw call, dirty D3D8 state is flushed to D3D11:
 
 ```
+Game calls SetRenderState(D3DRS_ZENABLE, TRUE)
+  → Stores in d3d8_render_state[D3DRS_ZENABLE]
+  → Marks depth state dirty
+
 Game calls DrawPrimitive(...)
-  → d3d8_shaders_prepare_draw / d3d8_combiners_prepare_draw describe the shaders,
-    vertex layout and uniform data (d3d8_pipe_set_*)
-  → d3d8_pipe_draw builds a key from shaders + layout + d3d8_states_get_key() +
-    target formats, finds or creates the pipeline, starts or reuses a render pass,
-    pushes uniforms, binds textures and samplers, and draws
+  → If depth dirty: create ID3D11DepthStencilState, bind it
+  → If blend dirty: create ID3D11BlendState, bind it
+  → If raster dirty: create ID3D11RasterizerState, bind it
+  → Upload transform matrices to constant buffer
+  → Issue ID3D11DeviceContext::Draw()
 ```
-
-SDL_GPU does not allow copy passes inside render passes, but D3D8 interleaves uploads and draws, so `gpu_device.c` ends the other kind of pass first. Buffers are uploaded lazily (`Unlock` only marks them dirty). The D3D8 backbuffer is an offscreen texture that is blitted to the window at Present, so `GetBackBuffer`, `LockRect` and gamma work without touching the swapchain.
-
-Not implemented: multisampled render targets (they are created single-sampled), D3D8 border-colour and mirror-once addressing (clamp / mirror stand in), `LockRect` on depth or block-compressed surfaces.
 
 ## Supported Features
 
@@ -97,12 +91,12 @@ D3DTSS_BORDERCOLOR                                     // Border color
 
 All Xbox `D3DFMT_*` constants use the canonical XDK binary values (see
 `d3d8_xbox.h`). Swizzled formats are unswizzled to linear at upload; every
-`D3DFMT_LIN_*` variant maps to the same SDL_GPU format as its swizzled
-counterpart. Formats whose GPU layout differs are converted in software
+`D3DFMT_LIN_*` variant maps to the same DXGI format as its swizzled
+counterpart. Formats whose D3D11 layout differs are converted in software
 at upload (YUV→BGRA, P8→palette-expanded BGRA, AL8→16-bit, R5G5B5A1/
 R4G4B4A4→bit-reordered).
 
-| Format | Code | SDL_GPU | Notes |
+| Format | Code | D3D11/DXGI | Notes |
 |--------|------|-----------|-------|
 | D3DFMT_L8 | 0x00 | R8_UNORM | 8-bit luminance |
 | D3DFMT_AL8 | 0x01 | R8G8_UNORM | 8-bit alpha+luma, expanded at upload |
@@ -128,7 +122,7 @@ R4G4B4A4→bit-reordered).
 | D3DFMT_R8B8 | 0x29 | R8G8_UNORM | |
 | D3DFMT_D24S8 | 0x2A | D24_UNORM_S8_UINT | also F24S8 (0x2B) |
 | D3DFMT_D16 | 0x2C | D16_UNORM | |
-| D3DFMT_F16 | 0x2D | R16_FLOAT | no float depth format; falls back to D16 |
+| D3DFMT_F16 | 0x2D | R16_FLOAT | no D3D11 float depth; falls back to D16 for DSV |
 | D3DFMT_L16 | 0x32 | R16_UNORM | |
 | D3DFMT_V16U16 | 0x33 | R16G16_SNORM | |
 | D3DFMT_R5G5B5A1 | 0x38 | B5G5R5A1 | bit-reordered at upload |
@@ -145,8 +139,8 @@ R4G4B4A4→bit-reordered).
 | D3DFMT_G16R16 | 0x42 | R16G16_UNORM | |
 | D3DFMT_A16L16 | 0x43 | R16G16_UNORM | luma+alpha |
 | D3DFMT_A16B16G16R16 | 0x44 | R16G16B16A16_UNORM | BGRA order in memory |
-| D3DFMT_A32B32G32R32 | 0x45 | R32G32B32A32_FLOAT | no 128-bit UNORM format |
-| D3DFMT_G32R32 | 0x46 | R32G32_FLOAT | no R32G32_UNORM format |
+| D3DFMT_A32B32G32R32 | 0x45 | R32G32B32A32_FLOAT | no 128-bit UNORM in DXGI |
+| D3DFMT_G32R32 | 0x46 | R32G32_FLOAT | no R32G32_UNORM in DXGI |
 | D3DFMT_L32 | 0x47 | R32_FLOAT | 32-bit luminance |
 | D3DFMT_A32L32 | 0x48 | R32G32_FLOAT | |
 | D3DFMT_V32U32 | 0x49 | R32G32_FLOAT | signed bump |
@@ -156,7 +150,7 @@ R4G4B4A4→bit-reordered).
 | D3DFMT_X2R10G10B10 | 0x4E | R10G10B10A2_UNORM | |
 | D3DFMT_A2B10G10R10 | 0x4F | R10G10B10A2_UNORM | |
 | D3DFMT_A2W10V10U10 | 0x50 | R10G10B10A2_UNORM | signed bump |
-| D3DFMT_R10G11B11 | 0x52 | R11G11B10_FLOAT | no exact format, approx |
+| D3DFMT_R10G11B11 | 0x52 | R11G11B10_FLOAT | no exact DXGI, approx |
 | D3DFMT_R11G11B10 | 0x53 | R11G11B10_FLOAT | |
 | D3DFMT_D24X8 | 0x54 | D24_UNORM_S8_UINT | stencil unused |
 | D3DFMT_D24FS8 | 0x55 | D24_UNORM_S8_UINT | float depth approximated |
@@ -164,22 +158,22 @@ R4G4B4A4→bit-reordered).
 | D3DFMT_DXN | 0x57 | BC5_UNORM | 2-channel normal compression |
 | D3DFMT_DXT3A | 0x59 | BC2_UNORM | explicit-alpha DXT3 variant |
 | D3DFMT_DXT5A | 0x5A | BC3_UNORM | alpha-only DXT5 variant |
-| D3DFMT_CTX1 | 0x58 | BC1_UNORM | no exact format, approx |
+| D3DFMT_CTX1 | 0x58 | BC1_UNORM | no exact DXGI, approx |
 | D3DFMT_LIN_* | 0x10-0x78 | (same as base) | all linear variants, e.g. LIN_A1R5G5B5=0x10, LIN_L8=0x13, LIN_D16=0x30; signed LIN_X8L8V8U8=0x14, LIN_V8U8=0x15, LIN_L6V5U5=0x18 are distinct; extended formats (float/10-bit/16-32-bit pairs/DXN/DXT3A/DXT5A/CTX1) use LIN_ codes 0x5B-0x78 |
 | D3DFMT_INDEX16/32 | 101/102 | R16_UINT / R32_UINT | index buffers |
 
-Textures created with `D3DUSAGE_RENDERTARGET` also get the colour-target usage
+Textures created with `D3DUSAGE_RENDERTARGET` also get `D3D11_BIND_RENDER_TARGET`
 and can be rendered to through `tex_GetSurfaceLevel()` + `SetRenderTarget`.
 
 ### Cube & Volume Textures
 
-`CreateCubeTexture` maps to a cube texture (6 layers) +
-(sampled as a cube). Each face holds its own mip
+`CreateCubeTexture` maps to a D3D11 `Texture2D` with `ArraySize=6` +
+`D3D11_RESOURCE_MISC_TEXTURECUBE` (TEXTURECUBE SRV). Each face holds its own mip
 chain; per-face `LockRect`/`UnlockRect` unswizzles + converts + uploads at
 subresource `face*levels+level`. `GetCubeMapSurface` returns an array-sliced
 RTV-backed surface (TEXTURE2DARRAY), so cube faces can be render targets.
 
-`CreateVolumeTexture` maps to a 3D texture with full mip chains.
+`CreateVolumeTexture` maps to a D3D11 `Texture3D` with full mip chains.
 `LockBox`/`UnlockBox` handle the Xbox 3D Z-order (round-robin interleaved bit)
 swizzle and per-slice format conversion. `GetVolumeLevel` returns a ref-counted
 `IDirect3DVolume8` wrapper that delegates to the parent texture.
@@ -236,8 +230,8 @@ DrawIndexedPrimitiveUP(type, min_idx, num_verts, prim_count, idx_data, idx_fmt, 
 
 // Resources
 CreateTexture(w, h, levels, usage, fmt, pool, &texture)
-CreateCubeTexture(edge, levels, usage, fmt, pool, &texture)    // 6-face cube texture
-CreateVolumeTexture(w, h, d, levels, usage, fmt, pool, &texture) // 3D texture
+CreateCubeTexture(edge, levels, usage, fmt, pool, &texture)    // 6-face, D3D11 TEXTURECUBE
+CreateVolumeTexture(w, h, d, levels, usage, fmt, pool, &texture) // D3D11 Texture3D
 CreateImageSurface(w, h, fmt, &surface)                        // lockable offscreen surface
 CreateVertexBuffer(length, usage, fvf, pool, &buffer)
 CreateIndexBuffer(length, usage, fmt, pool, &buffer)
@@ -261,7 +255,7 @@ SetViewport(&viewport)
 SetRenderTarget(surface, depth_surface)
 CreateRenderTarget(w, h, fmt, multisample, lockable, &surface)
 CreateDepthStencilSurface(w, h, fmt, multisample, &surface)
-// Surface LockRect/UnlockRect are implemented via a readback into a host buffer
+// Surface LockRect/UnlockRect are implemented via a D3D11_USAGE_STAGING
 // copy: sub-rect locks supported, write-back unless D3DLOCK_READONLY.
 
 // Xbox extensions
@@ -299,13 +293,13 @@ Xbox games that use custom vertex/pixel shader programs (via push buffer microco
   input, so float3/float4 texcoords in vertex buffers are supported.
 - **Extended formats** (float, 16/32-bit pairs, 10-bit, DXN/DXT3A/DXT5A/CTX1)
   are wired through conversion/bpp/swizzle. Formats whose memory layout does not
-  match their SDL_GPU target byte-for-byte are channel-swapped in software during
+  match their DXGI target byte-for-byte are channel-swapped in software during
   upload: `A16B16G16R16`/`A32B32G32R32` reorder their in-memory BGRA to RGBA,
   and `A2R10G10B10`/`X2R10G10B10` swap the A and R fields into
   `R10G10B10A2`. R6G5B5 graphs are 4:3 compressed (they stretch to 4x3 on
   format introspection); run-tested scopes are covered by `tests/d3d8_smoke`
-  (no GPU device needed), while DXN/DXT3A/DXT5A/CTX1 and the 10-bit float
-  formats use approximate format mappings and still warrant in-game validation.
+  (no D3D11 device needed), while DXN/DXT3A/DXT5A/CTX1 and the 10-bit float
+  formats use approximate DXGI mappings and still warrant in-game validation.
 
 ## Xbox-Specific Differences from PC D3D8
 

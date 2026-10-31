@@ -18,6 +18,30 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>
+
+#ifndef STATUS_BUFFER_TOO_SMALL
+#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
+#endif
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+#endif
+
+static INIT_ONCE s_dir_cs_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK initialize_dir_cs(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    (void)once;
+    (void)context;
+    InitializeCriticalSection((LPCRITICAL_SECTION)parameter);
+    return TRUE;
+}
+
+static void ensure_dir_cs(CRITICAL_SECTION *cs)
+{
+    InitOnceExecuteOnce(&s_dir_cs_once, initialize_dir_cs, cs, NULL);
+}
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -29,6 +53,14 @@
 #include <fnmatch.h>
 #endif
 
+/* Object handles and unsupported-code notes, defined in kernel_io.c. Declared
+ * here, not in kernel.h, because only this file and kernel_bridge.c use them. */
+extern NTSTATUS xbox_OpenSymbolicLink(const char* name, HANDLE* out);
+extern const char* xbox_SymbolicLinkHandleTarget(HANDLE h);
+extern int xbox_CloseObjectHandle(HANDLE h);
+extern void xbox_NoteUnsupportedIoctl(const char* what, ULONG code);
+static void xbox_dir_context_close(HANDLE FileHandle);
+
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
@@ -38,17 +70,9 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return ObjectAttributes->ObjectName->Buffer;
 }
 
-/* Xbox volume geometry.
- *
- * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
- * not cosmetic. A title's CRT startup asks for FileFsSizeInformation and
- * multiplies SectorsPerAllocationUnit by BytesPerSector, then *requires* the
- * product to equal the cluster size it was built for. Half-Life 2 checks for
- * 0x4000 and returns STATUS_DEVICE_NOT_READY (0xC000014F) otherwise, which
- * aborts CRT init before main ever runs -- the process then exits cleanly,
- * which reads as a title that did nothing rather than one that failed.
- *
- * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
+/* Default emulated volume geometry: 512-byte sectors and 16 KB clusters.
+ * Host capacity is expressed in these allocation units; this is not a claim
+ * that every Xbox device or FATX volume has the same geometry. */
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
@@ -58,9 +82,19 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  * with an undefined symbol -- invisible until something links an executable,
  * because a static archive never resolves its own references.
  *
- * The POSIX backend does not populate this yet, so it reads 0 there; that is a
- * missing detail rather than a missing symbol, and it is visible here. */
-uint32_t g_xbox_last_file_error;
+ * Both backends set it on a failed open: the Win32 error, or on POSIX the
+ * Win32 code its errno corresponds to (NtCreateFile only). */
+/* A bridge reads this after its host open returns. Streaming workers can open
+ * simultaneously, so another thread must not replace that call's reason. */
+static XBOX_THREAD_LOCAL uint32_t g_xbox_last_file_error;
+
+/* Startup configuration; immutable while file operations are running. */
+static int s_share_read_only;
+void xbox_SetReadOnlyFileSharing(BOOLEAN enabled)
+{
+    s_share_read_only = enabled != FALSE;
+}
+
 
 uint32_t xbox_LastFileError(void)
 {
@@ -70,6 +104,258 @@ uint32_t xbox_LastFileError(void)
 #if defined(_WIN32)
 /* ====================  Win32 backend  =================================== */
 /* ======================================================================== */
+
+static INIT_ONCE s_file_hitch_once = INIT_ONCE_STATIC_INIT;
+static volatile LONG s_file_hitch_ready;
+static int s_file_hitch_enabled;
+static LARGE_INTEGER s_file_hitch_frequency;
+
+/* Opt-in evidence for failed shared-file opens. The ledger does not change
+ * the effective access or sharing policy: it records opens, never retries or
+ * closes an owner's handle. It is diagnostic only, not handle ownership. */
+typedef struct XboxFileDiagOpen {
+    struct XboxFileDiagOpen *next;
+    HANDLE handle;
+    DWORD thread;
+    ULONG access, share, disposition, options;
+    WCHAR path[MAX_PATH];
+} XboxFileDiagOpen;
+
+static INIT_ONCE s_file_diag_once = INIT_ONCE_STATIC_INIT;
+static volatile LONG s_file_diag_ready;
+static int s_file_diag_enabled;
+static SRWLOCK s_file_diag_lock = SRWLOCK_INIT;
+static XboxFileDiagOpen *s_file_diag_opens;
+
+static BOOL CALLBACK file_diag_initialize(PINIT_ONCE once, PVOID parameter,
+                                         PVOID *context)
+{
+    const char *setting = getenv("RECOMP_FILE_DIAGNOSTICS");
+    (void)once; (void)parameter; (void)context;
+    s_file_diag_enabled = setting && *setting && strcmp(setting, "0") != 0;
+    InterlockedExchange(&s_file_diag_ready, 1);
+    return TRUE;
+}
+
+static void file_diag_init(void)
+{
+    if (!s_file_diag_ready)
+        InitOnceExecuteOnce(&s_file_diag_once, file_diag_initialize, NULL, NULL);
+}
+
+static int file_diag_path(const WCHAR *path, WCHAR normalized[MAX_PATH])
+{
+    WCHAR unc[MAX_PATH];
+    DWORD length;
+    if (!_wcsnicmp(path, L"\\\\?\\UNC\\", 8)) {
+        if (swprintf_s(unc, MAX_PATH, L"\\\\%s", path + 8) < 0) return 0;
+        path = unc;
+    } else if (!_wcsnicmp(path, L"\\\\?\\", 4)) {
+        path += 4;
+    }
+    length = GetFullPathNameW(path, MAX_PATH, normalized, NULL);
+    return length && length < MAX_PATH;
+}
+
+static void file_diag_open(HANDLE handle, const WCHAR *path, ULONG access,
+                           ULONG share, ULONG disposition, ULONG options)
+{
+    XboxFileDiagOpen *entry;
+    WCHAR normalized[MAX_PATH];
+    DWORD error = GetLastError();
+    file_diag_init();
+    if (!s_file_diag_enabled || !file_diag_path(path, normalized)) goto done;
+    entry = malloc(sizeof *entry);
+    if (!entry) {
+        fprintf(stderr, "[FILE_DIAG] file open could not be recorded handle=%p\n", handle);
+        goto done;
+    }
+    entry->handle = handle;
+    entry->thread = GetCurrentThreadId();
+    entry->access = access; entry->share = share;
+    entry->disposition = disposition; entry->options = options;
+    wcscpy_s(entry->path, MAX_PATH, normalized);
+    AcquireSRWLockExclusive(&s_file_diag_lock);
+    entry->next = s_file_diag_opens;
+    s_file_diag_opens = entry;
+    ReleaseSRWLockExclusive(&s_file_diag_lock);
+done:
+    SetLastError(error);
+}
+
+static BOOL file_diag_close_native(HANDLE handle)
+{
+    XboxFileDiagOpen **link, *entry = NULL;
+    DWORD error;
+    BOOL closed;
+    if (!s_file_diag_enabled) return CloseHandle(handle);
+    /* Serialize the close with ledger publication: once CloseHandle returns,
+     * another thread may already get this same native handle value. Removing
+     * by value after releasing the lock could erase that newer open's record. */
+    AcquireSRWLockExclusive(&s_file_diag_lock);
+    closed = CloseHandle(handle);
+    error = GetLastError();
+    if (closed) {
+        for (link = &s_file_diag_opens; *link; link = &(*link)->next) {
+            if ((*link)->handle != handle) continue;
+            entry = *link;
+            *link = entry->next;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_file_diag_lock);
+    free(entry);
+    SetLastError(error);
+    return closed;
+}
+
+/* SystemExtendedHandleInformation is used only on the failed-open path.
+ * Duplicate current-process handles long enough to query their disk paths,
+ * then close the duplicates. No foreign-process handles are opened, and no
+ * original handle is altered. A handle can disappear concurrently; such a
+ * failed duplicate is simply omitted rather than treated as an owner. */
+typedef struct XboxFileDiagHandleEntry {
+    PVOID object;
+    ULONG_PTR process_id, handle;
+    ULONG access;
+    USHORT backtrace, type;
+    ULONG attributes, reserved;
+} XboxFileDiagHandleEntry;
+typedef struct XboxFileDiagHandles {
+    ULONG_PTR count, reserved;
+    XboxFileDiagHandleEntry entries[1];
+} XboxFileDiagHandles;
+typedef LONG (NTAPI *XboxFileDiagQuerySystem)(ULONG, PVOID, ULONG, PULONG);
+
+static void file_diag_host_handles(const WCHAR *failed_path)
+{
+    XboxFileDiagQuerySystem query = (XboxFileDiagQuerySystem)GetProcAddress(
+        GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
+    XboxFileDiagHandles *snapshot = NULL;
+    ULONG capacity = 1024u * 1024u, needed = 0;
+    LONG status;
+    unsigned owners = 0;
+    if (!query) goto unavailable;
+    for (;;) {
+        snapshot = malloc(capacity);
+        if (!snapshot) goto unavailable;
+        status = query(64u, snapshot, capacity, &needed);
+        if (status >= 0) break;
+        free(snapshot); snapshot = NULL;
+        if ((ULONG)status != 0xC0000004u || capacity >= 32u * 1024u * 1024u)
+            goto unavailable;
+        capacity *= 2;
+        if (needed > capacity) capacity = needed;
+        if (capacity > 32u * 1024u * 1024u) goto unavailable;
+    }
+    if (snapshot->count > (capacity - offsetof(XboxFileDiagHandles, entries)) /
+                           sizeof snapshot->entries[0]) goto unavailable;
+    for (ULONG_PTR i = 0; i < snapshot->count; ++i) {
+        const XboxFileDiagHandleEntry *item = &snapshot->entries[i];
+        HANDLE duplicate;
+        WCHAR path[MAX_PATH], normalized[MAX_PATH];
+        DWORD length;
+        int tracked = 0;
+        if (item->process_id != GetCurrentProcessId()) continue;
+        if (!DuplicateHandle(GetCurrentProcess(), (HANDLE)item->handle,
+                GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) continue;
+        if (GetFileType(duplicate) != FILE_TYPE_DISK) {
+            CloseHandle(duplicate);
+            continue;
+        }
+        length = GetFinalPathNameByHandleW(duplicate, path, MAX_PATH,
+                                         FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        CloseHandle(duplicate);
+        if (!length || length >= MAX_PATH || !file_diag_path(path, normalized) ||
+            _wcsicmp(normalized, failed_path)) continue;
+        AcquireSRWLockShared(&s_file_diag_lock);
+        for (XboxFileDiagOpen *entry = s_file_diag_opens; entry; entry = entry->next)
+            if (entry->handle == (HANDLE)item->handle &&
+                !_wcsicmp(entry->path, failed_path)) { tracked = 1; break; }
+        ReleaseSRWLockShared(&s_file_diag_lock);
+        fprintf(stderr, "[FILE_DIAG] host_same_file handle=%p granted=0x%08lX guest_tracked=%d\n",
+                (HANDLE)item->handle, (unsigned long)item->access, tracked);
+        ++owners;
+    }
+    fprintf(stderr, "[FILE_DIAG] current_process_same_file_handles=%u; external or transient ownership is not determined\n",
+            owners);
+    free(snapshot);
+    return;
+unavailable:
+    free(snapshot);
+    fprintf(stderr, "[FILE_DIAG] current-process handle inventory unavailable; lock ownership unresolved\n");
+}
+
+static void file_diag_failure(const WCHAR *path, DWORD error)
+{
+    WCHAR normalized[MAX_PATH];
+    unsigned owners = 0;
+    file_diag_init();
+    if (!s_file_diag_enabled || error != ERROR_SHARING_VIOLATION ||
+        !file_diag_path(path, normalized))
+        goto done;
+    fprintf(stderr, "[FILE_DIAG] sharing failure pid=%lu thread=%lu path=%ls\n",
+            (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(), normalized);
+    AcquireSRWLockShared(&s_file_diag_lock);
+    for (XboxFileDiagOpen *entry = s_file_diag_opens; entry; entry = entry->next) {
+        if (_wcsicmp(entry->path, normalized)) continue;
+        fprintf(stderr, "[FILE_DIAG] guest_same_file handle=%p open_thread=%lu access=0x%08X share=0x%X disposition=%u options=0x%X\n",
+                entry->handle, (unsigned long)entry->thread, (unsigned)entry->access,
+                (unsigned)entry->share, (unsigned)entry->disposition, (unsigned)entry->options);
+        ++owners;
+    }
+    ReleaseSRWLockShared(&s_file_diag_lock);
+    fprintf(stderr, "[FILE_DIAG] active_guest_same_file_handles=%u\n", owners);
+    file_diag_host_handles(normalized);
+    fflush(stderr);
+done:
+    SetLastError(error);
+}
+
+static BOOL CALLBACK file_hitch_init(PINIT_ONCE once, PVOID parameter,
+                                     PVOID *context)
+{
+    const char *setting = getenv("RECOMP_HITCH_TRACE");
+    (void)once; (void)parameter; (void)context;
+    s_file_hitch_enabled = setting && *setting && strcmp(setting, "0") != 0;
+    if (s_file_hitch_enabled)
+        QueryPerformanceFrequency(&s_file_hitch_frequency);
+    InterlockedExchange(&s_file_hitch_ready, 1);
+    return TRUE;
+}
+
+static int64_t file_hitch_begin(void)
+{
+    LARGE_INTEGER now;
+    if (!s_file_hitch_ready)
+        InitOnceExecuteOnce(&s_file_hitch_once, file_hitch_init, NULL, NULL);
+    if (!s_file_hitch_enabled) return 0;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+static void file_hitch_end(int64_t started, HANDLE handle, ULONG length,
+                           PLARGE_INTEGER offset, DWORD bytes, BOOL result,
+                           DWORD error)
+{
+    LARGE_INTEGER ended;
+    double ms, duration;
+    if (!started) return;
+    QueryPerformanceCounter(&ended);
+    ms = 1000.0 / (double)s_file_hitch_frequency.QuadPart;
+    duration = (ended.QuadPart - started) * ms;
+    if (duration >= 8.0)
+        fprintf(stderr,
+            "[HITCH] phase=file_read qpc_ms=%.3f start_qpc_ms=%.3f "
+            "duration_ms=%.3f thread=%lu handle=%p length=%u offset=%lld "
+            "bytes=%lu error=%lu\n",
+            ended.QuadPart * ms, started * ms, duration,
+            (unsigned long)GetCurrentThreadId(), handle, (unsigned)length,
+            offset ? (long long)offset->QuadPart : -1LL,
+            (unsigned long)bytes, (unsigned long)(result ? ERROR_SUCCESS : error));
+    /* Timing and diagnostics must not replace the read's last-error value. */
+    SetLastError(error);
+}
 
 /* Convert Xbox create disposition to Win32 */
 static DWORD xbox_disposition_to_win32(ULONG Disposition)
@@ -114,6 +400,105 @@ static DWORD xbox_share_to_win32(ULONG Share)
     return result;
 }
 
+/* FATX overwrite semantics (Win32 side; the POSIX backend below has the
+ * same rule and the long story, at s_overwrite_pending).
+ *
+ * An overwrite open (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF) of an
+ * existing file sets its size to 0 on FATX, but FATX keeps no valid-data
+ * length, so a later SetEndOfFile that grows the file brings back the bytes
+ * already on disk. A title's z: texture cache can depend on it: it writes
+ * x.tmp, reopens it with CREATE_ALWAYS, only sets the end of file to the true
+ * size, and renames it to x.dat. CREATE_ALWAYS / TRUNCATE_EXISTING on NTFS (and
+ * Wine's ftruncate) zero-fill on the regrow, so every cache file came out as
+ * zeros of the right length.
+ *
+ * So an overwrite of an existing non-empty file opens it with OPEN_EXISTING
+ * and marks the handle pending. If the first thing done with it is setting
+ * the end of file, that is a plain SetEndOfFile to the new size, which keeps
+ * the bytes below it. Anything else (read, write, size query, allocation,
+ * close) first truncates to 0, the normal overwrite. A position query does
+ * not settle: XAPI SetEndOfFile makes one before it sets the end of file. */
+#define FATX_PENDING_MAX 64
+static HANDLE s_overwrite_pending[FATX_PENDING_MAX];
+static SRWLOCK s_overwrite_lock = SRWLOCK_INIT;
+
+static int disposition_overwrites(ULONG disposition)
+{
+    return disposition == XBOX_FILE_SUPERSEDE
+        || disposition == XBOX_FILE_OVERWRITE
+        || disposition == XBOX_FILE_OVERWRITE_IF;
+}
+
+/* Mark h pending. Returns 0 if the table is full. */
+static int overwrite_mark(HANDLE h)
+{
+    int i, ok = 0;
+    AcquireSRWLockExclusive(&s_overwrite_lock);
+    for (i = 0; i < FATX_PENDING_MAX; i++)
+        if (!s_overwrite_pending[i]) { s_overwrite_pending[i] = h; ok = 1; break; }
+    ReleaseSRWLockExclusive(&s_overwrite_lock);
+    return ok;
+}
+
+/* Take the pending mark without truncating. Returns 1 if h was pending. */
+static int overwrite_take(HANDLE h)
+{
+    int i, was = 0;
+    if (!h || h == INVALID_HANDLE_VALUE)
+        return 0;
+    AcquireSRWLockExclusive(&s_overwrite_lock);
+    for (i = 0; i < FATX_PENDING_MAX; i++)
+        if (s_overwrite_pending[i] == h) { s_overwrite_pending[i] = NULL; was = 1; break; }
+    ReleaseSRWLockExclusive(&s_overwrite_lock);
+    return was;
+}
+
+/* Truncate to 0, keeping the file pointer where it was. */
+static void truncate_to_zero(HANDLE h)
+{
+    LARGE_INTEGER cur, zero;
+    zero.QuadPart = 0;
+    if (!SetFilePointerEx(h, zero, &cur, FILE_CURRENT))
+        cur.QuadPart = 0;
+    SetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+    if (!SetEndOfFile(h))
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                 "overwrite: truncate failed err=%u", GetLastError());
+    SetFilePointerEx(h, cur, NULL, FILE_BEGIN);
+}
+
+/* Finish a pending overwrite: truncate to 0. */
+static void overwrite_settle(HANDLE h)
+{
+    if (overwrite_take(h))
+        truncate_to_zero(h);
+}
+
+/* The missing-file report's high/low split: a miss under a directory that
+ * exists is a file the dump lacks; one under a directory that does not is
+ * usually a title probing a loose-file layout it never shipped. Same answer
+ * as the POSIX version below for the same tree. */
+int xbox_host_parent_exists(const xbox_host_char *host_path)
+{
+    WCHAR dir[MAX_PATH];
+    const WCHAR *cut;
+    DWORD attrs;
+
+    if (!host_path)
+        return 0;
+    cut = wcsrchr(host_path, L'\\');
+    {
+        const WCHAR *fwd = wcsrchr(host_path, L'/');
+        if (fwd && (!cut || fwd > cut)) cut = fwd;
+    }
+    if (!cut || cut == host_path || (size_t)(cut - host_path) >= MAX_PATH)
+        return 0;
+    memcpy(dir, host_path, (size_t)(cut - host_path) * sizeof(WCHAR));
+    dir[cut - host_path] = 0;
+    attrs = GetFileAttributesW(dir);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
 static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
                                WCHAR* win_path, DWORD buf_size)
@@ -145,6 +530,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
     (void)AllocationSize;
+    g_xbox_last_file_error = 0;
 
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
@@ -178,24 +564,65 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
+    /* Application opt-in may broaden read sharing for read-only host files. */
+    DWORD share = xbox_share_to_win32(ShareAccess);
+    if (s_share_read_only && !(xbox_access_to_win32(DesiredAccess) & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA |
+          FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | DELETE)))
+        share |= FILE_SHARE_READ;
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
+            share, NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
         if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
-        h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL,
-            xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+        DWORD access = xbox_access_to_win32(DesiredAccess);
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        /* An overwrite of an existing non-empty file is deferred (see
+         * s_overwrite_pending). It needs write access to settle later. */
+        int defer = disposition_overwrites(CreateDisposition)
+                 && (access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA))
+                 && GetFileAttributesExW(win_path, GetFileExInfoStandard, &fad)
+                 && !(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                 && (fad.nFileSizeHigh || fad.nFileSizeLow);
+        h = INVALID_HANDLE_VALUE;
+        if (defer) {
+            h = CreateFileW(win_path, access, share,
+                NULL, OPEN_EXISTING, flags_and_attrs, NULL);
+            if (h != INVALID_HANDLE_VALUE)
+                overwrite_take(h);          /* a stale mark; see below */
+            if (h != INVALID_HANDLE_VALUE && !overwrite_mark(h))
+                truncate_to_zero(h);        /* no slot to defer in */
+            else if (h != INVALID_HANDLE_VALUE)
+                XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: overwrite of %S deferred", win_path);
+        }
+        if (h == INVALID_HANDLE_VALUE) {    /* not deferred, or it vanished */
+            h = CreateFileW(win_path, access, share, NULL,
+                xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+            /* A HANDLE value is reused once closed, and a pending handle
+             * closed by DuplicateHandle(DUPLICATE_CLOSE_SOURCE) never went
+             * through xbox_NtClose, so its mark may still be in the table.
+             * Clear it, or this unrelated file is truncated on first use. */
+            if (h != INVALID_HANDLE_VALUE)
+                overwrite_take(h);
+        }
     }
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
+        NTSTATUS status;
+        file_diag_failure(win_path, err);
+        const char *result = (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+            ? "NOT_FOUND" : "FAILED";
+        fprintf(stderr, "[NtCreateFile] %s path=%ls err=%lu access=0x%08X share=0x%X disposition=%u options=0x%X\n",
+                result, win_path, (unsigned long)err, (unsigned)DesiredAccess,
+                (unsigned)ShareAccess, (unsigned)CreateDisposition,
+                (unsigned)CreateOptions);
         /* Kept for the caller's trace. An NTSTATUS says "it did not open";
          * only the Win32 error distinguishes a title probing for a file that
          * is genuinely absent from one it cannot open because this runtime
@@ -206,20 +633,27 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          * silently decides a volume or asset is missing, and in a Release
          * build that decision was invisible. */
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                 "NtCreateFile FAILED: %S (err=%u)", win_path, err);
+                 "NtCreateFile %s: %S (err=%u)", result, win_path, err);
+        switch (err) {
+            case ERROR_FILE_NOT_FOUND: status = STATUS_OBJECT_NAME_NOT_FOUND; break;
+            case ERROR_PATH_NOT_FOUND: status = STATUS_OBJECT_PATH_NOT_FOUND; break;
+            case ERROR_ACCESS_DENIED:  status = STATUS_ACCESS_DENIED; break;
+            case ERROR_ALREADY_EXISTS: status = STATUS_OBJECT_NAME_COLLISION; break;
+            /* A short-lived host file lock is not a missing asset or a
+             * generic I/O failure. Preserve it through the guest's error
+             * conversion without retrying or altering existing handles. */
+            case ERROR_SHARING_VIOLATION: status = STATUS_SHARING_VIOLATION; break;
+            default:                   status = STATUS_UNSUCCESSFUL; break;
+        }
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = status;
             IoStatusBlock->Information = 0;
         }
-        switch (err) {
-            case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
-            case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
-            case ERROR_ACCESS_DENIED:  return STATUS_ACCESS_DENIED;
-            case ERROR_ALREADY_EXISTS: return STATUS_OBJECT_NAME_COLLISION;
-            default:                   return STATUS_UNSUCCESSFUL;
-        }
+        return status;
     }
 
+    file_diag_open(h, win_path, DesiredAccess, ShareAccess,
+                   CreateDisposition, CreateOptions);
     *FileHandle = h;
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
@@ -237,10 +671,15 @@ NTSTATUS __stdcall xbox_NtReadFile(
     DWORD bytes_read = 0;
     BOOL result;
     OVERLAPPED ov;
+    DWORD error;
+    int64_t hitch_started;
     (void)ApcRoutine; (void)ApcContext;
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
+
+    overwrite_settle(FileHandle);
+    hitch_started = file_hitch_begin();
 
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
@@ -250,8 +689,11 @@ NTSTATUS __stdcall xbox_NtReadFile(
     } else {
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
     }
+    error = GetLastError();
+    file_hitch_end(hitch_started, FileHandle, Length, ByteOffset, bytes_read,
+                   result, error);
 
-    if (result || GetLastError() == ERROR_HANDLE_EOF) {
+    if (result || error == ERROR_HANDLE_EOF) {
         IoStatusBlock->Information = bytes_read;
         if (bytes_read == 0 && Length > 0) {
             IoStatusBlock->Status = STATUS_END_OF_FILE;
@@ -262,8 +704,12 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_SUCCESS;
     }
 
-    XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p, len=%u) failed err=%u",
-               FileHandle, Length, GetLastError());
+    {
+        fprintf(stderr, "[NtReadFile] FAILED handle=%p len=%u err=%lu\n",
+                FileHandle, Length, (unsigned long)error);
+        XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p, len=%u) failed err=%u",
+                   FileHandle, Length, error);
+    }
     IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
     IoStatusBlock->Information = 0;
     return STATUS_UNSUCCESSFUL;
@@ -282,6 +728,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
+    overwrite_settle(FileHandle);
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
@@ -305,11 +752,15 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     return STATUS_UNSUCCESSFUL;
 }
 
+
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+    if (xbox_CloseObjectHandle(Handle))
+        return STATUS_SUCCESS;  /* object handle: a link or directory, nothing to close */
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(Handle);
+        overwrite_settle(Handle);
+        xbox_dir_context_close(Handle);
         return STATUS_SUCCESS;
     }
     return STATUS_INVALID_HANDLE;
@@ -333,6 +784,11 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+
+    /* Not for a position query: XAPI SetEndOfFile makes one before it
+     * sets the end of file, and a pending overwrite must survive it. */
+    if (FileInformationClass != XboxFilePositionInformation)
+        overwrite_settle(FileHandle);
 
     switch (FileInformationClass) {
         case XboxFileBasicInformation: {
@@ -427,6 +883,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             LARGE_INTEGER cur, zero = {0};
+            /* A pending overwrite ends here: SetEndOfFile to the new size
+             * keeps the old bytes below it (see s_overwrite_pending). */
+            overwrite_take(FileHandle);
             SetFilePointerEx(FileHandle, zero, &cur, FILE_CURRENT);
             SetFilePointerEx(FileHandle, info->EndOfFile, NULL, FILE_BEGIN);
             if (!SetEndOfFile(FileHandle)) {
@@ -454,6 +913,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_END_OF_FILE_INFORMATION info =
                 (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             FILE_ALLOCATION_INFO fai;
+            overwrite_settle(FileHandle);
             fai.AllocationSize = info->EndOfFile;
             if (!SetFileInformationByHandle(FileHandle, FileAllocationInfo,
                                             &fai, sizeof(fai))) {
@@ -506,12 +966,17 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)FileHandle;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
         case XboxFileFsSizeInformation: {
+            if (Length < sizeof(XBOX_FILE_FS_SIZE_INFORMATION)) {
+                IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+                IoStatusBlock->Information = 0;
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
@@ -584,34 +1049,63 @@ typedef struct {
     HANDLE file_handle;
     HANDLE find_handle;
     BOOL   first_done;
+    BOOL   initial_query;
+    BOOL   pending;
+    BOOL   exhausted;
+    WCHAR  pattern[MAX_PATH];
     WIN32_FIND_DATAW find_data;
 } DIR_CONTEXT;
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
-static BOOL s_dir_cs_init = FALSE;
 
 static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 {
-    if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
+    ensure_dir_cs(&s_dir_cs);
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
-        if (s_dir_contexts[i].file_handle == FileHandle && s_dir_contexts[i].find_handle != NULL) {
-            LeaveCriticalSection(&s_dir_cs);
+        if (s_dir_contexts[i].file_handle == FileHandle) {
             return &s_dir_contexts[i];
         }
     }
     if (!create) { LeaveCriticalSection(&s_dir_cs); return NULL; }
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
-        if (s_dir_contexts[i].find_handle == NULL) {
+        if (s_dir_contexts[i].file_handle == NULL) {
             s_dir_contexts[i].file_handle = FileHandle;
             s_dir_contexts[i].first_done = FALSE;
-            LeaveCriticalSection(&s_dir_cs);
+            s_dir_contexts[i].initial_query = TRUE;
+            s_dir_contexts[i].pending = FALSE;
+            s_dir_contexts[i].exhausted = FALSE;
             return &s_dir_contexts[i];
         }
     }
     LeaveCriticalSection(&s_dir_cs);
     return NULL;
+}
+
+/* A closed directory handle takes its enumeration with it. Host handle values
+ * are reused, and a search abandoned part-way (a title that stops at the first
+ * match) otherwise carried on under the next directory opened at the same
+ * value: its first answer was the old search's next entry. */
+static void xbox_dir_context_close(HANDLE FileHandle)
+{
+    ensure_dir_cs(&s_dir_cs);
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].file_handle == FileHandle) {
+            if (s_dir_contexts[i].find_handle &&
+                s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+                FindClose(s_dir_contexts[i].find_handle);
+            s_dir_contexts[i].find_handle = NULL;
+            s_dir_contexts[i].file_handle = NULL;
+            s_dir_contexts[i].first_done = FALSE;
+            s_dir_contexts[i].initial_query = FALSE;
+            s_dir_contexts[i].pending = FALSE;
+            s_dir_contexts[i].exhausted = FALSE;
+        }
+    }
+    file_diag_close_native(FileHandle);
+    LeaveCriticalSection(&s_dir_cs);
 }
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
@@ -632,11 +1126,44 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         return STATUS_INVALID_INFO_CLASS;
     }
 
+    ULONG header_size = (ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName);
+    if (Length < sizeof(XBOX_FILE_DIRECTORY_INFORMATION)) {
+        IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
     ctx = find_or_create_dir_context(FileHandle, TRUE);
-    if (!ctx)
+    if (!ctx) {
+        IoStatusBlock->Status = STATUS_INSUFFICIENT_RESOURCES;
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (ctx->exhausted && !RestartScan) {
+        IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_NO_MORE_FILES;
+    }
 
     if (RestartScan || !ctx->first_done) {
+        if (!ctx->first_done) {
+            if (FileName && FileName->Buffer && FileName->Length > 0) {
+                if (FileName->Length >= MAX_PATH) {
+                    IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
+                    LeaveCriticalSection(&s_dir_cs);
+                    return STATUS_INVALID_PARAMETER;
+                }
+                int pattern_chars = MultiByteToWideChar(CP_ACP, 0, FileName->Buffer,
+                    FileName->Length, ctx->pattern, MAX_PATH - 1);
+                if (pattern_chars <= 0 || pattern_chars >= MAX_PATH) {
+                    IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
+                    LeaveCriticalSection(&s_dir_cs);
+                    return STATUS_INVALID_PARAMETER;
+                }
+                ctx->pattern[pattern_chars] = L'\0';
+            } else {
+                ctx->pattern[0] = L'\0';
+            }
+        }
         if (ctx->find_handle && ctx->find_handle != INVALID_HANDLE_VALUE) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
@@ -647,35 +1174,42 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
                                                    FILE_NAME_NORMALIZED);
         if (path_len == 0 || path_len >= MAX_PATH) {
             IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            LeaveCriticalSection(&s_dir_cs);
             return STATUS_UNSUCCESSFUL;
         }
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
-            WCHAR pattern_wide[MAX_PATH];
-            MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
-                                pattern_wide, MAX_PATH);
-            pattern_wide[FileName->Length] = L'\0';
-            swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, pattern_wide);
+        if (ctx->pattern[0]) {
+            swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, ctx->pattern);
         } else {
             swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
         }
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
+        ctx->first_done = TRUE;
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
             ctx->find_handle = NULL;
+            ctx->first_done = TRUE;
+            ctx->exhausted = TRUE;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+            LeaveCriticalSection(&s_dir_cs);
             return STATUS_NO_MORE_FILES;
         }
         ctx->first_done = TRUE;
-    } else {
+        ctx->initial_query = TRUE;
+        ctx->pending = TRUE;
+        ctx->exhausted = FALSE;
+    } else if (!ctx->pending) {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
-            ctx->file_handle = NULL;
+            ctx->first_done = TRUE;
+            ctx->exhausted = TRUE;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+            LeaveCriticalSection(&s_dir_cs);
             return STATUS_NO_MORE_FILES;
         }
+        ctx->pending = TRUE;
     }
 
     /* FATX enumeration never exposes the host's dot directories. */
@@ -684,19 +1218,36 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
-            ctx->file_handle = NULL;
+            ctx->first_done = TRUE;
+            ctx->exhausted = TRUE;
+            ctx->pending = FALSE;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+            LeaveCriticalSection(&s_dir_cs);
             return STATUS_NO_MORE_FILES;
         }
+        ctx->pending = TRUE;
     }
 
-    entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
-    memset(entry, 0, Length);
     char filename_ansi[MAX_PATH];
     int name_len = WideCharToMultiByte(CP_ACP, 0, ctx->find_data.cFileName, -1,
                                        filename_ansi, MAX_PATH, NULL, NULL);
-    if (name_len > 0) name_len--;
+    if (name_len <= 0) {
+        IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_UNSUCCESSFUL;
+    }
+    name_len--;
 
+    ULONG available_name = Length - header_size;
+    ULONG copied_name = (ULONG)name_len < available_name ? (ULONG)name_len : available_name;
+    if (copied_name < (ULONG)name_len && !ctx->initial_query) {
+        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Information = 0;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_SUCCESS;
+    }
+    entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
+    memset(entry, 0, header_size);
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;
     entry->CreationTime.LowPart   = ctx->find_data.ftCreationTime.dwLowDateTime;
@@ -710,13 +1261,79 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->AllocationSize.QuadPart = (entry->EndOfFile.QuadPart + 4095) & ~4095LL;
     entry->FileAttributes = ctx->find_data.dwFileAttributes;
     entry->FileNameLength = name_len;
-    {
-        ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
-        if (name_len > 0 && (header_size + name_len) <= Length)
-            memcpy(entry->FileName, filename_ansi, name_len);
-        IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = header_size + name_len;
+    if (copied_name)
+        memcpy(entry->FileName, filename_ansi, copied_name);
+    IoStatusBlock->Information = header_size + copied_name;
+    if (copied_name < (ULONG)name_len) {
+        ctx->initial_query = FALSE;
+        IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_BUFFER_OVERFLOW;
     }
+    ctx->pending = FALSE;
+    ctx->initial_query = FALSE;
+    IoStatusBlock->Status = STATUS_SUCCESS;
+    LeaveCriticalSection(&s_dir_cs);
+    return STATUS_SUCCESS;
+}
+
+
+/* Rename an open file. See the POSIX version for the cases; this one asks
+ * the handle to do it (FileRenameInfo), which needs DELETE access, and falls
+ * back to MoveFileExW on the path the handle names. Tested under Proton
+ * only. */
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
+{
+    WCHAR src[MAX_PATH], dst[MAX_PATH];
+    const char *name = get_xbox_path(NewName);
+    DWORD n;
+
+    if (!name || !*name)
+        return STATUS_INVALID_PARAMETER;
+    n = GetFinalPathNameByHandleW(FileHandle, src, MAX_PATH,
+                                  FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!n || n >= MAX_PATH)
+        return STATUS_INVALID_HANDLE;
+
+    if (!NewName->RootDirectory && !strchr(name, '\\') && !strchr(name, ':')) {
+        WCHAR *slash = wcsrchr(src, L'\\');
+        size_t dir = slash ? (size_t)(slash - src) + 1 : 0;
+        memcpy(dst, src, dir * sizeof(WCHAR));
+        if (!MultiByteToWideChar(CP_ACP, 0, name, -1, dst + dir,
+                                 (int)(MAX_PATH - dir)))
+            return STATUS_OBJECT_NAME_INVALID;
+    } else if (!translate_obj_path(NewName, dst, MAX_PATH)) {
+        return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    {
+        size_t len = wcslen(dst);
+        size_t bytes = sizeof(FILE_RENAME_INFO) + len * sizeof(WCHAR);
+        FILE_RENAME_INFO *fri = (FILE_RENAME_INFO *)calloc(1, bytes);
+        BOOL ok = FALSE;
+        if (fri) {
+            fri->ReplaceIfExists = ReplaceIfExists ? TRUE : FALSE;
+            fri->RootDirectory = NULL;
+            fri->FileNameLength = (DWORD)(len * sizeof(WCHAR));
+            memcpy(fri->FileName, dst, (len + 1) * sizeof(WCHAR));
+            ok = SetFileInformationByHandle(FileHandle, FileRenameInfo, fri,
+                                            (DWORD)bytes);
+            free(fri);
+        }
+        if (!ok)
+            ok = MoveFileExW(src, dst,
+                             ReplaceIfExists ? MOVEFILE_REPLACE_EXISTING : 0);
+        if (!ok) {
+            DWORD e = GetLastError();
+            return e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS
+                 ? STATUS_OBJECT_NAME_COLLISION
+                 : e == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED
+                 : STATUS_UNSUCCESSFUL;
+        }
+    }
+    fprintf(stderr, "  [FILE] rename %S -> %S\n", src, dst);
+    fflush(stderr);
     return STATUS_SUCCESS;
 }
 
@@ -750,6 +1367,59 @@ static int posix_open_flags(ACCESS_MASK access, ULONG disposition)
     return rw | extra;
 }
 
+/* FATX overwrite semantics.
+ *
+ * An overwrite open (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF) of an
+ * existing file sets its size to 0 on FATX, but FATX keeps no valid-data
+ * length: growing the file again with SetEndOfFile, without writing, brings
+ * back the bytes already on disk. A title can rely on this when it builds a
+ * utility-drive texture cache:
+ *
+ *   CreateFile(x.tmp, CREATE_ALWAYS, NO_BUFFERING|OVERLAPPED)
+ *   SetEndOfFile(size rounded up to 512); WriteFile(all of it); CloseHandle
+ *   CreateFile(x.tmp, CREATE_ALWAYS)      <- the second overwrite
+ *   SetEndOfFile(true size); CloseHandle; rename x.tmp -> x.dat
+ *
+ * The second open only trims the sector padding. With O_TRUNC the host
+ * filesystem zero-fills on the regrow, so every cache file came out as zeros
+ * of the right length, and the game later loaded zero textures from them.
+ *
+ * So an overwrite of an existing non-empty file is opened without O_TRUNC
+ * and marked pending. If the first thing done with the handle is setting
+ * the end of file, that is a plain ftruncate to the new size, which keeps
+ * the old bytes below it as FATX does. Anything else (read, write, size
+ * query, allocation, close) first truncates to 0, which is the normal
+ * overwrite. The table is indexed by host fd. */
+#define FATX_PENDING_MAX 4096
+static volatile unsigned char s_overwrite_pending[FATX_PENDING_MAX];
+
+static int disposition_overwrites(ULONG disposition)
+{
+    return disposition == XBOX_FILE_SUPERSEDE
+        || disposition == XBOX_FILE_OVERWRITE
+        || disposition == XBOX_FILE_OVERWRITE_IF;
+}
+
+/* Finish a pending overwrite: truncate to 0. */
+static void overwrite_settle(int fd)
+{
+    if (fd >= 0 && fd < FATX_PENDING_MAX && s_overwrite_pending[fd]) {
+        s_overwrite_pending[fd] = 0;
+        if (ftruncate(fd, 0) != 0) { /* nothing more to do */ }
+    }
+}
+
+/* Take the pending mark without truncating (end-of-file set). Returns 1 if
+ * the handle was pending. */
+static int overwrite_take(int fd)
+{
+    if (fd >= 0 && fd < FATX_PENDING_MAX && s_overwrite_pending[fd]) {
+        s_overwrite_pending[fd] = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static void unix_to_filetime(time_t sec, long nsec, LARGE_INTEGER* out)
 {
     /* 100-ns ticks since 1601-01-01 */
@@ -769,6 +1439,23 @@ static ULONG mode_to_xbox_attrs(mode_t m)
     return a;
 }
 
+/* See the Win32 version: the same test, the same answer. */
+int xbox_host_parent_exists(const xbox_host_char *host_path)
+{
+    char dir[MAX_PATH];
+    const char *cut;
+    struct stat st;
+
+    if (!host_path)
+        return 0;
+    cut = strrchr(host_path, '/');
+    if (!cut || cut == host_path || (size_t)(cut - host_path) >= sizeof dir)
+        return 0;
+    memcpy(dir, host_path, (size_t)(cut - host_path));
+    dir[cut - host_path] = '\0';
+    return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 static NTSTATUS errno_to_status(int e)
 {
     switch (e) {
@@ -782,6 +1469,76 @@ static NTSTATUS errno_to_status(int e)
     }
 }
 
+/* Win32 error for a failed host open, as xbox_LastFileError reports it. */
+static DWORD errno_to_win32(int e)
+{
+    switch (e) {
+        case ENOENT:  return ERROR_FILE_NOT_FOUND;
+        case ENOTDIR: return ERROR_PATH_NOT_FOUND;
+        case EACCES:
+        case EPERM:   return ERROR_ACCESS_DENIED;
+        case EEXIST:  return ERROR_ALREADY_EXISTS;
+        default:      return ERROR_GEN_FAILURE;
+    }
+}
+
+/* Xbox access mask to the Win32 bits the share rules read. Mirrors
+ * xbox_access_to_win32 in the Win32 backend. */
+static DWORD posix_access_to_win32(ACCESS_MASK Access)
+{
+    DWORD result = 0;
+    if (Access & XBOX_GENERIC_READ)          result |= GENERIC_READ;
+    if (Access & XBOX_GENERIC_WRITE)         result |= GENERIC_WRITE;
+    if (Access & XBOX_GENERIC_ALL)           result |= GENERIC_ALL;
+    if (Access & XBOX_FILE_READ_DATA)        result |= FILE_READ_DATA;
+    if (Access & XBOX_FILE_WRITE_DATA)       result |= FILE_WRITE_DATA;
+    if (Access & XBOX_FILE_APPEND_DATA)      result |= FILE_APPEND_DATA;
+    if (Access & XBOX_FILE_READ_ATTRIBUTES)  result |= FILE_READ_ATTRIBUTES;
+    if (Access & XBOX_FILE_WRITE_ATTRIBUTES) result |= FILE_WRITE_ATTRIBUTES;
+    if (Access & XBOX_SYNCHRONIZE)           result |= SYNCHRONIZE;
+    if (Access & XBOX_DELETE)                result |= DELETE;
+    if (result == 0 || result == SYNCHRONIZE)
+        result |= GENERIC_READ;
+    return result;
+}
+
+/* Xbox share bits (FILE_SHARE_READ/WRITE/DELETE) are the Win32 values. */
+static DWORD posix_share_to_win32(ULONG Share)
+{
+    return (DWORD)(Share & (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE));
+}
+
+/* Host path for OBJECT_ATTRIBUTES. A relative name resolves under its
+ * RootDirectory handle's host path, as the Win32 backend does with
+ * GetFinalPathNameByHandle; everything else goes through the path table. */
+static BOOL posix_translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+                                     char* host_path, DWORD buf_size)
+{
+    const char* xbox_path = get_xbox_path(ObjectAttributes);
+    const char* root;
+    size_t used;
+
+    if (!xbox_path)
+        return FALSE;
+    if (!ObjectAttributes->RootDirectory || xbox_path[0] == '\\' ||
+        (xbox_path[0] && xbox_path[1] == ':'))
+        return xbox_translate_path(xbox_path, host_path, buf_size);
+
+    root = w32_handle_path(ObjectAttributes->RootDirectory);
+    if (!root)
+        return FALSE;
+    used = (size_t)snprintf(host_path, buf_size, "%s", root);
+    if (used + 2 >= buf_size)
+        return FALSE;
+    if (xbox_path[0]) {
+        host_path[used++] = '/';
+        for (; *xbox_path && used + 1 < buf_size; xbox_path++)
+            host_path[used++] = *xbox_path == '\\' ? '/' : *xbox_path;
+    }
+    host_path[used] = '\0';
+    return *xbox_path == '\0';   /* FALSE if the name did not fit */
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -789,37 +1546,95 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     ULONG CreateDisposition, ULONG CreateOptions)
 {
     char host_path[MAX_PATH];
-    (void)AllocationSize; (void)FileAttributes; (void)ShareAccess;
+    DWORD win_access, share;
+    int truncate = 0;
+    (void)AllocationSize; (void)FileAttributes;
+    g_xbox_last_file_error = 0;
 
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
+    if (!posix_translate_obj_path(ObjectAttributes, host_path, MAX_PATH)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
     int fd;
+    struct stat st;
+    /* A partition device opened as a directory (a free-space query) gets the
+     * directory that holds its image, as in the Win32 backend. */
+    if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) && stat(host_path, &st) == 0 &&
+        !S_ISDIR(st.st_mode)) {
+        char *slash = strrchr(host_path, '/');
+        if (slash && slash != host_path)
+            *slash = 0;
+    }
+    /* Preserve caller sharing unless the application opts into shared reads. */
+    win_access = posix_access_to_win32(DesiredAccess);
+    share = posix_share_to_win32(ShareAccess);
+    if (s_share_read_only && !(win_access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA |
+          FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | DELETE)))
+        share |= FILE_SHARE_READ;
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             mkdir(host_path, 0755);   /* EEXIST is fine */
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
-        fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
+        /* O_TRUNC is left to w32_open_handle_shared, so a refused open
+         * cannot empty a file another open still holds. An overwrite of an
+         * existing non-empty file is deferred instead (s_overwrite_pending). */
+        int flags = posix_open_flags(DesiredAccess, CreateDisposition);
+        int defer = disposition_overwrites(CreateDisposition)
+                 && stat(host_path, &st) == 0 && S_ISREG(st.st_mode)
+                 && st.st_size > 0;
+        truncate = (flags & O_TRUNC) != 0 && !defer;
+        fd = open(host_path, flags & ~O_TRUNC, 0644);
+        if (fd >= 0 && fd < FATX_PENDING_MAX)
+            s_overwrite_pending[fd] = (unsigned char)defer;
+        else if (fd >= 0 && defer)
+            truncate = 1;                   /* no slot to defer in: truncate now */
     }
 
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    int e = 0;
+    DWORD err = ERROR_SUCCESS;
     if (fd < 0) {
-        int e = errno;
-        XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+        e = errno;
+        err = errno_to_win32(e);
+        /* ENOENT covers a missing file and a missing directory alike. The
+         * console and the Win32 backend (ERROR_PATH_NOT_FOUND) tell them
+         * apart, and a title may branch on which, so POSIX does too. */
+        if (e == ENOENT && !xbox_host_parent_exists(host_path))
+            err = ERROR_PATH_NOT_FOUND;
+    } else {
+        handle = w32_open_handle_shared(fd, host_path, win_access, share, truncate);
+        if (handle == INVALID_HANDLE_VALUE) {
+            err = GetLastError();
+            close(fd);
+        }
+    }
+    if (handle == INVALID_HANDLE_VALUE) {
+        NTSTATUS status = err == ERROR_SHARING_VIOLATION ? STATUS_SHARING_VIOLATION
+                        : err == ERROR_PATH_NOT_FOUND ? STATUS_OBJECT_PATH_NOT_FOUND
+                        : fd < 0 ? errno_to_status(e) : STATUS_UNSUCCESSFUL;
+        const char *result = status == STATUS_SHARING_VIOLATION ? "SHARING_VIOLATION"
+                           : e == ENOENT || e == ENOTDIR ? "NOT_FOUND" : "FAILED";
+        /* Logged in release builds too: a failed open is how a title decides
+         * a volume or asset is missing. The Win32 reason is kept for the
+         * bridge, which turns a sharing conflict into the title's error. */
+        fprintf(stderr, "[NtCreateFile] %s path=%s errno=%d err=%lu access=0x%08X disposition=%u options=0x%X\n",
+                result, host_path, e, (unsigned long)err,
+                (unsigned)DesiredAccess, (unsigned)CreateDisposition, (unsigned)CreateOptions);
+        g_xbox_last_file_error = (uint32_t)err;
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = status;
             IoStatusBlock->Information = 0;
         }
-        return errno_to_status(e);
+        return status;
     }
 
-    *FileHandle = w32_open_handle(fd, host_path);
+    *FileHandle = handle;
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -843,6 +1658,7 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_INVALID_HANDLE;
     }
 
+    overwrite_settle(fd);
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
@@ -879,6 +1695,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
         return STATUS_INVALID_HANDLE;
     }
 
+    overwrite_settle(fd);
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
@@ -899,8 +1716,11 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+    if (xbox_CloseObjectHandle(Handle))
+        return STATUS_SUCCESS;  /* object handle: a link or directory, nothing to close */
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(Handle);
+        overwrite_settle(w32_handle_fd(Handle));
+        xbox_dir_context_close(Handle);
         return STATUS_SUCCESS;
     }
     return STATUS_INVALID_HANDLE;
@@ -909,8 +1729,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     char host_path[MAX_PATH];
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+    if (!posix_translate_obj_path(ObjectAttributes, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
     if (unlink(host_path) == 0) return STATUS_SUCCESS;
@@ -932,6 +1751,9 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
 
     struct stat st;
     if (FileInformationClass != XboxFilePositionInformation) {
+        /* Not for a position query: XAPI SetEndOfFile makes one before it
+         * sets the end of file, and a pending overwrite must survive it. */
+        overwrite_settle(fd);
         if (fstat(fd, &st) != 0)
             return STATUS_UNSUCCESSFUL;
     }
@@ -1010,7 +1832,29 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         }
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            /* A pending overwrite ends here: ftruncate to the new size keeps
+             * the old bytes below it (see s_overwrite_pending). */
+            overwrite_take(fd);
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
+                return STATUS_UNSUCCESSFUL;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
+        case XboxFileAllocationInformation: {
+            /* Reserve space before writing. The Win32 backend already handles
+             * this; POSIX fell through to STATUS_NOT_IMPLEMENTED. A title calls it as it copies textures
+             * into the utility-drive cache.
+             *
+             * NT semantics: an allocation below the end of file truncates to
+             * it; one above only reserves space and leaves the size alone.
+             * POSIX has no portable reservation, and the caller only needs the
+             * write that follows to succeed, so growing is a no-op. */
+            PXBOX_FILE_END_OF_FILE_INFORMATION info =
+                (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            struct stat st;
+            overwrite_settle(fd);
+            if (fstat(fd, &st) == 0 && (off_t)info->EndOfFile.QuadPart < st.st_size
+                    && ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
@@ -1043,16 +1887,92 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     }
 }
 
+/* Rename an open file (NtSetInformationFile, FileRenameInformation).
+ *
+ * A title can build each utility-drive cache file as z:\...\name.tmp, then
+ * rename it to name.dat and later open the .dat. With this class
+ * unimplemented the rename failed, so every .dat open failed with
+ * STATUS_OBJECT_NAME_NOT_FOUND and the title rebuilt the cache instead.
+ *
+ * The new name is resolved the way NT does:
+ *   RootDirectory set    relative to that directory handle
+ *   bare name, no root   within the file's own directory
+ *   anything else        a full Xbox path, through the path table
+ * POSIX rename() replaces an existing target, so ReplaceIfExists = FALSE is
+ * checked first. The handle keeps working (the fd follows the inode), and its
+ * recorded path is updated so a later delete-on-close removes the new name. */
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
+{
+    char dst[MAX_PATH];
+    const char *src = w32_handle_path(FileHandle);
+    const char *name = get_xbox_path(NewName);
+    struct stat st;
+
+    if (!src)
+        return STATUS_INVALID_HANDLE;
+    if (!name || !*name)
+        return STATUS_INVALID_PARAMETER;
+
+    if (NewName->RootDirectory
+            || (!strchr(name, '\\') && !strchr(name, ':'))) {
+        const char *base = NewName->RootDirectory
+                         ? w32_handle_path(NewName->RootDirectory) : src;
+        const char *slash;
+        size_t dir;
+        char *p;
+
+        if (!base)
+            return STATUS_INVALID_HANDLE;
+        if (NewName->RootDirectory) {
+            dir = strlen(base);
+        } else {
+            slash = strrchr(base, '/');
+            dir = slash ? (size_t)(slash - base) : 0;
+        }
+        if (dir + 1 + strlen(name) >= sizeof dst)
+            return STATUS_OBJECT_NAME_INVALID;
+        memcpy(dst, base, dir);
+        dst[dir] = '/';
+        strcpy(dst + dir + 1, name[0] == '\\' ? name + 1 : name);
+        for (p = dst + dir + 1; *p; p++)
+            if (*p == '\\') *p = '/';
+    } else if (!xbox_translate_path(name, dst, MAX_PATH)) {
+        return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    if (strcmp(src, dst) != 0) {
+        if (!ReplaceIfExists && stat(dst, &st) == 0)
+            return STATUS_OBJECT_NAME_COLLISION;
+        if (rename(src, dst) != 0) {
+            int e = errno;
+            fprintf(stderr, "  [FILE] rename %s -> %s FAILED (%s)\n",
+                    src, dst, strerror(e));
+            fflush(stderr);
+            return errno_to_status(e);
+        }
+    }
+    fprintf(stderr, "  [FILE] rename %s -> %s\n", src, dst);
+    fflush(stderr);
+    w32_handle_set_path(FileHandle, dst);
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)Length;
+
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
         case XboxFileFsSizeInformation: {
+            if (Length < sizeof(XBOX_FILE_FS_SIZE_INFORMATION)) {
+                IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+                IoStatusBlock->Information = 0;
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
@@ -1101,8 +2021,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 
     if (!FileInformation)
         return STATUS_INVALID_PARAMETER;
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+    if (!posix_translate_obj_path(ObjectAttributes, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     if (stat(host_path, &st) != 0)
         return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -1122,12 +2041,40 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 typedef struct {
     HANDLE handle;
     DIR*   dir;
-    char   pattern[64];
+    char   pattern[MAX_PATH];
+    BOOL   initial_query;
+    BOOL   pending;
+    BOOL   exhausted;
+    BOOL   pattern_set;
+    char   pending_name[MAX_PATH];
+    struct stat pending_stat;
 } DIR_CONTEXT;
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
-static BOOL s_dir_cs_init = FALSE;
+
+static void xbox_dir_context_close(HANDLE FileHandle)
+{
+    ensure_dir_cs(&s_dir_cs);
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        DIR_CONTEXT *ctx = &s_dir_contexts[i];
+        if (ctx->handle != FileHandle)
+            continue;
+        if (ctx->dir) {
+            closedir(ctx->dir);
+            ctx->dir = NULL;
+        }
+        ctx->handle = NULL;
+        ctx->initial_query = FALSE;
+        ctx->pending = FALSE;
+        ctx->exhausted = FALSE;
+        ctx->pattern_set = FALSE;
+        ctx->pattern[0] = '\0';
+    }
+    CloseHandle(FileHandle);
+    LeaveCriticalSection(&s_dir_cs);
+}
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
@@ -1144,7 +2091,13 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         return STATUS_INVALID_INFO_CLASS;
     }
 
-    if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
+    ULONG header_size = (ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName);
+    if (Length < sizeof(XBOX_FILE_DIRECTORY_INFORMATION)) {
+        IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
+    ensure_dir_cs(&s_dir_cs);
     EnterCriticalSection(&s_dir_cs);
 
     /* Locate or create the per-handle enumeration context. */
@@ -1154,61 +2107,114 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     if (!ctx) {
         for (int i = 0; i < MAX_DIR_CONTEXTS; i++)
             if (s_dir_contexts[i].handle == NULL) { ctx = &s_dir_contexts[i]; break; }
-        if (!ctx) { LeaveCriticalSection(&s_dir_cs); return STATUS_INSUFFICIENT_RESOURCES; }
+        if (!ctx) {
+            IoStatusBlock->Status = STATUS_INSUFFICIENT_RESOURCES;
+            LeaveCriticalSection(&s_dir_cs);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
         ctx->handle = FileHandle;
         ctx->dir = NULL;
+        ctx->initial_query = TRUE;
+        ctx->pending = FALSE;
+        ctx->exhausted = FALSE;
+        ctx->pattern_set = FALSE;
     }
 
-    if (RestartScan || ctx->dir == NULL) {
+    if (ctx->exhausted && !RestartScan) {
+        IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_NO_MORE_FILES;
+    }
+    if (RestartScan || (!ctx->exhausted && ctx->dir == NULL)) {
+        if (!ctx->pattern_set) {
+            if (FileName && FileName->Buffer && FileName->Length >= sizeof(ctx->pattern)) {
+                IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
+                LeaveCriticalSection(&s_dir_cs);
+                return STATUS_INVALID_PARAMETER;
+            }
+            if (FileName && FileName->Buffer && FileName->Length > 0) {
+                USHORT n = FileName->Length;
+                memcpy(ctx->pattern, FileName->Buffer, n);
+                ctx->pattern[n] = '\0';
+            } else {
+                strcpy(ctx->pattern, "*");
+            }
+            ctx->pattern_set = TRUE;
+        }
         if (ctx->dir) { closedir(ctx->dir); ctx->dir = NULL; }
         const char* dpath = w32_handle_path(FileHandle);
         if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
         ctx->dir = opendir(dpath);
         if (!ctx->dir) {
-            LeaveCriticalSection(&s_dir_cs);
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
-        }
-        if (FileName && FileName->Buffer && FileName->Length > 0) {
-            USHORT n = FileName->Length;
-            if (n >= sizeof(ctx->pattern)) n = sizeof(ctx->pattern) - 1;
-            memcpy(ctx->pattern, FileName->Buffer, n);
-            ctx->pattern[n] = '\0';
-        } else {
-            strcpy(ctx->pattern, "*");
-        }
-    }
-
-    /* Advance to the next entry matching the search pattern. */
-    struct dirent* de;
-    const char* dpath = w32_handle_path(FileHandle);
-    struct stat st;
-    for (;;) {
-        de = readdir(ctx->dir);
-        if (!de) {
-            closedir(ctx->dir);
-            ctx->dir = NULL;
             ctx->handle = NULL;
             LeaveCriticalSection(&s_dir_cs);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
-            continue;
-        if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
-            break;
+        ctx->initial_query = TRUE;
+        ctx->pending = FALSE;
+        ctx->exhausted = FALSE;
     }
 
-    char full[MAX_PATH];
-    snprintf(full, sizeof(full), "%s/%s", dpath ? dpath : ".", de->d_name);
-    if (stat(full, &st) != 0)
-        memset(&st, 0, sizeof(st));
-    LeaveCriticalSection(&s_dir_cs);
+    /* Advance to the next entry matching the search pattern. */
+    if (!ctx->pending) {
+        struct dirent* de;
+        const char* dpath = w32_handle_path(FileHandle);
+        if (!dpath) {
+            LeaveCriticalSection(&s_dir_cs);
+            IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            return STATUS_UNSUCCESSFUL;
+        }
+        errno = 0;
+        for (;;) {
+            de = readdir(ctx->dir);
+            if (!de) {
+                int read_error = errno;
+                closedir(ctx->dir);
+                ctx->dir = NULL;
+                ctx->pending = FALSE;
+                ctx->exhausted = TRUE;
+                LeaveCriticalSection(&s_dir_cs);
+                IoStatusBlock->Status = read_error ? errno_to_status(read_error) : STATUS_NO_MORE_FILES;
+                return IoStatusBlock->Status;
+            }
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                continue;
+            if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
+                break;
+        }
+        size_t name_length = strlen(de->d_name);
+        if (name_length >= sizeof(ctx->pending_name)) {
+            LeaveCriticalSection(&s_dir_cs);
+            IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            return STATUS_UNSUCCESSFUL;
+        }
+        memcpy(ctx->pending_name, de->d_name, name_length + 1);
+        if (fstatat(dirfd(ctx->dir), ctx->pending_name, &ctx->pending_stat, 0) != 0) {
+            NTSTATUS status = errno_to_status(errno);
+            ctx->pending = FALSE;
+            IoStatusBlock->Status = status;
+            LeaveCriticalSection(&s_dir_cs);
+            return status;
+        }
+        ctx->pending = TRUE;
+    }
 
+    size_t name_len = strlen(ctx->pending_name);
+    struct stat st = ctx->pending_stat;
+    char name[MAX_PATH];
+    memcpy(name, ctx->pending_name, name_len + 1);
+
+    ULONG copied_name = (ULONG)name_len < Length - header_size
+        ? (ULONG)name_len : Length - header_size;
+    if (copied_name < name_len && !ctx->initial_query) {
+        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Information = 0;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_SUCCESS;
+    }
     PXBOX_FILE_DIRECTORY_INFORMATION entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
-    memset(entry, 0, Length);
-
-    int name_len = (int)strlen(de->d_name);
+    memset(entry, 0, header_size + copied_name);
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;
     unix_to_filetime(st.st_ctime, 0, &entry->CreationTime);
@@ -1218,13 +2224,21 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->EndOfFile.QuadPart = st.st_size;
     entry->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
     entry->FileAttributes = mode_to_xbox_attrs(st.st_mode);
-    entry->FileNameLength = name_len;
+    entry->FileNameLength = (ULONG)name_len;
 
-    ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
-    if (name_len > 0 && (header_size + (ULONG)name_len) <= Length)
-        memcpy(entry->FileName, de->d_name, name_len);
+    if (copied_name)
+        memcpy(entry->FileName, name, copied_name);
+    IoStatusBlock->Information = header_size + copied_name;
+    if (copied_name < name_len) {
+        ctx->initial_query = FALSE;
+        IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
+        LeaveCriticalSection(&s_dir_cs);
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    ctx->pending = FALSE;
+    ctx->initial_query = FALSE;
     IoStatusBlock->Status = STATUS_SUCCESS;
-    IoStatusBlock->Information = header_size + name_len;
+    LeaveCriticalSection(&s_dir_cs);
     return STATUS_SUCCESS;
 }
 
@@ -1263,7 +2277,7 @@ NTSTATUS __stdcall xbox_NtFsControlFile(
 {
     (void)FileHandle; (void)Event; (void)ApcRoutine; (void)ApcContext;
     (void)InputBuffer; (void)InputBufferLength; (void)OutputBuffer; (void)OutputBufferLength;
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtFsControlFile(0x%X) - stub", FsControlCode);
+    xbox_NoteUnsupportedIoctl("NtFsControlFile", FsControlCode);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
         IoStatusBlock->Information = 0;
@@ -1279,7 +2293,7 @@ NTSTATUS __stdcall xbox_NtDeviceIoControlFile(
 {
     (void)FileHandle; (void)Event; (void)ApcRoutine; (void)ApcContext;
     (void)InputBuffer; (void)InputBufferLength; (void)OutputBuffer; (void)OutputBufferLength;
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtDeviceIoControlFile(0x%X) - stub", IoControlCode);
+    xbox_NoteUnsupportedIoctl("NtDeviceIoControlFile", IoControlCode);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
         IoStatusBlock->Information = 0;
@@ -1287,33 +2301,36 @@ NTSTATUS __stdcall xbox_NtDeviceIoControlFile(
     return STATUS_NOT_IMPLEMENTED;
 }
 
+/* The link's name comes from the OBJECT_ATTRIBUTES. Path translation (kernel_path.c)
+ * maps the drive letters; this only answers which link a handle names. */
 NTSTATUS __stdcall xbox_NtOpenSymbolicLinkObject(
     PHANDLE LinkHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
-    /*
-     * Xbox uses symbolic links for drive-letter mapping (D: -> \Device\CdRom0).
-     * Path translation handles this transparently, so return a dummy handle.
-     */
-    if (LinkHandle)
-        *LinkHandle = (HANDLE)(ULONG_PTR)0xDEAD0001;
-    XBOX_TRACE(XBOX_LOG_FILE, "NtOpenSymbolicLinkObject(%s) - stub",
-        get_xbox_path(ObjectAttributes) ? get_xbox_path(ObjectAttributes) : "?");
-    return STATUS_SUCCESS;
+    char name[128];
+    PXBOX_ANSI_STRING s;
+
+    if (!LinkHandle || !ObjectAttributes || !(s = ObjectAttributes->ObjectName) ||
+        !s->Buffer || s->Length >= sizeof(name))
+        return STATUS_INVALID_PARAMETER;
+    memcpy(name, s->Buffer, s->Length);
+    name[s->Length] = '\0';
+    return xbox_OpenSymbolicLink(name, LinkHandle);
 }
 
 NTSTATUS __stdcall xbox_NtQuerySymbolicLinkObject(
     HANDLE LinkHandle, PXBOX_ANSI_STRING LinkTarget, PULONG ReturnedLength)
 {
-    (void)LinkHandle;
-    const char* target = "\\Device\\CdRom0";
-    if (LinkTarget && LinkTarget->Buffer) {
-        USHORT len = (USHORT)strlen(target);
-        if (len < LinkTarget->MaximumLength) {
-            memcpy(LinkTarget->Buffer, target, len + 1);
-            LinkTarget->Length = len;
-        }
-    }
+    const char* target = xbox_SymbolicLinkHandleTarget(LinkHandle);
+    USHORT len;
+
+    if (!target)
+        return STATUS_INVALID_HANDLE;
+    len = (USHORT)strlen(target);
     if (ReturnedLength)
-        *ReturnedLength = (ULONG)strlen(target);
+        *ReturnedLength = (ULONG)len;
+    if (!LinkTarget || !LinkTarget->Buffer || len >= LinkTarget->MaximumLength)
+        return (NTSTATUS)0xC0000023L; /* STATUS_BUFFER_TOO_SMALL */
+    memcpy(LinkTarget->Buffer, target, len + 1);
+    LinkTarget->Length = len;
     return STATUS_SUCCESS;
 }

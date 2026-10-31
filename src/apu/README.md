@@ -3,10 +3,10 @@
 Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted from [xemu](https://github.com/xemu-project/xemu). The APU is a custom chip with three processors:
 
 - **VP (Voice Processor)** — 256 hardware voices, ADPCM/PCM decode, pitch shifting, envelopes, HRTF 3D audio
-- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass.
-- **EP (Encode Processor)** — DSP for AC3/DTS encoding. Currently **stubbed** — passthrough.
+- **GP (Global Processor)** — DSP for global effects (reverb, chorus), run by the DSP56300 interpreter in `dsp/` (see `dsp/PROVENANCE.md`).
+- **EP (Encode Processor)** — DSP for AC3/DTS encoding, also on the interpreter (adapted from xemu's `gp_ep.c`).
 
-Audio output goes through an SDL3 audio stream at 48kHz stereo 16-bit.
+Audio output uses Windows `waveOut` at 48kHz stereo 16-bit.
 
 ## Files
 
@@ -15,9 +15,9 @@ Audio output goes through an SDL3 audio stream at 48kHz stereo 16-bit.
 | `apu.h` | 70 | **Public API** — init, shutdown, MMIO, mixer voices |
 | `apu_state.h` | 525 | APU state struct (VP, GP, EP, DSP core, 256 voices) |
 | `apu_regs.h` | 366 | MCPX APU register definitions and field masks |
-| `apu_core.c` | 762 | MMIO handlers, frame thread, test tone |
+| `apu_core.c` | 762 | MMIO handlers, frame thread, waveOut output, test tone |
 | `apu_vp.c` | 1,247 | Voice Processor — decode, resample, mix, envelopes, HRTF |
-| `apu_dsp.c` | 90 | GP/EP stubs (mixbin 0/1 passthrough) |
+| `apu_dsp.c` | | GP/EP glue around the DSP interpreter in `dsp/` |
 | `apu_mmio_hook.c` | 253 | VEH x86-64 instruction decoder for 0xFE800000+ MMIO |
 | `apu_shim.h` | 431 | QEMU compatibility (threads, atomics, clocks → Win32) |
 | `apu_debug.h` | 104 | Debug logging macros |
@@ -77,17 +77,17 @@ mcpx_apu_shutdown(apu);
          ▼           ▼           ▼
    ┌──────────┐ ┌─────────┐ ┌─────────┐
    │    VP    │ │   GP    │ │   EP    │
-   │256 voices│ │  (stub) │ │  (stub) │
-   │ ADPCM/  │ │  effects│ │  encode │
-   │  PCM    │ │  bypass │ │  bypass │
+   │256 voices│ │ DSP     │ │ DSP     │
+   │ ADPCM/  │ │ effects │ │ encode  │
+   │  PCM    │ │ program │ │ program │
    └────┬─────┘ └────┬────┘ └────┬────┘
         │             │           │
         └──────┬──────┘───────────┘
                │ mixed samples
                ▼
    ┌──────────────────────────────┐
-   │  SDL3 audio (48kHz stereo)   │
-   │  3 × 1024-sample queue      │
+   │    waveOut (48kHz stereo)    │
+   │  4 × 2048-sample buffers    │
    └──────────────────────────────┘
 ```
 
@@ -170,4 +170,4 @@ Full register definitions in `apu_regs.h`.
 
 - `qemu_shim.h` (from `../nv2a/`) — QEMU type abstraction layer
 - `kernel32.lib` — Win32 threading
-- SDL3 — audio output (`apu_audio_out.c`)
+- `winmm.lib` — waveOut audio output

@@ -22,8 +22,14 @@
 #ifndef XBOX_WINNT_H
 #define XBOX_WINNT_H
 
-/* Thread-local storage qualifier (portable). */
-#if defined(_WIN32)
+/* Thread-local storage qualifier (portable).
+ *
+ * Keyed on the compiler, not the target. MinGW targets _WIN32 but is GCC, and
+ * GCC ignores __declspec(thread) with nothing but -Wattributes, so every
+ * XBOX_THREAD_LOCAL became one process-wide variable: the current IRQL, the
+ * last host path, the kernel-busy slot. recomp_types.h's RECOMP_TLS already
+ * tests _MSC_VER first for the same reason. */
+#if defined(_MSC_VER)
 #define XBOX_THREAD_LOCAL __declspec(thread)
 #else
 #define XBOX_THREAD_LOCAL __thread
@@ -147,10 +153,15 @@ typedef void             **PHANDLE, **LPHANDLE;
 typedef void              *HMODULE, *HINSTANCE, *HKEY, *HLOCAL, *HGLOBAL;
 typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
 
-/* PCONTEXT: Windows VEH register state. On Linux the equivalent is
- * ucontext_t*; we leave it opaque here since Linux callers don't use it. */
-typedef void              *PCONTEXT;
-
+/* PCONTEXT: the x86-64 registers a vectored exception handler reads and
+ * changes, with the Windows CONTEXT field names. win32_compat.c fills it from
+ * the signal's ucontext and writes it back when a handler continues. */
+typedef struct _CONTEXT {
+    uint64_t Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    uint64_t R8, R9, R10, R11, R12, R13, R14, R15;
+    uint64_t Rip;
+    uint32_t EFlags;
+} CONTEXT, *PCONTEXT;
 /* Xbox/UTF-16 wide char is 16-bit, unlike the 32-bit Linux wchar_t. */
 typedef uint16_t           WCHAR, *PWCHAR, *LPWSTR, *PWSTR;
 typedef const uint16_t    *LPCWSTR, *PCWSTR;

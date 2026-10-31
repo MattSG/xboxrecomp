@@ -13,8 +13,7 @@
  * and 2D overlays that way, so it is the first geometry to appear. Batches that
  * need a vertex program executed are counted and skipped rather than drawn
  * somewhere wrong -- see raster_batch(). Texturing, depth and vertex programs
- * are still a renderer, not a command decoder; the upgrade path is the PGRAPH translator
- * translator in src/nv2a/nv2a_pgraph_d3d8.c.
+ * are handled by the host renderer in src/video when it is active.
  *
  * Everything this does not handle is counted and ranked by
  * nv2a_pb_exec_report(), so what remains is a list rather than a guess.
@@ -26,17 +25,43 @@
  */
 #include <math.h>
 #include <stdio.h>
+#include "platform/recomp_profile.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
+#include "nv2a_flip_hold.h"
+#include "platform/host_time.h"   /* xbox_HostNowNs */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
+#include "nv2a_vsh_interp.h"
+#include "nv2a_combiner.h"
+#include "nv2a_backend.h"
+#include "../video/nv2a_d3d11.h"
+#if defined(_WIN32)
+#include <windows.h>
+#define NV_TLS __declspec(thread)
+#else
+#define NV_TLS __thread
+#endif
+
+static int (*s_nop_hook)(const NvD3DState *, uint32_t, uint32_t);
+static int s_nop_pending;
+
+void nv2a_pb_set_nop_hook(int (*hook)(const NvD3DState *, uint32_t, uint32_t))
+{
+    s_nop_hook = hook;
+    s_nop_pending = 0;
+}
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+extern void xbox_FramebufferWindowSetAA(uint32_t sy);
+extern uint32_t xbox_Nv2aFenceWordVa(void);
+extern int nv2a_pb_dma_walk(void);   /* nv2a_pb_scan.c: RECOMP_PB_WALK=dma */
 extern void xbox_FramebufferWindowStart(void);
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
@@ -57,9 +82,22 @@ extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
  * nothing is strictly better than writing over the guest, and a title that
  * cannot draw is easier to debug than one that has been overwritten.
  */
+static int guest_span_ok(uint64_t addr, uint32_t bytes);
+
 static int surface_hits_image(uint32_t base, uint32_t bytes)
 {
-    if (!g_xbox_image_hi || !bytes)
+    if (!bytes)
+        return 0;
+    /* The thread stacks sit just above the image. No surface lives there, so
+     * a DMA offset that reads as a VA in that range is just as wrong as one
+     * that lands on the image. */
+    if (base < XBOX_HEAP_BASE && (uint64_t)base + bytes > XBOX_STACK_BASE)
+        return 1;
+    /* And anything that is not guest memory at all: a clear wrote to
+     * 0xC532311B, an offset that names no memory the guest owns. */
+    if (!guest_span_ok(base, bytes))
+        return 1;
+    if (!g_xbox_image_hi)
         return 0;
     return base < g_xbox_image_hi && base + bytes > g_xbox_image_lo;
 }
@@ -87,29 +125,14 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  */
 static uint32_t dma_resolve(uint32_t offset)
 {
-    extern uint32_t xbox_ContiguousAllocatedBytes(void);
-
-    /* Did this runtime hand the offset out as contiguous memory? Then the
-     * bytes live in the window, and that is not a guess: the arena is a bump
-     * allocator from XBOX_CONTIG_BASE, so everything below its high-water
-     * mark is memory some MmAllocateContiguousMemory call returned. The
-     * title's own writes go through the window, so the executor's must too.
-     *
-     * Checking this BEFORE the image test is the whole point. The image test
-     * only catches an offset that would land on the title's code, and whether
-     * it does is an accident of where the image happens to end: Half-Life 2's
-     * colour surface is physical 0x00A6C000, which clears the image by 700 KB.
-     * So it looked like an ordinary VA, and the executor cleared 1.2 MB of
-     * black straight through the guest heap -- which faulted the title three
-     * frames later on a pointer that had been overwritten, while the real
-     * framebuffer at 0x80A6C000 stayed untouched and the screen stayed black. */
-    if (offset < xbox_ContiguousAllocatedBytes())
+    uint32_t guest_va;
+    if (xbox_PhysicalAddressResolve(offset, 1, &guest_va) == 1)
+        return guest_va;
+    /* Only offsets inside a block returned by the contiguous allocator use
+     * the separate window. Gaps below its bump pointer are ordinary RAM. */
+    if (xbox_ContiguousRangeAllocated(offset, 1))
         return XBOX_CONTIG_BASE + offset;
-    if (!surface_hits_image(offset, 1))
-        return offset;
-    if ((uint64_t)offset < XBOX_CONTIG_SIZE)
-        return XBOX_CONTIG_BASE + offset;
-    return offset;                         /* nothing better to offer */
+    return offset;
 }
 
 static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
@@ -122,7 +145,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
         said = 1;
         fprintf(stderr,
                 "  [GPU] REFUSING to %s surface 0x%08X..0x%08X: that overlaps "
-                "the loaded image (0x%08X..0x%08X).\n"
+                "the loaded image (0x%08X..0x%08X), a thread stack, or is "
+                "outside guest memory.\n"
                 "  [GPU]   SET_SURFACE_COLOR_OFFSET is a DMA-object offset, not "
                 "a guest VA, and this executor treats it as one. Writing here "
                 "would destroy the title's own code and globals.\n",
@@ -143,6 +167,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_BLEND_FUNC_DFACTOR      0x0348
 #define NV_BLEND_SRC_ALPHA                0x0302
 #define NV_BLEND_ONE_MINUS_SRC_ALPHA      0x0303
+#define NV097_SET_BLEND_COLOR             0x034C
+#define NV097_SET_BLEND_EQUATION          0x0350
 
 #define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
 #define NV097_SET_SURFACE_CLIP_VERTICAL   0x0204
@@ -156,6 +182,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_BEGIN_END               0x17FC
 #define NV097_SET_TEXTURE_OFFSET          0x1B00   /* +i*0x40 */
 #define NV097_SET_TEXTURE_FORMAT          0x1B04
+#define NV097_SET_TEXTURE_PALETTE         0x1B20   /* offset | size<<2 | dma */
 #define NV097_SET_TEXTURE_ADDRESS         0x1B08
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
@@ -166,15 +193,22 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
  * asks for a flip, and waits for it in a loop that makes no kernel calls
  * and burns no dispatch, which reads as a hang with no cause.
  *
- * ponytail: the flip completes the moment it is asked for, because there is
- * no scanout to be in the middle of. That makes every frame land instantly
- * and a title that paces itself on the flip runs as fast as it can draw.
- * Pacing wants the vblank clock in the kernel, not a sleep in here. */
+ * The flip completes here at once, because there is no scanout to be in the
+ * middle of; what the console's stall did to the title (wait for the vblank
+ * the swap asked for) is the flip hold's job: FLIP_STALL arms it, and the
+ * ack loop holds the next walk until the guest's vblank count allows the
+ * flip (nv2a_flip_hold.h). The swap's interval comes from the NO_OPERATION
+ * D3D pushes before it, software method 1. */
+#define NV097_NO_OPERATION                0x0100
 #define NV097_SET_FLIP_READ               0x0120
 #define NV097_SET_FLIP_WRITE              0x0124
 #define NV097_SET_FLIP_MODULO             0x0128
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
+#define NV097_NO_OPERATION                0x0100
+#define NV097_SET_CONTEXT_DMA_SEMAPHORE    0x01A8
+#define NV097_SET_SEMAPHORE_OFFSET         0x1D6C
+#define NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
 #define NV097_ARRAY_ELEMENT16             0x1800
 /* Draw a run of vertices straight out of the arrays, with no index list:
  * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
@@ -192,11 +226,14 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_VERTEX4F                0x1518   /* +0..0x0C, 4 floats */
 #define NV097_SET_VERTEX_DATA2F_M         0x1880   /* + attr*8,  2 floats */
 #define NV097_SET_VERTEX_DATA4F_M         0x1A00   /* + attr*16, 4 floats */
-#define NV097_SET_VERTEX_DATA4UB          0x1940   /* + attr*4,  D3DCOLOR */
+#define NV097_SET_VERTEX_DATA4UB          0x1940   /* + attr*4,  4 x u8 */
+#define NV097_SET_VERTEX_DATA2S           0x1900   /* + attr*4,  2 x s16 */
+#define NV097_SET_VERTEX_DATA4S_M         0x1980   /* + attr*8,  4 x s16 */
 
 /* One immediate vertex, as this file packs it for the shared draw path:
  * position float4, diffuse D3DCOLOR, texcoord0 float2. */
-#define IMM_VERTEX_DWORDS 7
+/* An immediate-mode vertex: all 16 attributes as float4. */
+#define IMM_VERTEX_DWORDS (NV_VERTEX_ATTRS * 4)
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
 
@@ -210,8 +247,24 @@ typedef struct {
 } VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
-#define NV_MAX_INDICES  4096
-#define NV_MAX_INLINE   4096            /* dwords of INLINE_ARRAY per batch */
+#define NV_MAX_INDICES  (1u << 20)
+#define NV_MAX_INLINE   (1u << 21)          /* dwords of INLINE_ARRAY per batch */
+
+static int exec_verbose(void);
+
+/* A batch past one of the caps above is dropped or cut short, never wrapped.
+ * Each cap logs once (by site, as a bit in `site`) and counts what it lost. */
+static uint32_t s_cap_dropped;
+static void cap_exceeded(uint32_t site, const char *what, uint32_t limit, uint32_t lost)
+{
+    static uint32_t logged;
+    s_cap_dropped += lost;
+    if (logged & site)
+        return;
+    logged |= site;
+    fprintf(stderr, "PB_EXEC: %s over the %u cap, %u dropped (counted, logged once per site)\n",
+            what, limit, lost);
+}
 
 /* Texture stage 0, decoded from what the title programmed.
  *
@@ -225,13 +278,24 @@ typedef struct {
     uint32_t pitch;                     /* bytes per row, from CONTROL1  */
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
+    uint32_t palette;                   /* guest address of the CLUT, P8 */
+    uint32_t levels;                    /* mip levels, from FORMAT       */
+    uint32_t filter;                    /* SET_TEXTURE_FILTER            */
+    uint32_t border;                    /* SET_TEXTURE_BORDER_COLOR      */
+    int      border_color;              /* FORMAT: BORDER reads `border` */
+    int      cube;                      /* FORMAT: six faces, not one    */
+    uint32_t swizzle_common_mask;
+    int swizzle_shift;        /* cached log2(min(width,height)); -1 = general */
     int      valid;
+    /* Raw registers the D3D11 path needs as well. */
+    uint32_t format_raw, address_raw, control0, palette_len;
+    float    bump_mat[4], bump_scale, bump_offset;
 } Texture;
 
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
-    uint16_t   idx[NV_MAX_INDICES];
+    uint32_t   idx[NV_MAX_INDICES];     /* DRAW_ARRAYS starts are 24-bit */
     uint32_t   idx_count;
     /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
      * instead of into a buffer the title points at. Same vertex format, a
@@ -240,9 +304,10 @@ static struct {
     uint32_t   inline_count;
     /* Current values of the immediate-mode attributes, and how many complete
      * vertices they have produced in this batch. */
-    float      imm_pos[4];
-    uint32_t   imm_diffuse;
-    float      imm_tex[2];
+    /* Immediate mode: every attribute's current value, as the SET_VERTEX
+     * methods leave it. Writing attribute 0 (position) emits a vertex. */
+    float      imm_attr[NV_VERTEX_ATTRS][4];
+    uint16_t   imm_used;                /* attributes written since BEGIN */
     uint32_t   imm_count;
     int        inline_active;
     uint32_t   draws, verts, nonzero_draws;
@@ -254,9 +319,22 @@ static struct {
      * that has not been drawn yet -- which is how a correctly rendered
      * sequence came out as 12 black BMPs. */
     uint32_t drawn_offset;
+    /* ...and the shape of that surface. A title also draws into small
+     * render targets (a title: 128x128 shadow/reflection maps, pitch 512),
+     * often after the main scene, so "last surface drawn" alone picked one of
+     * those and read it with the framebuffer's pitch: horizontal noise. The
+     * biggest surface drawn since the last flip is the one being presented. */
+    uint32_t drawn_pitch, drawn_x, drawn_y, drawn_w, drawn_h, drawn_bpp;
+    int drawn_stale;      /* set at a flip: the next draw starts a new frame */
     uint64_t pixels;
     uint32_t pixel_max;   /* brightest value any pixel write carried */
-    uint32_t clip_x, clip_w, clip_y, clip_h;
+    uint32_t clip_x, clip_w, clip_y, clip_h;       /* real (anti-aliased) pixels */
+    uint32_t clip_raw_h, clip_raw_v;    /* SET_SURFACE_CLIP_* as sent: logical */
+    float    aa_sx, aa_sy;              /* anti-aliasing scale of the surface */
+    /* SET_WINDOW_CLIP_TYPE and the 8 regions (min | max << 16): how Xbox
+     * D3D clips a viewport, as the GPU does not clip x/y. Regions never
+     * written are not used (mask). */
+    uint32_t wclip_type, wclip_mask, wclip_h[8], wclip_v[8];
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
@@ -266,8 +344,72 @@ static struct {
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
-    Texture  tex;
+    uint32_t blend_equation, blend_color;
+    uint32_t color_mask;        /* SET_COLOR_MASK: A<<24 R<<16 G<<8 B */
+    /* Visibility tests (D3D's Begin/EndVisibilityTest): pixels that pass the
+     * depth test while counting is on, reported by GET_REPORT. */
+    uint32_t zpass_enable, zpass_count, reports;
+    uint32_t blend_pairs[16];   /* sfactor<<16 | dfactor seen, for the report */
+    int blend_npairs;
+    Texture  texs[4];                   /* one per texture stage */
+    /* Register combiners and the per-pixel state around them. rc_seen: the
+     * title has programmed the combiners, so they decide every pixel's
+     * colour; until then the old "stage 0 texel * diffuse" stands in. */
+    Nv2aCombiner rc;
+    int      rc_seen;
+    uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
+    uint32_t alpha_test, alpha_func, alpha_ref;
+    uint32_t fog_enable, fog_mode, fog_color;
+    float    fog_param[2];
+    /* Vertex programs (nv2a_vsh_interp.c) and the depth buffer, which
+     * together are what a 3D scene needs and a 2D one never used. */
+    uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
+    uint32_t batches_program, verts_program, tris_behind;
+    /* Where program-path triangles go, so "nothing drew" has a reason. */
+    uint32_t xf_degenerate, xf_offscreen, xf_drawn;
+    uint64_t xf_depth_fail, xf_pixels;
+    float xf_min[3], xf_max[3];
+    uint32_t xf_fmt[16];  /* attribute formats seen: type | size<<4 | slot<<8 */
+    int xf_nfmt, xf_seeded;
+    uint32_t depth_test, depth_func, depth_mask;
+    uint32_t zeta_offset, zstencil_clear, zeta_pitch;
+    /* SET_CLEAR_RECT_HORIZONTAL / _VERTICAL (x0 | x1 << 16, inclusive):
+     * the area CLEAR_SURFACE covers on a swizzled surface (clear_surface).
+     * clear_rect_set: bit 0 horizontal, bit 1 vertical sent; the rect
+     * applies once both have been. */
+    uint32_t clear_rect_h, clear_rect_v;
+    int clear_rect_set;
+    /* Fixed-function transform: the composite matrix (world * view *
+     * projection * viewport, as D3D uploads it) and whether the title has
+     * sent one. The viewport offset is the constant-file entry c[59]. */
+    float    composite[16];
+    int      composite_set;
+    uint32_t batches_ffp;
+    /* State only the D3D11 path consumes. */
+    uint32_t stencil_test, stencil_func, stencil_ref, stencil_func_mask;
+    uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    uint32_t cull_enable, cull_face, front_face, shade_mode;
+    uint32_t control0;                  /* SET_CONTROL0 */
+    uint32_t poly_offset_fill;
+    float    poly_offset_factor, poly_offset_units;
+    uint32_t other_stage_input, dot_rgb_mapping;
 } s_gpu;
+
+/* The last value written to every Kelvin method, as the GPU's register file
+ * would hold it. State the executor does not model explicitly (lights,
+ * material colours, cull and clip state handed to a back end) is read from
+ * here. */
+static uint32_t s_reg[0x2000 / 4];
+static float reg_f(uint32_t method)
+{
+    float f;
+    memcpy(&f, &s_reg[method / 4], 4);
+    return f;
+}
+
+/* Where BACK_END_WRITE_SEMAPHORE_RELEASE lands; see nv2a_backend.h. */
+static uint32_t s_sem_va;
+void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -294,6 +436,21 @@ static int tex_size_from_format(uint32_t fmt)
     return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
 }
 
+static void tex_update_valid(Texture *t)
+{
+    uint32_t common = t->width < t->height ? t->width : t->height;
+    t->swizzle_shift = -1;
+    if (common && common <= 65536u &&
+        !(t->width & (t->width - 1u)) && !(t->height & (t->height - 1u))) {
+        uint32_t bits = common;
+        t->swizzle_common_mask = common - 1u;
+        t->swizzle_shift = 0;
+        while (bits > 1u) { bits >>= 1; ++t->swizzle_shift; }
+    }
+    t->valid = t->offset && t->width && t->height
+            && (tex_size_from_format(t->color) || t->pitch);
+}
+
 static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
@@ -303,9 +460,7 @@ static void record_tex_reg(uint32_t method, uint32_t param)
      * which is nearly all of them, since swizzled is the Xbox default. That
      * left the title's own textures unsampled and every textured quad drawn in
      * flat vertex colour. */
-    s_gpu.tex.valid = s_gpu.tex.offset && s_gpu.tex.width && s_gpu.tex.height
-                   && (tex_size_from_format(s_gpu.tex.color)
-                       || s_gpu.tex.pitch);
+    tex_update_valid(&s_gpu.texs[0]);
 }
 
 /* Every distinct texture a batch was drawn with, and how many batches used it.
@@ -334,11 +489,11 @@ static void note_texture_use(void)
 {
     int i;
 
-    if (!s_gpu.tex.valid)
+    if (!s_gpu.texs[0].valid)
         return;
     for (i = 0; i < s_tex_use_count; i++) {
-        if (s_tex_use[i].offset == s_gpu.tex.offset
-         && s_tex_use[i].color  == s_gpu.tex.color) {
+        if (s_tex_use[i].offset == s_gpu.texs[0].offset
+         && s_tex_use[i].color  == s_gpu.texs[0].color) {
             s_tex_use[i].batches++;
             /* Dump a surface that is redrawn, every Nth time it is bound.
              *
@@ -371,34 +526,79 @@ static void note_texture_use(void)
         }
     }
     if (s_tex_use_count < PB_EXEC_MAX_TEXTURES) {
-        s_tex_use[s_tex_use_count].offset  = s_gpu.tex.offset;
-        s_tex_use[s_tex_use_count].color   = s_gpu.tex.color;
-        s_tex_use[s_tex_use_count].width   = s_gpu.tex.width;
-        s_tex_use[s_tex_use_count].height  = s_gpu.tex.height;
+        s_tex_use[s_tex_use_count].offset  = s_gpu.texs[0].offset;
+        s_tex_use[s_tex_use_count].color   = s_gpu.texs[0].color;
+        s_tex_use[s_tex_use_count].width   = s_gpu.texs[0].width;
+        s_tex_use[s_tex_use_count].height  = s_gpu.texs[0].height;
         s_tex_use[s_tex_use_count].batches = 1;
         s_tex_use_count++;
         dump_texture_bmp((uint32_t)s_tex_use_count - 1);
     }
 }
 
+/* Slot + 1 of each method in s_unhandled: this runs for every method the
+ * executor does not model, millions of times a second, so no search. The
+ * report sorts s_unhandled and rebuilds the slots afterwards. */
+static uint16_t s_unhandled_slot[0x2000 / 4];
+
 static void note_unhandled(uint32_t method, uint32_t param)
 {
-    int i;
+    uint16_t *slot = &s_unhandled_slot[(method & 0x1FFC) / 4];
 
     s_gpu.unhandled_total++;
-    for (i = 0; i < s_unhandled_count; i++) {
-        if (s_unhandled[i].method == method) {
-            s_unhandled[i].count++;
-            s_unhandled[i].last_param = param;
-            return;
-        }
+    if (*slot) {
+        s_unhandled[*slot - 1].count++;
+        s_unhandled[*slot - 1].last_param = param;
+        return;
     }
     if (s_unhandled_count < PB_EXEC_MAX_UNHANDLED) {
         s_unhandled[s_unhandled_count].method = method;
         s_unhandled[s_unhandled_count].count = 1;
         s_unhandled[s_unhandled_count].last_param = param;
         s_unhandled_count++;
+        *slot = (uint16_t)s_unhandled_count;
     }
+}
+
+/* Is [addr, addr + bytes) inside memory the guest owns? That is ordinary RAM
+ * from 0, and the contiguous window at XBOX_CONTIG_BASE. The index of a vertex
+ * comes from the title's pushbuffer, 32 bits of it, so after a desync it can
+ * be anything; this is the one place every vertex read passes through. */
+static int guest_span_ok(uint64_t addr, uint32_t bytes)
+{
+    uint64_t end = addr + bytes;
+
+    if (end <= (uint64_t)XBOX_CONTIG_SIZE)
+        return 1;
+    return addr >= XBOX_CONTIG_BASE
+        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+}
+
+/* Bytes one element of attribute `a` occupies, as fetch_attr reads it. */
+static uint32_t attr_elem_bytes(const VertexAttr *a)
+{
+    uint32_t n = a->size < 4 ? a->size : 4;
+
+    switch (a->type) {
+    case 0: case 6: return 4;
+    case 1: case 5: return 2u * n;
+    case 4:         return n;
+    default:        return 4u * n;
+    }
+}
+
+/* A vertex fetch outside the mapped windows is refused (the caller gets a
+ * degenerate vertex) rather than read past the array. Logged for the first
+ * few so a stale array is visible without flooding the log. */
+static void log_fetch_refused(const VertexAttr *a, uint32_t index, uint64_t at)
+{
+    static int logged;
+    if (logged >= 8)
+        return;
+    logged++;
+    fprintf(stderr, "PB_EXEC: vertex fetch refused: va=0x%llx stride=%u index=%u type=%u size=%u (%d of 8 logged)\n",
+            (unsigned long long)at, (unsigned)a->stride, (unsigned)index,
+            (unsigned)a->type, (unsigned)a->size, logged);
 }
 
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
@@ -412,21 +612,36 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    if (!a->size || !a->stride)
+    if (!a->size) {
+        /* Disabled arrays use the current vertex attribute register. Titles
+         * can supply instance transform rows through SET_VERTEX_DATA4F. */
+        size_t attr = (size_t)(a - s_gpu.attr);
+        if (attr < NV_VERTEX_ATTRS) {
+            memcpy(out, s_gpu.imm_attr[attr], sizeof(float) * 4);
+            return 1;
+        }
         return 0;
+    }
+    /* A zero stride repeats the same enabled array element for every vertex. */
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
          * the buffered payload rather than a guest address -- and 0 is a legal
          * one there, which is why the offset test is on the other side of this
          * branch. */
         size_t at = (size_t)a->offset + (size_t)index * a->stride;
-        if (at + 4 > (size_t)s_gpu.inline_count * 4)
+        if (at + 4 > (size_t)s_gpu.inline_count * 4) {
+            log_fetch_refused(a, index, (uint64_t)at);
             return 0;
+        }
         p = (const uint8_t *)s_gpu.inline_buf + at;
     } else {
-        if (!a->offset)
+        uint64_t at = (uint64_t)a->offset + (uint64_t)index * a->stride;
+
+        if (!a->offset || !guest_span_ok(at, attr_elem_bytes(a))) {
+            log_fetch_refused(a, index, at);
             return 0;
-        p = mem + a->offset + (size_t)index * a->stride;
+        }
+        p = mem + at;
     }
 
     switch (a->type) {
@@ -447,13 +662,59 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         for (i = 0; i < a->size && i < 4; i++)
             out[i] = (float)p[i] / 255.0f;
         return 1;
+    /* The formats 3D geometry uses and screen-space quads never did. */
+    case 1:                                  /* signed short, normalised */
+        for (i = 0; i < a->size && i < 4; i++)
+            out[i] = (float)((const int16_t *)p)[i] / 32767.0f;
+        return 1;
+    case 5:                                  /* signed short, as is */
+        for (i = 0; i < a->size && i < 4; i++)
+            out[i] = (float)((const int16_t *)p)[i];
+        return 1;
+    case 6: {                                /* packed 11:11:10 normal */
+        uint32_t v = *(const uint32_t *)p;
+        out[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
+        out[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
+        out[2] = (float)((int32_t)v >> 22) / 511.0f;
+        return 1;
+    }
     default:
         return 0;
     }
 }
 
+static uint32_t surface_bpp(void);
+
+static void note_drawn(void)
+{
+    if (!s_gpu.drawn_stale && s_gpu.drawn_offset
+        && s_gpu.clip_w * s_gpu.clip_h < s_gpu.drawn_w * s_gpu.drawn_h)
+        return;
+    s_gpu.drawn_stale = 0;
+    s_gpu.drawn_offset = s_gpu.color_offset;
+    s_gpu.drawn_pitch = s_gpu.pitch;
+    s_gpu.drawn_bpp = surface_bpp();
+    s_gpu.drawn_x = s_gpu.clip_x; s_gpu.drawn_y = s_gpu.clip_y;
+    s_gpu.drawn_w = s_gpu.clip_w; s_gpu.drawn_h = s_gpu.clip_h;
+}
+
 static uint32_t surface_bpp(void)
 {
+    /* The surface format says it outright (NV097_SET_SURFACE_FORMAT_COLOR).
+     * Deriving it from pitch / clip width -- the only way before -- is right
+     * only while the clip spans the whole surface: A title narrows the clip
+     * to a 250-pixel window to draw its option values, 2560 / 250 came out as
+     * 10 bytes a pixel, and every such text quad was refused. */
+    switch (s_gpu.format & 0xF) {
+    case 0x1: case 0x2: case 0x3: case 0xA:
+        return 2;
+    case 0x4: case 0x5: case 0x6: case 0x7: case 0x8:
+        return 4;
+    case 0x9:
+        return 1;
+    default:
+        break;
+    }
     /* The pitch and the clip width together give the pixel size, which is more
      * reliable than decoding the format field: the format's colour code is
      * only meaningful alongside a type the title also sets, while the pitch is
@@ -473,26 +734,37 @@ static uint32_t surface_bpp(void)
  * ponytail: bottom-up 24bpp BMP, no palette, no compression. That is the one
  * format every viewer reads and it is 30 lines; PNG would need a dependency.
  */
+/* Set while RECOMP_FB_DUMP_FLIPS is dumping every flip: the report and
+ * after-draw dumps stand down then, or they would put duplicate frames into
+ * the sequence. */
+static int s_flip_dumping;
+
 static void dump_surface_bmp(void)
 {
     const char *prefix = getenv("RECOMP_FB_DUMP");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
+    int drawn = s_gpu.drawn_offset != 0;
+    uint32_t offset = drawn ? s_gpu.drawn_offset : s_gpu.color_offset;
+    uint32_t pitch = drawn ? s_gpu.drawn_pitch : s_gpu.pitch;
+    uint32_t cx = drawn ? s_gpu.drawn_x : s_gpu.clip_x;
+    uint32_t cy = drawn ? s_gpu.drawn_y : s_gpu.clip_y;
     static int seq;
     char path[512];
-    uint32_t w = s_gpu.clip_w, h = s_gpu.clip_h, y, x;
+    uint32_t w = drawn ? s_gpu.drawn_w : s_gpu.clip_w;
+    uint32_t h = drawn ? s_gpu.drawn_h : s_gpu.clip_h, y, x;
+    uint32_t bpp = drawn ? s_gpu.drawn_bpp : surface_bpp();
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
     FILE *f;
 
-    if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !s_gpu.color_offset)
+    if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !offset)
         return;
 
     row_bytes = w * 3;
     pad = (4 - (row_bytes & 3)) & 3;
     filesz = 54 + (row_bytes + pad) * h;
 
-    snprintf(path, sizeof path, "%s%03d.bmp", prefix, seq++);
+    snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq++);
     f = fopen(path, "wb");
     if (!f)
         return;
@@ -510,19 +782,17 @@ static void dump_surface_bmp(void)
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0; ) {
-        const uint8_t *row = mem + dma_resolve(s_gpu.drawn_offset
-                                                ? s_gpu.drawn_offset
-                                                : s_gpu.color_offset)
-                           + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+        const uint8_t *row = mem + dma_resolve(offset)
+                           + (size_t)(cy + y) * pitch;
         for (x = 0; x < w; x++) {
             uint8_t bgr[3];
             if (bpp == 4) {
-                uint32_t v = ((const uint32_t *)row)[s_gpu.clip_x + x];
+                uint32_t v = ((const uint32_t *)row)[cx + x];
                 bgr[0] = (uint8_t)(v);
                 bgr[1] = (uint8_t)(v >> 8);
                 bgr[2] = (uint8_t)(v >> 16);
             } else {
-                uint16_t v = ((const uint16_t *)row)[s_gpu.clip_x + x];
+                uint16_t v = ((const uint16_t *)row)[cx + x];
                 bgr[0] = (uint8_t)(( v        & 0x1F) << 3);
                 bgr[1] = (uint8_t)(((v >>  5) & 0x3F) << 2);
                 bgr[2] = (uint8_t)(((v >> 11) & 0x1F) << 3);
@@ -546,12 +816,163 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
 
+/* The surface rectangle in real pixels.
+ *
+ * SET_SURFACE_CLIP_* is in logical pixels; with anti-aliasing on, the surface
+ * is larger by the AA factor in SET_SURFACE_FORMAT bits 12-15 (0 = 1x1,
+ * 1 = 2x1 "center corner 2", 2 = 2x2 "square offset 4"), and so are the
+ * coordinates a vertex program or the composite matrix produces. X-Men
+ * Legends renders its 640x480 menu into a 1280x960 surface (pitch 5120),
+ * which read as an 8-bytes-per-pixel surface and drew nothing until this was
+ * applied. */
+static void surface_apply_clip(void)
+{
+    uint32_t aa = (s_gpu.format >> 12) & 0xF;
+    uint32_t sx = aa ? 2 : 1, sy = aa == 2 ? 2 : 1;
+
+    s_gpu.aa_sx = (float)sx;
+    s_gpu.aa_sy = (float)sy;
+
+    s_gpu.clip_x = (s_gpu.clip_raw_h & 0xFFFF) * sx;
+    s_gpu.clip_w = ((s_gpu.clip_raw_h >> 16) & 0xFFFF) * sx;
+    s_gpu.clip_y = (s_gpu.clip_raw_v & 0xFFFF) * sy;
+    s_gpu.clip_h = ((s_gpu.clip_raw_v >> 16) & 0xFFFF) * sy;
+}
+
+/* ---- Render back end (nv2a_backend.h) ------------------------------- */
+
+static const Nv2aBackend *s_backend;
+
+void nv2a_backend_register(const Nv2aBackend *backend)
+{
+    s_backend = backend;
+}
+
+static int backend_draws(void)
+{
+    return s_backend && s_backend->draw;
+}
+
+static void current_surface(Nv2aSurface *out)
+{
+    out->color_va        = dma_resolve(s_gpu.color_offset);
+    out->width           = s_gpu.clip_w;
+    out->height          = s_gpu.clip_h;
+    out->pitch           = s_gpu.pitch;
+    out->bytes_per_pixel = surface_bpp();
+    out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
+    out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+}
+
+/* Render state in the NV2A's own values, gathered from what the executor
+ * tracks and from the register mirror for what it does not (culling, the
+ * depth range). */
+static void current_render_state(Nv2aRenderState *r)
+{
+    r->blend_enable      = s_gpu.blend_enable;
+    r->blend_src         = s_gpu.blend_sfactor;
+    r->blend_dst         = s_gpu.blend_dfactor;
+    r->blend_eq          = s_gpu.blend_equation;
+    r->blend_color       = s_gpu.blend_color;
+    r->alpha_test_enable = s_gpu.alpha_test;
+    r->alpha_func        = s_gpu.alpha_func;
+    r->alpha_ref         = s_gpu.alpha_ref;
+    r->depth_test_enable = s_gpu.depth_test;
+    r->depth_func        = s_gpu.depth_func;
+    r->depth_write       = s_gpu.depth_mask;
+    r->color_mask        = s_gpu.color_mask;
+    r->cull_enable       = s_reg[0x0308 / 4];        /* SET_CULL_FACE_ENABLE */
+    r->cull_face         = s_reg[0x039C / 4];        /* SET_CULL_FACE */
+    r->front_face        = s_reg[0x03A0 / 4];        /* SET_FRONT_FACE */
+    r->zeta_va           = s_gpu.zeta_offset ? dma_resolve(s_gpu.zeta_offset) : 0;
+    r->depth_min         = reg_f(0x0394);            /* SET_CLIP_MIN */
+    r->depth_max         = reg_f(0x0398);            /* SET_CLIP_MAX */
+    r->stencil_enable    = s_reg[0x032C / 4];        /* SET_STENCIL_TEST_ENABLE */
+    r->stencil_write_mask = s_reg[0x0360 / 4];       /* SET_STENCIL_MASK */
+    r->stencil_func      = s_reg[0x0364 / 4];        /* SET_STENCIL_FUNC */
+    r->stencil_ref       = s_reg[0x0368 / 4];        /* SET_STENCIL_FUNC_REF */
+    r->stencil_func_mask = s_reg[0x036C / 4];        /* SET_STENCIL_FUNC_MASK */
+    r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
+    r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
+    r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
+}
+
+static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+
+int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+{
+    Texture saved = s_gpu.texs[0];
+    uint32_t x, y;
+    int ok = 1;
+
+    s_gpu.texs[0].offset = tex->offset;
+    s_gpu.texs[0].width  = tex->width;
+    s_gpu.texs[0].height = tex->height;
+    s_gpu.texs[0].pitch  = tex->pitch;
+    s_gpu.texs[0].color  = tex->color;
+    s_gpu.texs[0].addr_u = 3;
+    s_gpu.texs[0].addr_v = 3;
+    s_gpu.texs[0].palette = 0;          /* ponytail: no palettised formats */
+    s_gpu.texs[0].levels = 1;
+    s_gpu.texs[0].filter = 0;
+    s_gpu.texs[0].cube   = 0;
+    s_gpu.texs[0].valid  = 1;
+    for (y = 0; y < tex->height && ok; y++)
+        for (x = 0; x < tex->width; x++)
+            if (!sample_texture(x, y, &argb_out[(size_t)y * tex->width + x])) {
+                ok = 0;
+                break;
+            }
+    s_gpu.texs[0] = saved;
+    return ok;
+}
+
+/* Swizzled colour surfaces (SURFACE_FORMAT type 2, log2 width/height in bits
+ * 16-19/24-27): render-to-texture. The pixel at (x, y) lives at the same
+ * Morton offset a swizzled texture of that size uses, so the texture sampler
+ * reads back what was drawn. Written row-major instead, every render target a
+ * title samples later comes back scrambled -- SSX 3 draws six 128x128 rider
+ * shadow maps per frame and projects them onto the snow. s_swz_* are set with
+ * the surface, before the batch's pixels. RECOMP_SWIZZLED_RT=0 writes
+ * row-major. */
+static int s_swz_on;
+static uint32_t s_swz_mx, s_swz_my;
+
+static void surface_swizzle_update(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_SWIZZLED_RT");
+        enabled = !(e && e[0] == '0');
+    }
+    s_swz_on = enabled && ((s_gpu.format >> 8) & 0xF) == 2;
+    if (s_swz_on)
+        xbox_swizzle_masks(1u << ((s_gpu.format >> 16) & 0xF),
+                           1u << ((s_gpu.format >> 24) & 0xF),
+                           &s_swz_mx, &s_swz_my);
+}
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
 
+    /* A back end clears colour and/or depth/stencil itself (flags are the
+     * CLEAR_SURFACE bits: Z 0x1, stencil 0x2, colour 0xF0). */
+    if (s_backend && s_backend->clear) {
+        Nv2aSurface surf;
+        Nv2aRenderState rs;
+
+        if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
+            return;
+        current_surface(&surf);
+        current_render_state(&rs);
+        s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
+                         s_gpu.zstencil_clear);
+        s_gpu.clears++;
+        return;
+    }
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
@@ -565,6 +986,35 @@ static void clear_surface(uint32_t param)
         s_gpu.color_base = base;
     }
 
+    surface_swizzle_update();
+    if (s_swz_on) {
+        /* The clear covers CLEAR_RECT, not the surface clip: SSX 3 clears
+         * its 128x128 shadow maps whole but draws them through a 124x124
+         * clip, and samples them clamped -- the ring the clip leaves must be
+         * the clear colour, or everything outside a shadow is dark. */
+        uint8_t *base = mem + s_gpu.color_base;
+        uint32_t sw = 1u << ((s_gpu.format >> 16) & 0xF);
+        uint32_t sh = 1u << ((s_gpu.format >> 24) & 0xF);
+        uint32_t x0 = s_gpu.clip_x, x1 = s_gpu.clip_x + s_gpu.clip_w;
+        uint32_t y0 = s_gpu.clip_y, y1 = s_gpu.clip_y + s_gpu.clip_h;
+        uint16_t v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
+                                | ((s_gpu.clear_color >> 5) & 0x07E0)
+                                | ((s_gpu.clear_color >> 3) & 0x001F));
+        if ((s_gpu.clear_rect_set & 3) == 3) {
+            x0 = s_gpu.clear_rect_h & 0xFFFF; x1 = (s_gpu.clear_rect_h >> 16) + 1;
+            y0 = s_gpu.clear_rect_v & 0xFFFF; y1 = (s_gpu.clear_rect_v >> 16) + 1;
+        }
+        if (x1 > sw) x1 = sw;
+        if (y1 > sh) y1 = sh;
+        for (y = y0; y < y1; y++)
+            for (x = x0; x < x1; x++) {
+                size_t i = swizzle_deposit(x, s_swz_mx) | swizzle_deposit(y, s_swz_my);
+                if (bpp == 4)
+                    ((uint32_t *)base)[i] = s_gpu.clear_color;
+                else if (bpp == 2)
+                    ((uint16_t *)base)[i] = v16;
+            }
+    } else
     for (y = 0; y < s_gpu.clip_h; y++) {
         uint8_t *row = mem + s_gpu.color_base
                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
@@ -587,7 +1037,7 @@ static void clear_surface(uint32_t param)
     /* Progress markers, interleaved with everything else in the log. The
      * summary says drawing stopped; only a marker next to the surrounding
      * activity says what the title was doing when it stopped. */
-    if ((s_gpu.clears % 100) == 0)
+    if ((s_gpu.clears % 100) == 0 && exec_verbose())
         fprintf(stderr, "  [GPU] clear #%u\n", s_gpu.clears);
     /* Distinct clear colours actually used. "Cleared to black" and "the clear
      * never ran" look identical in the framebuffer, and only one of them is a
@@ -619,7 +1069,10 @@ static void clear_surface(uint32_t param)
      * zero.
      *
      * ponytail: bring-up aid, not a feature. It costs one branch per clear. */
-    if (getenv("RECOMP_RASTER_TEST")) {
+    static int raster_test = -1;
+    if (raster_test < 0)
+        raster_test = getenv("RECOMP_RASTER_TEST") != NULL;
+    if (raster_test) {
         static int announced;
         /* Every clear, not once: the title clears each frame and double-buffers,
          * so a triangle drawn a single time is erased before anyone sees it. */
@@ -645,8 +1098,10 @@ static void clear_surface(uint32_t param)
     /* Only until the title flips. Following the draw surface on every scan
      * shows the buffer being written right now, half a frame at a time; past
      * the first flip the window is repointed at the finished one instead. */
-    if (s_gpu.flips == 0)
+    if (s_gpu.flips == 0) {
         xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+        xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
+    }
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -664,7 +1119,7 @@ static void clear_surface(uint32_t param)
 }
 
 
-/* ── Rasteriser ──────────────────────────────────────────────────────────
+/* â”€â”€ Rasteriser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  *
  * Fills triangles straight into the guest framebuffer, the same memory
  * clear_surface() writes and the framebuffer window already shows. That is the
@@ -675,9 +1130,8 @@ static void clear_surface(uint32_t param)
  * correction, and only batches whose attribute 0 is already in screen space.
  * A title running a vertex program hands over object-space positions that mean
  * nothing without executing the program, so those batches are counted and
- * skipped rather than drawn somewhere wrong. Upgrade path is the PGRAPH translator
- * translator in src/nv2a/nv2a_pgraph_d3d8.c once vertex programs are
- * translated; this exists to get the first geometry on screen for every title,
+ * skipped rather than drawn somewhere wrong. The host renderers in src/video
+ * execute vertex programs; this CPU fallback provides the first geometry,
  * which in practice is UI, HUD and 2D overlays -- all pre-transformed.
  */
 
@@ -708,13 +1162,35 @@ static void clear_surface(uint32_t param)
  * resolve does exactly that -- its last column and last row, 1119 pixels of
  * white on a black frame, from a rounding step at the boundary.
  */
+/* NV097_SET_TEXTURE_ADDRESS per-axis modes (xemu NV_PGRAPH_TEXADDRESS0_ADDRU_*):
+ * 1 wrap, 2 mirror, 3 clamp-to-edge, 4 border, 5 clamp (GL_CLAMP). Border is
+ * resolved by sample_tex() before it gets here. Mode 5 is logged at the
+ * register write and sampled as clamp-to-edge. */
+static int tex_coord_outside(uint32_t c, uint32_t size)
+{
+    return (int32_t)c < 0 || (int32_t)c >= (int32_t)size;
+}
+
 static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
 {
+    /* Coordinates are signed: a bilinear tap one texel left of or above
+     * texel 0 is -1, which must wrap to the far edge or clamp to 0 -- as an
+     * unsigned value it clamped to the far edge instead. */
+    int32_t sc = (int32_t)c, n = (int32_t)size;
     if (!size)
         return 0;
-    if (mode == 1)                         /* wrap */
-        return c % size;
-    return c >= size ? size - 1 : c;       /* clamp, and everything else */
+    if (mode == 1) { /* wrap, including negative bilinear taps */
+        int32_t remainder;
+        if (!(size & (size - 1u))) return c & (size - 1u);
+        remainder = sc % n;
+        return (uint32_t)(remainder < 0 ? remainder + n : remainder);
+    }
+    if (mode == 2) { /* mirror: period 2n, the odd half reflected back */
+        int32_t period = 2 * n, m = sc % period;
+        if (m < 0) m += period;
+        return (uint32_t)(m < n ? m : period - 1 - m);
+    }
+    return sc < 0 ? 0u : (sc >= n ? size - 1 : c);   /* clamp, and the rest */
 }
 
 static uint32_t expand(uint32_t v, uint32_t bits)
@@ -744,31 +1220,96 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
-static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+/* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
+static int sample_tex(const Texture *t, uint32_t face_offset,
+                      uint32_t u, uint32_t v, uint32_t *argb)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
-    uint32_t fmt;
+    uint32_t fmt, base = t->offset + face_offset;
 
-    if (!s_gpu.tex.valid)
+    if (!t->valid)
         return 0;
-    u = wrap_coord(u, s_gpu.tex.width,  s_gpu.tex.addr_u);
-    v = wrap_coord(v, s_gpu.tex.height, s_gpu.tex.addr_v);
+    /* BORDER (4) with FORMAT's border source set to "colour": texels outside
+     * the image read SET_TEXTURE_BORDER_COLOR. Projected shadow maps rely on
+     * it -- clamped instead, everything outside the projection takes the
+     * edge texel and the shadow's frustum is drawn as a dark wedge. */
+    if (t->border_color
+        && ((t->addr_u == 4 && tex_coord_outside(u, t->width)) ||
+            (t->addr_v == 4 && tex_coord_outside(v, t->height)))) {
+        *argb = t->border;
+        return 1;
+    }
+    u = wrap_coord(u, t->width,  t->addr_u);
+    v = wrap_coord(v, t->height, t->addr_v);
 
-    fmt = s_gpu.tex.color;
-    if (d3d8_format_dxt_block_bytes(fmt))
-        return d3d8_dxt_decode_texel(mem + s_gpu.tex.offset, fmt, u, v,
-                                     s_gpu.tex.width, argb);
+    fmt = t->color;
+    if (d3d8_format_dxt_block_bytes(fmt)) {
+        /* Decoded blocks, direct-mapped by address. Every texel of a DXT
+         * texture decodes its whole 4x4 block, and bilinear reads four
+         * neighbours that nearly always share one -- this was a tenth of
+         * the executor's time. Keyed on the block's bytes as well as its
+         * address, so a texture rewritten in place (a render target reused,
+         * a streamed mip) never returns stale texels.
+         * ponytail: single-threaded executor, so a plain static table. */
+        static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
+                        uint32_t px[16]; } cache[4096];
+        uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
+        uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
+        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
+        uintptr_t key = (uintptr_t)blk;
+        size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
+        uint64_t raw[2] = {0, 0};
+        memcpy(raw, blk, bb);
+        if (cache[slot].key != key || cache[slot].fmt != fmt
+            || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
+            d3d8_dxt_decode_block(blk, fmt, cache[slot].px);
+            {
+                static NV_TLS int validate = -1;
+                static NV_TLS unsigned checked, mismatches;
+                if (validate < 0) validate = getenv("RECOMP_DXT_VALIDATE") != NULL;
+                if (validate) {
+                    uint32_t i;
+                    for (i = 0; i < 16; ++i) {
+                        uint32_t reference = 0;
+                        d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
+                                             by * 4 + (i >> 2), t->width, &reference);
+                        if (reference != cache[slot].px[i] && ++mismatches <= 4)
+                            fprintf(stderr, "[DXT_VERIFY] mismatch fmt=%02X pixel=%u new=%08X reference=%08X\n",
+                                    fmt, i, cache[slot].px[i], reference);
+                    }
+                    if (++checked == 1024)
+                        fprintf(stderr, "[DXT_VERIFY] blocks=%u mismatches=%u fmt=%02X\n",
+                                checked, mismatches, fmt);
+                }
+            }
+            cache[slot].key = key;
+            cache[slot].fmt = fmt;
+            cache[slot].raw[0] = raw[0];
+            cache[slot].raw[1] = raw[1];
+        }
+        *argb = cache[slot].px[(v & 3) * 4 + (u & 3)];
+        return 1;
+    }
     if (d3d8_format_is_swizzled(fmt)) {
         /* Morton order: a texel's index is interleaved from x and y instead of
          * v*pitch + u, so index from the base of the image. The switch below
          * casts to each format's own width, which makes that index a texel
          * index for every one of them. */
         fmt = linear_twin(fmt);
-        p = mem + s_gpu.tex.offset;
-        u = swizzle_offset(u, v, s_gpu.tex.width, s_gpu.tex.height);
+        p = mem + base;
+        if (t->swizzle_shift >= 0) {
+            uint32_t common = t->swizzle_common_mask;
+            uint32_t major = t->width > t->height ? u : v;
+            /* Shared coordinate bits interleave; the larger dimension's
+             * remaining bits occupy contiguous positions above them. */
+            u = swizzle_spread(u & common) | (swizzle_spread(v & common) << 1)
+              | ((major & ~common) << t->swizzle_shift);
+        } else {
+            u = swizzle_offset(u, v, t->width, t->height);
+        }
     } else {
-        p = mem + s_gpu.tex.offset + (size_t)v * s_gpu.tex.pitch;
+        p = mem + base + (size_t)v * t->pitch;
     }
 
     switch (fmt) {
@@ -779,6 +1320,15 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
         return 1;
     case 0x1E:                                      /* LIN_X8R8G8B8 */
         *argb = ((const uint32_t *)p)[u] | 0xFF000000u;
+        return 1;
+
+    /* 8-bit palette index, swizzled. A title draws its logo and frontend
+     * header art this way; without a case every such quad came out as the
+     * unsupported-format fill, a white box where the logo should be. */
+    case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
+        if (!t->palette)
+            return 0;
+        *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
         return 1;
 
     /* 32-bit, other channel orders. The name gives the byte order from the
@@ -882,6 +1432,11 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
     }
 }
 
+static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+{
+    return sample_tex(&s_gpu.texs[0], 0, u, v, argb);
+}
+
 /* Write a bound texture out as a BMP, through the sampler rather than around it.
  *
  * "Which texture is this" is not answerable from an address and a format, and
@@ -898,7 +1453,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
 static void dump_texture_bmp(uint32_t seq)
 {
     const char *prefix = getenv("RECOMP_TEX_DUMP");
-    uint32_t w = s_gpu.tex.width, h = s_gpu.tex.height, x, y;
+    uint32_t w = s_gpu.texs[0].width, h = s_gpu.texs[0].height, x, y;
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
     char path[512];
@@ -911,7 +1466,7 @@ static void dump_texture_bmp(uint32_t seq)
     filesz = 54 + (row_bytes + pad) * h;
 
     snprintf(path, sizeof path, "%s%02u_%08X_fmt%02X.bmp",
-             prefix, seq, s_gpu.tex.offset, s_gpu.tex.color);
+             prefix, seq, s_gpu.texs[0].offset, s_gpu.texs[0].color);
     f = fopen(path, "wb");
     if (!f)
         return;
@@ -944,7 +1499,7 @@ static void dump_texture_bmp(uint32_t seq)
     }
     fclose(f);
     fprintf(stderr, "  [TEXDUMP] %s (%ux%u fmt 0x%02X)\n",
-            path, w, h, s_gpu.tex.color);
+            path, w, h, s_gpu.texs[0].color);
     fflush(stderr);
 }
 
@@ -961,9 +1516,24 @@ static void dump_texture_bmp(uint32_t seq)
  * playback rate. */
 static uint8_t *s_surface;          /* host address of surface row 0 */
 
+/* Element index of pixel (x, y) in the current colour surface, relative to
+ * the `row` it sets: the row itself, or the surface base for a swizzled one. */
+static inline size_t surface_index(int x, int y, uint8_t **row)
+{
+    if (s_swz_on) {
+        *row = s_surface;
+        return swizzle_deposit((uint32_t)x, s_swz_mx)
+             | swizzle_deposit((uint32_t)y, s_swz_my);
+    }
+    *row = s_surface + (size_t)y * s_gpu.pitch;
+    return (size_t)x;
+}
+
 static int surface_begin_batch(const uint8_t *mem)
 {
     uint32_t base = dma_resolve(s_gpu.color_offset);
+
+    surface_swizzle_update();
 
     if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return 0;
@@ -971,60 +1541,138 @@ static int surface_begin_batch(const uint8_t *mem)
     return 1;
 }
 
-static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
+static uint32_t pack_color(const float c[4]);
+
+/* One GL blend factor, per channel (r g b a). */
+static void blend_factor(uint32_t f, const float s[4], const float d[4],
+                         float out[4])
+{
+    int k;
+    for (k = 0; k < 4; k++) {
+        float c = (float)((s_gpu.blend_color >> (k == 3 ? 24 : 16 - 8 * k))
+                          & 0xFF) / 255.0f;
+        switch (f) {
+        case 0x0000: out[k] = 0.0f;            break;   /* ZERO                */
+        case 0x0001: out[k] = 1.0f;            break;   /* ONE                 */
+        case 0x0300: out[k] = s[k];            break;   /* SRC_COLOR           */
+        case 0x0301: out[k] = 1.0f - s[k];     break;
+        case 0x0302: out[k] = s[3];            break;   /* SRC_ALPHA           */
+        case 0x0303: out[k] = 1.0f - s[3];     break;
+        case 0x0304: out[k] = d[3];            break;   /* DST_ALPHA           */
+        case 0x0305: out[k] = 1.0f - d[3];     break;
+        case 0x0306: out[k] = d[k];            break;   /* DST_COLOR           */
+        case 0x0307: out[k] = 1.0f - d[k];     break;
+        case 0x0308: out[k] = k == 3 ? 1.0f : fminf(s[3], 1.0f - d[3]); break;
+        case 0x8001: out[k] = c;               break;   /* CONSTANT_COLOR      */
+        case 0x8002: out[k] = 1.0f - c;        break;
+        case 0x8003: out[k] = (float)(s_gpu.blend_color >> 24) / 255.0f; break;
+        case 0x8004: out[k] = 1.0f - (float)(s_gpu.blend_color >> 24) / 255.0f; break;
+        default:     out[k] = f ? 1.0f : 0.0f; break;
+        }
+    }
+}
+
+static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb,
+                      uint64_t *pixels, uint32_t *pixel_max)
 {
     uint8_t *row;
+    size_t xi;
 
     (void)mem;
     if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
         return;
     if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
         return;
-    s_gpu.pixels++;
-    if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
-        s_gpu.pixel_max = argb;
-    row = s_surface + (size_t)y * s_gpu.pitch;
+    /* A swizzled target is 1<<log on a side, whatever the clip says: past
+     * it the swizzle index wraps onto other texels (xemu bounds it too). */
+    if (s_swz_on && ((uint32_t)x >> ((s_gpu.format >> 16) & 0xF)
+                     || (uint32_t)y >> ((s_gpu.format >> 24) & 0xF)))
+        return;
+    /* Counted per caller: the worker pool's rows each count their own. */
+    (*pixels)++;
+    if ((argb & 0x00FFFFFFu) > (*pixel_max & 0x00FFFFFFu))
+        *pixel_max = argb;
+    xi = surface_index(x, y, &row);
 
-    /* src*srcAlpha + dst*(1-srcAlpha), and only that pair.
+    /* Blending, with the GL factor set and equations the NV2A takes.
      *
-     * Any other factor combination falls through to an opaque write rather
-     * than being approximated: a wrong blend is harder to recognise on
-     * screen than no blend, and this is the only pair this title sets.
-     *
-     * Fully opaque is left alone deliberately. It is the same arithmetic,
-     * but skipping it keeps the full-screen quads -- which are drawn with
-     * blending enabled and alpha 255 -- on exactly the path they were on
-     * before, so this cannot change what they produce. */
+     * Only SRC_ALPHA / ONE_MINUS_SRC_ALPHA used to be honoured and every other
+     * pair was written opaque. Menus never noticed; a race does: a title
+     * finishes its 3D frame with screen-space passes that modulate or add
+     * over the scene, and written opaque they paint the whole view over. */
     if (s_gpu.blend_enable
-        && s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
-        && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA
-        && (argb >> 24) != 0xFF) {
-        uint32_t sa = argb >> 24;
-        uint32_t dst = 0;
-        if (sa == 0)
-            return;                        /* nothing of the source survives */
+        && !(s_gpu.blend_sfactor == 1 && s_gpu.blend_dfactor == 0)) {
+        uint32_t dst = 0xFF000000u;
+        float sc[4], dc[4], sf[4], df[4], out[4];
+        int k;
         if (bpp == 4) {
-            dst = ((const uint32_t *)row)[x];
+            dst = ((const uint32_t *)row)[xi];
         } else if (bpp == 2) {
-            uint32_t t = ((const uint16_t *)row)[x];
-            dst = (((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
-                 | ((t & 0x001Fu) << 3));
+            uint32_t t = ((const uint16_t *)row)[xi];
+            dst = 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
+                | ((t & 0x001Fu) << 3);
         }
         {
-            uint32_t r = (((argb >> 16) & 0xFF) * sa
-                        + ((dst >> 16) & 0xFF) * (255u - sa) + 127u) / 255u;
-            uint32_t g = (((argb >>  8) & 0xFF) * sa
-                        + ((dst >>  8) & 0xFF) * (255u - sa) + 127u) / 255u;
-            uint32_t b = (((argb      ) & 0xFF) * sa
-                        + ((dst      ) & 0xFF) * (255u - sa) + 127u) / 255u;
-            argb = 0xFF000000u | (r << 16) | (g << 8) | b;
+            static NV_TLS int generic = -1;
+            if (generic < 0) generic = getenv("RECOMP_BLEND_GENERIC") != NULL;
+            if (!generic && s_gpu.blend_equation == 0x8006u &&
+                s_gpu.blend_sfactor == 0x0302u &&
+                s_gpu.blend_dfactor == 0x0303u) {
+                uint32_t alpha = argb >> 24, mixed = 0;
+                unsigned shift;
+                /* Division by the odd denominator 255 never lands exactly on
+                 * a half integer. +127 gives the same rounded byte as the
+                 * normalized float SRC_ALPHA / ONE_MINUS_SRC_ALPHA path. */
+                for (shift = 0; shift < 32; shift += 8) {
+                    uint32_t src = (argb >> shift) & 255u;
+                    uint32_t dest = (dst >> shift) & 255u;
+                    mixed |= ((src * alpha + dest * (255u - alpha) + 127u) / 255u)
+                             << shift;
+                }
+                argb = mixed;
+            } else {
+                for (k = 0; k < 4; k++) {           /* r g b a, 0..1 */
+                    int sh = k == 3 ? 24 : 16 - 8 * k;
+                    sc[k] = (float)((argb >> sh) & 0xFF) / 255.0f;
+                    dc[k] = (float)((dst  >> sh) & 0xFF) / 255.0f;
+                }
+                blend_factor(s_gpu.blend_sfactor, sc, dc, sf);
+                blend_factor(s_gpu.blend_dfactor, sc, dc, df);
+                for (k = 0; k < 4; k++) {
+                    float a = sc[k] * sf[k], b = dc[k] * df[k];
+                    switch (s_gpu.blend_equation) {
+                    case 0x800A: out[k] = a - b; break;               /* SUBTRACT     */
+                    case 0x800B: out[k] = b - a; break;               /* REV_SUBTRACT */
+                    case 0x8007: out[k] = fminf(sc[k], dc[k]); break; /* MIN          */
+                    case 0x8008: out[k] = fmaxf(sc[k], dc[k]); break; /* MAX          */
+                    default:     out[k] = a + b; break;               /* ADD          */
+                    }
+                }
+                argb = pack_color(out);
+            }
         }
     }
 
+    if (s_gpu.color_mask != 0x01010101u) {
+        uint32_t keep = 0, old;
+        if (!(s_gpu.color_mask & 0x01000000u)) keep |= 0xFF000000u;
+        if (!(s_gpu.color_mask & 0x00010000u)) keep |= 0x00FF0000u;
+        if (!(s_gpu.color_mask & 0x00000100u)) keep |= 0x0000FF00u;
+        if (!(s_gpu.color_mask & 0x00000001u)) keep |= 0x000000FFu;
+        if (keep == 0xFFFFFFFFu)
+            return;
+        if (bpp == 4) {
+            old = ((const uint32_t *)row)[xi];
+        } else {
+            uint32_t t = ((const uint16_t *)row)[xi];
+            old = ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5) | ((t & 0x001Fu) << 3);
+        }
+        argb = (argb & ~keep) | (old & keep);
+    }
     if (bpp == 4) {
-        ((uint32_t *)row)[x] = argb;
+        ((uint32_t *)row)[xi] = argb;
     } else if (bpp == 2) {
-        ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
+        ((uint16_t *)row)[xi] = (uint16_t)(((argb >> 8) & 0xF800)
                                         | ((argb >> 5) & 0x07E0)
                                         | ((argb >> 3) & 0x001F));
     }
@@ -1041,7 +1689,7 @@ static void raster_triangle(const float a[2], const float b[2],
     uint32_t bpp = surface_bpp();
     float area;
     int minx, maxx, miny, maxy, x, y;
-    int textured = uv && s_gpu.tex.valid;
+    int textured = uv && s_gpu.texs[0].valid;
 
     if (bpp != 4 && bpp != 2)
         return;
@@ -1093,15 +1741,15 @@ static void raster_triangle(const float a[2], const float b[2],
                 if (su < 0.0f) su = 0.0f;
                 if (sv < 0.0f) sv = 0.0f;
                 if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
-                    put_pixel(mem, bpp, x, y, texel);
+                    put_pixel(mem, bpp, x, y, texel, &s_gpu.pixels, &s_gpu.pixel_max);
                     continue;
                 }
             }
-            put_pixel(mem, bpp, x, y, argb);
+            put_pixel(mem, bpp, x, y, argb, &s_gpu.pixels, &s_gpu.pixel_max);
         }
     }
     s_gpu.tris_drawn++;
-    s_gpu.drawn_offset = s_gpu.color_offset;
+    note_drawn();
 }
 
 /* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
@@ -1144,7 +1792,7 @@ static const VertexAttr *color_attr(void)
  *
  * ponytail: takes the first float2 it finds, so a title with two texcoord sets
  * gets stage 0's -- which is what this single-texture rasteriser samples
- * anyway. Multi-texture wants the PGRAPH translator, not another heuristic. */
+ * anyway. Multi-texture wants the D3D11 translator, not another heuristic. */
 static const VertexAttr *texcoord_attr(void)
 {
     uint32_t a;
@@ -1178,9 +1826,9 @@ static int fetch_texcoord(uint32_t index, float out[2])
         return 0;
     out[0] = t[0];
     out[1] = t[1];
-    if (tex_size_from_format(s_gpu.tex.color)) {
-        out[0] *= (float)s_gpu.tex.width;
-        out[1] *= (float)s_gpu.tex.height;
+    if (tex_size_from_format(s_gpu.texs[0].color)) {
+        out[0] *= (float)s_gpu.texs[0].width;
+        out[1] *= (float)s_gpu.texs[0].height;
     }
     return 1;
 }
@@ -1195,6 +1843,183 @@ static uint32_t vertex_color(uint32_t index)
          | ((uint32_t)(c[0] * 255.0f) << 16)
          | ((uint32_t)(c[1] * 255.0f) <<  8)
          |  (uint32_t)(c[2] * 255.0f);
+}
+
+/* ---- Fixed-function transform and lighting --------------------------------
+ *
+ * With TRANSFORM_EXECUTION_MODE on "fixed" (not "program") and a composite
+ * matrix uploaded, attribute 0 is an object-space position and the hardware
+ * computes
+ *     clip[i] = sum_j M[4i+j] * pos[j]
+ * with the 16 floats in the order the methods deliver them (translation in
+ * M[3], M[7], M[11]; X-Men Legends' menu matrix ends in the row 0 0 0 1), then
+ *     screen = clip.xyz / clip.w + viewport offset (c[59]).
+ * The composite matrix carries the viewport scale for the *logical* surface;
+ * with anti-aliasing the result is scaled up to the real surface.
+ *
+ * The result is handed on in the same shape a vertex program produces
+ * (Nv2aVshOutput, position already in screen space, w the clip w), so a
+ * fixed-function batch shares the program path's near-plane clipping,
+ * texturing, combiners and depth buffer.
+ *
+ * ponytail: no texture-coordinate generation or texture matrices (texture
+ * coordinates are taken from the attribute streams as they are), no fog
+ * coordinate, no specular, no point sprites. */
+
+/* Is this batch transformed by the fixed-function unit? Inline-array batches
+ * are left to the screen-space path, as they were before. */
+static int batch_is_ffp(void)
+{
+    return s_gpu.composite_set && (s_gpu.xf_mode & 3) != 2
+        && !s_gpu.inline_active;
+}
+
+/* Fixed-function vertex lighting (SET_LIGHTING_ENABLE).
+ *
+ * With lighting on, the diffuse colour the combiners see is computed per
+ * vertex from the normal and up to eight lights; the vertex's own colour
+ * stream is ignored unless SET_COLOR_MATERIAL routes it in. Using the colour
+ * stream anyway is what drew every lit mesh -- characters, streets -- black.
+ *
+ * XDK D3D pre-multiplies material into the light colours and folds
+ * emission + material ambient * global ambient into SCENE_AMBIENT_COLOR, so
+ * the hardware sum is simply
+ *   colour = scene_ambient + sum_i atten_i * (ambient_i + diffuse_i * max(0, N.L_i))
+ * with alpha from SET_MATERIAL_ALPHA. Everything is in eye space.
+ *
+ * ponytail: normals go through the model-view matrix itself rather than the
+ * inverse transpose (exact for rotations and uniform scale), no specular, no
+ * spot cones, no back-face colours, no skinning. Add them when a mesh looks
+ * wrong rather than dark. */
+#define NV_LIGHTS 8
+
+/* RECOMP_FFP_FLIP_NORMALS: a compatibility option, off by default. See
+ * lit_color(). */
+static int ffp_flip_normals(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("RECOMP_FFP_FLIP_NORMALS") != NULL;
+    return on;
+}
+
+static int lit_color(uint32_t index, float out[4])
+{
+    const float *mv = (const float *)&s_reg[0x0480 / 4];
+    float pos[4], nrm[4], vc[4], e[3], n[3], len;
+    uint32_t mask = s_reg[0x03BC / 4], colmat = s_reg[0x0298 / 4];
+    int i, have_vc;
+
+    if (!s_reg[0x0314 / 4] || !s_gpu.attr[2].size)
+        return 0;
+    if (!fetch_attr(&s_gpu.attr[0], index, pos)
+     || !fetch_attr(&s_gpu.attr[2], index, nrm))
+        return 0;
+    have_vc = fetch_attr(color_attr(), index, vc);
+
+    for (i = 0; i < 3; i++) {
+        e[i] = mv[4 * i] * pos[0] + mv[4 * i + 1] * pos[1]
+             + mv[4 * i + 2] * pos[2] + mv[4 * i + 3];
+        n[i] = mv[4 * i] * nrm[0] + mv[4 * i + 1] * nrm[1]
+             + mv[4 * i + 2] * nrm[2];
+    }
+    len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (len > 1e-8f) { n[0] /= len; n[1] /= len; n[2] /= len; }
+    /* Optional (RECOMP_FFP_FLIP_NORMALS): light the side the viewer sees.
+     * Some meshes carry normals that face away from the camera (X-Men
+     * Legends' streets and sidewalks: authentic file data, drawn with culling
+     * off), and lighting them as stored leaves only the light's ambient term
+     * -- black ground. Flipping a normal that points away from the eye is
+     * two-sided lighting with the back material equal to the front one.
+     * This is NOT hardware behaviour: it applies even when the title left
+     * two-sided lighting off (NV097_SET_TWO_SIDE_LIGHT_EN, method 0x17C4,
+     * which X-Men Legends writes as 0), and how the hardware makes such a mesh
+     * look right is not established. So it is a compatibility option a game
+     * project turns on for meshes it has seen need it, and off otherwise, so
+     * it cannot change how any other title is lit.
+     * ponytail: per vertex, not per face; exact for flat ground, a vertex on
+     * a silhouette may pick the other side. */
+    if (ffp_flip_normals() && n[0] * e[0] + n[1] * e[1] + n[2] * e[2] > 0.0f) {
+        n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2];
+    }
+
+    out[0] = reg_f(0x0A10); out[1] = reg_f(0x0A14); out[2] = reg_f(0x0A18);
+    for (i = 0; i < NV_LIGHTS; i++) {
+        uint32_t kind = (mask >> (2 * i)) & 3, b = 0x1000 + (uint32_t)i * 0x80;
+        float l[3], att = 1.0f, ndl, amb[3], dif[3];
+        int k;
+
+        if (!kind)
+            continue;
+        if (kind == 1) {                                    /* infinite */
+            l[0] = reg_f(b + 0x34); l[1] = reg_f(b + 0x38); l[2] = reg_f(b + 0x3C);
+        } else {                                            /* local / spot */
+            float d;
+            l[0] = reg_f(b + 0x5C) - e[0];
+            l[1] = reg_f(b + 0x60) - e[1];
+            l[2] = reg_f(b + 0x64) - e[2];
+            d = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+            if (d > reg_f(b + 0x24) && reg_f(b + 0x24) > 0.0f)
+                continue;                                   /* out of range */
+            if (d > 1e-8f) { l[0] /= d; l[1] /= d; l[2] /= d; }
+            att = reg_f(b + 0x68) + reg_f(b + 0x6C) * d + reg_f(b + 0x70) * d * d;
+            att = att > 1e-8f ? 1.0f / att : 1.0f;
+        }
+        ndl = n[0] * l[0] + n[1] * l[1] + n[2] * l[2];
+        if (ndl < 0.0f) ndl = 0.0f;
+        for (k = 0; k < 3; k++) {
+            amb[k] = reg_f(b + 0x00 + 4 * k);
+            dif[k] = reg_f(b + 0x0C + 4 * k);
+            /* COLOR_MATERIAL: 1 in the ambient (bits 2-3) or diffuse (bits
+             * 4-5) field takes that material colour from the vertex. */
+            if (have_vc && ((colmat >> 2) & 3) == 1) amb[k] *= vc[k];
+            if (have_vc && ((colmat >> 4) & 3) == 1) dif[k] *= vc[k];
+            out[k] += att * (amb[k] + dif[k] * ndl);
+        }
+    }
+    out[3] = (have_vc && ((colmat >> 4) & 3) == 1) ? vc[3] : reg_f(0x03B4);
+    for (i = 0; i < 4; i++)
+        out[i] = out[i] < 0.0f ? 0.0f : out[i] > 1.0f ? 1.0f : out[i];
+    return 1;
+}
+
+/* One fixed-function vertex, in the shape a vertex program produces. */
+static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
+{
+    const float *m = s_gpu.composite, *off = nv2a_vsh_constant(59);
+    float in[4], clip[4], c[4], w;
+    uint32_t st;
+    int i;
+
+    if (!fetch_attr(&s_gpu.attr[0], index, in))
+        return 0;
+    for (i = 0; i < 4; i++)
+        clip[i] = m[4 * i] * in[0] + m[4 * i + 1] * in[1]
+                + m[4 * i + 2] * in[2] + m[4 * i + 3] * in[3];
+    /* A vertex behind the camera (w < 0) is kept: the clipper cuts it at the
+     * near plane, and rejecting it dropped every batch that reached behind
+     * the eye -- X-Men Legends' street and sidewalk meshes, which extend past
+     * a top-down camera. Only w = 0 has no image. */
+    w = clip[3];
+    if (fabsf(w) <= 1e-6f)
+        return 0;
+
+    memset(out, 0, sizeof *out);
+    out->pos[0] = (clip[0] / w + off[0]) * s_gpu.aa_sx;
+    out->pos[1] = (clip[1] / w + off[1]) * s_gpu.aa_sy;
+    out->pos[2] = clip[2] / w + off[2];
+    out->pos[3] = w;
+
+    if (!lit_color(index, c) && !fetch_attr(color_attr(), index, c))
+        c[0] = c[1] = c[2] = c[3] = 1.0f;
+    for (i = 0; i < 4; i++)
+        out->d0[i] = c[i] < 0.0f ? 0.0f : c[i] > 1.0f ? 1.0f : c[i];
+
+    fetch_attr(texcoord_attr(), index, out->tex[0]);
+    for (st = 1; st < 4; st++)
+        fetch_attr(&s_gpu.attr[9 + st], index, out->tex[st]);
+    return 1;
 }
 
 /* An untransformed batch drawn as if it were screen space smears a few pixels
@@ -1218,6 +2043,11 @@ static uint32_t vertex_color(uint32_t index)
  */
 #define OBJECT_SPACE_SPAN 8.0f
 
+/* The surface's anti-aliasing scale, never below 1, for positions that arrive
+ * in logical pixels (pre-transformed vertices) and must land in real ones. */
+static float aa_scale_x(void) { return s_gpu.aa_sx > 1.0f ? s_gpu.aa_sx : 1.0f; }
+static float aa_scale_y(void) { return s_gpu.aa_sy > 1.0f ? s_gpu.aa_sy : 1.0f; }
+
 static int batch_is_screen_space(void)
 {
     float p[4], lo_x, hi_x, lo_y, hi_y;
@@ -1238,11 +2068,12 @@ static int batch_is_screen_space(void)
         if (p[1] > hi_y) hi_y = p[1];
     }
 
-    /* Entirely off the surface: nothing to draw under either reading. */
-    if (hi_x < (float)s_gpu.clip_x
-     || lo_x > (float)(s_gpu.clip_x + s_gpu.clip_w)
-     || hi_y < (float)s_gpu.clip_y
-     || lo_y > (float)(s_gpu.clip_y + s_gpu.clip_h))
+    /* Entirely off the surface: nothing to draw under either reading. The
+     * positions are in logical pixels and the clip rect is in real ones. */
+    if (hi_x * aa_scale_x() < (float)s_gpu.clip_x
+     || lo_x * aa_scale_x() > (float)(s_gpu.clip_x + s_gpu.clip_w)
+     || hi_y * aa_scale_y() < (float)s_gpu.clip_y
+     || lo_y * aa_scale_y() > (float)(s_gpu.clip_y + s_gpu.clip_h))
         return 0;
 
     /* Small enough to be model units rather than pixels. */
@@ -1281,6 +2112,81 @@ static int s_drawn_dumps;
 
 static void dump_surface_bmp(void);
 
+/* A fixed-function batch without texture coordinates is drawn untextured, as
+ * the screen-space path does, whatever stale texture the stage still holds. */
+static int s_xf_no_tex;
+
+/* Triangles bound for a back end: collected for the whole batch, handed over
+ * in one draw() call by backend_flush(). Whatever feeds them -- the program
+ * and fixed-function paths here, or the screen-space path below -- the back
+ * end only ever sees surface pixels. Past the cap the rest of the batch is
+ * dropped. */
+#define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
+static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
+static uint32_t   s_bcount;
+
+static Nv2aVertex *backend_slot(void)
+{
+    if (!s_bverts
+        && !(s_bverts = (Nv2aVertex *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bverts)))
+        return NULL;
+    if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
+        return NULL;
+    return &s_bverts[s_bcount];
+}
+
+static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+{
+    float su = 1.0f, sv = 1.0f;
+
+    if (tex_size_from_format(s_gpu.texs[0].color)) {
+        su = (float)s_gpu.texs[0].width;
+        sv = (float)s_gpu.texs[0].height;
+    }
+    o->x = v->pos[0];
+    o->y = v->pos[1];
+    o->z = v->pos[2];
+    o->rhw = 1.0f / v->pos[3];
+    o->diffuse = pack_color(v->d0);
+    o->u = v->tex[0][0] * su;
+    o->v = v->tex[0][1] * sv;
+}
+
+/* `textured`: the batch carried texture coordinates, so the bound texture is
+ * part of it. */
+static void backend_flush(int textured)
+{
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aTexture tex;
+    Nv2aBatch batch;
+
+    if (!s_bcount)
+        return;
+    current_surface(&surf);
+    current_render_state(&rs);
+    batch.vertices = s_bverts;
+    batch.count = s_bcount;
+    batch.texture = NULL;
+    batch.state = &rs;
+    if (textured && s_gpu.texs[0].valid) {
+        tex.offset = s_gpu.texs[0].offset;
+        tex.width  = s_gpu.texs[0].width;
+        tex.height = s_gpu.texs[0].height;
+        tex.pitch  = s_gpu.texs[0].pitch;
+        tex.color  = s_gpu.texs[0].color;
+        tex.addr_u = s_gpu.texs[0].addr_u;
+        tex.addr_v = s_gpu.texs[0].addr_v;
+        tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
+        tex.filter = s_gpu.texs[0].filter;
+        batch.texture = &tex;
+    }
+    s_backend->draw(&surf, &batch);
+    s_gpu.tris_drawn += s_bcount / 3;
+    s_bcount = 0;
+    note_drawn();
+}
+
 /* One triangle by vertex index: gather position and, if the batch has one,
  * texture coordinate 0. A vertex whose position cannot be read is not drawn;
  * a batch whose texcoords cannot be read is drawn untextured rather than not
@@ -1289,28 +2195,1479 @@ static void dump_surface_bmp(void);
 static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 {
     float p[3][4], uv[3][2];
-    int textured;
+    int textured, j;
 
     if (!fetch_attr(&s_gpu.attr[0], i0, p[0])
      || !fetch_attr(&s_gpu.attr[0], i1, p[1])
      || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
         return;
+    for (j = 0; j < 3; j++) {                        /* logical -> real pixels */
+        p[j][0] *= aa_scale_x();
+        p[j][1] *= aa_scale_y();
+    }
 
     textured = fetch_texcoord(i0, uv[0])
             && fetch_texcoord(i1, uv[1])
             && fetch_texcoord(i2, uv[2]);
 
+    if (backend_draws()) {                 /* a back end rasterises */
+        Nv2aVertex *o = backend_slot();
+        const uint32_t ix[3] = { i0, i1, i2 };
+        int k;
+
+        if (!o)
+            return;
+        for (k = 0; k < 3; k++) {
+            o[k].x = p[k][0];
+            o[k].y = p[k][1];
+            o[k].z = p[k][2];
+            o[k].rhw = p[k][3];
+            o[k].diffuse = vertex_color(ix[k]);
+            o[k].u = textured ? uv[k][0] : 0.0f;
+            o[k].v = textured ? uv[k][1] : 0.0f;
+        }
+        s_bcount += 3;
+        return;
+    }
     raster_triangle(p[0], p[1], p[2], argb,
                     textured ? (const float (*)[2])uv : NULL);
 }
 
-static void raster_batch(void)
+/* ---- 3D: vertex programs and depth -------------------------------------
+ *
+ * A batch drawn while TRANSFORM_EXECUTION_MODE says "program" carries
+ * model-space positions. Each vertex is run through the title's own vertex
+ * program (nv2a_vsh_interp.c), whose oPos output on Xbox D3D is already
+ * screen space -- the runtime appends the viewport transform and the divide
+ * by w -- with the clip-space w left in oPos.w. So the rasteriser gets pixel
+ * coordinates and a depth, and w for perspective-correct texturing.
+ *
+ * ponytail: no clipping. A triangle with any vertex behind the eye (w <= 0)
+ * is dropped rather than clipped, which loses the slivers that cross the near
+ * plane; road right under the camera is where that shows. Clip in
+ * homogeneous space if it matters. */
+
+/* Depth buffers, host-side, one per zeta surface the title uses. The real one
+ * lives in guest memory in a tiled format nothing here decodes, and nothing
+ * the title does reads it back, so a float buffer per zeta offset is enough. */
+#define NV_ZBUF_W 1280   /* 640x480 at 2x2 anti-aliasing */
+#define NV_ZBUF_H 1024
+static struct { uint32_t offset; float *z; } s_zbufs[4];
+static int s_ftrace;            /* frame trace: 0 idle, 2 tracing, 3 done */
+static int s_zbuf_next;
+
+static float zclear_value(void)
+{
+    /* Zeta format in SURFACE_FORMAT bits 4-7: 1 is Z16, 2 is Z24S8. */
+    uint32_t zf = (s_gpu.format >> 4) & 0xF;
+    return zf == 1 ? (float)(s_gpu.zstencil_clear & 0xFFFF)
+                   : (float)(s_gpu.zstencil_clear >> 8);
+}
+
+static float *zbuf_current(int create)
+{
+    int i;
+    size_t k;
+
+    for (i = 0; i < 4; i++)
+        if (s_zbufs[i].z && s_zbufs[i].offset == s_gpu.zeta_offset)
+            return s_zbufs[i].z;
+    if (!create)
+        return NULL;
+    i = s_zbuf_next++ & 3;
+    if (!s_zbufs[i].z)
+        s_zbufs[i].z = (float *)malloc(sizeof(float) * NV_ZBUF_W * NV_ZBUF_H);
+    if (!s_zbufs[i].z)
+        return NULL;
+    s_zbufs[i].offset = s_gpu.zeta_offset;
+    for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
+        s_zbufs[i].z[k] = 3.4e38f;
+    return s_zbufs[i].z;
+}
+
+static void zbuf_clear(void)
+{
+    float *z = zbuf_current(1), v = zclear_value();
+    size_t k;
+    if (z)
+        for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
+            z[k] = v;
+}
+
+static int depth_pass(float z, float stored)
+{
+    switch (s_gpu.depth_func) {                   /* GL enums, as the NV2A */
+    case 0x200: return 0;
+    case 0x201: return z <  stored;
+    case 0x202: return z == stored;
+    case 0x203: return z <= stored;
+    case 0x204: return z >  stored;
+    case 0x205: return z != stored;
+    case 0x206: return z >= stored;
+    default:    return 1;
+    }
+}
+
+static uint32_t pack_color(const float c[4])
+{
+    int i;
+    uint32_t b[4];
+    for (i = 0; i < 4; i++) {
+        float f = c[i] < 0.0f ? 0.0f : (c[i] > 1.0f ? 1.0f : c[i]);
+        b[i] = (uint32_t)(f * 255.0f + 0.5f);
+    }
+    return (b[3] << 24) | (b[0] << 16) | (b[1] << 8) | b[2];
+}
+
+static uint32_t modulate(uint32_t t, const float c[4])
+{
+    float f[4];
+    f[0] = (float)((t >> 16) & 0xFF) / 255.0f * c[0];
+    f[1] = (float)((t >> 8) & 0xFF) / 255.0f * c[1];
+    f[2] = (float)(t & 0xFF) / 255.0f * c[2];
+    f[3] = (float)(t >> 24) / 255.0f * c[3];
+    return pack_color(f);
+}
+
+/* Bytes one texel of a (non-DXT) format takes, for cube-face strides. */
+static uint32_t tex_texel_bytes(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
+        return 1;
+    case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
+    case 0x1C: case 0x1D:
+        return 2;
+    default:
+        return 4;
+    }
+}
+
+/* Bytes between cube faces: one face with all its mip levels, rounded up to
+ * the NV2A's 128-byte face alignment (xemu texture.c). */
+static uint32_t tex_face_stride(const Texture *t)
+{
+    uint32_t w = t->width, h = t->height, lv, total = 0;
+    uint32_t block = d3d8_format_dxt_block_bytes(t->color);
+    uint32_t levels = t->levels ? t->levels : 1;
+
+    if (!tex_size_from_format(t->color))
+        return (t->pitch * t->height + 127u) & ~127u;
+    for (lv = 0; lv < levels; lv++) {
+        uint32_t lw = (w >> lv) ? (w >> lv) : 1, lh = (h >> lv) ? (h >> lv) : 1;
+        total += block ? ((lw + 3) / 4) * ((lh + 3) / 4) * block
+                       : lw * lh * tex_texel_bytes(t->color);
+    }
+    return (total + 127u) & ~127u;
+}
+
+/* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
+ * floats. An unusable stage reads white, so a missing texture multiplies
+ * through instead of blacking the pixel out. */
+/* ARGB bilinear taps share format, row and addressing decisions.
+ * Resolve those once for the four neighbours rather than invoking the generic
+ * format decoder for every tap. Other formats retain the generic sampler. */
+static int rc_32_taps(const Texture *t, uint32_t face, int32_t u, int32_t v,
+                            uint32_t texels[4])
+{
+    uint32_t u0, u1, v0, v1, opaque;
+    const uint8_t *base;
+    const uint32_t *row0, *row1;
+    int swizzled = t->color == 0x06u || t->color == 0x07u;
+    if (!t->valid || (!swizzled && t->color != 0x12u && t->color != 0x1eu))
+        return 0;
+    /* Border taps need sample_tex()'s per-tap border colour; let it take them. */
+    if (t->addr_u == 4 || t->addr_v == 4)
+        return 0;
+    u0 = wrap_coord((uint32_t)u, t->width, t->addr_u);
+    u1 = wrap_coord((uint32_t)(u + 1), t->width, t->addr_u);
+    v0 = wrap_coord((uint32_t)v, t->height, t->addr_v);
+    v1 = wrap_coord((uint32_t)(v + 1), t->height, t->addr_v);
+    base = (const uint8_t *)xbox_GetMemoryOffset() + t->offset + face;
+    opaque = t->color == 0x1eu || t->color == 0x07u ? 0xff000000u : 0u;
+    if (swizzled) {
+        const uint32_t *pixels = (const uint32_t *)base;
+        uint32_t x0, x1, y0, y1;
+        if (t->swizzle_shift < 0)
+            return 0;
+        x0 = swizzle_spread(u0 & t->swizzle_common_mask);
+        x1 = swizzle_spread(u1 & t->swizzle_common_mask);
+        y0 = swizzle_spread(v0 & t->swizzle_common_mask) << 1;
+        y1 = swizzle_spread(v1 & t->swizzle_common_mask) << 1;
+        if (t->width > t->height) {
+            x0 |= (u0 & ~t->swizzle_common_mask) << t->swizzle_shift;
+            x1 |= (u1 & ~t->swizzle_common_mask) << t->swizzle_shift;
+        } else {
+            y0 |= (v0 & ~t->swizzle_common_mask) << t->swizzle_shift;
+            y1 |= (v1 & ~t->swizzle_common_mask) << t->swizzle_shift;
+        }
+        texels[0] = pixels[x0 | y0] | opaque;
+        texels[1] = pixels[x1 | y0] | opaque;
+        texels[2] = pixels[x0 | y1] | opaque;
+        texels[3] = pixels[x1 | y1] | opaque;
+    } else {
+        row0 = (const uint32_t *)(base + (size_t)v0 * t->pitch);
+        row1 = (const uint32_t *)(base + (size_t)v1 * t->pitch);
+        texels[0] = row0[u0] | opaque;
+        texels[1] = row0[u1] | opaque;
+        texels[2] = row1[u0] | opaque;
+        texels[3] = row1[u1] | opaque;
+    }
+    return 1;
+}
+
+static void rc_texel(const Texture *t, uint32_t face, float u, float v,
+                     float out[4])
+{
+    uint32_t texel, mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
+    if (tex_size_from_format(t->color)) {
+        u *= (float)t->width;
+        v *= (float)t->height;
+    }
+    /* TENT (bilinear) when the title asks for it, magnifying or minifying:
+     * a 64x32 sky gradient stretched over the screen is blocks with nearest
+     * texels and a gradient with four. MAG 2 is tent; MIN 2 is tent at LOD 0
+     * and 4/6 the tent mip modes.
+     * ponytail: level 0 only, no mip selection -- minified textures shimmer.
+     * Add LOD from the screen-space derivative when that shows. */
+    if (mag == 2 || min == 2 || min == 4 || min == 6) {
+        float fu = u - 0.5f, fv = v - 0.5f, wu, wv, c[4][4];
+        int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv), k, j;
+        wu = fu - (float)iu;
+        wv = fv - (float)iv;
+        {
+            static NV_TLS int generic = -1;
+            uint32_t taps[4];
+            int linear;
+            if (generic < 0) generic = getenv("RECOMP_TEX_GENERIC") != NULL;
+            if (!generic && wu == 0.0f && wv == 0.0f) {
+                if (sample_tex(t, face, (uint32_t)iu, (uint32_t)iv, &texel))
+                    nv2a_rc_unpack(texel, out);
+                else
+                    out[0] = out[1] = out[2] = out[3] = 1.0f;
+                return;
+            }
+            linear = !generic && rc_32_taps(t, face, iu, iv, taps);
+            for (k = 0; k < 4; k++) {
+                if (linear) {
+                    nv2a_rc_unpack(taps[k], c[k]);
+                } else if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
+                                      (uint32_t)(iv + (k >> 1)), &texel)) {
+                    nv2a_rc_unpack(texel, c[k]);
+                } else {
+                    c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
+                }
+            }
+        }
+        for (j = 0; j < 4; j++)
+            out[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
+                   + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
+        return;
+    }
+    if (sample_tex(t, face, (uint32_t)(int32_t)floorf(u),
+                   (uint32_t)(int32_t)floorf(v), &texel))
+        nv2a_rc_unpack(texel, out);
+    else
+        out[0] = out[1] = out[2] = out[3] = 1.0f;
+}
+
+/* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
+ * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
+static int rc_stage_fetch(int st, const float c[4], float out[4])
+{
+    const Texture *t = &s_gpu.texs[st];
+    uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F, j;
+    float q = c[3] != 0.0f ? c[3] : 1.0f;
+
+    switch (mode) {
+    case 0:                                       /* NONE */
+        out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f;
+        return 1;
+    case 1: case 2:                               /* PROJECT2D / 3D */
+        rc_texel(t, 0, c[0] / q, c[1] / q, out);
+        return 1;
+    case 3: {                                     /* CUBEMAP */
+        float x = c[0], y = c[1], z = c[2];
+        float ax = fabsf(x), ay = fabsf(y), az = fabsf(z), ma, sc, tc;
+        uint32_t face;
+        if (!t->cube) {
+            rc_texel(t, 0, c[0], c[1], out);
+            return 1;
+        }
+        if (ax >= ay && ax >= az) {
+            face = x > 0 ? 0 : 1; ma = ax; sc = x > 0 ? -z : z; tc = -y;
+        } else if (ay >= az) {
+            face = y > 0 ? 2 : 3; ma = ay; sc = x; tc = y > 0 ? z : -z;
+        } else {
+            face = z > 0 ? 4 : 5; ma = az; sc = z > 0 ? x : -x; tc = -y;
+        }
+        if (ma == 0.0f)
+            ma = 1.0f;
+        rc_texel(t, face * tex_face_stride(t), (sc / ma + 1.0f) * 0.5f,
+                 (tc / ma + 1.0f) * 0.5f, out);
+        return 1;
+    }
+    case 4:                                       /* PASSTHRU */
+        for (j = 0; j < 4; j++)
+            out[j] = c[j] < 0.0f ? 0.0f : (c[j] > 1.0f ? 1.0f : c[j]);
+        return 1;
+    case 5:                                       /* CLIPPLANE */
+        out[0] = out[1] = out[2] = out[3] = 0.0f;
+        for (j = 0; j < 4; j++) {
+            int ge = (s_gpu.clip_plane_mode >> (st * 4 + j)) & 1;
+            if (ge ? c[j] >= 0.0f : c[j] < 0.0f)
+                return 0;
+        }
+        return 1;
+    default:
+        /* ponytail: bump-env and dot-product modes read zero; they are water
+         * and bump effects -- add them when a title's look depends on one. */
+        out[0] = out[1] = out[2] = out[3] = 0.0f;
+        return 1;
+    }
+}
+
+/* The fixed-function fog unit, per vertex, from the program's oFog.x
+ * (xemu vsh.c). Fog disabled reads as factor 1: no fog. */
+static float fog_factor(float d)
+{
+    float f, px = s_gpu.fog_param[0], py = s_gpu.fog_param[1];
+    if (!s_gpu.fog_enable)
+        return 1.0f;
+    switch (s_gpu.fog_mode) {
+    case 0x800: case 0x802:                       /* EXP, EXP_ABS */
+        f = px + exp2f(d * py * 16.0f) - 1.5f;
+        break;
+    case 0x801: case 0x803:                       /* EXP2, EXP2_ABS */
+        f = px + exp2f(-d * d * py * py * 32.0f) - 1.5f;
+        break;
+    default:                                      /* LINEAR, LINEAR_ABS */
+        f = px + d * py - 1.0f;
+        break;
+    }
+    if (s_gpu.fog_mode == 0x802 || s_gpu.fog_mode == 0x803
+        || s_gpu.fog_mode == 0x804)
+        f = fabsf(f);
+    if (f != f)
+        f = 1.0f;
+    return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+}
+
+static int alpha_test_pass(float a)
+{
+    int v = (int)(a * 255.0f + 0.5f), r = (int)(s_gpu.alpha_ref & 0xFF);
+    switch (s_gpu.alpha_func) {
+    case 0x200: return 0;                         /* NEVER    */
+    case 0x201: return v <  r;                    /* LESS     */
+    case 0x202: return v == r;                    /* EQUAL    */
+    case 0x203: return v <= r;                    /* LEQUAL   */
+    case 0x204: return v >  r;                    /* GREATER  */
+    case 0x205: return v != r;                    /* NOTEQUAL */
+    case 0x206: return v >= r;                    /* GEQUAL   */
+    default:    return 1;                         /* ALWAYS   */
+    }
+}
+
+/* Everything a triangle's pixels need, computed once per triangle, so the
+ * pixel loop can run over any subset of rows on any thread. */
+typedef struct {
+    uint8_t *mem;
+    uint32_t bpp, texture_inputs;
+    const Nv2aVshOutput *va, *vb, *vc;
+    const float *a, *b, *c;
+    float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
+    float *zb;
+    int minx, maxx, miny, maxy, use_rc, textured;
+} XfTri;
+
+typedef struct { uint64_t depth_fail, pixels; uint32_t zpass, pixel_max; } XfCount;
+
+/* Conservatively collect texture registers read by the combiner program.
+ * Stage zero also initializes r0.a. Clip/other shader modes still execute
+ * even when their result is unused, since they may reject the pixel. */
+static uint32_t rc_texture_inputs(const Nv2aCombiner *rc)
+{
+    uint32_t mask = 1u, n = rc->control & 0xffu, stage, shift;
+    /* A one-stage program that writes r0.a without reading its initial value
+     * has no implicit texture-zero dependency. Keep the conservative default
+     * for mux/blue-to-alpha flags, other destinations and longer programs. */
+    if (n == 1u &&
+        (rc->color_ocw[0] == 0xc0u || rc->color_ocw[0] == 0xc00u) &&
+        (rc->alpha_ocw[0] == 0xc0u || rc->alpha_ocw[0] == 0xc00u)) {
+        int reads_initial_alpha = 0;
+        for (shift = 0; shift < 32u; shift += 8u) {
+            uint32_t rgb_input = (rc->color_icw[0] >> shift) & 31u;
+            uint32_t alpha_input = (rc->alpha_icw[0] >> shift) & 31u;
+            if (rgb_input == 0x1cu || alpha_input == 0x1cu)
+                reads_initial_alpha = 1;
+        }
+        if (!reads_initial_alpha) mask = 0u;
+    }
+    if (n > 8u) n = 8u;
+    for (stage = 0; stage < n; ++stage) {
+        for (shift = 0; shift < 32u; shift += 8u) {
+            uint32_t a = (rc->color_icw[stage] >> shift) & 15u;
+            uint32_t b = (rc->alpha_icw[stage] >> shift) & 15u;
+            if (a >= 8u && a <= 11u) mask |= 1u << (a - 8u);
+            if (b >= 8u && b <= 11u) mask |= 1u << (b - 8u);
+        }
+    }
+    if (rc->final0 || rc->final1) {
+        for (shift = 0; shift < 32u; shift += 8u) {
+            uint32_t a = (rc->final0 >> shift) & 15u;
+            uint32_t b = (rc->final1 >> shift) & 15u;
+            if (a >= 8u && a <= 11u) mask |= 1u << (a - 8u);
+            if (shift && b >= 8u && b <= 11u) mask |= 1u << (b - 8u);
+        }
+    }
+    for (stage = 0; stage < 4u; ++stage) {
+        uint32_t mode = (rc->stage_program >> (stage * 5u)) & 31u;
+        if (mode && mode != 1u && mode != 2u && mode != 3u)
+            mask |= 1u << stage;
+    }
+    return mask;
+}
+
+/* Rows y0, y0+step, ... < maxy of triangle T. */
+static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+{
+    const float *a = T->a, *b = T->b, *c = T->c;
+    const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
+    int x, y, k;
+
+    for (y = y0; y < T->maxy; y += step) {
+        for (x = T->minx; x < T->maxx; x++) {
+            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
+            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
+            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
+            float l0, l1, l2, z, col[4], pw;
+            uint32_t argb;
+            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
+               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                continue;
+            /* w1 is opposite a, w2 opposite b, w0 opposite c. */
+            l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
+            z = l0 * a[2] + l1 * b[2] + l2 * c[2];
+            {
+                float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
+                int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
+                /* Depth test, then shade, then alpha test, and only then the
+                 * depth write: an alpha-tested texel that is cut away must
+                 * not leave its depth behind (foliage, fences). */
+                if (zp && s_gpu.depth_test && !depth_pass(z, *zp)) {
+                    cnt->depth_fail++;
+                    continue;
+                }
+                argb = 0;
+                if (shade) {
+                    for (k = 0; k < 4; k++)
+                        col[k] = l0 * va->d0[k] + l1 * vb->d0[k] + l2 * vc->d0[k];
+                    pw = l0 * T->iw[0] + l1 * T->iw[1] + l2 * T->iw[2];
+                    if (T->use_rc) {
+                        float d1[4], fog[4], t[4][4], out[4], tc[4];
+                        int st, j, keep = 1;
+                        for (k = 0; k < 4; k++)
+                            d1[k] = l0 * va->d1[k] + l1 * vb->d1[k] + l2 * vc->d1[k];
+                        fog[0] = T->fogc[0]; fog[1] = T->fogc[1]; fog[2] = T->fogc[2];
+                        fog[3] = l0 * T->vfog[0] + l1 * T->vfog[1] + l2 * T->vfog[2];
+                        for (st = 0; st < 4 && keep; st++) {
+                    if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F) ||
+                        !(T->texture_inputs & (1u << st))) {
+                                t[st][0] = t[st][1] = t[st][2] = 0.0f;
+                                t[st][3] = 1.0f;
+                                continue;
+                            }
+                            for (j = 0; j < 4; j++)
+                                tc[j] = (l0 * T->stc[0][st][j] + l1 * T->stc[1][st][j]
+                                       + l2 * T->stc[2][st][j]) / pw;
+                            keep = rc_stage_fetch(st, tc, t[st]);
+                        }
+                        if (!keep)
+                            continue;
+                        nv2a_rc_eval(&s_gpu.rc, col, d1, fog,
+                                     (const float (*)[4])t, out);
+                        if (s_gpu.alpha_test && !alpha_test_pass(out[3]))
+                            continue;
+                        argb = pack_color(out);
+                    } else {
+                        argb = pack_color(col);
+                        if (T->textured) {
+                            uint32_t texel;
+                            float tu, tv;
+                            tu = (l0 * T->uv[0][0] + l1 * T->uv[1][0] + l2 * T->uv[2][0]) / pw;
+                            tv = (l0 * T->uv[0][1] + l1 * T->uv[1][1] + l2 * T->uv[2][1]) / pw;
+                            if (sample_texture((uint32_t)(int32_t)floorf(tu),
+                                               (uint32_t)(int32_t)floorf(tv), &texel))
+                                argb = modulate(texel, col);
+                        }
+                        if (s_gpu.alpha_test
+                            && !alpha_test_pass((float)(argb >> 24) / 255.0f))
+                            continue;
+                    }
+                }
+                /* A disabled depth test suppresses depth writes too. A
+                 * menu background retains its write mask and must not fill
+                 * the depth buffer before the vehicle preview is drawn. */
+                if (zp && s_gpu.depth_test && s_gpu.depth_mask)
+                    *zp = z;
+                if (s_gpu.zpass_enable)
+                    cnt->zpass++;
+                if (!(s_gpu.color_mask & 0x01010101u))
+                    continue;              /* colour writes off: depth only */
+            }
+            put_pixel(T->mem, T->bpp, x, y, argb, &cnt->pixels, &cnt->pixel_max);
+        }
+    }
+}
+
+/* Worker threads for big triangles.
+ *
+ * The rasteriser is a software GPU, and a title's frame is dominated by a
+ * handful of full-screen passes -- composites, blurs, the menu backdrops --
+ * each two triangles of 300,000 pixels through the register combiners. Those
+ * split cleanly by row: every pixel reads only its own depth and colour, so
+ * interleaved rows on N threads need no locking. Small triangles stay on the
+ * executor thread, where waking workers would cost more than it saves.
+ * RECOMP_RASTER_THREADS=<n> sets the count (1 = off); the default leaves a
+ * few cores for the title and the host.
+ * Pixel statistics stay in each worker's stack while shading. Merge them
+ * once per triangle so diagnostic counters do not contend across cores. */
+#define NV_RASTER_MAX_THREADS 16
+#define NV_RASTER_MT_MIN_PIXELS 8192
+
+#if defined(_WIN32)
+static struct {
+    int n;                                  /* threads incl. the caller */
+    HANDLE start[NV_RASTER_MAX_THREADS], done;
+    volatile LONG pending;
+    const XfTri *tris;
+    int ntris;
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_pool;
+
+/* Worker k owns the rows y with y % n == k, for every triangle of the run,
+ * in submission order. Each pixel therefore sees its triangles in the order
+ * the title drew them, whichever thread draws it. */
+static void xf_rows_owned(const XfTri *tris, int ntris, int k, int n,
+                          XfCount *cnt)
+{
+    int i;
+    for (i = 0; i < ntris; i++) {
+        int y0 = tris[i].miny + ((k - tris[i].miny) % n + n) % n;
+        xf_rows(&tris[i], y0, n, cnt);
+    }
+}
+
+static DWORD WINAPI raster_worker(LPVOID arg)
+{
+    int k = (int)(intptr_t)arg;
+    for (;;) {
+        WaitForSingleObject(s_pool.start[k], INFINITE);
+        memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
+        xf_rows_owned(s_pool.tris, s_pool.ntris, k, s_pool.n, &s_pool.cnt[k]);
+        if (InterlockedDecrement(&s_pool.pending) == 0)
+            SetEvent(s_pool.done);
+    }
+    return 0;
+}
+
+static int raster_pool_size(void)
+{
+    static int init;
+    if (!init) {
+        const char *e = getenv("RECOMP_RASTER_THREADS");
+        SYSTEM_INFO si;
+        int n, k;
+        init = 1;
+        GetSystemInfo(&si);
+        n = e ? atoi(e) : (int)si.dwNumberOfProcessors - 4;
+        if (n < 1) n = 1;
+        if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
+        s_pool.n = n;
+        if (n > 1) {
+            s_pool.done = CreateEventA(NULL, FALSE, FALSE, NULL);
+            for (k = 0; k < n - 1; k++) {
+                s_pool.start[k] = CreateEventA(NULL, FALSE, FALSE, NULL);
+                CloseHandle(CreateThread(NULL, 0, raster_worker,
+                                         (LPVOID)(intptr_t)k, 0, NULL));
+            }
+        }
+    }
+    return s_pool.n;
+}
+
+static void xf_rows_parallel(const XfTri *T, int ntris, long px,
+                             XfCount *total)
+{
+    int n = raster_pool_size(), k;
+
+    if (n <= 1 || px < NV_RASTER_MT_MIN_PIXELS) {
+        for (k = 0; k < ntris; k++)
+            xf_rows(&T[k], T[k].miny, 1, total);
+        return;
+    }
+    s_pool.tris = T;
+    s_pool.ntris = ntris;
+    s_pool.pending = n - 1;
+    for (k = 0; k < n - 1; k++)
+        SetEvent(s_pool.start[k]);
+    {
+        XfCount mine = {0, 0, 0};
+        xf_rows_owned(T, ntris, n - 1, n, &mine);
+        WaitForSingleObject(s_pool.done, INFINITE);
+        total->depth_fail += mine.depth_fail;
+        total->pixels += mine.pixels;
+        total->zpass += mine.zpass;
+        if ((mine.pixel_max & 0x00FFFFFFu) > (total->pixel_max & 0x00FFFFFFu))
+            total->pixel_max = mine.pixel_max;
+    }
+    for (k = 0; k < n - 1; k++) {
+        total->depth_fail += s_pool.cnt[k].depth_fail;
+        total->pixels += s_pool.cnt[k].pixels;
+        total->zpass += s_pool.cnt[k].zpass;
+        if ((s_pool.cnt[k].pixel_max & 0x00FFFFFFu) > (total->pixel_max & 0x00FFFFFFu))
+            total->pixel_max = s_pool.cnt[k].pixel_max;
+    }
+}
+#else
+static void xf_rows_parallel(const XfTri *T, int ntris, long px,
+                             XfCount *total)
+{
+    int k;
+    (void)px;
+    for (k = 0; k < ntris; k++)
+        xf_rows(&T[k], T[k].miny, 1, total);
+}
+#endif
+
+/* Triangles waiting for the end of their batch.
+ *
+ * A level is thousands of small triangles, each far below the size worth
+ * waking the pool for, so they all drew on the executor thread while the
+ * workers slept: Fallout: Brotherhood of Steel's first level ran at 5 fps
+ * with the executor at 100% and every worker idle. Queuing a batch's
+ * triangles and handing the whole run over at once costs one wake per batch.
+ * GPU state cannot change inside a batch, so drawing later reads the same
+ * state. The vertices are copied: near-plane clipping passes stack locals.
+ * ponytail: a fixed-size queue flushed when full; 2048 covers a typical
+ * batch, and a bigger one just splits into several runs. */
+#define XF_QUEUE_MAX 2048
+typedef struct { XfTri t; Nv2aVshOutput v[3]; } XfQueued;
+static XfQueued *s_xfq;
+static XfTri s_xfq_tris[XF_QUEUE_MAX];
+static int s_xfq_n;
+static long s_xfq_px;
+
+static void xf_queue_flush(void)
+{
+    XfCount cnt = {0, 0, 0};
+    int i;
+
+    if (!s_xfq_n)
+        return;
+    for (i = 0; i < s_xfq_n; i++)
+        s_xfq_tris[i] = s_xfq[i].t;
+    xf_rows_parallel(s_xfq_tris, s_xfq_n, s_xfq_px, &cnt);
+    s_gpu.xf_depth_fail += cnt.depth_fail;
+    s_gpu.xf_pixels += cnt.pixels;
+    s_gpu.pixels += cnt.pixels;
+    if ((cnt.pixel_max & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
+        s_gpu.pixel_max = cnt.pixel_max;
+    s_gpu.zpass_count += cnt.zpass;
+    s_xfq_n = 0;
+    s_xfq_px = 0;
+}
+
+static void xf_queue_push(const XfTri *T)
+{
+    XfQueued *q;
+
+    if (!s_xfq && !(s_xfq = (XfQueued *)malloc(XF_QUEUE_MAX * sizeof *s_xfq))) {
+        XfCount cnt = {0, 0, 0};
+        xf_rows_parallel(T, 1, 0, &cnt);
+        return;
+    }
+    if (s_xfq_n == XF_QUEUE_MAX)
+        xf_queue_flush();
+    q = &s_xfq[s_xfq_n++];
+    q->t = *T;
+    q->v[0] = *T->va; q->v[1] = *T->vb; q->v[2] = *T->vc;
+    q->t.va = &q->v[0]; q->t.vb = &q->v[1]; q->t.vc = &q->v[2];
+    q->t.a = q->v[0].pos; q->t.b = q->v[1].pos; q->t.c = q->v[2].pos;
+    s_xfq_px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+}
+
+static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+                               const Nv2aVshOutput *vc)
+{
+    XfTri T;
+    XfCount cnt = {0, 0, 0};
+    const Nv2aVshOutput *v[3];
+    const float *a, *b, *c;
+    float area, su = 1.0f, sv = 1.0f;
+    int k;
+    static int no_rc = -1;
+
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    memset(&T, 0, sizeof T);
+    T.mem = (uint8_t *)xbox_GetMemoryOffset();
+    T.bpp = surface_bpp();
+    T.textured = s_gpu.texs[0].valid && !s_xf_no_tex;
+    T.use_rc = s_gpu.rc_seen && !no_rc;
+    T.texture_inputs = rc_texture_inputs(&s_gpu.rc);
+    T.va = va; T.vb = vb; T.vc = vc;
+
+    v[0] = va; v[1] = vb; v[2] = vc;
+    a = va->pos; b = vb->pos; c = vc->pos;
+    T.a = a; T.b = b; T.c = c;
+    if (T.bpp != 4 && T.bpp != 2)
+        return;
+    if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
+        s_gpu.tris_behind++;
+        return;
+    }
+    area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    if (area == 0.0f || area != area) {
+        s_gpu.xf_degenerate++;
+        return;
+    }
+    if (backend_draws()) {                     /* a back end rasterises */
+        Nv2aVertex *o = backend_slot();
+        if (o) {
+            backend_from_xf(va, &o[0]);
+            backend_from_xf(vb, &o[1]);
+            backend_from_xf(vc, &o[2]);
+            s_bcount += 3;
+        }
+        return;
+    }
+    for (k = 0; k < 3; k++) {
+        if (!s_gpu.xf_seeded)
+            s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
+        if (a[k] < s_gpu.xf_min[k]) s_gpu.xf_min[k] = a[k];
+        if (a[k] > s_gpu.xf_max[k]) s_gpu.xf_max[k] = a[k];
+    }
+    s_gpu.xf_seeded = 1;
+    if (!surface_begin_batch(T.mem))
+        return;
+    if (s_gpu.depth_test || s_gpu.depth_mask)
+        T.zb = zbuf_current(1);
+    if (tex_size_from_format(s_gpu.texs[0].color)) {
+        su = (float)s_gpu.texs[0].width;
+        sv = (float)s_gpu.texs[0].height;
+    }
+    for (k = 0; k < 3; k++) {
+        /* NV2A clamps raster W to [2^-64, 2^64] (xemu glsl/vsh.c,
+         * clampAwayZeroInf). Screen-space shaders can emit RCP(0) = +Inf;
+         * taking its reciprocal directly makes every interpolated texture
+         * coordinate 0/0, corrupting fullscreen composites. Keep shader
+         * output intact and apply the hardware range at raster setup. */
+        float raster_w = v[k]->pos[3];
+        if (raster_w > 0x1p64f) raster_w = 0x1p64f;
+        if (raster_w < 0x1p-64f) raster_w = 0x1p-64f;
+        T.iw[k] = 1.0f / raster_w;
+        T.uv[k][0] = v[k]->tex[0][0] * su * T.iw[k];
+        T.uv[k][1] = v[k]->tex[0][1] * sv * T.iw[k];
+    }
+    if (T.use_rc) {
+        int st, j;
+        for (k = 0; k < 3; k++) {
+            for (st = 0; st < 4; st++)
+                for (j = 0; j < 4; j++)
+                    T.stc[k][st][j] = v[k]->tex[st][j] * T.iw[k];
+            T.vfog[k] = fog_factor(v[k]->fog[0]);
+        }
+        /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+        nv2a_rc_unpack(s_gpu.fog_color, T.fogc);
+        { float r = T.fogc[2]; T.fogc[2] = T.fogc[0]; T.fogc[0] = r; }
+    }
+
+    T.minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
+    T.maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
+    T.miny = (int)floorf(fminf(a[1], fminf(b[1], c[1])));
+    T.maxy = (int)ceilf (fmaxf(a[1], fmaxf(b[1], c[1])));
+    if (T.minx < (int)s_gpu.clip_x) T.minx = (int)s_gpu.clip_x;
+    if (T.miny < (int)s_gpu.clip_y) T.miny = (int)s_gpu.clip_y;
+    if (T.maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) T.maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
+    if (T.maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) T.maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (T.maxx > NV_ZBUF_W || T.maxy > NV_ZBUF_H) {
+        /* The host depth buffer is fixed at NV_ZBUF_W x NV_ZBUF_H, so pixels
+         * past it are not drawn in the software path. Logged once. */
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "PB_EXEC: software raster clipped to the %dx%d depth buffer (target %dx%d)\n",
+                    NV_ZBUF_W, NV_ZBUF_H, (int)(s_gpu.clip_x + s_gpu.clip_w), (int)(s_gpu.clip_y + s_gpu.clip_h));
+        }
+    }
+    if (T.maxx > NV_ZBUF_W) T.maxx = NV_ZBUF_W;
+    if (T.maxy > NV_ZBUF_H) T.maxy = NV_ZBUF_H;
+    if (T.minx >= T.maxx || T.miny >= T.maxy) {
+        s_gpu.tris_skipped_offscreen++;
+        s_gpu.xf_offscreen++;
+        return;
+    }
+    s_gpu.xf_drawn++;
+    T.inv_area = 1.0f / area;
+
+    xf_queue_push(&T);
+    (void)cnt;
+    s_gpu.tris_drawn++;
+    note_drawn();
+}
+
+
+/* Near-plane clipping.
+ *
+ * A triangle with a vertex behind the eye (w <= 0) used to be dropped whole.
+ * That is invisible for distant geometry and ruinous close up: in a chase
+ * view the road under the camera is exactly the set of triangles that reach
+ * behind it, so the bottom of the frame showed a hole -- a quarter of every
+ * race frame's triangles went this way.
+ *
+ * Clipping has to happen in clip space, but the D3D epilogue has already
+ * divided x, y and z by w and applied the viewport, leaving w alone. Each
+ * vertex is taken to (x*w, y*w, z*w, w): screen = clip / w * scale + offset
+ * makes that an affine image of clip space, so clipping and interpolating
+ * there is exact without knowing the scale. That matters: the viewport is
+ * the title's own business -- c[58]/c[59] for most, but SSX 3's programs
+ * keep it elsewhere and c[58] reads 0, which turned every clipped triangle
+ * into a point. Everything else the vertex carries -- colours, fog, texture
+ * coordinates -- is linear in clip space and is interpolated directly.
+ *
+ * The polygon is clipped against w = NV_CLIP_W and then the near plane
+ * z = 0 (Sutherland-Hodgman), divided back by w, and fanned. The near plane
+ * is screen z = the viewport's z offset (s_xf_o[2], 0 for D3D). Clipping at
+ * w alone let geometry between the eye and the near plane through at huge
+ * screen coordinates: torn streaks at the frame's edges. RECOMP_CLIP_NEAR_Z=0
+ * clips at w only.
+ * ponytail: near planes only; x/y/far fall to the rasteriser's bounds
+ * check, which is correct, just slower for huge off-screen triangles. */
+#define NV_CLIP_W 1e-3f
+
+/* The z offset of the current batch's screen-space transform (the near
+ * plane, see above), scaled like the vertices. Set by xf_set_viewport(). */
+static float s_xf_o[3];
+
+static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
+                    Nv2aVshOutput *out)
+{
+    const float *pa = (const float *)a, *pb = (const float *)b;
+    float *po = (float *)out;
+    size_t i, n = sizeof(Nv2aVshOutput) / sizeof(float);
+    for (i = 0; i < n; i++)
+        po[i] = pa[i] + (pb[i] - pa[i]) * t;
+}
+
+/* Signed distance of a vertex in (x*w, y*w, z*w, w) to clip plane `pl`:
+ * 0 is w = NV_CLIP_W, 1 the near plane. */
+static float xf_clip_dist(const Nv2aVshOutput *v, int pl)
+{
+    return pl == 0 ? v->pos[3] - NV_CLIP_W : v->pos[2] - s_xf_o[2] * v->pos[3];
+}
+
+/* Sutherland-Hodgman: clip polygon in[0..n) against plane pl into out. */
+static int xf_clip_poly(const Nv2aVshOutput *in, int n, int pl,
+                        Nv2aVshOutput *out)
+{
+    int i, m = 0;
+    for (i = 0; i < n; i++) {
+        const Nv2aVshOutput *p = &in[i], *q = &in[(i + 1) % n];
+        float dp = xf_clip_dist(p, pl), dq = xf_clip_dist(q, pl);
+        if (dp >= 0.0f)
+            out[m++] = *p;
+        if ((dp >= 0.0f) != (dq >= 0.0f)) {
+            Nv2aVshOutput *v = &out[m++];
+            xf_lerp(p, q, dp / (dp - dq), v);
+            /* Exactly on the plane: at w in the 1e4s the lerp's rounding is
+             * bigger than NV_CLIP_W, and a w <= 0 divides to inf/NaN. */
+            if (pl == 0)
+                v->pos[3] = NV_CLIP_W;
+            else
+                v->pos[2] = s_xf_o[2] * v->pos[3];
+        }
+    }
+    return m;
+}
+
+static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+                              const Nv2aVshOutput *c)
+{
+    static int near_z = -1;
+    const Nv2aVshOutput *in[3];
+    Nv2aVshOutput p0[8], p1[8];
+    int n = 3, i, j, pl, planes, inside = 1;
+
+    if (near_z < 0) {
+        const char *e = getenv("RECOMP_CLIP_NEAR_Z");
+        near_z = !(e && e[0] == '0');
+    }
+    planes = near_z ? 2 : 1;
+    in[0] = a; in[1] = b; in[2] = c;
+    for (i = 0; i < 3; i++) {
+        p0[i] = *in[i];
+        for (j = 0; j < 3; j++)
+            p0[i].pos[j] = in[i]->pos[j] * in[i]->pos[3];
+        for (pl = 0; pl < planes; pl++) {
+            float d = xf_clip_dist(&p0[i], pl);
+            if (d != d || d - d != 0.0f)
+                return;                       /* not finite: no position at all */
+            if (d < 0.0f)
+                inside = 0;
+        }
+    }
+    if (inside) {
+        raster_xf_triangle(a, b, c);
+        return;
+    }
+    n = xf_clip_poly(p0, n, 0, p1);
+    if (planes > 1 && n)
+        n = xf_clip_poly(p1, n, 1, p0);
+    else
+        memcpy(p0, p1, sizeof p1);
+    if (n < 3) {
+        s_gpu.tris_behind++;                  /* wholly clipped away */
+        return;
+    }
+    /* Back to screen space: divide by the (now positive) w. */
+    for (i = 0; i < n; i++)
+        for (j = 0; j < 3; j++)
+            p0[i].pos[j] /= p0[i].pos[3];
+    for (i = 1; i + 1 < n; i++)
+        raster_xf_triangle(&p0[0], &p0[i], &p0[i + 1]);
+}
+
+static Nv2aVshOutput *s_xf;
+static uint32_t s_xf_cap;
+
+/* Grown to the largest batch seen rather than sized for NV_MAX_INDICES up
+ * front, which is a million vertices. */
+static int xf_reserve(uint32_t n)
+{
+    if (n > s_xf_cap) {
+        Nv2aVshOutput *p = (Nv2aVshOutput *)realloc(s_xf, (size_t)n * sizeof *p);
+        if (!p) return 0;
+        s_xf = p;
+        s_xf_cap = n;
+    }
+    return 1;
+}
+
+/* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
+ * interpreter off (the batch then falls to the screen-space heuristics). */
+static int batch_uses_program(void)
+{
+    static int no_vsh = -1;
+
+    if (no_vsh < 0)
+        no_vsh = getenv("RECOMP_NO_VSH") != NULL;
+    return (s_gpu.xf_mode & 3) == 2 && !no_vsh;
+}
+
+static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+{
+    float in[NV2A_VSH_INPUTS][4];
+    uint32_t a;
+
+    if (!batch_uses_program())
+        return ffp_vertex(index, out);
+    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        /* An attribute with no array (size 0) reads its current value, the
+         * one the SET_VERTEX_DATA* methods left -- as the hardware does --
+         * not a fixed 0,0,0,1. SSX 3's sprite program passes its 4x4
+         * transforms in v8..v15 this way, set per batch with
+         * SET_VERTEX_DATA4F; reading 0,0,0,1 there sent every vertex of
+         * its front end to the viewport offset. imm_attr starts at 0,0,0,1,
+         * so an attribute nobody set still reads the old default. */
+        if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
+            memcpy(in[a], s_gpu.imm_attr[a], sizeof in[a]);
+        else
+            fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
+    }
+    if (!nv2a_vsh_run((const float (*)[4])in, out))
+        return 0;
+    /* oPos.w == 0 comes from a program that never divided by w: x, y and z
+     * are already surface units. The hardware draws such a vertex (xemu
+     * clamps w away from zero, in front of the eye), but raster_xf_clipped
+     * would count it behind the eye. w = 1 draws it at the same place and
+     * keeps 1/w finite. -0 stays behind the eye and is clipped, as on xemu. */
+    if (out->pos[3] == 0.0f && !signbit(out->pos[3]))
+        out->pos[3] = 1.0f;
+    /* The program's viewport is in logical pixels; the surface may be larger
+     * (anti-aliasing). */
+    out->pos[0] *= s_gpu.aa_sx;
+    out->pos[1] *= s_gpu.aa_sy;
+    return 1;
+}
+
+static void xf_set_viewport(void)
+{
+    const float *of = nv2a_vsh_constant(59);
+
+    s_xf_o[0] = of[0] * s_gpu.aa_sx;
+    s_xf_o[1] = of[1] * s_gpu.aa_sy;
+    s_xf_o[2] = of[2];
+}
+
+static void raster_batch_program(void)
+{
+    uint32_t i, n = s_gpu.idx_count;
+
+    if (!xf_reserve(n))
+        return;
+    for (i = 0; i < n; i++)
+        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+            return;                                    /* no program loaded */
+    xf_set_viewport();
+    {
+        const VertexAttr *tc = texcoord_attr();
+        s_xf_no_tex = !batch_uses_program() && !(tc->offset && tc->stride);
+    }
+    if (batch_uses_program()) {
+        s_gpu.batches_program++;
+        s_gpu.verts_program += n;
+    } else {
+        static int ftrace = -1;
+
+        s_gpu.batches_ffp++;
+        /* RECOMP_FFP_TRACE: the matrix and the first vertices of the first few
+         * fixed-function batches, raw and transformed -- the one view that
+         * tells a wrong matrix layout from wrong vertex data. */
+        if (ftrace < 0)
+            ftrace = getenv("RECOMP_FFP_TRACE") != NULL;
+        if (ftrace && s_gpu.batches_ffp <= 4) {
+            const float *m = s_gpu.composite;
+            float in[4];
+
+            fprintf(stderr, "  [FFP] batch %u prim %u n %u mode 0x%X"
+                            " clip %ux%u+%u+%u aa %gx%g\n"
+                            "  [FFP]   M = %g %g %g %g | %g %g %g %g |"
+                            " %g %g %g %g | %g %g %g %g\n",
+                    s_gpu.batches_ffp, s_gpu.prim, n, s_gpu.xf_mode,
+                    s_gpu.clip_w, s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y,
+                    s_gpu.aa_sx, s_gpu.aa_sy,
+                    m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                    m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+            for (i = 0; i < n && i < 4; i++) {
+                fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], in);
+                fprintf(stderr, "  [FFP]   v%u (%g %g %g %g) -> (%g %g %g, w %g)\n",
+                        s_gpu.idx[i], in[0], in[1], in[2], in[3],
+                        s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
+                        s_xf[i].pos[3]);
+            }
+        }
+    }
+    if (s_gpu.blend_enable) {
+        uint32_t pair = s_gpu.blend_sfactor << 16 | (s_gpu.blend_dfactor & 0xFFFF);
+        int j;
+        for (j = 0; j < s_gpu.blend_npairs && s_gpu.blend_pairs[j] != pair; j++)
+            ;
+        if (j == s_gpu.blend_npairs && j < 16)
+            s_gpu.blend_pairs[s_gpu.blend_npairs++] = pair;
+    }
+    {
+        /* RECOMP_VSH_TRACE=<n>: print n program batches -- attribute setup,
+         * raw inputs, key constants, and what came out. */
+        static int left = -1;
+        if (left < 0) {
+            const char *t = getenv("RECOMP_VSH_TRACE");
+            left = t ? atoi(t) : 0;
+        }
+        /* Spread out: one every 20000 program batches, so a run that spends
+         * its first half in menus still traces the 3D scene. */
+        if (left > 0 && n >= 3 &&
+            (s_ftrace == 2 || s_gpu.batches_program % 20000 == 0)) {
+            float in[4];
+            left--;
+            if (s_gpu.inline_active) {
+                fprintf(stderr, "[VTRACE] inline dwords=%u:", s_gpu.inline_count);
+                for (i = 0; i < s_gpu.inline_count && i < 16; i++)
+                    fprintf(stderr, " %08X", s_gpu.inline_buf[i]);
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "[VTRACE] prim %u n %u idx %u %u %u\n", s_gpu.prim,
+                    n, s_gpu.idx[0], s_gpu.idx[1], s_gpu.idx[2]);
+            for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+                const VertexAttr *at = &s_gpu.attr[i];
+                if (!at->size)
+                    continue;
+                fetch_attr(at, s_gpu.idx[0], in);
+                fprintf(stderr, "[VTRACE]   v%u off %08X type %u size %u"
+                        " stride %u = %g %g %g %g\n", i, at->offset, at->type,
+                        at->size, at->stride, in[0], in[1], in[2], in[3]);
+            }
+            {
+                static const uint32_t cs[] = {0, 1, 58, 59, 96, 97, 98, 99, 112, 113, 114, 115};
+                for (i = 0; i < sizeof(cs) / sizeof(cs[0]); i++) {
+                    const float *c = nv2a_vsh_constant(cs[i]);
+                    fprintf(stderr, "[VTRACE]   c[%u] %g %g %g %g%c", cs[i],
+                            c[0], c[1], c[2], c[3], 10);
+                }
+            }
+            for (i = 0; i < 3; i++)
+                fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
+                        s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
+                        s_xf[i].pos[3]);
+        }
+    }
+    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
+        const VertexAttr *at = &s_gpu.attr[i];
+        uint32_t f = at->type | (at->size << 4) | (i << 8), j;
+        if (!at->size || !at->stride)
+            continue;
+        for (j = 0; j < (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_fmt[j] != f; j++)
+            ;
+        if (j == (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_nfmt < 16)
+            s_gpu.xf_fmt[s_gpu.xf_nfmt++] = f;
+    }
+    if (s_gpu.texs[0].valid)
+        note_texture_use();
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3)
+            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++)
+            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++)
+            raster_xf_clipped(&s_xf[0], &s_xf[i], &s_xf[i+1]);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            raster_xf_clipped(&s_xf[i], &s_xf[i+2], &s_xf[i+3]);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+3]);
+            raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
+        }
+        break;
+    default:
+        break;
+    }
+    /* The batch's triangles, all at once (see xf_queue_push). */
+    xf_queue_flush();
+    if (backend_draws())
+        backend_flush(!s_xf_no_tex);
+}
+
+/* ---- D3D11 path ---------------------------------------------------------
+ *
+ * The default renderer. Vertices are transformed here (the title's vertex
+ * program on the CPU, de-duplicated per batch), assembled into a triangle
+ * list with each triangle's winding preserved, and handed to the D3D11
+ * backend with the full pipeline state. RECOMP_SOFT_RASTER=1 keeps the
+ * software rasteriser above as a reference renderer. */
+
+static int use_d3d(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = !getenv("RECOMP_SOFT_RASTER") && nv2a_d3d_init();
+        fprintf(stderr, "[GPU] renderer: %s\n", on ? "D3D11" : "software reference");
+    }
+    return on;
+}
+
+static uint32_t *s_di, s_di_cap;
+static float (*s_pos)[4];
+static uint32_t s_pos_cap;
+static int grow(void **p, uint32_t *cap, uint32_t need, size_t elem)
+{
+    if (need <= *cap) return 1;
+    {
+        uint32_t n = *cap ? *cap : 1024;
+        void *q;
+        while (n < need) n *= 2;
+        q = realloc(*p, (size_t)n * elem);
+        if (!q) return 0;
+        *p = q;
+        *cap = n;
+    }
+    return 1;
+}
+
+static void d3d_fill_state(NvD3DState *st)
+{
+    int k;
+    memset(st, 0, sizeof *st);
+    st->color_addr = s_gpu.color_offset ? dma_resolve(s_gpu.color_offset) : 0;
+    st->zeta_addr = s_gpu.zeta_offset ? dma_resolve(s_gpu.zeta_offset) : 0;
+    st->color_pitch = s_gpu.pitch;
+    st->zeta_pitch = s_gpu.zeta_pitch;
+    st->surface_format = s_gpu.format;
+    st->clip_x = s_gpu.clip_x; st->clip_y = s_gpu.clip_y;
+    st->clip_w = s_gpu.clip_w; st->clip_h = s_gpu.clip_h;
+    st->wclip_type = s_gpu.wclip_type;
+    st->wclip_mask = s_gpu.wclip_mask;
+    memcpy(st->wclip_h, s_gpu.wclip_h, sizeof st->wclip_h);
+    memcpy(st->wclip_v, s_gpu.wclip_v, sizeof st->wclip_v);
+    st->blend_enable = s_gpu.blend_enable;
+    st->blend_sfactor = s_gpu.blend_sfactor;
+    st->blend_dfactor = s_gpu.blend_dfactor;
+    st->blend_equation = s_gpu.blend_equation ? s_gpu.blend_equation : 0x8006;
+    st->blend_color = s_gpu.blend_color;
+    st->color_mask = s_gpu.color_mask;
+    st->depth_test = s_gpu.depth_test;
+    st->depth_func = s_gpu.depth_func;
+    st->depth_mask = s_gpu.depth_mask;
+    st->stencil_test = s_gpu.stencil_test;
+    st->stencil_func = s_gpu.stencil_func;
+    st->stencil_ref = s_gpu.stencil_ref;
+    st->stencil_func_mask = s_gpu.stencil_func_mask;
+    st->stencil_write_mask = s_gpu.stencil_write_mask;
+    st->stencil_fail = s_gpu.stencil_fail;
+    st->stencil_zfail = s_gpu.stencil_zfail;
+    st->stencil_zpass = s_gpu.stencil_zpass;
+    st->cull_enable = s_gpu.cull_enable;
+    st->cull_face = s_gpu.cull_face;
+    st->front_face = s_gpu.front_face;
+    st->poly_offset_fill = s_gpu.poly_offset_fill;
+    st->poly_offset_factor = s_gpu.poly_offset_factor;
+    st->poly_offset_units = s_gpu.poly_offset_units;
+    st->flat_shade = s_gpu.shade_mode == 0x1D00;
+    st->z_perspective = (s_gpu.control0 >> 16) & 1;
+    st->rc = s_gpu.rc;
+    st->rc_seen = s_gpu.rc_seen;
+    st->clip_plane_mode = s_gpu.clip_plane_mode;
+    st->other_stage_input = s_gpu.other_stage_input;
+    st->dot_rgb_mapping = s_gpu.dot_rgb_mapping;
+    st->alpha_test = s_gpu.alpha_test;
+    st->alpha_func = s_gpu.alpha_func;
+    st->alpha_ref = s_gpu.alpha_ref;
+    st->fog_color = s_gpu.fog_color;
+    st->fog_enable = s_gpu.fog_enable;
+    st->fog_mode = s_gpu.fog_mode;
+    st->fog_param[0] = s_gpu.fog_param[0];
+    st->fog_param[1] = s_gpu.fog_param[1];
+    st->tex_used = s_gpu.texs[0].valid ? 1u : 0u;
+    for (k = 0; k < 4; k++) {
+        const Texture *t = &s_gpu.texs[k];
+        NvD3DTexture *o = &st->tex[k];
+        if (!t->valid) continue;
+        o->addr = t->offset;
+        o->format = t->format_raw;
+        o->color = t->color;
+        o->width = t->width; o->height = t->height;
+        o->pitch = t->pitch;
+        o->levels = t->levels;
+        o->cube = (uint32_t)t->cube;
+        o->address = t->address_raw;
+        o->control0 = t->control0;
+        o->filter = t->filter;
+        o->palette = t->palette;
+        o->palette_len = t->palette_len ? t->palette_len : 256;
+        o->border = t->border;
+        memcpy(o->bump_mat, t->bump_mat, sizeof o->bump_mat);
+        o->bump_scale = t->bump_scale;
+        o->bump_offset = t->bump_offset;
+    }
+}
+
+/* The primitive as an index list (triangles, lines or points), each entry
+ * map[position]. Every other triangle of a strip is listed in reverse so its
+ * winding -- and so culling -- matches the strip's. */
+static uint32_t build_list(uint32_t n, const uint32_t *map, uint32_t *out, int *topo)
+{
+    uint32_t i, ni = 0;
+    *topo = NV_D3D_TRIANGLES;
+#define TRI(a, b, c) do { out[ni++] = map[a]; out[ni++] = map[b]; \
+                          out[ni++] = map[c]; } while (0)
+    switch (s_gpu.prim) {
+    case NV_PRIM_POINTS:
+        *topo = NV_D3D_POINTS;
+        for (i = 0; i < n; i++) out[ni++] = map[i];
+        break;
+    case NV_PRIM_LINES:
+        *topo = NV_D3D_LINES;
+        for (i = 0; i + 1 < n; i += 2) { out[ni++] = map[i]; out[ni++] = map[i + 1]; }
+        break;
+    case NV_PRIM_LINE_STRIP:
+    case NV_PRIM_LINE_LOOP:
+        *topo = NV_D3D_LINES;
+        for (i = 0; i + 1 < n; i++) { out[ni++] = map[i]; out[ni++] = map[i + 1]; }
+        if (s_gpu.prim == NV_PRIM_LINE_LOOP && n > 2) {
+            out[ni++] = map[n - 1]; out[ni++] = map[0];
+        }
+        break;
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1) TRI(i + 1, i, i + 2);
+            else TRI(i, i + 1, i + 2);
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) TRI(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) { TRI(i, i + 1, i + 2); TRI(i, i + 2, i + 3); }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) { TRI(i, i + 1, i + 3); TRI(i, i + 3, i + 2); }
+        break;
+    default:
+        break;
+    }
+#undef TRI
+    return ni;
+}
+
+/* Where a vertex lands on screen (x, y, z, w), for widescreen placement of
+ * 2D overlays only -- the GPU transforms every vertex it draws. */
+static int d3d_screen_pos(uint32_t guest_idx, int program, float out[4])
+{
+    if (program) {
+        Nv2aVshOutput o;
+        if (!transform_vertex(guest_idx, &o)) return 0;
+        memcpy(out, o.pos, sizeof o.pos);
+    } else {
+        if (!fetch_attr(&s_gpu.attr[0], guest_idx, out)) return 0;
+        out[3] = s_gpu.attr[0].size == 4 && out[3] > 0.0f ? 1.0f / out[3] : 1.0f;
+    }
+    return 1;
+}
+
+/* The batch, drawn by the GPU: its vertex program (program) or its
+ * pre-transformed vertices, straight from the title's arrays. */
+/* Interpolation (see nv2a_pb_replay): a recorded frame keeps a copy of each
+ * draw's vertices, since by the time it is drawn again the title may be
+ * filling the same buffers for the next one; a replayed draw reads them. */
+static void pb_draw_vertices(NvD3DAttrib attr[NV_VERTEX_ATTRS], uint32_t lo, uint32_t hi);
+
+static void d3d_draw_batch(int program)
+{
+    NvD3DAttrib attr[NV_VERTEX_ATTRS];
+    float def[NV_VERTEX_ATTRS][4];
+    const float (*pos)[4] = NULL;
+    uint32_t n = s_gpu.idx_count, i, ni, lo, hi;
+    int topo;
+    NvD3DState st;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+
+    if (n < 1 || !s_gpu.prim)
+        return;
+    d3d_fill_state(&st);
+    for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+        const VertexAttr *a = &s_gpu.attr[i];
+        attr[i].enabled = a->size != 0;
+        attr[i].type = a->type;
+        attr[i].size = a->size;
+        attr[i].stride = a->stride;
+        attr[i].data = !a->size ? NULL
+                     : s_gpu.inline_active ? (const uint8_t *)s_gpu.inline_buf + a->offset
+                     : a->offset ? mem + a->offset : NULL;
+    }
+    lo = hi = s_gpu.idx[0];
+    for (i = 1; i < n; i++) {
+        if (s_gpu.idx[i] < lo) lo = s_gpu.idx[i];
+        if (s_gpu.idx[i] > hi) hi = s_gpu.idx[i];
+    }
+    pb_draw_vertices(attr, lo, hi);
+    memcpy(def, s_gpu.imm_attr, sizeof def);
+    /* Pre-transformed batches with no diffuse at all are white. */
+    if (!program && !s_gpu.attr[3].size && !s_gpu.attr[3].offset)
+        def[3][0] = def[3][1] = def[3][2] = def[3][3] = 1.0f;
+    if (!grow((void **)&s_di, &s_di_cap, n * 6 + 6, sizeof *s_di))
+        return;
+    ni = build_list(n, s_gpu.idx, s_di, &topo);
+    if (!ni)
+        return;
+    if (nv2a_d3d_widescreen() && hi - lo < 65536 &&
+        grow((void **)&s_pos, &s_pos_cap, hi - lo + 1, sizeof *s_pos) &&
+        d3d_screen_pos(s_gpu.idx[0], program, s_pos[s_gpu.idx[0] - lo]) &&
+        s_pos[s_gpu.idx[0] - lo][3] == 1.0f) {
+        /* A screen-space overlay: where it lands decides its placement.
+         * Vertices the batch does not use copy the first one's position,
+         * which keeps them inside its cluster. */
+        const float *first = s_pos[s_gpu.idx[0] - lo];
+        for (i = 0; i <= hi - lo; i++)
+            if (i != s_gpu.idx[0] - lo) memcpy(s_pos[i], first, sizeof s_pos[i]);
+        for (i = 1; i < n; i++)
+            if (!d3d_screen_pos(s_gpu.idx[i], program, s_pos[s_gpu.idx[i] - lo]))
+                return;                            /* no program loaded */
+        pos = (const float (*)[4])s_pos;
+    }
+    nv2a_d3d_draw_ub(&st, topo, attr, (const float (*)[4])def, program, s_di, ni, lo, hi, pos);
+    s_gpu.batches_program += program;
+    s_gpu.verts_program += program ? n : 0;
+    s_gpu.xf_drawn += ni / 3;
+    s_gpu.tris_drawn += ni / 3;
+    if (s_gpu.texs[0].valid)
+        note_texture_use();
+    note_drawn();
+}
+
+static void d3d_clear(uint32_t param)
+{
+    NvD3DState st;
+    uint32_t x0, x1, y0, y1;
+    d3d_fill_state(&st);
+    if (s_gpu.clear_rect_h || s_gpu.clear_rect_v) {
+        x0 = s_gpu.clear_rect_h & 0xFFFF; x1 = s_gpu.clear_rect_h >> 16;
+        y0 = s_gpu.clear_rect_v & 0xFFFF; y1 = s_gpu.clear_rect_v >> 16;
+    } else {
+        x0 = s_gpu.clip_x; x1 = s_gpu.clip_x + s_gpu.clip_w - 1;
+        y0 = s_gpu.clip_y; y1 = s_gpu.clip_y + s_gpu.clip_h - 1;
+    }
+    nv2a_d3d_clear(&st, param, s_gpu.clear_color, s_gpu.zstencil_clear, x0, y0, x1, y1);
+    s_gpu.clears++;
+    if (st.color_addr && (param & NV097_CLEAR_COLOR_MASK)) {
+        if (s_gpu.flips == 0)
+            xbox_FramebufferWindowSet(st.color_addr, s_gpu.pitch);
+        xbox_FramebufferWindowStart();
+    }
+}
+
+/* A single point or a two-vertex line is a complete primitive. */
+static uint32_t prim_min_vertices(void)
+{
+    if (s_gpu.prim == NV_PRIM_POINTS) return 1;
+    if (s_gpu.prim >= NV_PRIM_LINES && s_gpu.prim <= NV_PRIM_LINE_STRIP) return 2;
+    return 3;
+}
+
+static void raster_batch_impl(void)
 {
     uint32_t i;
     uint32_t before = s_gpu.tris_drawn;
+    int textured = 0;
 
-    if (s_gpu.idx_count < 3)
+    if (s_gpu.idx_count < prim_min_vertices())
         return;
+    /* Array draws leave their final attribute values in the current registers,
+     * which subsequent draws can consume with the corresponding array off. */
+    for (i = 0; i < NV_VERTEX_ATTRS; ++i) {
+        float current[4];
+        if (s_gpu.attr[i].size &&
+            fetch_attr(&s_gpu.attr[i], s_gpu.idx[s_gpu.idx_count - 1], current))
+            memcpy(s_gpu.imm_attr[i], current, sizeof current);
+    }
+    if (use_d3d()) {
+        if (batch_uses_program())
+            d3d_draw_batch(1);
+        else if (batch_is_screen_space())
+            d3d_draw_batch(0);
+        else
+            s_gpu.batches_untransformed++;
+        return;
+    }
+    if (batch_uses_program() || batch_is_ffp()) {
+        raster_batch_program();
+        return;
+    }
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         return;
@@ -1322,10 +3679,11 @@ static void raster_batch(void)
 
         if (!(tc->offset && tc->stride))
             s_gpu.batches_no_uv++;
-        else if (!s_gpu.tex.valid)
+        else if (!s_gpu.texs[0].valid)
             s_gpu.batches_no_tex++;
         else {
             s_gpu.batches_textured++;
+            textured = 1;
             note_texture_use();
         }
     }
@@ -1372,8 +3730,10 @@ static void raster_batch(void)
     default:
         break;                             /* points and lines: not yet */
     }
+    if (backend_draws())
+        backend_flush(textured);
 
-    if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
+    if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0 && exec_verbose())
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
 
     /* Capture the surface while the geometry is still on it.
@@ -1383,7 +3743,8 @@ static void raster_batch(void)
      * was wiped a moment ago -- which reads as "nothing was drawn" when the
      * triangles went down correctly just before it. A few frames that actually
      * contain geometry are worth more than any number of clears. */
-    if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW) {
+    if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW
+        && !s_flip_dumping) {
         s_drawn_dumps++;
         dump_surface_bmp();
     }
@@ -1393,6 +3754,58 @@ static void raster_batch(void)
  * question is what space attribute 0 arrives in: a title running a vertex
  * program hands over object-space positions that mean nothing without running
  * it, while pre-transformed screen-space coordinates can be drawn directly. */
+/* RECOMP_FRAME_TRACE=<flag file>: once the file exists, log every batch of
+ * the next whole frame (flip to flip) -- where it drew, with what texture,
+ * blend and depth state, and how many pixels it actually wrote. "The frame
+ * is black" has many causes and this is what tells them apart. */
+
+static void raster_batch(void)
+{
+    RECOMP_PROFILE_BEGIN("Raster batch");
+    raster_batch_impl();
+    RECOMP_PROFILE_END();
+}
+
+static void frame_trace_flip(void)
+{
+    static const char *flag = (const char *)-1;
+    if (flag == (const char *)-1)
+        flag = getenv("RECOMP_FRAME_TRACE");
+    if (!flag)
+        return;
+    if (s_ftrace == 3) {
+        /* Deleting the flag file re-arms the trace for the next time it
+         * appears, so one run can trace several moments. */
+        FILE *f = fopen(flag, "rb");
+        if (f)
+            fclose(f);
+        else
+            s_ftrace = 0;
+        return;
+    }
+    if (s_ftrace == 2) {
+        s_ftrace = 3;
+        fprintf(stderr, "[FTRACE] end of frame\n");
+        return;
+    }
+    if (s_ftrace == 0) {
+        FILE *f = fopen(flag, "rb");
+        if (!f)
+            return;
+        fclose(f);
+        s_ftrace = 2;
+        fprintf(stderr, "[FTRACE] frame begins (flip %u)\n", s_gpu.flips);
+    }
+}
+
+/* Cached: an uncached getenv per draw was most of a millisecond a frame. */
+static int exec_verbose(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    return v;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -1401,7 +3814,7 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    if ((s_gpu.draws % 200) == 0 && exec_verbose())
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -1421,9 +3834,81 @@ static void draw_primitive(void)
         }
     }
 
-    raster_batch();
+    {
+        uint32_t t0 = s_gpu.tris_drawn;
+        uint64_t p0 = s_gpu.pixels;
+        raster_batch();
+        if (s_ftrace == 2) {
+            fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
+                    " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
+                    " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
+                    (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
+                    s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
+                    s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
+                    s_gpu.texs[0].valid ? "on" : "off", s_gpu.texs[0].offset,
+                    s_gpu.texs[0].width, s_gpu.texs[0].height, s_gpu.texs[0].color,
+                    s_gpu.blend_enable, s_gpu.blend_sfactor,
+                    s_gpu.blend_dfactor, s_gpu.blend_equation,
+                    s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
+                    s_gpu.tris_drawn - t0,
+                    (unsigned long long)(s_gpu.pixels - p0));
+            fprintf(stderr, "[FTRACE]     cmask %08X stencil %u func %X ref %X mask %X/%X ops %X %X %X | cull %u %X front %X | surffmt %08X zeta %08X%c",
+                    s_gpu.color_mask, s_gpu.stencil_test, s_gpu.stencil_func, s_gpu.stencil_ref,
+                    s_gpu.stencil_func_mask, s_gpu.stencil_write_mask, s_gpu.stencil_fail,
+                    s_gpu.stencil_zfail, s_gpu.stencil_zpass, s_gpu.cull_enable, s_gpu.cull_face,
+                    s_gpu.front_face, s_gpu.format, s_gpu.zeta_offset, 10);
+            if ((s_gpu.xf_mode & 3) == 2 && s_xf_cap >= 3)
+                fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
+                        s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
+                        s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
+                        s_xf[2].pos[0], s_xf[2].pos[1], 10);
+        {
+            uint32_t sample;
+                    nv2a_vsh_debug_dump();
+                    const float *scale = nv2a_vsh_constant(58);
+            const float *offset = nv2a_vsh_constant(59);
+            fprintf(stderr, "[FTRACE] viewport scale %g %g %g offset %g %g %g\n",
+                    scale[0], scale[1], scale[2], offset[0], offset[1], offset[2]);
+            for (sample = 0; sample < s_gpu.idx_count && sample < 3; ++sample) {
+                float input[4];
+                const VertexAttr *position = &s_gpu.attr[0];
+                int valid = fetch_attr(position, s_gpu.idx[sample], input);
+                fprintf(stderr, "[FTRACE] input%u idx %u base %08X type %u size %u stride %u valid %d pos %g %g %g %g\n",
+                        sample, s_gpu.idx[sample], position->offset, position->type,
+                        position->size, position->stride, valid,
+                        input[0], input[1], input[2], input[3]);
+            }
+        }
+        if (s_gpu.rc_seen) {
+                int st;
+                fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
+                        s_gpu.rc.control & 0xFF, s_gpu.rc.control,
+                        s_gpu.rc.stage_program, s_gpu.rc.final0, s_gpu.rc.final1);
+                for (st = 0; st < 4; st++)
+                    if ((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)
+                        fprintf(stderr, " | t%d %08X %ux%u fmt %02X%s", st,
+                                s_gpu.texs[st].offset, s_gpu.texs[st].width,
+                                s_gpu.texs[st].height, s_gpu.texs[st].color,
+                                s_gpu.texs[st].valid ? "" : " (invalid)");
+                fputc(10, stderr);
+                for (st = 0; st < (int)(s_gpu.rc.control & 0xFF) && st < 8; st++)
+                    fprintf(stderr, "[FTRACE]       s%d icw %08X %08X ocw %08X %08X c %08X %08X%c",
+                            st, s_gpu.rc.color_icw[st], s_gpu.rc.alpha_icw[st],
+                            s_gpu.rc.color_ocw[st], s_gpu.rc.alpha_ocw[st],
+                            s_gpu.rc.factor0[st], s_gpu.rc.factor1[st], 10);
+            }
+            if ((s_gpu.xf_mode & 3) == 2) {
+                uint32_t r;
+                for (r = 112; r < 116; r++) {
+                    const float *c = nv2a_vsh_constant(r);
+                    fprintf(stderr, "[FTRACE]     c[%u] %g %g %g %g%c", r,
+                            c[0], c[1], c[2], c[3], 10);
+                }
+            }
+        }
+    }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (exec_verbose()) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -1437,9 +3922,9 @@ static void draw_primitive(void)
              * invisible. */
             fprintf(stderr, "  [GPU]   tex: off 0x%08X %ux%u pitch %u"
                             " colour 0x%02X swizzled %d valid %d\n",
-                    s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
-                    s_gpu.tex.pitch, s_gpu.tex.color,
-                    d3d8_format_is_swizzled(s_gpu.tex.color), s_gpu.tex.valid);
+                    s_gpu.texs[0].offset, s_gpu.texs[0].width, s_gpu.texs[0].height,
+                    s_gpu.texs[0].pitch, s_gpu.texs[0].color,
+                    d3d8_format_is_swizzled(s_gpu.texs[0].color), s_gpu.texs[0].valid);
             {
                 uint32_t k;
                 for (k = 0; k < s_gpu.idx_count && k < 3; k++) {
@@ -1465,8 +3950,8 @@ static void draw_primitive(void)
                 }
                 fprintf(stderr, "  [GPU]   tex: off 0x%08X %ux%u pitch %u"
                                 " colour 0x%02X valid %d\n",
-                        s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
-                        s_gpu.tex.pitch, s_gpu.tex.color, s_gpu.tex.valid);
+                        s_gpu.texs[0].offset, s_gpu.texs[0].width, s_gpu.texs[0].height,
+                        s_gpu.texs[0].pitch, s_gpu.texs[0].color, s_gpu.texs[0].valid);
             }
             {
                 /* Every attribute the batch has, not just position. If the
@@ -1522,9 +4007,8 @@ static void draw_primitive(void)
  * The title's own attribute table is saved and put back: these offsets and
  * strides are ours, and it has not stopped using its.
  *
- * ponytail: each attribute is padded to a whole dword. That is exact for the
- * float and D3DCOLOR formats every inline batch actually uses; a packed
- * sub-dword attribute would need the unpadded layout.
+ * Packed SHORT formats occupy two bytes per component, rather than the
+ * four bytes used by FLOAT. Each attribute is padded to a whole dword.
  */
 static void draw_inline_array(void)
 {
@@ -1538,6 +4022,10 @@ static void draw_inline_array(void)
         if (!s_gpu.attr[a].size)
             continue;
         switch (s_gpu.attr[a].type) {
+        /* Fonts can pack SHORT positions and texture coordinates. */
+        case 1: /* normalised signed short */
+        case 5: bytes = 2 * s_gpu.attr[a].size; break; /* signed short */
+        case 6: bytes = 4; break; /* packed 11:11:10 normal */
         case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
         case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
         case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
@@ -1551,14 +4039,16 @@ static void draw_inline_array(void)
         goto out;
 
     count = (s_gpu.inline_count * 4) / vsize;
-    if (count < 3 || count > NV_MAX_INDICES)
+    if (count > NV_MAX_INDICES)
+        cap_exceeded(1, "INLINE_ARRAY vertex count", NV_MAX_INDICES, count);
+    if (count < prim_min_vertices() || count > NV_MAX_INDICES)
         goto out;
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
         if (s_gpu.attr[a].size)
             s_gpu.attr[a].stride = vsize;
 
     for (i = 0; i < count; i++)
-        s_gpu.idx[i] = (uint16_t)i;
+        s_gpu.idx[i] = i;
     s_gpu.idx_count = count;
 
     s_gpu.inline_active = 1;
@@ -1582,32 +4072,35 @@ out:
  *
  * ponytail: position, diffuse and texcoord0 only. That is what a 2D quad
  * carries and what this rasteriser samples; a second texcoord set or a normal
- * would need the PGRAPH translator, not more slots here.
+ * would need the D3D11 translator, not more slots here.
  */
 static void draw_immediate(void)
 {
     VertexAttr saved[NV_VERTEX_ATTRS];
     uint32_t i;
 
-    if (s_gpu.imm_count < 3)
+    if (s_gpu.imm_count < prim_min_vertices())
         return;
 
     memcpy(saved, s_gpu.attr, sizeof saved);
     memset(s_gpu.attr, 0, sizeof s_gpu.attr);
     /* Offsets are byte offsets into inline_buf here, not guest addresses --
      * fetch_attr reads them that way while inline_active is set, which is
-     * also why 0 is a legal offset for position. */
-    s_gpu.attr[0].type = 2; s_gpu.attr[0].size = 4;   /* position float4  */
-    s_gpu.attr[0].offset = 0;
-    s_gpu.attr[3].type = 0; s_gpu.attr[3].size = 4;   /* diffuse D3DCOLOR */
-    s_gpu.attr[3].offset = 16;
-    s_gpu.attr[9].type = 2; s_gpu.attr[9].size = 2;   /* texcoord0 float2 */
-    s_gpu.attr[9].offset = 20;
-    s_gpu.attr[0].stride = s_gpu.attr[3].stride = s_gpu.attr[9].stride =
-        IMM_VERTEX_DWORDS * 4;
+     * also why 0 is a legal offset for position. Every attribute is a float4;
+     * the ones the batch never set carry their standing values, as on the
+     * GPU. */
+    for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+        s_gpu.attr[i].type = 2;
+        s_gpu.attr[i].size = 4;
+        s_gpu.attr[i].offset = i * 16;
+        s_gpu.attr[i].stride = IMM_VERTEX_DWORDS * 4;
+    }
 
+    if (s_gpu.imm_count > NV_MAX_INDICES)
+        cap_exceeded(2, "immediate-mode vertex count", NV_MAX_INDICES,
+                     s_gpu.imm_count - NV_MAX_INDICES);
     for (i = 0; i < s_gpu.imm_count && i < NV_MAX_INDICES; i++)
-        s_gpu.idx[i] = (uint16_t)i;
+        s_gpu.idx[i] = i;
     s_gpu.idx_count = i;
 
     /* fetch_attr bounds-checks against inline_count dwords. */
@@ -1621,16 +4114,19 @@ static void draw_immediate(void)
     s_gpu.inline_count = 0;
 }
 
-/* A vertex is complete: append it in the layout draw_immediate describes. */
+/* A vertex is complete: append all 16 attributes in the layout
+ * draw_immediate describes. */
 static void imm_emit_vertex(void)
 {
     uint32_t at = s_gpu.imm_count * IMM_VERTEX_DWORDS;
 
-    if (!s_gpu.prim || at + IMM_VERTEX_DWORDS > NV_MAX_INLINE)
+    if (!s_gpu.prim)
         return;
-    memcpy(&s_gpu.inline_buf[at],     s_gpu.imm_pos, 4 * sizeof(float));
-    memcpy(&s_gpu.inline_buf[at + 4], &s_gpu.imm_diffuse, sizeof(uint32_t));
-    memcpy(&s_gpu.inline_buf[at + 5], s_gpu.imm_tex, 2 * sizeof(float));
+    if (at + IMM_VERTEX_DWORDS > NV_MAX_INLINE) {
+        cap_exceeded(4, "immediate-mode payload (dwords)", NV_MAX_INLINE, IMM_VERTEX_DWORDS);
+        return;
+    }
+    memcpy(&s_gpu.inline_buf[at], s_gpu.imm_attr, sizeof s_gpu.imm_attr);
     s_gpu.imm_count++;
 }
 
@@ -1639,67 +4135,694 @@ static void imm_emit_vertex(void)
  * Split out because it is a range test against five separate bases, and that
  * reads better than five more cases in an already long switch.
  */
+/* The immediate-mode attribute methods (xemu pgraph.c SET_VERTEX_DATA*).
+ * Each sets an attribute's current value; completing attribute 0 -- the
+ * position -- emits a vertex carrying every attribute as it stands. This used
+ * to keep position, diffuse and texcoord 0 only, which dropped any quad with
+ * a second texture coordinate: A title composites its whole 3D scene into
+ * the frame with exactly such a quad, and the frame never got the scene. */
 static int imm_vertex_method(uint32_t method, uint32_t param)
 {
     union { uint32_t u; float f; } v;
+    uint32_t attr, c;
+    float *a;
     v.u = param;
 
     if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
-        uint32_t c = (method - NV097_SET_VERTEX4F) / 4;
-        s_gpu.imm_pos[c] = v.f;
-        if (c == 3)                      /* w completes the vertex */
+        c = (method - NV097_SET_VERTEX4F) / 4;
+        s_gpu.imm_attr[0][c] = v.f;
+        s_gpu.imm_used |= 1;
+        if (c == 3)
             imm_emit_vertex();
         return 1;
     }
     if (method >= NV097_SET_VERTEX3F && method < NV097_SET_VERTEX3F + 12) {
-        uint32_t c = (method - NV097_SET_VERTEX3F) / 4;
-        s_gpu.imm_pos[c] = v.f;
-        if (c == 2) {                    /* z completes it, w is implicitly 1 */
-            s_gpu.imm_pos[3] = 1.0f;
+        c = (method - NV097_SET_VERTEX3F) / 4;
+        s_gpu.imm_attr[0][c] = v.f;
+        s_gpu.imm_used |= 1;
+        if (c == 2) {
+            s_gpu.imm_attr[0][3] = 1.0f;
             imm_emit_vertex();
         }
         return 1;
     }
     if (method >= NV097_SET_VERTEX_DATA2F_M
             && method < NV097_SET_VERTEX_DATA2F_M + NV_VERTEX_ATTRS * 8) {
-        uint32_t off = method - NV097_SET_VERTEX_DATA2F_M;
-        if (off / 8 == 9)                /* attribute 9 is texture coord 0 */
-            s_gpu.imm_tex[(off % 8) / 4] = v.f;
+        attr = (method - NV097_SET_VERTEX_DATA2F_M) / 8;
+        c = ((method - NV097_SET_VERTEX_DATA2F_M) % 8) / 4;
+        a = s_gpu.imm_attr[attr];
+        a[c] = v.f;
+        if (c == 1) {
+            a[2] = 0.0f; a[3] = 1.0f;
+        }
+        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        if (attr == 0 && c == 1)
+            imm_emit_vertex();
         return 1;
     }
     if (method >= NV097_SET_VERTEX_DATA4F_M
             && method < NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16) {
-        uint32_t off = method - NV097_SET_VERTEX_DATA4F_M;
-        uint32_t attr = off / 16, c = (off % 16) / 4;
-        if (attr == 0) {
-            s_gpu.imm_pos[c] = v.f;
-            if (c == 3)
-                imm_emit_vertex();
-        } else if (attr == 9 && c < 2) {
-            s_gpu.imm_tex[c] = v.f;
-        }
+        attr = (method - NV097_SET_VERTEX_DATA4F_M) / 16;
+        c = ((method - NV097_SET_VERTEX_DATA4F_M) % 16) / 4;
+        s_gpu.imm_attr[attr][c] = v.f;
+        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        if (attr == 0 && c == 3)
+            imm_emit_vertex();
+        return 1;
+    }
+    if (method >= NV097_SET_VERTEX_DATA2S
+            && method < NV097_SET_VERTEX_DATA2S + NV_VERTEX_ATTRS * 4) {
+        attr = (method - NV097_SET_VERTEX_DATA2S) / 4;
+        a = s_gpu.imm_attr[attr];
+        a[0] = (float)(int16_t)(param & 0xFFFF);
+        a[1] = (float)(int16_t)(param >> 16);
+        a[2] = 0.0f; a[3] = 1.0f;
+        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        if (attr == 0)
+            imm_emit_vertex();
         return 1;
     }
     if (method >= NV097_SET_VERTEX_DATA4UB
             && method < NV097_SET_VERTEX_DATA4UB + NV_VERTEX_ATTRS * 4) {
-        if ((method - NV097_SET_VERTEX_DATA4UB) / 4 == 3)   /* diffuse */
-            s_gpu.imm_diffuse = param;
+        /* Bytes in register order, x from the low byte (xemu). */
+        attr = (method - NV097_SET_VERTEX_DATA4UB) / 4;
+        a = s_gpu.imm_attr[attr];
+        a[0] = (float)( param        & 0xFF) / 255.0f;
+        a[1] = (float)((param >>  8) & 0xFF) / 255.0f;
+        a[2] = (float)((param >> 16) & 0xFF) / 255.0f;
+        a[3] = (float)( param >> 24        ) / 255.0f;
+        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        if (attr == 0)
+            imm_emit_vertex();
+        return 1;
+    }
+    if (method >= NV097_SET_VERTEX_DATA4S_M
+            && method < NV097_SET_VERTEX_DATA4S_M + NV_VERTEX_ATTRS * 8) {
+        attr = (method - NV097_SET_VERTEX_DATA4S_M) / 8;
+        c = ((method - NV097_SET_VERTEX_DATA4S_M) % 8) / 4;
+        a = s_gpu.imm_attr[attr];
+        a[c * 2]     = (float)(int16_t)(param & 0xFFFF);
+        a[c * 2 + 1] = (float)(int16_t)(param >> 16);
+        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        if (attr == 0 && c == 1)
+            imm_emit_vertex();
         return 1;
     }
     return 0;
 }
+/* The texture stage registers, all four stages. Stage i's registers are
+ * 0x1B00 + 0x40*i onwards; only stage 0 used to be decoded, which was
+ * enough for menus drawn one texture at a time and not for a 3D frame that
+ * composites its scene through a second stage. */
+static void tex_stage_method(uint32_t method, uint32_t param)
+{
+    uint32_t stage = (method - NV_TEX_FIRST) / 0x40;
+    uint32_t reg = NV_TEX_FIRST + ((method - NV_TEX_FIRST) & 0x3F);
+    Texture *t = &s_gpu.texs[stage];
+
+    switch (reg) {
+    case NV097_SET_TEXTURE_OFFSET:
+        /* A DMA-object offset like a surface's: physical, reached through
+         * the contiguous window when it names contiguous memory. */
+        t->offset = dma_resolve(param);
+        break;
+    case NV097_SET_TEXTURE_FORMAT:
+        t->format_raw = param;
+        t->color = (param >> 8) & 0xFF;
+        t->cube = (param >> 2) & 1;
+        t->border_color = (param >> 3) & 1;    /* BORDER_SOURCE: colour */
+        t->levels = (param >> 16) & 0xF;
+        /* A swizzled texture carries its own dimensions here, as log2 in
+         * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
+         * a title that only uses swizzled textures never sends one. */
+        if (tex_size_from_format(t->color)) {
+            t->width  = 1u << ((param >> 20) & 0xF);
+            t->height = 1u << ((param >> 24) & 0xF);
+        }
+        break;
+    case NV097_SET_TEXTURE_PALETTE:
+        /* The low six bits carry the DMA context and the entry count. */
+        t->palette = dma_resolve(param & ~0x3Fu);
+        t->palette_len = 256u >> ((param >> 2) & 3);
+        break;
+    case 0x1B0C:                                  /* SET_TEXTURE_CONTROL0 */
+        t->control0 = param;
+        break;
+    case 0x1B24:                                  /* SET_TEXTURE_BORDER_COLOR */
+        t->border = param;
+        break;
+    case 0x1B28: case 0x1B2C: case 0x1B30: case 0x1B34: /* BUMP_ENV_MAT */
+        memcpy(&t->bump_mat[(reg - 0x1B28) / 4], &param, 4);
+        break;
+    case 0x1B38: memcpy(&t->bump_scale, &param, 4); break;
+    case 0x1B3C: memcpy(&t->bump_offset, &param, 4); break;
+    case NV097_SET_TEXTURE_ADDRESS:
+        t->address_raw = param;
+        /* Four bits per axis: 1 wrap, 2 mirror, 3 clamp-to-edge, 4 border
+         * (the border colour when FORMAT selects it, else clamped). */
+        t->addr_u =  param        & 0xF;
+        t->addr_v = (param >>  8) & 0xF;
+        if (t->addr_u == 0 || t->addr_u > 4 || t->addr_v == 0 || t->addr_v > 4) {
+            static int logged;
+            if (logged < 4) {
+                logged++;
+                fprintf(stderr, "PB_EXEC: texture %d address mode u=%u v=%u not implemented (clamp)\n",
+                        stage, t->addr_u, t->addr_v);
+            }
+        }
+        break;
+    case NV097_SET_TEXTURE_CONTROL1:
+        t->pitch = param >> 16;          /* linear formats only */
+        break;
+    case NV097_SET_TEXTURE_IMAGE_RECT:
+        t->width  = param >> 16;
+        t->height = param & 0xFFFF;
+        break;
+    case 0x1B14:                                  /* SET_TEXTURE_FILTER */
+        t->filter = param;
+        break;
+    default:
+        break;
+    }
+    tex_update_valid(t);
+    if (stage == 0)
+        record_tex_reg(method, param);
+}
+
+/* The flip hold (nv2a_flip_hold.h). The executor arms it at FLIP_STALL; the
+ * ack loop in xbox_memory_layout.c polls it each pass and, while it holds,
+ * walks nothing, leaves DMA_GET behind PUT and the PFB flush unacknowledged.
+ * Both run on the ack thread, so the state needs no lock. */
+static XboxFlipHold s_flip_hold;
+static uint32_t s_vbl_count;        /* the vblank count last seen to move */
+static uint64_t s_vbl_moved_ns;
+/* The vblank count when the walk that reaches a FLIP_STALL began, which is
+ * close to when the title submitted the segment holding its Swap. Sampled
+ * at the FLIP_STALL instead, the segment's own draw time (several ms) moved
+ * a frame the title swapped just before a vblank past it; the title's next
+ * frame then counted as a second flip in the same vblank and was held for
+ * most of a frame. */
+static uint32_t s_walk_vbl;
+
+void nv2a_pb_exec_walk_begin(void)
+{
+    s_walk_vbl = xbox_VblankCount();
+}
+
+/* RECOMP_FLIP_PACING: unset or 0 off (flips complete at once and frame
+ * counters are bumped on every flip, as before), edge (D3D's rule: a late
+ * frame waits for the next vblank), anything else on. Opt-in: it holds the
+ * title's GPU on the guest vblank clock, which only runs under RECOMP_VBLANK,
+ * and a held flip is a stall a title's own pacing has never seen here.
+ * The first caller can be the timer thread, a KeSetTimer caller (through
+ * the vblank mode) or the ack thread. Two first callers read the same
+ * variable and store the same values, the edge flag before the mode, so the
+ * race costs at most a second log line. No Interlocked: tests link the
+ * executor without the platform layer (tests/nv2a_ffp_backend). */
+int nv2a_pb_exec_flip_pacing(void)
+{
+    static volatile int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_FLIP_PACING");
+        int m = (!e || !*e || !strcmp(e, "0")) ? 0
+                : !strcmp(e, "edge") ? 2 : 1;
+        s_flip_hold.edge = m == 2;
+        mode = m;
+        if (e)
+            fprintf(stderr, "  [GPU] flip pacing %s (RECOMP_FLIP_PACING=%s)\n",
+                    m == 0 ? "off" : m == 2 ? "edge" : "on", e);
+    }
+    return mode;
+}
+
+/* The guest vblank count, and whether it is a running clock: vblanks are on
+ * and the count moved within XBOX_FLIP_CLOCK_STALE_NS. Without it a hold
+ * would only ever end on its timeout. */
+static uint32_t flip_clock(uint64_t now_ns, int *ok)
+{
+    uint32_t c = xbox_VblankCount();
+    if (c != s_vbl_count) {
+        s_vbl_count = c;
+        s_vbl_moved_ns = now_ns;
+    }
+    *ok = s_vbl_moved_ns && now_ns - s_vbl_moved_ns < XBOX_FLIP_CLOCK_STALE_NS;
+    return c;
+}
+
+/* Once per pass of the ack loop: 1 while a flip is held. */
+int nv2a_pb_exec_flip_poll(void)
+{
+    uint64_t now;
+    uint32_t c;
+    int ok;
+
+    if (!s_flip_hold.held)
+        return 0;
+    now = xbox_HostNowNs();
+    c = flip_clock(now, &ok);
+    return xbox_FlipHoldPoll(&s_flip_hold, c, now, ok);
+}
+
+/* The hold's line in the periodic [GPU] report, then reset. */
+static void flip_hold_report(void)
+{
+    XboxFlipHold *h = &s_flip_hold;
+    if (nv2a_pb_exec_flip_pacing() == 0)
+        return;
+    fprintf(stderr, "[GPU] flip hold: holds %u held_ms %.1f hold_timeouts %u"
+            " clock_stops %u iv0 %u iv1 %u iv2 %u iv3 %u nonop %u"
+            " counters_owned %u\n", h->holds, h->held_ns / 1e6, h->timeouts,
+            h->clock_stops, h->iv[0], h->iv[1], h->iv[2], h->iv[3], h->nonop,
+            xbox_Nv2aFrameCountersOwned());
+    h->holds = h->timeouts = h->clock_stops = h->nonop = 0;
+    h->iv[0] = h->iv[1] = h->iv[2] = h->iv[3] = 0;
+    h->held_ns = 0;
+}
+
+/* Last released semaphore value and release count for diagnostics and
+ * explicit caller recovery; the scanner does not infer missing releases. */
+static uint32_t s_semaphore_last, s_semaphore_releases;
+uint32_t nv2a_pb_exec_semaphore_last_value(void) { return s_semaphore_last; }
+uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_semaphore_releases; }
+/* ---- Frames between a title's own: interpolation ----------------------
+ *
+ * A title whose world updates at a fixed rate draws
+ * only when it updates. Between updates, the last frame is drawn again from
+ * what the GPU was told: every method of each finished frame is recorded,
+ * and replayed with every vertex-program constant (the matrices, among them)
+ * part way from its value in the frame before to its value in this one --
+ * what a game with its own fixed timestep does with its objects' states, done
+ * where every drawn object's transform is plain.
+ *
+ * Constants are matched between the two frames by the draw they precede,
+ * keyed on what it draws (vertex array addresses, primitive, the constant
+ * registers loaded) and how many such draws came before, so an object
+ * appearing or going does not pair its neighbours with the wrong matrices.
+ * A draw with no partner keeps its own values. Nothing the title can read is
+ * touched: a replay writes no notify, frame counter or flip state, and the
+ * constant file is put back as the frame left it. */
+void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+typedef struct { uint32_t sm, param; } PbCmd;          /* sm: subch<<16 | method */
+typedef struct { uint32_t key, occ, tc0, ntc; } PbSeg;
+typedef struct PbState PbState;
+static int pb_frame_state_capture(PbState **state);
+static int pb_frame_state_load(const PbState *state);
+typedef struct {
+    PbCmd *cmd; uint32_t ncmd, capcmd;
+    uint32_t *tc; uint32_t ntc, captc;                 /* the constant words, in order */
+    PbSeg *seg; uint32_t nseg, capseg;
+    float *prev; uint8_t *has;                         /* per constant word: partner */
+    uint32_t capprev;
+    uint8_t *vdata; uint32_t nvdata, capvdata;         /* each draw's vertices, copied */
+    uint32_t (*voff)[NV_VERTEX_ATTRS]; uint32_t ndraw, capdraw;  /* +1; 0: not copied */
+    PbState *start;                                    /* state before the first recorded method */
+    uint8_t start_valid, invalid;
+} PbFrame;
+static PbFrame s_frames[3];                            /* recording, last, previous */
+static PbFrame *s_rec_f = &s_frames[0], *s_last_f = &s_frames[1], *s_prev_f = &s_frames[2];
+static volatile LONG s_interp_ms;                     /* last request, GetTickCount */
+static volatile LONG s_interp_enabled;
+/* Interpolating: a frame between was asked for lately. A load or a movie,
+ * which ask for none, show their own frames. */
+static int interp_on(void)
+{
+    LONG ms;
+    if (!s_interp_enabled) return 0;
+    ms = s_interp_ms;
+    return GetTickCount() - (DWORD)ms < 250;
+}
+static int s_replaying;
+static uint32_t s_replay_draw;                         /* draws replayed so far */
+static volatile LONG s_frames_done;                    /* frames finished recording */
+static uint32_t s_methods_since_flip;
+
+static int pb_grow(void **p, uint32_t *cap, uint32_t need, size_t elem)
+{
+    if (need <= *cap) return 1;
+    uint32_t n = *cap ? *cap : 4096;
+    while (n < need) n *= 2;
+    void *q = realloc(*p, (size_t)n * elem);
+    if (!q) {
+        fprintf(stderr, "[INTERP] recorder buffer allocation failed; frame rejected\n");
+        return 0;
+    }
+    *p = q; *cap = n;
+    return 1;
+}
+
+static void pb_record(uint32_t subch, uint32_t method, uint32_t param)
+{
+    PbFrame *f = s_rec_f;
+    if (f->invalid) return;
+    if (!f->start_valid) {
+        /* Enabling from the guest thread may land in the middle of a frame.
+         * A suffix must not be replayed as if it were a whole image. */
+        if (s_methods_since_flip || !pb_frame_state_capture(&f->start)) {
+            f->invalid = 1;
+            return;
+        }
+        f->start_valid = 1;
+    }
+    if (!pb_grow((void **)&f->cmd, &f->capcmd, f->ncmd + 1, sizeof *f->cmd)) {
+        f->invalid = 1;
+        return;
+    }
+    f->cmd[f->ncmd].sm = subch << 16 | method;
+    f->cmd[f->ncmd++].param = param;
+}
+
+static uint32_t pb_mix(uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; }
+
+/* The frame's constant words and the draws they belong to. */
+static void pb_segment(PbFrame *f)
+{
+    uint32_t va[4] = {0}, loads = 2166136261u, i;
+    PbSeg cur = {0};
+    f->ntc = f->nseg = 0;
+    for (i = 0; i < f->ncmd; i++) {
+        uint32_t m = f->cmd[i].sm & 0xFFFF, p = f->cmd[i].param;
+        if (f->cmd[i].sm >> 16) continue;
+        if (m >= 0x1720 && m < 0x1730) va[(m - 0x1720) / 4] = p;
+        else if (m == 0x1EA4) loads = pb_mix(loads, p);
+        else if (m >= 0x0B80 && m < 0x0C00) {
+            if (!pb_grow((void **)&f->tc, &f->captc, f->ntc + 1, sizeof *f->tc)) {
+                f->invalid = 1;
+                return;
+            }
+            if (!cur.ntc) cur.tc0 = f->ntc;
+            f->tc[f->ntc++] = p;
+            cur.ntc++;
+        } else if (m == 0x17FC && p && cur.ntc) {       /* BEGIN: the draw they are for */
+            uint32_t k = pb_mix(pb_mix(pb_mix(pb_mix(pb_mix(loads, cur.ntc), va[0]), va[1]), va[2]), p);
+            if (!pb_grow((void **)&f->seg, &f->capseg, f->nseg + 1, sizeof *f->seg)) {
+                f->invalid = 1;
+                return;
+            }
+            cur.key = k;
+            cur.occ = 0;
+            for (uint32_t s = 0; s < f->nseg; s++)        /* ponytail: O(n^2), a hash map if frames grow */
+                if (f->seg[s].key == k) cur.occ++;
+            f->seg[f->nseg++] = cur;
+            cur.ntc = 0;
+            loads = 2166136261u;
+        }
+    }
+}
+
+/* Pair the last frame's constant words with the previous frame's. */
+static uint32_t s_dbg_keyed, s_dbg_close;   /* DIAG */
+static void pb_pair(PbFrame *l, const PbFrame *p)
+{
+    if (l->invalid) return;
+    if (!pb_grow((void **)&l->prev, &l->capprev, l->ntc + 1, sizeof *l->prev)) {
+        l->invalid = 1;
+        return;
+    }
+    free(l->has);
+    l->has = (uint8_t *)calloc(l->ntc + 1, 1);
+    if (!l->has) {
+        l->invalid = 1;
+        fprintf(stderr, "[INTERP] pair mask allocation failed; frame rejected\n");
+        return;
+    }
+    /* A reused frame can carry an old mask. Clear it even when its new
+     * predecessor was incomplete, so stale matches never leak through. */
+    if (p->invalid) return;
+    for (uint32_t s = 0; s < l->nseg; s++) {
+        const PbSeg *a = &l->seg[s];
+        for (uint32_t t = 0; t < p->nseg; t++) {
+            const PbSeg *b = &p->seg[t];
+            if (b->key != a->key || b->occ != a->occ || b->ntc != a->ntc) continue;
+            s_dbg_keyed++;
+            /* Between two ticks an object's constants move a little. Any
+             * that moved a lot (a HUD piece paired with the next one drawn
+             * from the same buffer) say this is not its partner. */
+            uint32_t w;
+            for (w = 0; w < a->ntc; w++) {
+                float x, y;
+                memcpy(&x, &l->tc[a->tc0 + w], 4);
+                memcpy(&y, &p->tc[b->tc0 + w], 4);
+                float d = x > y ? x - y : y - x, m = (x > 0 ? x : -x) + (y > 0 ? y : -y);
+                if (!(d <= 0.1f || d <= 0.2f * m)) break;
+            }
+            if (w < a->ntc) break;
+            s_dbg_close++;
+            for (w = 0; w < a->ntc; w++) {
+                memcpy(&l->prev[a->tc0 + w], &p->tc[b->tc0 + w], 4);
+                l->has[a->tc0 + w] = 1;
+            }
+            break;
+        }
+    }
+}
+
+/* A flip ended the frame being recorded. */
+static void pb_frame_done(void)
+{
+    static DWORD last_ms;
+    DWORD now = GetTickCount();
+    PbFrame *t = s_prev_f;
+    s_prev_f = s_last_f;
+    s_last_f = s_rec_f;
+    s_rec_f = t;
+    s_rec_f->ncmd = 0;
+    s_rec_f->nvdata = s_rec_f->ndraw = 0;
+    s_rec_f->invalid = s_rec_f->start_valid = 0;
+    if (!s_last_f->invalid) pb_segment(s_last_f);
+    DWORD gap = now - last_ms;
+    if (now - last_ms > 200)          /* after a pause: nothing to come from */
+        s_prev_f->nseg = 0;
+    last_ms = now;
+    s_dbg_keyed = s_dbg_close = 0;
+    pb_pair(s_last_f, s_prev_f);
+    if (s_frames_done % 30 == 0)   /* DIAG */
+        fprintf(stderr, "[INTERP] gap %lu cmds %u consts %u draws %u prev %u keyed %u close %u\n",
+                (unsigned long)gap, s_last_f->ncmd, s_last_f->ntc, s_last_f->nseg, s_prev_f->nseg, s_dbg_keyed, s_dbg_close);
+    InterlockedIncrement(&s_frames_done);
+}
+
+/* Discard a recording when interpolation was off for the frame just drawn.
+ * Keep the old last complete frame available for the next interpolation run. */
+static void pb_discard_recording(void)
+{
+    s_rec_f->ncmd = s_rec_f->ntc = s_rec_f->nseg = 0;
+    s_rec_f->nvdata = s_rec_f->ndraw = 0;
+    s_rec_f->invalid = s_rec_f->start_valid = 0;
+}
+
+void nv2a_pb_interp_enable(int on)
+{
+    if (on) {
+        InterlockedExchange(&s_interp_ms, (LONG)GetTickCount());
+        InterlockedExchange(&s_interp_enabled, 1);
+    } else {
+        InterlockedExchange(&s_interp_enabled, 0);
+    }
+}
+
+long nv2a_pb_frames_done(void) { return s_frames_done; }
+
+static void pb_draw_vertices(NvD3DAttrib attr[NV_VERTEX_ATTRS], uint32_t lo, uint32_t hi)
+{
+    uint32_t i;
+    if (s_replaying) {
+        PbFrame *f = s_last_f;
+        uint32_t d = s_replay_draw++;
+        if (d >= f->ndraw) return;
+        for (i = 0; i < NV_VERTEX_ATTRS; i++)
+            if (f->voff[d][i])
+                attr[i].data = f->vdata + (f->voff[d][i] - 1) - (size_t)lo * attr[i].stride;
+        return;
+    }
+    if (!interp_on()) {
+        if (s_rec_f->start_valid) s_rec_f->invalid = 1;
+        return;
+    }
+    PbFrame *f = s_rec_f;
+    if (f->invalid) return;
+    if (!pb_grow((void **)&f->voff, &f->capdraw, f->ndraw + 1, sizeof *f->voff)) {
+        f->invalid = 1;
+        return;
+    }
+    memset(f->voff[f->ndraw], 0, sizeof *f->voff);
+    for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+        uint32_t st = attr[i].stride, len = st ? (hi - lo + 1) * st : 16;
+        if (!attr[i].enabled || !attr[i].data || s_gpu.inline_active || len > (64u << 20)) continue;
+        if (!pb_grow((void **)&f->vdata, &f->capvdata, f->nvdata + len + 16, 1)) {
+            f->invalid = 1;
+            return;
+        }
+        memcpy(f->vdata + f->nvdata, attr[i].data + (size_t)lo * st, len);
+        f->voff[f->ndraw][i] = f->nvdata + 1;
+        f->nvdata = (f->nvdata + len + 15) & ~15u;
+    }
+    f->ndraw++;
+}
+
+/* The executor as a frame in progress left it, around a replay: the state
+ * every method sets, the texture registers, the vertex programs and
+ * constants, and a batch begun but not ended. A title draws to textures in
+ * its world update, so a replay can fall between commands of the next frame,
+ * which must go on as if it had not. */
+struct PbState {
+    uint8_t *head, *mid, *tail;          /* s_gpu around idx[] and inline_buf[] */
+    uint32_t *idx, *inl;
+    uint8_t *vsh;
+    uint32_t tex_reg[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
+    uint8_t tex_set[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
+    uint8_t *surface;
+};
+
+#define GPU_AT(f) ((size_t)((uint8_t *)&s_gpu.f - (uint8_t *)&s_gpu))
+static int pb_state(PbState *st, int save)
+{
+    size_t a = GPU_AT(idx), b0 = GPU_AT(idx_count), b1 = GPU_AT(inline_buf);
+    size_t c0 = GPU_AT(inline_count), c1 = sizeof s_gpu;
+    uint8_t *g = (uint8_t *)&s_gpu;
+    if (!st->head) {
+        st->head = (uint8_t *)malloc(a); st->mid = (uint8_t *)malloc(b1 - b0);
+        st->tail = (uint8_t *)malloc(c1 - c0); st->vsh = (uint8_t *)malloc(nv2a_vsh_state_size());
+        st->idx = (uint32_t *)malloc(sizeof s_gpu.idx); st->inl = (uint32_t *)malloc(sizeof s_gpu.inline_buf);
+        if (!st->head || !st->mid || !st->tail || !st->vsh || !st->idx || !st->inl) {
+            free(st->head); free(st->mid); free(st->tail);
+            free(st->vsh); free(st->idx); free(st->inl);
+            memset(st, 0, sizeof *st);
+            fprintf(stderr, "[INTERP] cannot allocate GPU state snapshot; replay refused\n");
+            return 0;
+        }
+    }
+    if (save) {
+        memcpy(st->head, g, a); memcpy(st->mid, g + b0, b1 - b0); memcpy(st->tail, g + c0, c1 - c0);
+        memcpy(st->idx, s_gpu.idx, s_gpu.idx_count * sizeof *s_gpu.idx);
+        memcpy(st->inl, s_gpu.inline_buf, s_gpu.inline_count * sizeof *s_gpu.inline_buf);
+        memcpy(st->tex_reg, s_tex_reg, sizeof s_tex_reg); memcpy(st->tex_set, s_tex_set, sizeof s_tex_set);
+        st->surface = s_surface;
+        nv2a_vsh_state_save(st->vsh);
+    } else {
+        memcpy(g, st->head, a); memcpy(g + b0, st->mid, b1 - b0); memcpy(g + c0, st->tail, c1 - c0);
+        memcpy(s_gpu.idx, st->idx, s_gpu.idx_count * sizeof *s_gpu.idx);
+        memcpy(s_gpu.inline_buf, st->inl, s_gpu.inline_count * sizeof *s_gpu.inline_buf);
+        memcpy(s_tex_reg, st->tex_reg, sizeof s_tex_reg); memcpy(s_tex_set, st->tex_set, sizeof s_tex_set);
+        s_surface = st->surface;
+        nv2a_vsh_state_restore(st->vsh);
+    }
+    return 1;
+}
+
+static int pb_frame_state_capture(PbState **state)
+{
+    if (!*state) {
+        *state = (PbState *)malloc(sizeof **state);
+        if (!*state) {
+            fprintf(stderr, "[INTERP] frame-start state allocation failed; frame rejected\n");
+            return 0;
+        }
+        memset(*state, 0, sizeof **state);
+    }
+    return pb_state(*state, 1);
+}
+
+static int pb_frame_state_load(const PbState *state)
+{
+    return state && pb_state((PbState *)state, 0);
+}
+
+/* The last frame again, at t between the previous one (0) and it (1).
+ * 0 if there is none to draw. */
+int nv2a_pb_replay(float t)
+{
+    static PbState saved;
+    PbFrame *f = s_last_f;
+    uint32_t i, k = 0;
+    if (f->invalid || !f->start_valid || !f->start || !f->ncmd || !f->has) return 0;
+    if (!pb_state(&saved, 1)) return 0;
+    if (!pb_frame_state_load(f->start)) {
+        pb_state(&saved, 0);
+        return 0;
+    }
+    s_replaying = 1;
+    s_replay_draw = 0;
+    for (i = 0; i < f->ncmd; i++) {
+        uint32_t sm = f->cmd[i].sm, m = sm & 0xFFFF, p = f->cmd[i].param;
+        if (!(sm >> 16) && m >= 0x0B80 && m < 0x0C00) {
+            if (k < f->ntc && f->has[k]) {
+                float a = f->prev[k], b, v;
+                memcpy(&b, &p, 4);
+                v = a + (b - a) * t;
+                if (v == v && v - v == 0.0f) memcpy(&p, &v, 4);   /* finite only */
+            }
+            k++;
+        }
+        nv2a_pb_exec_method(sm >> 16, m, p);
+    }
+    s_replaying = 0;
+    pb_state(&saved, 0);
+    return 1;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+    static uint32_t semaphore_dma, semaphore_offset;
+    int record_frame = !s_replaying && interp_on();
+
+    /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
+     * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
+     * held 0xFF000000 at times, which put the write outside guest memory). */
+    if (subch == 0 && method == 0x1D70 && s_sem_va) {
+        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+        *(volatile uint32_t *)(mem + s_sem_va) = param;
+        return;
+    }
     if (!inited) {
         inited = 1;
+        s_gpu.aa_sx = s_gpu.aa_sy = 1.0f;
+        /* Stencil state as the hardware resets it: GL_ALWAYS, masks 0xFF,
+         * GL_KEEP, until the title says otherwise. */
+        s_reg[0x0364 / 4] = 0x207u;                            /* FUNC */
+        s_reg[0x0360 / 4] = s_reg[0x036C / 4] = 0xFFu;         /* MASK, FUNC_MASK */
+        s_reg[0x0370 / 4] = s_reg[0x0374 / 4] = s_reg[0x0378 / 4] = 0x1E00u;
+        s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
+        {
+            int i;
+            for (i = 0; i < NV_VERTEX_ATTRS; i++)
+                s_gpu.imm_attr[i][3] = 1.0f;
+        }
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
     }
+    if (subch == 0)                        /* the 3D class's register file */
+        s_reg[(method & 0x1FFCu) / 4] = param;
+    if (!s_replaying) {
+        if (record_frame) pb_record(subch, method, param);
+        else if (s_rec_f->start_valid) s_rec_f->invalid = 1;
+        if (!subch && method == NV097_FLIP_STALL) {
+            if (!record_frame) pb_discard_recording();
+            s_methods_since_flip = 0;
+        } else if (s_methods_since_flip != UINT32_MAX) {
+            s_methods_since_flip++;
+        }
+    }
+    if (method == 0x100) { /* NV097_NO_OPERATION */
+        if (s_nop_hook) {
+            NvD3DState st;
+            d3d_fill_state(&st);
+            int handled = s_nop_hook(&st, subch, param);
+            s_nop_pending = 1;
+            if (handled) return;
+        }
+    } else if (s_nop_pending) {
+        s_nop_pending = 0;
+        if (s_nop_hook) s_nop_hook(NULL, 0, 0);
+    }
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
-     * the values are visible. */
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+     * the values are visible. Cached: this runs for every method, and an
+     * uncached getenv here was a quarter of the executor's time. */
+    static int verbose = -1;
+    if (verbose < 0)
+        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    if (verbose) {
         static int shown[8];
         int slot = -1;
         switch (method) {
@@ -1717,26 +4840,125 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     subch, method, param);
     }
 
+    if (s_ftrace == 2) {
+        /* RECOMP_FRAME_TRACE_METHODS: every method of the traced frame,
+         * less the bulk (vertex data, program and constant uploads). */
+        static int all = -1;
+        if (all < 0)
+            all = getenv("RECOMP_FRAME_TRACE_METHODS") != NULL;
+        static int consts = -1;
+        if (consts < 0)
+            consts = getenv("RECOMP_FRAME_TRACE_CONSTANTS") != NULL;
+        if (all && !(method >= 0x1800 && method < 0x1A00)
+            && (consts ? !(method >= 0x0B00 && method < 0x0B80)
+                       : !(method >= 0x0B00 && method < 0x0C00)))
+            fprintf(stderr, "[FTRACE]   m %u:%04X = %08X%c", subch, method,
+                    param, 10);
+    }
+    if (subch == 0 && method >= NV_TEX_FIRST && method <= NV_TEX_LAST) {
+        tex_stage_method(method, param);
+        return;
+    }
+    /* XDK D3D's KickOff (found in a title's statically linked D3D, which
+     * reads it back; see d3d8ltcg-device-context.md) ends every kick with
+     * method 0x0310 on subchannel 5:
+     *
+     *     ((pushbuffer_address * 8 | (fence & 0x1F)) << 2) | (wrap & 3)
+     *
+     * The GPU latches it into PGRAPH 0x400B10, and D3D waits there for the
+     * kick's fence bits. Unmodelled, 0x400B10 read 0 and the wait ended only
+     * when the semaphore happened to be a multiple of 32. (DMA_GET, which D3D
+     * reads next, is published by the walk itself; see nv2a_pb_scan.c. The
+     * marker's own address is behind the executor's read position, so it is
+     * not used for that.)
+     *
+     * D3D compares the latch's fence bits with the semaphore, so the two have
+     * to tell the same story. When a back end names the semaphore the
+     * executor writes it from the title's own releases, and the marker agrees
+     * with it. A project that mirrors the title's fence instead (the runtime
+     * writes "everything submitted is consumed" into the word,
+     * xbox_Nv2aMirrorFence) holds D3D's own submitted counter there, which
+     * the marker's fence bits do not match, and D3D's wait then lasts for
+     * ever: the title froze at the first screen whose walk was long enough to
+     * enter it. So for a mirrored fence the latch carries the mirror's fence
+     * bits and the marker's address, which is what a GPU that had consumed
+     * everything would report. */
+    if (method == 0x0310 && subch == 5 && nv2a_pb_dma_walk()) {
+        volatile uint32_t *r = xbox_Nv2aRegPtr(0x400B10);
+
+        if (!r)
+            return;
+        if (!s_sem_va) {
+            uint32_t va = xbox_Nv2aFenceWordVa();
+
+            if (va) {
+                uint32_t sem = *(volatile uint32_t *)
+                               ((uint8_t *)xbox_GetMemoryOffset() + va);
+                param = (param & ~0x7Cu) | ((sem & 0x1Fu) << 2);
+            }
+        }
+        *r = param;
+        return;
+    }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(method, param);
         return;
     }
     switch (method) {
+    case NV097_SET_CONTEXT_DMA_SEMAPHORE:
+        if (s_replaying) return;
+        semaphore_dma = param;
+        return;
+    case NV097_SET_SEMAPHORE_OFFSET:
+        if (s_replaying) return;
+        semaphore_offset = param;
+        return;
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        if (s_replaying) return;
+        xbox_Nv2aSemaphoreRelease(semaphore_dma, semaphore_offset, param);
+        s_semaphore_last = param;
+        s_semaphore_releases++;
+        return;
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
-        s_gpu.clip_x = param & 0xFFFF;
-        s_gpu.clip_w = (param >> 16) & 0xFFFF;
+        s_gpu.clip_raw_h = param;
+        surface_apply_clip();
         break;
     case NV097_SET_SURFACE_CLIP_VERTICAL:
-        s_gpu.clip_y = param & 0xFFFF;
-        s_gpu.clip_h = (param >> 16) & 0xFFFF;
+        s_gpu.clip_raw_v = param;
+        surface_apply_clip();
+        break;
+    case 0x02B4:                                  /* SET_WINDOW_CLIP_TYPE */
+        s_gpu.wclip_type = param;
+        break;
+    case 0x02C0: case 0x02C4: case 0x02C8: case 0x02CC:   /* SET_WINDOW_CLIP_HORIZONTAL(n) */
+    case 0x02D0: case 0x02D4: case 0x02D8: case 0x02DC:
+        s_gpu.wclip_h[(method - 0x02C0) / 4] = param;
+        s_gpu.wclip_mask |= 1u << (method - 0x02C0) / 4;
+        break;
+    case 0x02E0: case 0x02E4: case 0x02E8: case 0x02EC:   /* SET_WINDOW_CLIP_VERTICAL(n) */
+    case 0x02F0: case 0x02F4: case 0x02F8: case 0x02FC:
+        s_gpu.wclip_v[(method - 0x02E0) / 4] = param;
+        s_gpu.wclip_mask |= 1u << (method - 0x02E0) / 4;
         break;
     case NV097_SET_SURFACE_FORMAT:
         s_gpu.format = param;
+        surface_apply_clip();
+        break;
+    case 0x1D98:                       /* SET_CLEAR_RECT_HORIZONTAL */
+        s_gpu.clear_rect_h = param;
+        s_gpu.clear_rect_set |= 1;
+        break;
+    case 0x1D9C:                       /* SET_CLEAR_RECT_VERTICAL */
+        s_gpu.clear_rect_v = param;
+        s_gpu.clear_rect_set |= 2;
         break;
     case NV097_SET_SURFACE_PITCH:
         s_gpu.pitch = param & 0xFFFF;      /* colour pitch; zeta is the top half */
+        s_gpu.zeta_pitch = param >> 16;
         break;
     case NV097_SET_SURFACE_COLOR_OFFSET:
+        if (s_ftrace == 2)
+            fprintf(stderr, "[FTRACE] color offset -> %08X%c", param, 10);
         s_gpu.color_offset = param;
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
@@ -1745,6 +4967,62 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_BLEND_ENABLE:
         s_gpu.blend_enable = param;
         break;
+    case NV097_SET_BLEND_EQUATION:
+        s_gpu.blend_equation = param;
+        break;
+    case 0x0358:                                  /* SET_COLOR_MASK */
+        s_gpu.color_mask = param;
+        break;
+
+    /* Register combiners. */
+    case 0x0288: s_gpu.rc.final0 = param; break;  /* SPECULAR_FOG_CW0 */
+    case 0x028C: s_gpu.rc.final1 = param; break;  /* SPECULAR_FOG_CW1 */
+    case 0x1E20: s_gpu.rc.final_c0 = param; break;/* SPECULAR_FOG_FACTOR */
+    case 0x1E24: s_gpu.rc.final_c1 = param; break;
+    case 0x1E60:                                  /* COMBINER_CONTROL */
+        s_gpu.rc.control = param;
+        s_gpu.rc_seen = 1;
+        break;
+    case 0x1E70: s_gpu.rc.stage_program = param; break;
+    case 0x17F8: s_gpu.clip_plane_mode = param; break;
+
+    /* Alpha test and fog. */
+    case 0x0300: s_gpu.alpha_test = param; break;
+    case 0x033C: s_gpu.alpha_func = param; break;
+    case 0x0340: s_gpu.alpha_ref = param; break;
+    case 0x02A4: s_gpu.fog_enable = param; break;
+    case 0x02A8: s_gpu.fog_color = param; break;  /* R in bits 0-7 */
+    case 0x029C: s_gpu.fog_mode = param; break;
+    case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
+    case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
+    case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
+        s_gpu.zpass_count = 0;
+        if (use_d3d()) nv2a_d3d_zpass_clear();
+        break;
+    case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
+        s_gpu.zpass_enable = param;
+        if (use_d3d()) nv2a_d3d_zpass_enable(param != 0);
+        break;
+    case 0x17D0: {                                /* GET_REPORT */
+        /* The GPU's answer to a visibility test: 16 bytes at the report
+         * DMA offset -- a timestamp, the pixel count, and 0 for "done".
+         * Never written, a title polling it (D3D's GetVisibilityTestResult
+         * starts the slot at 0xFFFFFFFF) sees every test incomplete. A title
+         * culls its world with these, so the race's main view drew only
+         * the sky while the cube-map passes, which do not test, drew it all.
+         * The report DMA object starts at physical 0 here, as D3D sets it. */
+        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+        uint32_t at = dma_resolve(param & 0x00FFFFFFu);
+        uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
+        if (use_d3d()) s_gpu.zpass_count = nv2a_d3d_zpass_read();
+        memcpy(mem + at, &stamp, 8);
+        memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
+        memset(mem + at + 12, 0, 4);
+        break;
+    }
+    case NV097_SET_BLEND_COLOR:
+        s_gpu.blend_color = param;
+        break;
     case NV097_SET_BLEND_FUNC_SFACTOR:
         s_gpu.blend_sfactor = param;
         break;
@@ -1752,7 +5030,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.blend_dfactor = param;
         break;
     case NV097_CLEAR_SURFACE:
+        if (s_ftrace == 2)
+            fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X%c",
+                    param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
+                    s_gpu.clear_color, 10);
+        if (use_d3d()) {
+            d3d_clear(param);
+            break;
+        }
         clear_surface(param);
+        if (param & 0x01)                         /* Z */
+            zbuf_clear();
         break;
 
     case NV097_SET_BEGIN_END:
@@ -1780,8 +5068,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_INLINE_ARRAY:
         /* Vertex data, not a pointer to it. Buffered rather than decoded here
          * because the format is only fully known at END. */
-        if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
-            s_gpu.inline_buf[s_gpu.inline_count++] = param;
+        if (s_gpu.prim) {
+            if (s_gpu.inline_count < NV_MAX_INLINE)
+                s_gpu.inline_buf[s_gpu.inline_count++] = param;
+            else
+                cap_exceeded(8, "INLINE_ARRAY payload (dwords)", NV_MAX_INLINE, 1);
+        }
         break;
 
     case NV097_DRAW_ARRAYS: {
@@ -1800,30 +5092,54 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (!s_gpu.prim)
             break;
         for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+            s_gpu.idx[s_gpu.idx_count++] = start + i;
+        if (i < count)
+            cap_exceeded(16, "DRAW_ARRAYS indices", NV_MAX_INDICES, count - i);
         break;
     }
 
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
-        if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+        if (!s_gpu.prim)
+            break;
+        if (s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
+            s_gpu.idx[s_gpu.idx_count++] = param & 0xFFFF;
+            s_gpu.idx[s_gpu.idx_count++] = param >> 16;
+        } else {
+            cap_exceeded(32, "ARRAY_ELEMENT16 indices", NV_MAX_INDICES, 2);
         }
         break;
-    case NV097_SET_TEXTURE_OFFSET:
-        /* A texture offset is a DMA-object offset, exactly like a surface or a
-         * vertex array offset -- physical, and reachable only through the
-         * contiguous window when it names contiguous memory. */
-        s_gpu.tex.offset = dma_resolve(param);
-        record_tex_reg(method, param);
+
+    case 0x1808:                            /* ARRAY_ELEMENT32: one index */
+        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
+            s_gpu.idx[s_gpu.idx_count++] = param;
         break;
+    case NV097_NO_OPERATION:
+        /* Non-zero, it is one of D3D's software methods, which the GPU traps
+         * to D3D's interrupt handler on the console. Only the swap's interval
+         * matters here (nv2a_flip_hold.h); the rest stays a no-op. A notify
+         * the title waits on is answered either way (xbox_Nv2aNop); a replay
+         * answers nothing. */
+        if (!s_replaying)
+            xbox_Nv2aNop(param);
+        if (!nv2a_pb_exec_flip_pacing()) {
+            if (!imm_vertex_method(method, param))
+                note_unhandled(method, param);   /* as before the hold */
+            break;
+        }
+        if (param && !s_replaying)
+            xbox_FlipHoldSwap(&s_flip_hold, param);
+        return;
 
     case NV097_SET_FLIP_READ:
+        if (s_ftrace == 2)
+            fprintf(stderr, "[FTRACE] P_READ %u%c", param, 10);
         s_gpu.flip_read = param;
         return;
 
     case NV097_SET_FLIP_WRITE:
+        if (s_ftrace == 2)
+            fprintf(stderr, "[FTRACE] P_WRITE %u%c", param, 10);
         s_gpu.flip_write = param;
         return;
 
@@ -1832,19 +5148,38 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_INCREMENT_WRITE:
+        if (s_replaying) return;
         s_gpu.flip_write = s_gpu.flip_modulo
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        frame_trace_flip();
         return;
 
-    case NV097_FLIP_STALL:
+    case NV097_FLIP_STALL: {
+        /* The flip is measured from the vblank the title swapped in (the
+         * walk's start, s_walk_vbl); the hold's clock starts here, before
+         * the present below: a vsynced present can hold this thread for a
+         * host frame, and that time counts against the hold. */
+        uint64_t stall_ns = xbox_HostNowNs();
+        int clock_ok;
+        uint32_t stall_vbl;
+        (void)flip_clock(stall_ns, &clock_ok);
+        stall_vbl = s_walk_vbl;
+        if (s_ftrace == 2)
+            fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
+                    s_gpu.drawn_offset, s_gpu.color_offset, 10);
         /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is now. */
+         * There is no scanout here to wait for, so that is now; when the
+         * title may go on is the flip hold's (below). */
         s_gpu.flip_read = s_gpu.flip_write;
         /* And this is a completed swap, which is what a title's own swap
-         * counter counts -- see xbox_Nv2aFrameCounterFlip. */
-        xbox_Nv2aFrameCounterFlip();
+         * counter counts -- see xbox_Nv2aFrameCounterFlip. A replay is not
+         * one of the title's. */
+        if (!s_replaying)
+            xbox_Nv2aFrameCounterFlip();
+        if (!s_replaying && record_frame)  /* this method was the last recorded */
+            pb_frame_done();
         /* Hand the window a copy of the frame just finished.
          *
          * The buffer the title has finished is the one the last batch drew
@@ -1853,16 +5188,54 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * here, rather than letting the window read guest memory on its own
          * clock, is what stops it showing a surface the rasteriser is still
          * writing. */
+        {
+            extern void xbox_FramebufferWindowFrameStats(uint32_t);
+            static uint32_t draws_at_flip;
+            xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
+            draws_at_flip = s_gpu.draws;
+        }
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                : s_gpu.color_offset;
+            uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
+                                                : s_gpu.pitch;
             if (done) {
-                xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
-                xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
+                extern void nv2a_d3d_flip_present(uint32_t, uint32_t, int);
+                xbox_FramebufferWindowSet(dma_resolve(done), pitch);
+                xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
+                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+                /* Interpolating, the title's own frame is not shown: the
+                 * replays of it are (nv2a_pb_replay). */
+                nv2a_d3d_flip_present(dma_resolve(done), pitch, s_replaying || !interp_on());
             }
         }
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        {
+            /* RECOMP_FB_DUMP_FLIPS: dump every presented frame, not one per
+             * report -- a consecutive sequence, which is what a headless
+             * recording (frames -> ffmpeg) needs. "1" dumps from boot; any
+             * other value names a file, and frames are dumped while it
+             * exists, so a capture can start mid-game without writing
+             * gigabytes of menus first. */
+            static const char *spec = (const char *)-1;
+            if (spec == (const char *)-1)
+                spec = getenv("RECOMP_FB_DUMP_FLIPS");
+            if (spec) {
+                int on = strcmp(spec, "1") == 0;
+                if (!on) {
+                    FILE *f = fopen(spec, "rb");
+                    if (f) { fclose(f); on = 1; }
+                }
+                s_flip_dumping = on;
+                if (on)
+                    dump_surface_bmp();
+            }
+        }
+        s_gpu.drawn_stale = 1;
+        if (s_backend && s_backend->flip)
+            s_backend->flip();
+
+        if (verbose) {
             static unsigned n;
             if (n++ < 8) {
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
@@ -1870,46 +5243,136 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 fflush(stderr);
             }
         }
-        return;
-
-    case NV097_SET_TEXTURE_FORMAT:
-        s_gpu.tex.color = (param >> 8) & 0xFF;
-        /* A swizzled texture carries its own dimensions here, as log2 in
-         * BASE_SIZE_U/V (nv2a_regs.h: 0x00F00000 / 0x0F000000). It has to:
-         * SET_TEXTURE_IMAGE_RECT describes a linear image, and a title that
-         * only uses swizzled textures never sends one -- this title sends it
-         * once and sets a format 3,176 times. Without this the width and
-         * height stayed zero and nothing was ever sampled. */
-        if (tex_size_from_format((param >> 8) & 0xFF)) {
-            s_gpu.tex.width  = 1u << ((param >> 20) & 0xF);
-            s_gpu.tex.height = 1u << ((param >> 24) & 0xF);
+        /* Arm the hold. Not inside a pushbuffer CALL: the subroutine's
+         * return lives in this walk alone, so the hold could not resume
+         * there; that flip completes at once and still sets the count the
+         * next one is measured from. The swap above (frame counter,
+         * present) is counted now, when the hold is armed, not at its
+         * release: what the title waits on is GET and the PFB flush, and
+         * a title polling its swap counter sees the flip up to a vblank
+         * early. */
+        if (nv2a_pb_exec_flip_pacing()) {
+            extern int nv2a_pb_scan_in_call(void);
+            xbox_FlipHoldStall(&s_flip_hold, stall_vbl, stall_ns,
+                               clock_ok && !nv2a_pb_scan_in_call());
         }
-        record_tex_reg(method, param);
+        return;
+    }
+
+    /* Vertex programs and their constants: forwarded as they arrive. */
+    case 0x1E94:                                  /* TRANSFORM_EXECUTION_MODE */
+        s_gpu.xf_mode = param;
+        break;
+    case 0x1E98:                                  /* _PROGRAM_CXT_WRITE_EN */
+        nv2a_vsh_set_cxt_write(param);
+        break;
+    case 0x1E9C:                                  /* _PROGRAM_LOAD */
+        nv2a_vsh_set_load_slot(param);
+        break;
+    case 0x1EA0:                                  /* _PROGRAM_START */
+        nv2a_vsh_set_start_slot(param);
+        break;
+    case 0x1EA4:                                  /* _CONSTANT_LOAD */
+        nv2a_vsh_set_constant_load(param);
         break;
 
-    case NV097_SET_TEXTURE_ADDRESS:
-        /* Four bits per axis. 1 is wrap, 3 is clamp-to-edge; the rest (mirror,
-         * border) fall back to clamp, which is wrong at an edge rather than
-         * wrong everywhere. */
-        s_gpu.tex.addr_u =  param        & 0xF;
-        s_gpu.tex.addr_v = (param >>  8) & 0xF;
-        record_tex_reg(method, param);
+    /* Fixed-function transform: the composite matrix, 16 floats. The viewport
+     * offset arrives in the constant file, above. */
+    case 0x0680: case 0x0684: case 0x0688: case 0x068C:
+    case 0x0690: case 0x0694: case 0x0698: case 0x069C:
+    case 0x06A0: case 0x06A4: case 0x06A8: case 0x06AC:
+    case 0x06B0: case 0x06B4: case 0x06B8: case 0x06BC:
+        memcpy(&s_gpu.composite[(method - 0x0680) / 4], &param, 4);
+        s_gpu.composite_set = 1;
         break;
 
-    case NV097_SET_TEXTURE_CONTROL1:
-        /* Pitch lives in the top half. Only meaningful for a linear format; a
-         * swizzled texture has no pitch because it has no rows. */
-        s_gpu.tex.pitch = param >> 16;
-        record_tex_reg(method, param);
+    /* Stencil, culling, polygon offset, shading. */
+    case 0x032C: s_gpu.stencil_test = param; break;
+    case 0x0360: s_gpu.stencil_write_mask = param; break;
+    case 0x0364: s_gpu.stencil_func = param; break;
+    case 0x0368: s_gpu.stencil_ref = param; break;
+    case 0x036C: s_gpu.stencil_func_mask = param; break;
+    case 0x0370: s_gpu.stencil_fail = param; break;
+    case 0x0374: s_gpu.stencil_zfail = param; break;
+    case 0x0378: s_gpu.stencil_zpass = param; break;
+    case 0x0308: s_gpu.cull_enable = param; break;
+    case 0x039C: s_gpu.cull_face = param; break;
+    case 0x03A0: s_gpu.front_face = param; break;
+    case 0x037C: s_gpu.shade_mode = param; break;
+    case 0x0290: s_gpu.control0 = param; break;
+    case 0x0338: s_gpu.poly_offset_fill = param; break;
+    case 0x0384: memcpy(&s_gpu.poly_offset_factor, &param, 4); break;
+    case 0x0388: memcpy(&s_gpu.poly_offset_units, &param, 4); break;
+    case 0x1E74: s_gpu.dot_rgb_mapping = param; break;
+    case 0x1E78: s_gpu.other_stage_input = param;
         break;
 
-    case NV097_SET_TEXTURE_IMAGE_RECT:
-        s_gpu.tex.width  = param >> 16;
-        s_gpu.tex.height = param & 0xFFFF;
-        record_tex_reg(method, param);
-        break;
+    /* Depth. */
+    case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
+    case 0x0354: s_gpu.depth_func = param; break; /* DEPTH_FUNC */
+    case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
+    case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
+    case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
 
     default:
+        if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
+            s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
+            break;
+        }
+        if (method >= 0x0AC0 && method < 0x0AE0) {         /* COLOR_ICW(i) */
+            s_gpu.rc.color_icw[(method - 0x0AC0) / 4] = param;
+            break;
+        }
+        if (method >= 0x1E40 && method < 0x1E60) {         /* COLOR_OCW(i) */
+            s_gpu.rc.color_ocw[(method - 0x1E40) / 4] = param;
+            break;
+        }
+        if (method >= 0x0AA0 && method < 0x0AC0) {         /* ALPHA_OCW(i) */
+            s_gpu.rc.alpha_ocw[(method - 0x0AA0) / 4] = param;
+            break;
+        }
+        if (method >= 0x0A60 && method < 0x0A80) {         /* FACTOR0(i) */
+            s_gpu.rc.factor0[(method - 0x0A60) / 4] = param;
+            break;
+        }
+        if (method >= 0x0A80 && method < 0x0AA0) {         /* FACTOR1(i) */
+            s_gpu.rc.factor1[(method - 0x0A80) / 4] = param;
+            break;
+        }
+        /* SET_VIEWPORT_OFFSET / _SCALE. The GPU keeps these in the constant
+         * file, at c[59] and c[58] -- exactly where the D3D epilogue reads
+         * them -- so they are constants that happen to arrive by method.
+         * Dropped, every vertex program put its whole batch at the origin:
+         * no 3D anywhere, and a black car on the garage screen. */
+        if (method >= 0x0A20 && method < 0x0A30) {
+            nv2a_vsh_constant_component(59, (method - 0x0A20) / 4, param);
+            break;
+        }
+        if (method >= 0x0AF0 && method < 0x0B00) {
+            nv2a_vsh_constant_component(58, (method - 0x0AF0) / 4, param);
+            break;
+        }
+        /* The rest of the transform context that shares the constant file:
+         * SET_FOG_PLANE is c[57] and SET_EYE_POSITION c[56]. Vertex programs
+         * read them like any constant -- SSX 3's shadow-caster program takes
+         * its colour from c[57] -- and dropped, they read whatever an earlier
+         * constant upload left there: half its shadow maps came out opaque. */
+        if (method >= 0x09D0 && method < 0x09E0) {         /* SET_FOG_PLANE */
+            nv2a_vsh_constant_component(57, (method - 0x09D0) / 4, param);
+            break;
+        }
+        if (method >= 0x0A50 && method < 0x0A60) {         /* SET_EYE_POSITION */
+            nv2a_vsh_constant_component(56, (method - 0x0A50) / 4, param);
+            break;
+        }
+        if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */
+            nv2a_vsh_program_word(param);
+            break;
+        }
+        if (method >= 0x0B80 && method < 0x0C00) {    /* TRANSFORM_CONSTANT(i) */
+            nv2a_vsh_constant_word(param);
+            break;
+        }
         if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
             record_tex_reg(method, param);
         if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
@@ -1926,6 +5389,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             VertexAttr *a = &s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
             a->type   =  param        & 0x0F;
             a->size   = (param >> 4)  & 0x0F;
+            if (a->size == 7)                   /* SIZE_3W */
+                a->size = 3;
             a->stride = (param >> 8)  & 0xFF;
         } else if (!imm_vertex_method(method, param)) {
             note_unhandled(method, param);
@@ -2102,6 +5567,19 @@ void nv2a_pb_exec_report(void)
     }
     int i, j;
 
+    {
+        /* Frames per second of guest time, from flips between reports. */
+        static uint32_t last_flips;
+        static unsigned long last_ms;
+        unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
+        if (last_ms && now > last_ms)
+            fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
+                    (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
+                    s_gpu.flips, 10);
+        last_flips = s_gpu.flips;
+        last_ms = now;
+    }
+    flip_hold_report();
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                     " clears %u | %u unhandled methods (%d distinct)\n",
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
@@ -2113,7 +5591,8 @@ void nv2a_pb_exec_report(void)
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
-    dump_surface_bmp();
+    if (!s_flip_dumping)
+        dump_surface_bmp();
 
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one
@@ -2128,6 +5607,32 @@ void nv2a_pb_exec_report(void)
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
+    fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
+                    " %u triangles dropped behind the eye\n",
+            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    if (s_gpu.batches_ffp)
+        fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
+                s_gpu.batches_ffp);
+    fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
+                    " %u drawn; pixels %llu written, %llu depth-failed;"
+                    " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
+            s_gpu.xf_degenerate, s_gpu.xf_offscreen, s_gpu.xf_drawn,
+            (unsigned long long)s_gpu.xf_pixels,
+            (unsigned long long)s_gpu.xf_depth_fail,
+            s_gpu.xf_min[0], s_gpu.xf_max[0], s_gpu.xf_min[1], s_gpu.xf_max[1],
+            s_gpu.xf_min[2], s_gpu.xf_max[2]);
+    {
+        fprintf(stderr, "[GPU]   blend pairs (src/dst):");
+        for (j = 0; j < s_gpu.blend_npairs; j++)
+            fprintf(stderr, " %X/%X", s_gpu.blend_pairs[j] >> 16,
+                    s_gpu.blend_pairs[j] & 0xFFFF);
+        fputc(10, stderr);
+        fprintf(stderr, "[GPU]   program attribute formats (slot:type/size):");
+        for (j = 0; j < s_gpu.xf_nfmt; j++)
+            fprintf(stderr, " v%u:%u/%u", s_gpu.xf_fmt[j] >> 8,
+                    s_gpu.xf_fmt[j] & 15, (s_gpu.xf_fmt[j] >> 4) & 15);
+        fprintf(stderr, "\n");
+    }
 
     /* And of the batches that did rasterise, how many sampled anything. A menu
      * that draws its background from one texture and its text from another
@@ -2185,5 +5690,8 @@ void nv2a_pb_exec_report(void)
                     v.u, v.f);
         }
     }
-    }    fflush(stderr);
+    }
+    for (i = 0; i < s_unhandled_count; i++)       /* the sort moved them */
+        s_unhandled_slot[(s_unhandled[i].method & 0x1FFC) / 4] = (uint16_t)(i + 1);
+    fflush(stderr);
 }

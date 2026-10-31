@@ -33,11 +33,9 @@ add_compile_definitions(
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH
     "Path to the xboxrecomp toolkit root directory")
 
-# Add xboxrecomp as a subdirectory -- this builds all 6 runtime libraries
+# Add xboxrecomp as a subdirectory -- this builds the selected runtime libraries
 # and provides the 'xboxrecomp' umbrella target to link against.
-if(NOT TARGET xboxrecomp)
-    add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
-endif()
+add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
 # ── Recompiled game executable ──────────────────────────────────
 
@@ -70,7 +68,7 @@ add_executable(${PROJECT_NAME} WIN32
     ${RECOMP_GEN_SOURCES}
 )
 
-# Link against the xboxrecomp umbrella target (all 6 runtime libraries)
+# Link against the xboxrecomp umbrella target (selected runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
 # Include paths for generated recomp headers
@@ -80,17 +78,16 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${XBOXRECOMP_DIR}/include
 )
 
-# Windows libraries needed at link time. Graphics, audio and input come in
-# through the xboxrecomp target (SDL3 and SDL_shadercross).
+# Windows SDK libraries needed at link time
 target_link_libraries(${PROJECT_NAME} PRIVATE
+    d3d11
+    dxgi
+    dxguid
+    winmm
     # Lets the fault handler resolve the host RIP back to the generated
     # function's symbol, i.e. to the guest function that faulted.
     dbghelp
 )
-
-# The runtime compiles shaders at run time with DXC, which loads dxcompiler.dll
-# and dxil.dll from beside the executable; copy them there.
-xbox_copy_runtime_dlls(${PROJECT_NAME})
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)

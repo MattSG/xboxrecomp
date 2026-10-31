@@ -37,19 +37,3 @@ bin/
 *.obj
 *.exe
 tools/split/output/
-
-# Build output and local scratch (never commit; game assets neither)
-build/
-build-*/
-build-tooling/
-*.pdb
-*.ilk
-*.obj
-*.tlog
-.serena/
-# Game data and media extracted from a title: user supplies their own
-*.xpr
-*.xip
-*.xmv
-*.wmv
-*.xbx

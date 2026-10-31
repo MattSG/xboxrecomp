@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(recomp_nv2a_wbc_flush C)
+set(CMAKE_C_STANDARD 11)
+if(WIN32)
+    add_executable(recomp_nv2a_wbc_flush test_nv2a_wbc_flush.c
+        ../../src/kernel/nv2a_wbc_flush.c)
+    target_include_directories(recomp_nv2a_wbc_flush PRIVATE ../../src ../../src/kernel ../../include)
+    enable_testing()
+    add_test(NAME recomp_nv2a_wbc_flush COMMAND recomp_nv2a_wbc_flush)
+endif()

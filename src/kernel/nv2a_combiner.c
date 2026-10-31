@@ -1,0 +1,335 @@
+/**
+ * NV2A register combiners. See nv2a_combiner.h.
+ *
+ * Register numbers (an input or output byte's low nibble):
+ *   0 zero/discard  1 c0  2 c1  3 fog  4 v0  5 v1  8-11 t0-t3  12 r0  13 r1
+ *   14 v1+r0 sum and 15 E*F product (final combiner only)
+ * An input byte is reg | alpha<<4 | mapping<<5. In the RGB portion the alpha
+ * bit replicates .a; in the alpha portion it picks .a over .b.
+ */
+#include "nv2a_combiner.h"
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+/* The rasteriser evaluates pixels on several threads. */
+#if defined(_MSC_VER)
+#define NV_RC_TLS __declspec(thread)
+#else
+#define NV_RC_TLS __thread
+#endif
+
+enum { R_ZERO = 0, R_C0 = 1, R_C1 = 2, R_FOG = 3, R_V0 = 4, R_V1 = 5,
+       R_T0 = 8, R_R0 = 12, R_R1 = 13, R_SUM = 14, R_EF = 15 };
+
+void nv2a_rc_unpack(uint32_t c, float o[4])
+{
+    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
+    o[1] = (float)((c >>  8) & 0xFF) / 255.0f;
+    o[2] = (float)( c        & 0xFF) / 255.0f;
+    o[3] = (float)( c >> 24        ) / 255.0f;
+}
+
+/* Per-thread memoization of repeated D3DCOLOR constants. */
+static const float *unpack_cached(uint32_t c)
+{
+    static NV_RC_TLS uint32_t key[16];
+    static NV_RC_TLS float val[16][4];
+    static NV_RC_TLS int valid[16];
+    unsigned slot = (c ^ (c >> 8) ^ (c >> 16) ^ (c >> 24)) & 15u;
+    if (!valid[slot] || key[slot] != c) {
+        nv2a_rc_unpack(c, val[slot]);
+        key[slot] = c;
+        valid[slot] = 1;
+    }
+    return val[slot];
+}
+
+static float clampf(float x, float lo, float hi)
+{
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+
+/* PS_INPUTMAPPING, psh.c get_input_var. */
+static float map_in(float x, uint32_t byte)
+{
+    float p = x < 0.0f ? 0.0f : x;
+    switch ((byte >> 5) & 7) {
+    case 0:  return p;                               /* unsigned identity */
+    case 1:  return 1.0f - clampf(x, 0.0f, 1.0f);    /* unsigned invert   */
+    case 2:  return 2.0f * p - 1.0f;                 /* expand normal     */
+    case 3:  return -2.0f * p + 1.0f;                /* expand negate     */
+    case 4:  return p - 0.5f;                        /* half-bias normal  */
+    case 5:  return -p + 0.5f;                       /* half-bias negate  */
+    case 6:  return x;                               /* signed identity   */
+    default: return -x;                              /* signed negate     */
+    }
+}
+
+/* PS_COMBINEROUTPUT scale/bias, psh.c get_output. */
+static float map_out(float x, uint32_t mapping)
+{
+    switch (mapping) {
+    case 0x08: return x - 0.5f;
+    case 0x10: return x * 2.0f;
+    case 0x18: return (x - 0.5f) * 2.0f;
+    case 0x20: return x * 4.0f;
+    case 0x30: return x * 0.5f;
+    default:   return x;
+    }
+}
+
+static void read_rgb(float R[16][4], uint32_t byte, float v[3])
+{
+    const float *r = R[byte & 0xF];
+    int i;
+    for (i = 0; i < 3; i++)
+        v[i] = map_in((byte & 0x10) ? r[3] : r[i], byte);
+}
+
+static float read_alpha(float R[16][4], uint32_t byte)
+{
+    const float *r = R[byte & 0xF];
+    return map_in((byte & 0x10) ? r[3] : r[2], byte);
+}
+
+void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
+                  const float v1[4], const float fog[4],
+                  const float t[4][4], float out[4])
+{
+    float R[16][4];
+    uint32_t n = rc->control & 0xFF, flags = rc->control >> 8, s;
+    int i;
+
+    /* D3D's single-stage UI combiners reduce to diffuse colour or
+     * diffuse * texture. Recognize the exact register program, including
+     * output destinations and direct final-combiner routing; all other
+     * programs retain the general interpreter below. */
+    {
+        static NV_RC_TLS int generic = -1;
+        uint32_t ci = rc->color_icw[0], ai = rc->alpha_icw[0];
+        int colour = ci == 0x04200000u || ci == 0xc4200000u ? 1 :
+                     ci == 0x08040000u ? 2 : ci == 0xc8c42000u ? 3
+                   : ci == 0x08200000u || ci == 0xc8200000u ? 4
+                   : ci == 0xd1200000u ? 5 : 0;
+        int alpha = ai == 0x14200000u || ai == 0xd4201010u ? 1 :
+                    ai == 0x18140000u ? 2 : ai == 0xd8d41010u ? 3 :
+                    ai == 0xd4c81010u ? 4
+                  : ai == 0xd8301010u || ai == 0x18300000u ? 5
+                  : ai == 0xd1301010u ? 6 : 0;
+        static NV_RC_TLS int trace = -1;
+        static NV_RC_TLS unsigned reported;
+        if (generic < 0) {
+            generic = getenv("RECOMP_RC_GENERIC") != NULL;
+        if (trace < 0) trace = getenv("RECOMP_RC_TRACE") != NULL;
+        }
+        if (trace && rc->final0 == 0x04080900u && !(reported & 1u)) {
+            reported |= 1u;
+            fprintf(stderr, "[RC_DISPATCH] generic=%d n=%u ci=%08X ai=%08X "
+                    "co=%08X ao=%08X final=%08X/%08X\n",
+                    generic, n, ci, ai, rc->color_ocw[0], rc->alpha_ocw[0],
+                    rc->final0, rc->final1);
+            fflush(stderr);
+        }
+        if (!generic && rc->final0 == 0x04080900u &&
+            (rc->final1 >> 8) == 0x000014u) {
+            uint32_t stage, count = n > 8u ? 8u : n;
+            int untouched_inputs = 1;
+            for (stage = 0; stage < count; ++stage) {
+                uint32_t shift;
+                for (shift = 0; shift <= 8u; shift += 4u) {
+                    uint32_t rgb_dst = (rc->color_ocw[stage] >> shift) & 15u;
+                    uint32_t alpha_dst = (rc->alpha_ocw[stage] >> shift) & 15u;
+                    if (rgb_dst == R_V0 || rgb_dst == R_T0 || rgb_dst == R_T0 + 1 ||
+                        alpha_dst == R_V0) {
+                        untouched_inputs = 0;
+                        break;
+                    }
+                }
+                if (!untouched_inputs) break;
+            }
+            if (untouched_inputs) {
+                if (trace && !(reported & 2u)) {
+                    reported |= 2u;
+                    fprintf(stderr, "[RC_DISPATCH] background fast path active\n");
+                    fflush(stderr);
+                }
+                /* Final A=v0, B=t0, C=t1, D=0, G=v0.a. Writes to other
+                 * registers are dead; reject any program that changes the
+                 * RGB inputs or v0.a, including blue-to-alpha via v0. */
+                for (i = 0; i < 3; ++i) {
+                    float a = v0[i] < 0.0f ? 0.0f : v0[i];
+                    float b = t[0][i] < 0.0f ? 0.0f : t[0][i];
+                    float c = t[1][i] < 0.0f ? 0.0f : t[1][i];
+                    out[i] = clampf(c * (1.0f - a) + b * a, 0.0f, 1.0f);
+                }
+                out[3] = clampf(v0[3], 0.0f, 1.0f);
+                return;
+            }
+        }
+        if (!generic && n == 1u && colour && alpha &&
+            (rc->color_ocw[0] == 0xc0u || rc->color_ocw[0] == 0xc00u) &&
+            (rc->alpha_ocw[0] == 0xc0u || rc->alpha_ocw[0] == 0xc00u) &&
+            rc->final0 == 0x0000000cu && (rc->final1 >> 8) == 0x00001cu) {
+            for (i = 0; i < 3; ++i) {
+                float value = v0[i];
+                if (colour == 2)
+                    value = (t[0][i] < 0.0f ? 0.0f : t[0][i]) *
+                            (value < 0.0f ? 0.0f : value);
+                else if (colour == 3)
+                    value = t[0][i] * value;
+                else if (colour == 4)
+                    value = t[0][i];
+                else if (colour == 5)
+                    value = (float)(rc->factor0[0] >> 24) / 255.0f;
+                out[i] = clampf(value, 0.0f, 1.0f);
+            }
+            if (alpha == 1)
+                out[3] = clampf(v0[3], 0.0f, 1.0f);
+            else if (alpha == 2)
+                out[3] = clampf((t[0][3] < 0.0f ? 0.0f : t[0][3]) *
+                               (v0[3] < 0.0f ? 0.0f : v0[3]), 0.0f, 1.0f);
+            else if (alpha == 3)
+                out[3] = clampf(t[0][3] * v0[3], 0.0f, 1.0f);
+            else if (alpha == 4)
+                out[3] = clampf(v0[3] * t[0][2], 0.0f, 1.0f);
+            else if (alpha == 5)
+                out[3] = clampf(t[0][3], 0.0f, 1.0f);
+            else
+                out[3] = (float)(rc->factor0[0] >> 24) / 255.0f;
+            return;
+        }
+        if (trace) {
+            static NV_RC_TLS uint32_t seen[16][8];
+            static NV_RC_TLS unsigned used;
+            uint32_t key[8] = { rc->control, rc->stage_program, ci, ai,
+                               rc->color_ocw[0], rc->alpha_ocw[0],
+                               rc->final0, rc->final1 };
+            unsigned entry;
+            for (entry = 0; entry < used; ++entry)
+                if (!memcmp(seen[entry], key, sizeof key)) break;
+            if (entry == used && used < 16) {
+                memcpy(seen[used++], key, sizeof key);
+                fprintf(stderr, "[RC_GENERIC_PROGRAM] control=%08X stages=%08X ci=%08X ai=%08X co=%08X ao=%08X final=%08X/%08X\n",
+                        key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
+                fflush(stderr);
+            }
+        }
+    }
+
+    if (n > 8)
+        n = 8;
+    /* Only the registers a program can read before writing need a value:
+     * zero, r0, r1 and the final-combiner specials. */
+    for (i = 0; i < 4; i++) {
+        R[0][i] = R[6][i] = R[7][i] = 0.0f;
+        R[12][i] = R[13][i] = R[14][i] = R[15][i] = 0.0f;
+    }
+    for (i = 0; i < 4; i++) {
+        R[R_FOG][i] = fog[i];
+        R[R_V0][i] = v0[i];
+        R[R_V1][i] = v1[i];
+        R[R_T0 + 0][i] = t[0][i];
+        R[R_T0 + 1][i] = t[1][i];
+        R[R_T0 + 2][i] = t[2][i];
+        R[R_T0 + 3][i] = t[3][i];
+    }
+    /* r0.a starts as texture 0's alpha, or 1 with stage 0 off (psh.c). */
+    R[R_R0][3] = (rc->stage_program & 0x1F) ? t[0][3] : 1.0f;
+
+    for (s = 0; s < n; s++) {
+        uint32_t icw = rc->color_icw[s], ocw = rc->color_ocw[s];
+        uint32_t aicw = rc->alpha_icw[s], aocw = rc->alpha_ocw[s];
+        uint32_t fl = ocw >> 12, afl = aocw >> 12;
+        /* No destination means no live result. Constants reload in the
+         * next stage/final combiner, and register zero always remains zero. */
+        if (!((ocw | aocw) & 0xfffu)) continue;
+        float A[3], B[3], C[3], D[3], ab[3], cd[3], ms[3];
+        float aA, aB, aC, aD, aab, acd, ams;
+        int mux_cd;
+
+        /* One c0/c1 for every stage, or one per stage (COMBINERCOUNT). */
+        memcpy(R[R_C0], unpack_cached(rc->factor0[(flags & 0x010) ? s : 0]), 16);
+        memcpy(R[R_C1], unpack_cached(rc->factor1[(flags & 0x100) ? s : 0]), 16);
+        mux_cd = (flags & 1) ? R[R_R0][3] >= 0.5f
+                             : ((int)(R[R_R0][3] * 255.0f) & 1);
+
+        /* Both portions read before either writes (psh.c emits all the
+         * arithmetic, then the assignments). */
+        read_rgb(R, icw >> 24, A); read_rgb(R, icw >> 16, B);
+        read_rgb(R, icw >> 8, C);  read_rgb(R, icw, D);
+        aA = read_alpha(R, aicw >> 24); aB = read_alpha(R, aicw >> 16);
+        aC = read_alpha(R, aicw >> 8);  aD = read_alpha(R, aicw);
+
+        for (i = 0; i < 3; i++) {
+            float dab = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
+            float dcd = C[0] * D[0] + C[1] * D[1] + C[2] * D[2];
+            float pab = (fl & 2) ? dab : A[i] * B[i];
+            float pcd = (fl & 1) ? dcd : C[i] * D[i];
+            float sum = (fl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
+            ab[i] = clampf(map_out(pab, fl & 0x38), -1.0f, 1.0f);
+            cd[i] = clampf(map_out(pcd, fl & 0x38), -1.0f, 1.0f);
+            ms[i] = clampf(map_out(sum, fl & 0x38), -1.0f, 1.0f);
+        }
+        {
+            float pab = aA * aB, pcd = aC * aD;
+            float sum = (afl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
+            aab = clampf(map_out(pab, afl & 0x38), -1.0f, 1.0f);
+            acd = clampf(map_out(pcd, afl & 0x38), -1.0f, 1.0f);
+            ams = clampf(map_out(sum, afl & 0x38), -1.0f, 1.0f);
+        }
+
+        /* RGB destinations; blue-to-alpha also writes the destination's .a. */
+        if ((ocw >> 4) & 0xF) {
+            float *d = R[(ocw >> 4) & 0xF];
+            d[0] = ab[0]; d[1] = ab[1]; d[2] = ab[2];
+            if (fl & 0x80) d[3] = ab[2];
+        }
+        if (ocw & 0xF) {
+            float *d = R[ocw & 0xF];
+            d[0] = cd[0]; d[1] = cd[1]; d[2] = cd[2];
+            if (fl & 0x40) d[3] = cd[2];
+        }
+        if ((ocw >> 8) & 0xF) {
+            float *d = R[(ocw >> 8) & 0xF];
+            d[0] = ms[0]; d[1] = ms[1]; d[2] = ms[2];
+        }
+        if ((aocw >> 4) & 0xF) R[(aocw >> 4) & 0xF][3] = aab;
+        if (aocw & 0xF)        R[aocw & 0xF][3] = acd;
+        if ((aocw >> 8) & 0xF) R[(aocw >> 8) & 0xF][3] = ams;
+        /* Register 0 is zero whatever was "written" to it. */
+        R[R_ZERO][0] = R[R_ZERO][1] = R[R_ZERO][2] = R[R_ZERO][3] = 0.0f;
+    }
+
+    if (rc->final0 || rc->final1) {
+        uint32_t f0 = rc->final0, f1 = rc->final1, fflags = f1 & 0xFF;
+        float A[3], B[3], C[3], D[3], E[3], F[3];
+
+        memcpy(R[R_C0], unpack_cached(rc->final_c0), 16);
+        memcpy(R[R_C1], unpack_cached(rc->final_c1), 16);
+        /* V1R0 sum: optional complements (0x40 v1, 0x20 r0), clamp (0x80). */
+        for (i = 0; i < 3; i++) {
+            float a = (fflags & 0x40) ? 1.0f - R[R_V1][i] : R[R_V1][i];
+            float b = (fflags & 0x20) ? 1.0f - R[R_R0][i] : R[R_R0][i];
+            R[R_SUM][i] = (fflags & 0x80) ? clampf(a + b, 0.0f, 1.0f) : a + b;
+        }
+        R[R_SUM][3] = 0.0f;
+        read_rgb(R, f1 >> 24, E);
+        read_rgb(R, f1 >> 16, F);
+        for (i = 0; i < 3; i++)
+            R[R_EF][i] = E[i] * F[i];
+        R[R_EF][3] = 0.0f;
+        read_rgb(R, f0 >> 24, A); read_rgb(R, f0 >> 16, B);
+        read_rgb(R, f0 >> 8, C);  read_rgb(R, f0, D);
+        /* D + mix(C, B, A), alpha from G. */
+        for (i = 0; i < 3; i++)
+            out[i] = D[i] + C[i] * (1.0f - A[i]) + B[i] * A[i];
+        out[3] = read_alpha(R, f1 >> 8);
+    } else {
+        for (i = 0; i < 4; i++)
+            out[i] = R[R_R0][i];
+    }
+    for (i = 0; i < 4; i++)
+        out[i] = clampf(out[i], 0.0f, 1.0f);
+}
