@@ -46,3 +46,12 @@ function(xbox_copy_ffmpeg target)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_ff_dlls} $<TARGET_FILE_DIR:${target}>)
     endif()
 endfunction()
+
+# Every executable that links the runtime libraries needs the DLLs beside it
+# on Windows: SDL_shadercross's DXC (dxcompiler.dll, dxil.dll) and FFmpeg are
+# imported by the static libraries whether or not a particular program uses
+# them. Call this once per executable.
+function(xbox_copy_runtime_dlls target)
+    xbox_copy_dxc(${target})
+    xbox_copy_ffmpeg(${target})
+endfunction()

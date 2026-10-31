@@ -11,6 +11,7 @@ add_subdirectory(../.. runtime)
 add_executable(memory_layout_posix_test test_main.c)
 target_include_directories(memory_layout_posix_test PRIVATE ../../src/kernel)
 target_link_libraries(memory_layout_posix_test PRIVATE xboxrecomp)
+xbox_copy_runtime_dlls(memory_layout_posix_test)
 enable_testing()
 add_test(NAME memory_layout_posix_test
          COMMAND memory_layout_posix_test

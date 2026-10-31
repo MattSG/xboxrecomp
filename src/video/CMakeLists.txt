@@ -10,4 +10,4 @@ target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 target_link_libraries(xbox_video PUBLIC xbox_d3d8)
-target_link_libraries(xbox_video PRIVATE xbox::ffmpeg)
+target_link_libraries(xbox_video PUBLIC xbox::ffmpeg)

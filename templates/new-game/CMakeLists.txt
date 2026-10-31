@@ -88,9 +88,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 
 # The runtime compiles shaders at run time with DXC, which loads dxcompiler.dll
 # and dxil.dll from beside the executable; copy them there.
-xbox_copy_dxc(${PROJECT_NAME})
-# FFmpeg (FMV video, WMA audio): on Windows the downloaded DLLs go beside the executable too.
-xbox_copy_ffmpeg(${PROJECT_NAME})
+xbox_copy_runtime_dlls(${PROJECT_NAME})
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)

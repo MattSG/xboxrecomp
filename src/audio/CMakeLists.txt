@@ -16,7 +16,7 @@ target_link_libraries(xbox_dsound PUBLIC xbox_apu)
 target_link_libraries(xbox_dsound PUBLIC platform)
 
 # WMA assets are decoded to PCM with FFmpeg (SDL3 has no decoder).
-target_link_libraries(xbox_dsound PRIVATE xbox::ffmpeg)
+target_link_libraries(xbox_dsound PUBLIC xbox::ffmpeg)
 
 if(MSVC)
     target_compile_options(xbox_dsound PRIVATE /W4 /O2)

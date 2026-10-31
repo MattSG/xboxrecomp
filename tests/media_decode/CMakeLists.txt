@@ -9,7 +9,6 @@ if(XBOX_FFMPEG_ROOT)
     target_compile_definitions(media_decode_test PRIVATE
         XBOX_FFMPEG_BIN="${XBOX_FFMPEG_ROOT}/bin/ffmpeg.exe")
 endif()
-xbox_copy_dxc(media_decode_test)
-xbox_copy_ffmpeg(media_decode_test)
+xbox_copy_runtime_dlls(media_decode_test)
 enable_testing()
 add_test(NAME media_decode_test COMMAND media_decode_test)

@@ -35,12 +35,14 @@ target_link_libraries(d3d8_states_smoke PRIVATE platform SDL3::SDL3)
 
 add_executable(d3d8_gamma test_gamma.c)
 target_link_libraries(d3d8_gamma PRIVATE xbox_d3d8)
-xbox_copy_dxc(d3d8_gamma)
 
 add_executable(d3d8_a8 test_a8.c)
 target_link_libraries(d3d8_a8 PRIVATE xbox_d3d8)
-xbox_copy_dxc(d3d8_a8)
 
+xbox_copy_runtime_dlls(d3d8_smoke)
+xbox_copy_runtime_dlls(d3d8_states_smoke)
+xbox_copy_runtime_dlls(d3d8_gamma)
+xbox_copy_runtime_dlls(d3d8_a8)
 enable_testing()
 add_test(NAME d3d8_smoke COMMAND d3d8_smoke)
 add_test(NAME d3d8_states_smoke COMMAND d3d8_states_smoke)
