@@ -3342,6 +3342,36 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
     nv2a_d3d_flip_present(surface_addr, pitch, 1);
 }
 
+/* The title's thread asks for a frame by raising a flag and waits for this thread to lower it; it
+ * sleeps on a semaphore the presenter posts when it is done (see nv2a_d3d11.c: yielding in a loop kept
+ * a core busy). A stale post only makes one wait return early, and the loop rechecks the flag; the short
+ * timeout is a safety net. The semaphore is made by the title's thread before it raises its flag. */
+static SDL_Semaphore *s_request_done;
+
+static void request_raise(SDL_AtomicInt *flag)
+{
+    if (!s_request_done)
+        s_request_done = SDL_CreateSemaphore(0);
+    SDL_SetAtomicInt(flag, 1);
+}
+
+static void request_wait(SDL_AtomicInt *flag)
+{
+    while (SDL_GetAtomicInt(flag)) {
+        if (s_request_done)
+            SDL_WaitSemaphoreTimeout(s_request_done, 10);
+        else
+            SDL_Delay(0);
+    }
+}
+
+static void request_complete(SDL_AtomicInt *flag)
+{
+    SDL_SetAtomicInt(flag, 0);
+    if (s_request_done)
+        SDL_SignalSemaphore(s_request_done);
+}
+
 /* Match D3D11's title-thread request/executor-thread replay handoff. */
 static SDL_AtomicInt s_interp_req;
 static float s_interp_t;
@@ -3351,8 +3381,8 @@ void nv2a_d3d_interp_frame(float t, int need_new)
     (void)need_new; /* Replay the latest completed frame, as D3D11 does. */
     nv2a_pb_interp_enable(1);
     s_interp_t = t;
-    SDL_SetAtomicInt(&s_interp_req, 1);
-    while (SDL_GetAtomicInt(&s_interp_req)) SDL_Delay(0);
+    request_raise(&s_interp_req);
+    request_wait(&s_interp_req);
 }
 
 /* The last flipped frame shown again, paced like a flip (see nv2a_d3d11.c). */
@@ -3362,9 +3392,8 @@ void nv2a_d3d_repeat_frame(void)
 {
     if (!s_shown)
         return;
-    SDL_SetAtomicInt(&s_repeat, 1);
-    while (SDL_GetAtomicInt(&s_repeat))
-        SDL_Delay(0);
+    request_raise(&s_repeat);
+    request_wait(&s_repeat);
 }
 
 void nv2a_d3d_tick(void)
@@ -3378,7 +3407,7 @@ void nv2a_d3d_tick(void)
         extern int nv2a_pb_replay(float);
         if (!nv2a_pb_replay(s_interp_t) && !present_kept_image(NULL))
             present_surface(s_shown, NULL);
-        SDL_SetAtomicInt(&s_interp_req, 0);
+        request_complete(&s_interp_req);
         return;
     }
     if (SDL_GetAtomicInt(&s_repeat)) {
@@ -3388,7 +3417,7 @@ void nv2a_d3d_tick(void)
         pace_flip(&pacing);
         frame_csv(pacing.ticks);
         s_frame++;
-        SDL_SetAtomicInt(&s_repeat, 0);
+        request_complete(&s_repeat);
         return;
     }
     now = SDL_GetTicks();

@@ -4189,13 +4189,44 @@ void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch)
  * device; the asker waits for it as it would for a flip. */
 static volatile LONG s_repeat;
 
+/* The title's thread asks for a frame by raising a flag and waits for this thread to lower it. It
+ * sleeps on an event the presenter sets when it is done: yielding in a loop kept a whole core busy
+ * and woke late. The short timeout is only a safety net against a missed wake-up. The event is made
+ * by the title's thread before it raises its flag, so the presenter always finds it. */
+static HANDLE s_request_done;
+
+static void request_raise(volatile LONG *flag)
+{
+    if (!s_request_done)
+        s_request_done = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (s_request_done)
+        ResetEvent(s_request_done);
+    InterlockedExchange(flag, 1);
+}
+
+static void request_wait(volatile LONG *flag)
+{
+    while (InterlockedCompareExchange(flag, 1, 1)) {
+        if (s_request_done)
+            WaitForSingleObject(s_request_done, 10);
+        else
+            SwitchToThread();
+    }
+}
+
+static void request_complete(volatile LONG *flag)
+{
+    InterlockedExchange(flag, 0);
+    if (s_request_done)
+        SetEvent(s_request_done);
+}
+
 void nv2a_d3d_repeat_frame(void)
 {
     if (!s_shown)
         return;
-    InterlockedExchange(&s_repeat, 1);
-    while (InterlockedCompareExchange(&s_repeat, 1, 1))
-        SwitchToThread();
+    request_raise(&s_repeat);
+    request_wait(&s_repeat);
 }
 
 /* A frame drawn by the executor from the last one it recorded, part way
@@ -4213,9 +4244,8 @@ void nv2a_d3d_interp_frame(float t, int need_new)
     nv2a_pb_interp_enable(1);
     s_interp_t = t;
     InterlockedExchange(&s_interp_need, need_new);
-    InterlockedExchange(&s_interp_req, 1);
-    while (InterlockedCompareExchange(&s_interp_req, 1, 1))
-        SwitchToThread();
+    request_raise(&s_interp_req);
+    request_wait(&s_interp_req);
 }
 
 void nv2a_d3d_tick(void)
@@ -4240,7 +4270,7 @@ void nv2a_d3d_tick(void)
         { static int rp; if (++rp % 600 == 0) fprintf(stderr, "[INTERP] replays %d t %.2f\n", rp, s_interp_t); }   /* DIAG */
         if (!nv2a_pb_replay(s_interp_t) && !present_kept())   /* nothing recorded yet */
             present_surface(s_shown, NULL);
-        InterlockedExchange(&s_interp_req, 0);
+        request_complete(&s_interp_req);
         return;
     }
     if (s_repeat) {
@@ -4251,7 +4281,7 @@ void nv2a_d3d_tick(void)
         pace_vblank();
         frame_csv(qpc() - t0);
         s_frame++;
-        InterlockedExchange(&s_repeat, 0);
+        request_complete(&s_repeat);
         return;
     }
     now = GetTickCount();
