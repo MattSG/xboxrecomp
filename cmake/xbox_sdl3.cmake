@@ -22,6 +22,7 @@ endif()
 # submodules; the first build is long).
 if(NOT TARGET SDL3_shadercross::SDL3_shadercross-static)
     set(SDLSHADERCROSS_VENDORED ON CACHE BOOL "" FORCE)
+    set(ENABLE_SPIRV_CODEGEN ON CACHE BOOL "" FORCE)
     set(SDLSHADERCROSS_CLI OFF CACHE BOOL "" FORCE)
     set(SDLSHADERCROSS_SHARED OFF CACHE BOOL "" FORCE)
     set(SDLSHADERCROSS_STATIC ON CACHE BOOL "" FORCE)
@@ -33,3 +34,15 @@ if(NOT TARGET SDL3_shadercross::SDL3_shadercross-static)
         GIT_SUBMODULES_RECURSE TRUE)
     FetchContent_MakeAvailable(shadercross)
 endif()
+
+# DXC loads dxcompiler.dll / dxil.dll at run time. Without the vendored copies
+# next to the executable the loader finds a system dxcompiler.dll, which has no
+# SPIR-V back end ("SPIR-V CodeGen not available"). Call this for every
+# executable that compiles shaders.
+function(xbox_copy_dxc target)
+    if(WIN32 AND TARGET dxcompiler AND TARGET dxildll)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:dxcompiler> $<TARGET_FILE:dxildll> $<TARGET_FILE_DIR:${target}>)
+    endif()
+endfunction()
