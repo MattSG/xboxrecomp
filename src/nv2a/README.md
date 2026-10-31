@@ -265,4 +265,4 @@ SET_MASK(v, mask, val)// Set masked field
 - **No shader execution** — NV2A vertex/pixel programs are not emulated.
 - **No texture fetch** — Texture state is tracked but not sampled.
 
-For actual rendering, use `xbox_d3d8` (the D3D8→D3D11 layer) or build a rendering backend that reads PGRAPH state and issues D3D11 draw calls.
+For actual rendering, use `xbox_d3d8` (the SDL_GPU-backed D3D8 layer) or build a rendering backend that reads PGRAPH state and issues GPU draw calls.

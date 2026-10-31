@@ -49,6 +49,7 @@ int xgpu_init(XGpu *g, const char *title, int width, int height, int hidden)
         return 0;
     }
     g->swap_format = SDL_GetGPUSwapchainTextureFormat(g->device, g->window);
+    g->present_format = g->swap_format;
     if (!make_backbuffer(g, (Uint32)width, (Uint32)height)) {
         fprintf(stderr, "[gpu] backbuffer failed: %s\n", SDL_GetError());
         xgpu_shutdown(g);
@@ -125,12 +126,15 @@ SDL_GPURenderPass *xgpu_render_pass(XGpu *g, XGpuTargets t, const XGpuClear *cle
 
     if (!xgpu_cmd(g))
         return NULL;
-    if (g->render && !clear && g->targets.color == t.color && g->targets.depth == t.depth)
+    if (g->render && !clear && g->targets.color == t.color && g->targets.depth == t.depth &&
+        g->targets.color_mip == t.color_mip && g->targets.color_layer == t.color_layer)
         return g->render;
     xgpu_end_passes(g);
 
     SDL_zero(c);
     c.texture = color;
+    c.mip_level = t.color_mip;
+    c.layer_or_depth_plane = t.color_layer;
     c.store_op = SDL_GPU_STOREOP_STORE;
     if (clear && clear->color) {
         c.load_op = SDL_GPU_LOADOP_CLEAR;
@@ -144,13 +148,12 @@ SDL_GPURenderPass *xgpu_render_pass(XGpu *g, XGpuTargets t, const XGpuClear *cle
         d.texture = t.depth;
         d.store_op = SDL_GPU_STOREOP_STORE;
         d.stencil_store_op = SDL_GPU_STOREOP_STORE;
-        if (clear && clear->depth) {
-            d.load_op = SDL_GPU_LOADOP_CLEAR;
-            d.stencil_load_op = SDL_GPU_LOADOP_CLEAR;
+        /* Depth and stencil share a texture but D3D8 clears them separately. */
+        d.load_op = (clear && clear->depth) ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+        d.stencil_load_op = (clear && clear->stencil) ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+        if (clear) {
             d.clear_depth = clear->z;
-        } else {
-            d.load_op = SDL_GPU_LOADOP_LOAD;
-            d.stencil_load_op = SDL_GPU_LOADOP_LOAD;
+            d.clear_stencil = clear->stencil_value;
         }
     }
     g->render = SDL_BeginGPURenderPass(g->cmd, &c, 1, t.depth ? &d : NULL);
@@ -331,7 +334,8 @@ void xgpu_present(XGpu *g)
 
     if (xgpu_cmd(g)) {
         xgpu_end_passes(g);
-        if (SDL_WaitAndAcquireGPUSwapchainTexture(g->cmd, g->window, &swap, &sw, &sh) && swap) {
+        if (SDL_WaitAndAcquireGPUSwapchainTexture(g->cmd, g->window, &swap, &sw, &sh) && swap &&
+            !(g->present_hook && g->present_hook(g, swap, sw, sh))) {
             SDL_GPUBlitInfo bi;
             SDL_zero(bi);
             bi.source.texture = g->backbuffer;
@@ -391,7 +395,24 @@ XGpuTex *xgputex_ref(XGpuTex *t)
 void xgputex_unref(XGpu *g, XGpuTex *t)
 {
     if (t && --t->refs <= 0) {
-        SDL_ReleaseGPUTexture(g->device, t->tex);
+        if (!t->borrowed)
+            SDL_ReleaseGPUTexture(g->device, t->tex);
         SDL_free(t);
     }
+}
+
+XGpuTex *xgputex_wrap(SDL_GPUTexture *tex, SDL_GPUTextureFormat format, Uint32 w, Uint32 h)
+{
+    XGpuTex *t = (XGpuTex *)SDL_calloc(1, sizeof(*t));
+    if (!t)
+        return NULL;
+    t->tex = tex;
+    t->refs = 1;
+    t->type = SDL_GPU_TEXTURETYPE_2D;
+    t->format = format;
+    t->width = w; t->height = h;
+    t->depth_or_layers = 1;
+    t->levels = 1;
+    t->borrowed = 1;
+    return t;
 }

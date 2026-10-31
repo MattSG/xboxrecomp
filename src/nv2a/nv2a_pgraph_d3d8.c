@@ -1,7 +1,7 @@
 /*
- * NV2A PGRAPH → D3D11 Translator
+ * NV2A PGRAPH → D3D8 Translator
  *
- * Translates NV2A push buffer methods into D3D8→D3D11 rendering calls.
+ * Translates NV2A push buffer methods into D3D8 on SDL_GPU rendering calls.
  * Designed for Xbox static recompilation (xboxrecomp toolkit).
  *
  * Menu rendering profile (captured from xemu):
@@ -11,7 +11,7 @@
  *   - Textured 2D elements in 640×480 screen space
  */
 
-#include "nv2a_pgraph_d3d11.h"
+#include "nv2a_pgraph_d3d8.h"
 #include "nv2a_regs.h"
 #include <stdio.h>
 #include <string.h>
@@ -50,7 +50,7 @@ static IDirect3DTexture8 *create_dxt5_texture(IDirect3DDevice8 *dev,
     HRESULT hr = dev->lpVtbl->CreateTexture(dev, width, height, 1,
         0 /*Usage*/, 0x0F /*DXT5*/, 0 /*D3DPOOL_DEFAULT*/, &tex);
     if (hr != 0 || !tex) {
-        fprintf(stderr, "[PGRAPH-D3D11] Failed to create font atlas texture: hr=0x%08X\n", hr);
+        fprintf(stderr, "[PGRAPH-D3D8] Failed to create font atlas texture: hr=0x%08X\n", hr);
         return NULL;
     }
 
@@ -60,10 +60,10 @@ static IDirect3DTexture8 *create_dxt5_texture(IDirect3DDevice8 *dev,
     if (hr == 0 && lr.pBits) {
         memcpy(lr.pBits, dxt5_data, data_size);
         tex->lpVtbl->UnlockRect(tex, 0);
-        fprintf(stderr, "[PGRAPH-D3D11] Created font atlas: %ux%u DXT5 (%u bytes)\n",
+        fprintf(stderr, "[PGRAPH-D3D8] Created font atlas: %ux%u DXT5 (%u bytes)\n",
                 width, height, data_size);
     } else {
-        fprintf(stderr, "[PGRAPH-D3D11] Failed to lock font atlas: hr=0x%08X\n", hr);
+        fprintf(stderr, "[PGRAPH-D3D8] Failed to lock font atlas: hr=0x%08X\n", hr);
     }
     return tex;
 }
@@ -183,7 +183,7 @@ static struct {
     int texture_lookup_done;
 
     /* Stats */
-    PgraphD3D11Stats stats;
+    PgraphD3D8Stats stats;
 
     /* Chyron scroll */
     float chyron_scroll_offset;  /* Pixels to shift X for chyron text */
@@ -205,7 +205,7 @@ static float u2f(uint32_t u) {
  * Initialization
  * ══════════════════════════════════════════════════════════════════════ */
 
-void pgraph_d3d11_init(void)
+void pgraph_d3d8_init(void)
 {
     memset(&g_pg, 0, sizeof(g_pg));
     g_pg.vert_stride = INLINE_VERT_DWORDS;  /* Default: 5 dwords per vertex */
@@ -213,13 +213,13 @@ void pgraph_d3d11_init(void)
     g_pg.color_mask = 0x01010101;
     g_pg.initialized = 1;
 
-    fprintf(stderr, "[PGRAPH-D3D11] Translator initialized\n");
+    fprintf(stderr, "[PGRAPH-D3D8] Translator initialized\n");
 }
 
-void pgraph_d3d11_shutdown(void)
+void pgraph_d3d8_shutdown(void)
 {
     g_pg.initialized = 0;
-    fprintf(stderr, "[PGRAPH-D3D11] Translator shut down (draws=%u, verts=%u)\n",
+    fprintf(stderr, "[PGRAPH-D3D8] Translator shut down (draws=%u, verts=%u)\n",
             g_pg.stats.draw_calls, g_pg.stats.vertices_submitted);
 }
 
@@ -331,7 +331,7 @@ static void submit_draw(void)
 
     /* Log first few draws' vertex positions (once) */
     if (g_pg.stats.draw_calls < 3 && num_verts >= 3) {
-        fprintf(stderr, "[PGRAPH-D3D11] Draw verts (mode=%u, %u in → %u out):\n",
+        fprintf(stderr, "[PGRAPH-D3D8] Draw verts (mode=%u, %u in → %u out):\n",
                 g_pg.draw_mode, num_verts, out_vert_count);
         uint32_t show = num_verts < 8 ? num_verts : 8;
         for (uint32_t i = 0; i < show; i++) {
@@ -363,7 +363,7 @@ static void submit_draw(void)
     if (g_textures_loaded) {
         if (!g_pg.texture_lookup_done) {
             g_pg.texture_lookup_done = 1;
-            fprintf(stderr, "[PGRAPH-D3D11] Texture lookup init (global_txd has %d textures)\n",
+            fprintf(stderr, "[PGRAPH-D3D8] Texture lookup init (global_txd has %d textures)\n",
                     g_global_txd.count);
             for (int ti = 0; ti < g_global_txd.count; ti++) {
                 fprintf(stderr, "    [%3d] %-24s %3ux%-3u fmt=0x%X\n",
@@ -445,7 +445,7 @@ static void submit_draw(void)
     g_pg.stats.vertices_submitted += num_verts;
 
     if (g_pg.stats.draw_calls <= 5 || (g_pg.stats.draw_calls % 1000) == 0) {
-        fprintf(stderr, "[PGRAPH-D3D11] Draw #%u: %u verts, prim=%d, prims=%u\n",
+        fprintf(stderr, "[PGRAPH-D3D8] Draw #%u: %u verts, prim=%d, prims=%u\n",
                 g_pg.stats.draw_calls, num_verts, g_pg.d3d_prim_type, prim_count);
     }
 }
@@ -454,7 +454,7 @@ static void submit_draw(void)
  * Method Handler
  * ══════════════════════════════════════════════════════════════════════ */
 
-int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
+int pgraph_d3d8_method(int subchannel, uint32_t method, uint32_t param)
 {
     if (!g_pg.initialized)
         return 0;
@@ -633,7 +633,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     }
 }
 
-void pgraph_d3d11_flush(void)
+void pgraph_d3d8_flush(void)
 {
     if (g_pg.in_draw) {
         submit_draw();
@@ -642,12 +642,12 @@ void pgraph_d3d11_flush(void)
     g_pg.stats.frames++;
 }
 
-void pgraph_d3d11_set_chyron_scroll(uint32_t pixels)
+void pgraph_d3d8_set_chyron_scroll(uint32_t pixels)
 {
     g_pg.chyron_scroll_offset = (float)pixels;
 }
 
-void pgraph_d3d11_get_stats(PgraphD3D11Stats *out)
+void pgraph_d3d8_get_stats(PgraphD3D8Stats *out)
 {
     if (out) *out = g_pg.stats;
 }

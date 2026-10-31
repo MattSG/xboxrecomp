@@ -19,18 +19,22 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_gpu.h>
 
+struct XGpu;
+
 /* The attachments a render pass draws into. Passes are reused while the
  * targets stay the same; any change ends the pass and starts a new one. */
 typedef struct XGpuTargets {
     SDL_GPUTexture *color;               /* NULL = the backbuffer */
     SDL_GPUTexture *depth;               /* may be NULL */
+    Uint32          color_mip, color_layer;   /* which level/face of `color` */
 } XGpuTargets;
 
 /* Which attachments a new render pass clears instead of loading. */
 typedef struct XGpuClear {
-    int   color, depth;
+    int   color, depth, stencil;
     float rgba[4];
     float z;
+    Uint8 stencil_value;
 } XGpuClear;
 
 typedef struct XGpu {
@@ -51,6 +55,12 @@ typedef struct XGpu {
     Uint32                 ring_size, ring_used;
 
     int                    in_frame;     /* between xgpu_begin_frame and present */
+
+    /* Optional: draw the backbuffer into the swapchain image yourself (gamma,
+     * scaling filters). Return nonzero if you did; zero falls back to a blit. */
+    int                  (*present_hook)(struct XGpu *g, SDL_GPUTexture *swap,
+                                         Uint32 swap_w, Uint32 swap_h);
+    SDL_GPUTextureFormat   present_format;   /* swapchain format, for pipelines */
 } XGpu;
 
 /* hidden != 0 creates the window without showing it (tests, headless runs).
@@ -122,12 +132,15 @@ typedef struct XGpuTex {
     SDL_GPUTextureType     type;
     SDL_GPUTextureFormat   format;
     Uint32                 width, height, depth_or_layers, levels;
+    int                    borrowed;      /* not ours to release (the backbuffer) */
 } XGpuTex;
 
 /* Returns NULL on failure. The caller owns one reference. */
 XGpuTex *xgputex_create(XGpu *g, SDL_GPUTextureType type, SDL_GPUTextureFormat format,
                         Uint32 w, Uint32 h, Uint32 depth_or_layers, Uint32 levels,
                         SDL_GPUTextureUsageFlags usage);
+/* Wraps a texture owned elsewhere; unref never releases it. */
+XGpuTex *xgputex_wrap(SDL_GPUTexture *tex, SDL_GPUTextureFormat format, Uint32 w, Uint32 h);
 XGpuTex *xgputex_ref(XGpuTex *t);
 void     xgputex_unref(XGpu *g, XGpuTex *t);
 

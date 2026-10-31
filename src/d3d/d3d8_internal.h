@@ -11,14 +11,8 @@
 #define COBJMACROS
 #include "d3d8_xbox.h"
 
-/* Portable: D3D8 device accessor used by recompiled code on both backends
- * (d3d8_device.c on Windows, d3d8_gl.c on POSIX). */
+/* D3D8 device accessor used by recompiled code. */
 IDirect3DDevice8 *d3d8_GetDevice(void);
-
-#if defined(_WIN32)
-/* === Everything below is the D3D11 backend. The POSIX d3d8_compat
- * library (d3d8_gl.c) implements its own internal state and does not
- * need any of these declarations. === */
 
 #include "gfx/gpu_device.h"
 
@@ -35,6 +29,8 @@ UINT                 d3d8_GetBackbufferHeight(void);
 void d3d8_gamma_set(const D3DGAMMARAMP *ramp);
 void d3d8_gamma_get(D3DGAMMARAMP *ramp);
 void d3d8_gamma_shutdown(void);
+/* XGpu.present_hook: draws the backbuffer into the swapchain image through the ramp. */
+int  d3d8_gamma_present(XGpu *g, SDL_GPUTexture *swap, Uint32 swap_w, Uint32 swap_h);
 
 /* Current render state array accessor */
 const DWORD         *d3d8_GetRenderStates(void);
@@ -361,7 +357,5 @@ int     d3d8_pipe_draw(const D3D8Draw *draw);
 void    d3d8_GetCurrentTargets(XGpuTargets *t, SDL_GPUTextureFormat *color_fmt,
                                SDL_GPUTextureFormat *depth_fmt, Uint32 *w, Uint32 *h);
 void    d3d8_GetViewport(D3DVIEWPORT8 *vp);
-
-#endif /* _WIN32 -- end of D3D11 backend section */
 
 #endif /* BURNOUT3_D3D8_INTERNAL_H */
