@@ -7,26 +7,26 @@
  * implemented, none of it is observable. This is the other half: a window that
  * reads that memory and puts it on screen.
  *
- * Deliberately plain GDI rather than the D3D8 layer. The point is to display
- * whatever the guest actually wrote, so the fewer stages between guest memory
- * and the screen the better -- and it must keep working while the D3D8 layer
- * is busy with something else, such as the FMV player's own window.
+ * Deliberately plain: a CPU-converted image uploaded to an SDL texture, not the
+ * D3D8 layer. The point is to display whatever the guest actually wrote, so the
+ * fewer stages between guest memory and the screen the better -- and it must
+ * keep working while the D3D8 layer is busy with something else, such as the
+ * FMV player's own window.
  *
  * Off unless RECOMP_FB_WINDOW is set.
  */
+#include <SDL3/SDL.h>
 #include <stdint.h>
-
-#if defined(_WIN32)
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+void xbox_PumpEvents(void);
 
-static volatile LONG s_fb_running;
+static SDL_AtomicInt s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
-static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+static uint32_t     *s_rgb;           /* converted 32-bit copy that is uploaded */
 
 /* A finished frame, taken at the flip and shown until the next one.
  *
@@ -40,7 +40,7 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * Two buffers and an index, swapped after the copy completes, so the window
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
-static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+static SDL_AtomicInt s_present_idx = { -1 };   /* -1 until the first flip */
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -59,17 +59,16 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
     const uint8_t *src;
-    LONG next;
+    int next;
     uint32_t bpp, x, y;
 
-    if (!s_fb_running || !fb_va || !pitch)
+    if (!SDL_GetAtomicInt(&s_fb_running) || !fb_va || !pitch)
         return;
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
-    next = (s_present_idx == 0) ? 1 : 0;
+    next = (SDL_GetAtomicInt(&s_present_idx) == 0) ? 1 : 0;
     if (!s_present[next]) {
-        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
-                                             4);
+        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
         if (!s_present[next])
             return;
     }
@@ -95,71 +94,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         }
     }
     /* Published only once it is whole. */
-    InterlockedExchange(&s_present_idx, next);
-}
-
-/* Which keys are down, for the pad stand-in in src/input.
- *
- * GetAsyncKeyState looked like the cheaper way to ask and does not work
- * here: it reads a state Wine keeps for the X server, and a guest process
- * drawing through GDI never sees it change. The window that has the focus
- * is the thing that receives the keys, so that is what has to remember
- * them.
- *
- * Reading this needs no lock. Each entry is written only by the window
- * thread and read only by the USB thread, one byte at a time, and a press
- * seen a frame late is indistinguishable from one made a frame later. */
-static volatile unsigned char s_key_down[256];
-
-int xbox_FramebufferKeyDown(int vk)
-{
-    if ((unsigned)vk > 255)
-        return 0;
-    return s_key_down[vk] != 0;
-}
-
-static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
-{
-    switch (m) {
-    case WM_CLOSE:
-    case WM_DESTROY:
-        InterlockedExchange(&s_fb_running, 0);
-        return 0;
-
-    case WM_KEYDOWN:
-    case WM_SYSKEYDOWN:
-        if ((unsigned)w < 256)
-            s_key_down[w] = 1;
-        /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
-         *
-         * The obvious diagnostic -- sampling which keys are held, once a
-         * second, from the input path -- cannot tell a key that was never
-         * pressed from one that was tapped: a 100 ms press is caught about
-         * one time in ten. That ambiguity is expensive when the only way
-         * to test is to ask someone to press a key and describe what
-         * happened. This answers "did it arrive" on its own. */
-        if (getenv("RECOMP_KEY_TRACE")) {
-            static unsigned n;
-            if (n++ < 40) {
-                fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)w);
-                fflush(stderr);
-            }
-        }
-        /* System keys still go to Windows, or Alt+F4 stops closing us. */
-        return m == WM_SYSKEYDOWN ? DefWindowProcA(h, m, w, l) : 0;
-
-    case WM_KEYUP:
-    case WM_SYSKEYUP:
-        if ((unsigned)w < 256)
-            s_key_down[w] = 0;
-        return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
-
-    /* Alt-tabbing away with a key held would leave it held for ever. */
-    case WM_KILLFOCUS:
-        memset((void *)s_key_down, 0, sizeof s_key_down);
-        return 0;
-    }
-    return DefWindowProcA(h, m, w, l);
+    SDL_SetAtomicInt(&s_present_idx, next);
 }
 
 /* The display formats an Xbox front buffer is actually set to. The pitch says
@@ -234,76 +169,55 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
-static DWORD WINAPI fb_thread(LPVOID unused)
+static int SDLCALL fb_thread(void *unused)
 {
-    HWND hwnd;
-    HDC hdc;
-    BITMAPINFO bi;
-    RECT r;
+    SDL_Window *window = NULL;
+    SDL_Renderer *renderer = NULL;
+    SDL_Texture *texture;
 
     (void)unused;
 
-    {
-        WNDCLASSA wc;
-        memset(&wc, 0, sizeof(wc));
-        wc.lpfnWndProc   = fb_wndproc;
-        wc.hInstance     = GetModuleHandleA(NULL);
-        wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
-        wc.lpszClassName = "XboxRecompFramebuffer";
-        RegisterClassA(&wc);
-    }
-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                           CW_USEDEFAULT, CW_USEDEFAULT,
-                           r.right - r.left, r.bottom - r.top,
-                           NULL, NULL, GetModuleHandleA(NULL), NULL);
-    if (!hwnd) {
-        InterlockedExchange(&s_fb_running, 0);
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO) ||
+        !SDL_CreateWindowAndRenderer("Xbox Recomp - Framebuffer", (int)s_fb_width,
+                                     (int)s_fb_height, SDL_WINDOW_RESIZABLE,
+                                     &window, &renderer)) {
+        fprintf(stderr, "  [FBWIN] cannot open window: %s\n", SDL_GetError());
+        SDL_SetAtomicInt(&s_fb_running, 0);
         return 0;
     }
-    hdc = GetDC(hwnd);
-
-    memset(&bi, 0, sizeof(bi));
-    bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth       = (LONG)s_fb_width;
-    bi.bmiHeader.biHeight      = -(LONG)s_fb_height;   /* top-down */
-    bi.bmiHeader.biPlanes      = 1;
-    bi.bmiHeader.biBitCount    = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-
+    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING,
+                                (int)s_fb_width, (int)s_fb_height);
     s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+    if (!texture || !s_rgb) {
+        SDL_SetAtomicInt(&s_fb_running, 0);
+    } else {
+        fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n", s_fb_width, s_fb_height);
+    }
 
-    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
-            s_fb_width, s_fb_height);
+    while (SDL_GetAtomicInt(&s_fb_running)) {
+        int shown = 0;
 
-    while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
-        MSG msg;
-        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageA(&msg);
-        }
-        if (s_present_idx >= 0 && s_rgb) {
+        xbox_PumpEvents();
+        if (SDL_GetAtomicInt(&s_present_idx) >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
-             * the dump path and GDI see one consistent image even if the
-             * next flip lands mid-blit. */
-            LONG idx = s_present_idx;
+             * the dump path and the texture see one consistent image even if
+             * the next flip lands mid-upload. */
+            int idx = SDL_GetAtomicInt(&s_present_idx);
             if (s_present[idx])
-                memcpy(s_rgb, s_present[idx],
-                       (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+                memcpy(s_rgb, s_present[idx], (size_t)s_fb_width * s_fb_height * 4);
+            shown = 1;
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
-            const uint8_t *src =
-                (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
+            const uint8_t *src = (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            shown = 1;
+        }
+        if (shown) {
+            SDL_UpdateTexture(texture, NULL, s_rgb, (int)(s_fb_width * 4));
+            SDL_RenderClear(renderer);
+            SDL_RenderTexture(renderer, texture, NULL, NULL);
+            SDL_RenderPresent(renderer);
         }
         {
             /* One dump a few seconds in, so the title has had time to render
@@ -328,11 +242,12 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 xbox_FramebufferDumpBmp(dump);
             }
         }
-        Sleep(16);
+        SDL_Delay(16);
     }
 
-    ReleaseDC(hwnd, hdc);
-    DestroyWindow(hwnd);
+    if (texture) SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
     free(s_rgb);
     s_rgb = NULL;
     return 0;
@@ -340,22 +255,15 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 
 void xbox_FramebufferWindowStart(void)
 {
-    HANDLE th;
+    SDL_Thread *th;
 
     if (!getenv("RECOMP_FB_WINDOW"))
         return;
-    if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
+    if (!SDL_CompareAndSwapAtomicInt(&s_fb_running, 0, 1))
         return;
-    th = CreateThread(NULL, 0, fb_thread, NULL, 0, NULL);
+    th = SDL_CreateThread(fb_thread, "framebuffer window", NULL);
     if (th)
-        CloseHandle(th);
+        SDL_DetachThread(th);
     else
-        InterlockedExchange(&s_fb_running, 0);
+        SDL_SetAtomicInt(&s_fb_running, 0);
 }
-
-#else
-void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowStart(void) {}
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
-#endif

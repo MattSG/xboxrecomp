@@ -115,52 +115,14 @@ static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
 
 /* Window events: the game's internal loop drives rendering, so nothing else
- * pumps the window. Called from every present. Also tracks held keys for the
- * RECOMP_KEYBOARD pad stand-in (see src/input). */
-static unsigned char g_keys_down[512];
-
-static void d3d8_pump_events(void)
-{
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED)
-            exit(0);
-        if ((e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) &&
-            (unsigned)e.key.scancode < sizeof(g_keys_down))
-            g_keys_down[e.key.scancode] = (e.type == SDL_EVENT_KEY_DOWN);
-        if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST)
-            memset(g_keys_down, 0, sizeof(g_keys_down));
-    }
-}
-
-/* Win32 virtual-key code -> SDL scancode, for the keys src/input uses. */
-int xbox_D3DKeyDown(int vk)
-{
-    SDL_Scancode sc = SDL_SCANCODE_UNKNOWN;
-
-    if (vk >= 'A' && vk <= 'Z')      sc = (SDL_Scancode)(SDL_SCANCODE_A + (vk - 'A'));
-    else if (vk >= '1' && vk <= '9') sc = (SDL_Scancode)(SDL_SCANCODE_1 + (vk - '1'));
-    else switch (vk) {
-    case 0x08: sc = SDL_SCANCODE_BACKSPACE; break;
-    case 0x0D: sc = SDL_SCANCODE_RETURN; break;
-    case 0x25: sc = SDL_SCANCODE_LEFT; break;
-    case 0x26: sc = SDL_SCANCODE_UP; break;
-    case 0x27: sc = SDL_SCANCODE_RIGHT; break;
-    case 0x28: sc = SDL_SCANCODE_DOWN; break;
-    case 0x62: sc = SDL_SCANCODE_KP_2; break;
-    case 0x64: sc = SDL_SCANCODE_KP_4; break;
-    case 0x66: sc = SDL_SCANCODE_KP_6; break;
-    case 0x68: sc = SDL_SCANCODE_KP_8; break;
-    case 0x10: return g_keys_down[SDL_SCANCODE_LSHIFT] || g_keys_down[SDL_SCANCODE_RSHIFT];
-    case 0x11: return g_keys_down[SDL_SCANCODE_LCTRL] || g_keys_down[SDL_SCANCODE_RCTRL];
-    default: return 0;
-    }
-    return sc != SDL_SCANCODE_UNKNOWN && g_keys_down[sc];
-}
+ * pumps the window. Called from every present. The pump (src/video/sdl_events.c)
+ * is shared with the framebuffer window so the two never steal each other's
+ * events, and it keeps the held-key state for the RECOMP_KEYBOARD pad stand-in. */
+void xbox_PumpEvents(void);
 
 static HRESULT d3d8_present(void)
 {
-    d3d8_pump_events();
+    xbox_PumpEvents();
     xgpu_present(&g_device_state.gpu);
     xgpu_begin_frame(&g_device_state.gpu);
     d3d8_pipe_begin_frame();
