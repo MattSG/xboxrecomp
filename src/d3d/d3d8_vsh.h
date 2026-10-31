@@ -46,7 +46,7 @@
 #ifndef XBOXRECOMP_D3D8_VSH_H
 #define XBOXRECOMP_D3D8_VSH_H
 
-#include <d3d11.h>
+#include "gfx/gpu_shader.h"
 #include <stdint.h>
 #include <windows.h>
 

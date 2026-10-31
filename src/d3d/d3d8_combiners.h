@@ -40,7 +40,7 @@
 #ifndef XBOXRECOMP_D3D8_COMBINERS_H
 #define XBOXRECOMP_D3D8_COMBINERS_H
 
-#include <d3d11.h>
+#include "gfx/gpu_shader.h"
 #include <stdint.h>
 #include <windows.h>
 
@@ -316,7 +316,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
  * @return       Compiled pixel shader, or NULL on failure.
  *               The shader is owned by the cache - do NOT release it.
  */
-ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state);
+const XGpuShader *d3d8_combiners_get_shader(const NV2ACombinerState *state);
 
 /**
  * Prepare for a draw call using register combiners.

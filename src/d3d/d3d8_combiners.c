@@ -53,9 +53,6 @@ static NV2ACombinerState g_combiner_state;
 /** Dirty flag - set when any PS render state changes. */
 static BOOL g_dirty = TRUE;
 
-/** PS constant buffer (uploaded to GPU each draw). */
-static ID3D11Buffer *g_combiner_cb = NULL;
-
 /* ================================================================
  * Shader Cache
  *
@@ -71,7 +68,7 @@ typedef struct CombinerCacheEntry {
     BOOL                in_use;
     uint32_t            hash;
     NV2ACombinerState   state;
-    ID3D11PixelShader  *shader;
+    XGpuShader          shader;
     uint32_t            last_used_frame;
 } CombinerCacheEntry;
 
@@ -489,23 +486,25 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     int off = 0;
     int i;
 
-    /* ---- Texture samplers ---- */
+    /* ---- Texture samplers ----
+     * All four are always declared and used (see the keep-alive at the end of
+     * main): SDL_GPU wants fragment sampler bindings to be 0..n-1 with no gaps,
+     * and the compiler drops unused resources. A stage with no texture mode
+     * is declared as 2D and gets a white texture bound at draw time. */
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
-        if (state->tex_mode[i] != NV2A_TEXMODE_NONE) {
-            if (state->tex_mode[i] == NV2A_TEXMODE_CUBEMAP) {
-                EMIT("TextureCube  tex%d : register(t%d);\n", i, i);
-            } else if (state->tex_mode[i] == NV2A_TEXMODE_3D) {
-                EMIT("Texture3D    tex%d : register(t%d);\n", i, i);
-            } else {
-                EMIT("Texture2D    tex%d : register(t%d);\n", i, i);
-            }
-            EMIT("SamplerState samp%d : register(s%d);\n", i, i);
+        if (state->tex_mode[i] == NV2A_TEXMODE_CUBEMAP) {
+            EMIT("TextureCube  tex%d : register(t%d, space2);\n", i, i);
+        } else if (state->tex_mode[i] == NV2A_TEXMODE_3D) {
+            EMIT("Texture3D    tex%d : register(t%d, space2);\n", i, i);
+        } else {
+            EMIT("Texture2D    tex%d : register(t%d, space2);\n", i, i);
         }
+        EMIT("SamplerState samp%d : register(s%d, space2);\n", i, i);
     }
     EMIT("\n");
 
     /* ---- Constant buffer ---- */
-    EMIT("cbuffer CombinerCB : register(b0) {\n");
+    EMIT("cbuffer CombinerCB : register(b0, space3) {\n");
     EMIT("    float4 c0[8];\n");    /* Per-stage C0 */
     EMIT("    float4 c1[8];\n");    /* Per-stage C1 */
     EMIT("    float4 fc0;\n");      /* Final combiner C0 */
@@ -521,12 +520,12 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     /* ---- Input structure ---- */
     EMIT("struct PS_IN {\n");
     EMIT("    float4 pos     : SV_POSITION;\n");
-    EMIT("    float4 color0  : COLOR0;\n");
-    EMIT("    float4 color1  : COLOR1;\n");
-    EMIT("    float3 tc0     : TEXCOORD0;\n");
-    EMIT("    float3 tc1     : TEXCOORD1;\n");
-    EMIT("    float3 tc2     : TEXCOORD2;\n");
-    EMIT("    float3 tc3     : TEXCOORD3;\n");
+    EMIT("    [[vk::location(0)]] float4 color0  : COLOR0;\n");
+    EMIT("    [[vk::location(1)]] float4 color1  : COLOR1;\n");
+    EMIT("    [[vk::location(2)]] float3 tc0     : TEXCOORD0;\n");
+    EMIT("    [[vk::location(3)]] float3 tc1     : TEXCOORD1;\n");
+    EMIT("    [[vk::location(4)]] float3 tc2     : TEXCOORD2;\n");
+    EMIT("    [[vk::location(5)]] float3 tc3     : TEXCOORD3;\n");
     EMIT("};\n\n");
 
     /* ---- Main function ---- */
@@ -785,6 +784,15 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("        if (!alpha_pass) discard;\n");
     EMIT("    }\n\n");
 
+    /* Keep every declared texture alive: a zero-weighted fetch the compiler
+     * must keep (x * 0 is not x for NaN), so all four sampler bindings exist. */
+    for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        if (state->tex_mode[i] == NV2A_TEXMODE_CUBEMAP || state->tex_mode[i] == NV2A_TEXMODE_3D)
+            EMIT("    result.a += 0.0 * tex%d.SampleLevel(samp%d, float3(0, 0, 0), 0).a;\n", i, i);
+        else
+            EMIT("    result.a += 0.0 * tex%d.SampleLevel(samp%d, float2(0, 0), 0).a;\n", i, i);
+    }
+
     EMIT("    return result;\n");
     EMIT("}\n");
 
@@ -797,53 +805,26 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
  * Shader Compilation & Cache
  * ================================================================ */
 
-static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state)
+static int compile_combiner_shader(const NV2ACombinerState *state, XGpuShader *out)
 {
     /* 16KB should be more than enough for any combiner shader */
     char hlsl[16384];
-    ID3DBlob *code = NULL;
-    ID3DBlob *errors = NULL;
-    ID3D11PixelShader *ps = NULL;
-    HRESULT hr;
     int len;
 
     len = d3d8_combiners_generate_hlsl(state, hlsl, sizeof(hlsl));
     if (len < 0) {
         fprintf(stderr, "NV2A combiners: HLSL generation failed (buffer overflow)\n");
-        return NULL;
+        return 0;
     }
-
-    hr = D3DCompile(hlsl, (SIZE_T)len, "ps_combiner",
-                    NULL, NULL, "main", "ps_5_0",
-                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                    &code, &errors);
-    if (FAILED(hr)) {
-        fprintf(stderr, "NV2A combiners: HLSL compile failed: %s\n",
-                errors ? (char *)ID3D10Blob_GetBufferPointer(errors)
-                       : "unknown error");
+    if (!xgpu_compile_hlsl_ex(d3d8_GetGpu()->device, hlsl, "main", 1, "ps_combiner", out)) {
         /* Dump the generated source for debugging */
         fprintf(stderr, "--- Generated HLSL ---\n%s\n--- End HLSL ---\n", hlsl);
-        if (errors) ID3D10Blob_Release(errors);
-        return NULL;
+        return 0;
     }
-    if (errors) ID3D10Blob_Release(errors);
-
-    hr = ID3D11Device_CreatePixelShader(
-        d3d8_GetD3D11Device(),
-        ID3D10Blob_GetBufferPointer(code),
-        ID3D10Blob_GetBufferSize(code),
-        NULL, &ps);
-    ID3D10Blob_Release(code);
-
-    if (FAILED(hr)) {
-        fprintf(stderr, "NV2A combiners: CreatePixelShader failed: 0x%08lX\n", hr);
-        return NULL;
-    }
-
-    return ps;
+    return 1;
 }
 
-ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
+const XGpuShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
 {
     uint32_t hash = combiner_state_hash(state);
     uint32_t idx = hash & (COMBINER_CACHE_SIZE - 1);
@@ -856,21 +837,21 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
 
         if (!entry->in_use) {
             /* Cache miss - compile and insert */
-            ID3D11PixelShader *ps = compile_combiner_shader(state);
-            if (!ps) return NULL;
+            XGpuShader ps;
+            if (!compile_combiner_shader(state, &ps)) return NULL;
 
             entry->in_use = TRUE;
             entry->hash = hash;
             memcpy(&entry->state, state, sizeof(NV2ACombinerState));
             entry->shader = ps;
             entry->last_used_frame = g_frame_counter;
-            return ps;
+            return &entry->shader;
         }
 
         if (entry->hash == hash && combiner_state_equal(&entry->state, state)) {
             /* Cache hit */
             entry->last_used_frame = g_frame_counter;
-            return entry->shader;
+            return &entry->shader;
         }
     }
 
@@ -881,7 +862,7 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
     {
         uint32_t lru_slot = idx;
         uint32_t lru_frame = UINT32_MAX;
-        ID3D11PixelShader *ps;
+        XGpuShader ps;
         CombinerCacheEntry *entry;
 
         for (probe = 0; probe < COMBINER_CACHE_SIZE; probe++) {
@@ -892,18 +873,17 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
         }
 
         entry = &g_cache[lru_slot];
-        if (entry->shader) {
-            ID3D11PixelShader_Release(entry->shader);
-        }
+        /* A draw recorded earlier this frame may still use the old shader; SDL
+         * defers destruction until the GPU is finished with it. */
+        xgpu_release_shader(d3d8_GetGpu()->device, &entry->shader);
 
-        ps = compile_combiner_shader(state);
-        if (!ps) return NULL;
+        if (!compile_combiner_shader(state, &ps)) { entry->in_use = FALSE; return NULL; }
 
         entry->hash = hash;
         memcpy(&entry->state, state, sizeof(NV2ACombinerState));
         entry->shader = ps;
         entry->last_used_frame = g_frame_counter;
-        return ps;
+        return &entry->shader;
     }
 }
 
@@ -913,30 +893,11 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
 
 HRESULT d3d8_combiners_init(void)
 {
-    D3D11_BUFFER_DESC cbd;
-    HRESULT hr;
-
     memset(g_cache, 0, sizeof(g_cache));
     memset(&g_combiner_state, 0, sizeof(g_combiner_state));
     g_ps_token = 0;
     g_dirty = TRUE;
     g_frame_counter = 0;
-
-    /* Create the PS constant buffer for combiner shaders.
-     * Size must match NV2APSConstants, rounded up to 16-byte alignment. */
-    memset(&cbd, 0, sizeof(cbd));
-    cbd.ByteWidth = (sizeof(NV2APSConstants) + 15) & ~15;
-    cbd.Usage = D3D11_USAGE_DYNAMIC;
-    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL,
-                                   &g_combiner_cb);
-    if (FAILED(hr)) {
-        fprintf(stderr, "NV2A combiners: Failed to create constant buffer: "
-                "0x%08lX\n", hr);
-        return hr;
-    }
 
     fprintf(stderr, "NV2A combiners: Initialized (cache size=%d)\n",
             COMBINER_CACHE_SIZE);
@@ -949,16 +910,10 @@ void d3d8_combiners_shutdown(void)
 
     /* Release all cached shaders */
     for (i = 0; i < COMBINER_CACHE_SIZE; i++) {
-        if (g_cache[i].in_use && g_cache[i].shader) {
-            ID3D11PixelShader_Release(g_cache[i].shader);
-        }
+        if (g_cache[i].in_use)
+            xgpu_release_shader(d3d8_GetGpu()->device, &g_cache[i].shader);
     }
     memset(g_cache, 0, sizeof(g_cache));
-
-    if (g_combiner_cb) {
-        ID3D11Buffer_Release(g_combiner_cb);
-        g_combiner_cb = NULL;
-    }
 
     fprintf(stderr, "NV2A combiners: Shut down\n");
 }
@@ -987,19 +942,12 @@ void d3d8_combiners_mark_dirty(void)
 
 BOOL d3d8_combiners_prepare_draw(void)
 {
-    ID3D11DeviceContext *ctx;
-    ID3D11PixelShader *ps;
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    const XGpuShader *ps;
     const DWORD *rs;
-    HRESULT hr;
     int i;
 
     /* Not using combiner shaders - fall back to fixed-function */
     if (g_ps_token == 0)
-        return FALSE;
-
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx || !g_combiner_cb)
         return FALSE;
 
     rs = d3d8_GetRenderStates();
@@ -1019,17 +967,17 @@ BOOL d3d8_combiners_prepare_draw(void)
     }
 
     /* Bind the combiner pixel shader */
-    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    d3d8_pipe_set_ps(ps);
 
     /* Update the PS constant buffer with current values.
      *
      * Even though the shader structure doesn't change, the constant
      * values (C0, C1, fog, alpha ref) can change every frame via
      * render state writes. So we always re-upload. */
-    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_combiner_cb,
-                                0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        NV2APSConstants *cb = (NV2APSConstants *)mapped.pData;
+    {
+        NV2APSConstants cb_local;
+        NV2APSConstants *cb = &cb_local;
+        memset(cb, 0, sizeof(*cb));
 
         /* Per-stage constants */
         for (i = 0; i < NV2A_MAX_COMBINER_STAGES; i++) {
@@ -1054,11 +1002,8 @@ BOOL d3d8_combiners_prepare_draw(void)
             cb->alpha_only[i] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
         }
 
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_combiner_cb, 0);
+        d3d8_pipe_set_uniforms(1, 0, cb, sizeof(*cb));
     }
-
-    /* Bind the constant buffer to PS slot 0 */
-    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_combiner_cb);
 
     /* Advance frame counter for LRU tracking */
     g_frame_counter++;
