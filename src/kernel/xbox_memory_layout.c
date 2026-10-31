@@ -303,6 +303,16 @@ int xbox_GuestRangeInWindow(uint32_t va, uint32_t bytes)
     return va >= 0x10000u && va < XBOX_DEVKIT_RAM && bytes <= XBOX_DEVKIT_RAM - va;
 }
 
+#ifdef _WIN32
+/* Per-frame hooks ask about the same committed region many times a frame, and each VirtualQuery is a
+ * system call. The last region a thread found committed is remembered for a few milliseconds; a
+ * region that is not committed (MMIO windows, guard pages) is never remembered. The guest's RAM is one
+ * allocation that lives for the whole run, and a query followed by a read was never atomic anyway. */
+static RECOMP_TLS uintptr_t s_mapped_lo, s_mapped_hi;
+static RECOMP_TLS ULONGLONG s_mapped_stamp;
+enum { MAPPED_CACHE_MS = 8 };
+#endif
+
 int xbox_GuestMapped(uint32_t va, uint32_t bytes)
 {
     uintptr_t host;
@@ -312,10 +322,17 @@ int xbox_GuestMapped(uint32_t va, uint32_t bytes)
 #ifdef _WIN32
     {
         MEMORY_BASIC_INFORMATION info;
+        ULONGLONG now = GetTickCount64();
+        if (host >= s_mapped_lo && host < s_mapped_hi && bytes <= s_mapped_hi - host &&
+            now - s_mapped_stamp < MAPPED_CACHE_MS)
+            return 1;
         if (!VirtualQuery((void *)host, &info, sizeof info) || info.State != MEM_COMMIT ||
             (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
             return 0;
-        return host + bytes <= (uintptr_t)info.BaseAddress + info.RegionSize;
+        s_mapped_lo = (uintptr_t)info.BaseAddress;
+        s_mapped_hi = s_mapped_lo + info.RegionSize;
+        s_mapped_stamp = now;
+        return host + bytes <= s_mapped_hi;
     }
 #else
     {
