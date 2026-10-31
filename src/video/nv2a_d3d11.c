@@ -1553,6 +1553,27 @@ static Depth *depth_find(uint32_t p)
     return best;
 }
 
+/* The depth buffer a depth-format (Y16) texture at p reads: the one bound
+ * there most recently that covers it, each Z24S8 pixel being two texels.
+ * A title can draw a small pass (a brightness probe) with its scene depth
+ * address just before a pass that samples the scene depth; when that pass
+ * binds depth, it gets a small buffer of its own at the same address, and
+ * the most recently bound buffer is no longer the scene's. The lookup before
+ * bind_targets and the one after could then disagree, and the draw sampled a
+ * depth view last rebuilt in an earlier frame. */
+static Depth *depth_find_texture(uint32_t p, uint32_t width, uint32_t height)
+{
+    Depth *best = NULL, *last = depth_find(p);
+    int i;
+    for (i = 0; i < MAX_DEPTHS; i++) {
+        Depth *d = &s_depth[i];
+        if (d->tex && d->phys == p && d->zf != 1 && 2 * d->w >= width && d->h >= height &&
+            (!best || d->seq > best->seq))
+            best = d;
+    }
+    return best ? best : last;
+}
+
 static Depth *depth_get(uint32_t va, uint32_t iw, uint32_t ih, UINT samples)
 {
     uint32_t p = phys(va);
@@ -2635,7 +2656,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         if (t->color != 0x35 || t->cube || !t->addr) continue;
         /* A depth buffer wins over a colour surface at the same address:
          * titles bind one there for colour-masked stencil passes. */
-        if ((zt = depth_find(phys(t->addr))) != NULL) { if (!depth_y16(zt)) return 0; continue; }
+        if ((zt = depth_find_texture(phys(t->addr), t->width, t->height)) != NULL) { if (!depth_y16(zt)) return 0; continue; }
         rt = surface_find(phys(t->addr));
         if (rt && rt->bpp == 4) { surface_sync(rt, 0); surface_y16(rt); }
     }
@@ -2673,7 +2694,7 @@ static int setup_pipeline(const NvD3DState *st, int topology, Surface **out_s,
         s_draw_textured = 1;
         if (!s_draw_tex_addr) s_draw_tex_addr = t->addr;
         if (rt && rt->sx > rt->sy * 1.001f) s_draw_reads_wide = 1;
-        zt = t->color == 0x35 && !t->cube ? depth_find(phys(t->addr)) : NULL;
+        zt = t->color == 0x35 && !t->cube ? depth_find_texture(phys(t->addr), t->width, t->height) : NULL;
         if (zt && zt->y16_srv) {
             view = zt->y16_srv;                 /* each pixel is two texels */
             pc.tex_scale[n][0] = 1.0f / (float)(2 * zt->w);
