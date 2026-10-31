@@ -1,5 +1,5 @@
 /**
- * Xbox DirectSound → XAudio2 Compatibility Layer
+ * Xbox DirectSound → SDL3 audio Compatibility Layer
  *
  * Implements the Xbox DirectSound interfaces. Currently provides
  * stub sound buffer objects that accept all method calls silently.

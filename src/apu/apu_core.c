@@ -177,31 +177,10 @@ static struct {
 } g_test_tone = { false, 0.0, 0.0, 0 };
 
 /* ============================================================
- * Monitor - Audio output (XAudio2 primary, waveOut fallback)
+ * Monitor - Audio output (SDL3 stream, see apu_xaudio2.c)
  * ============================================================ */
 
-#if defined(_WIN32)
-#include <mmsystem.h>
-#pragma comment(lib, "winmm.lib")
-#endif
-/* On Linux, waveOut* are inert stubs from win32_compat.h: the APU's
- * waveOut fallback path stays inactive and never produces audio. */
-
-/* Ring of waveOut buffers for double-buffering */
-#define WAVEOUT_NUM_BUFS 4
-#define WAVEOUT_BUF_SAMPLES 2048  /* ~42.7ms at 48kHz, matches 8-frame delivery rate */
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
-
-typedef struct {
-    HWAVEOUT hwo;
-    WAVEHDR  hdrs[WAVEOUT_NUM_BUFS];
-    int16_t  bufs[WAVEOUT_NUM_BUFS][WAVEOUT_BUF_SAMPLES][2];
-    int      next_buf;
-    bool     initialized;
-    int      frames_written;
-} WaveOutState;
-
-static WaveOutState g_waveout = { 0 };
 
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 {
@@ -210,62 +189,17 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
-    /* Try XAudio2 first (lower latency) */
-    if (xa2_init()) {
-        fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
-        return;
-    }
-    fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
-
-    WAVEFORMATEX wfx = { 0 };
-    wfx.wFormatTag      = WAVE_FORMAT_PCM;
-    wfx.nChannels       = 2;
-    wfx.nSamplesPerSec  = 48000;
-    wfx.wBitsPerSample  = 16;
-    wfx.nBlockAlign     = wfx.nChannels * wfx.wBitsPerSample / 8;
-    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
-
-    MMRESULT mr = waveOutOpen(&g_waveout.hwo, WAVE_MAPPER, &wfx,
-                               0, 0, CALLBACK_NULL);
-    if (mr != MMSYSERR_NOERROR) {
-        fprintf(stderr, "[APU] waveOutOpen failed (error %u)\n", mr);
-        g_waveout.initialized = false;
-        return;
-    }
-
-    /* Prepare all headers */
-    for (int i = 0; i < WAVEOUT_NUM_BUFS; i++) {
-        memset(&g_waveout.hdrs[i], 0, sizeof(WAVEHDR));
-        g_waveout.hdrs[i].lpData = (LPSTR)g_waveout.bufs[i];
-        g_waveout.hdrs[i].dwBufferLength = WAVEOUT_BUF_SAMPLES * 2 * sizeof(int16_t);
-        waveOutPrepareHeader(g_waveout.hwo, &g_waveout.hdrs[i], sizeof(WAVEHDR));
-    }
-
-    g_waveout.next_buf = 0;
-    g_waveout.initialized = true;
-    g_waveout.frames_written = 0;
-
-    fprintf(stderr, "[APU] waveOut audio output initialized (48kHz stereo 16-bit, %d buffers)\n",
-            WAVEOUT_NUM_BUFS);
+    if (xa2_init())
+        fprintf(stderr, "[APU] Using SDL3 audio backend\n");
+    else
+        fprintf(stderr, "[APU] SDL3 audio unavailable, running silent\n");
 }
 
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 {
     (void)d;
-    if (xa2_is_active()) {
+    if (xa2_is_active())
         xa2_shutdown();
-        return;
-    }
-    if (!g_waveout.initialized) return;
-
-    waveOutReset(g_waveout.hwo);
-    for (int i = 0; i < WAVEOUT_NUM_BUFS; i++) {
-        waveOutUnprepareHeader(g_waveout.hwo, &g_waveout.hdrs[i], sizeof(WAVEHDR));
-    }
-    waveOutClose(g_waveout.hwo);
-    g_waveout.initialized = false;
-    fprintf(stderr, "[APU] waveOut audio output shut down (%d frames written)\n",
-            g_waveout.frames_written);
 }
 
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
@@ -274,7 +208,6 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
     if (xa2_is_active()) {
         int buf_size = xa2_get_buffer_size();
         int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
@@ -305,61 +238,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
 
         xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
-        return;
     }
-
-    if (!g_waveout.initialized) return;
-
-    int idx = g_waveout.next_buf;
-    WAVEHDR *hdr = &g_waveout.hdrs[idx];
-
-    /* Wait if this buffer is still playing (with timeout) */
-    int wait_loops = 0;
-    while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
-        qemu_mutex_unlock(&d->lock);
-        Sleep(1);
-        qemu_mutex_lock(&d->lock);
-        if (++wait_loops > 50) break;
-    }
-
-    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
-    int16_t *out = (int16_t *)g_waveout.bufs[idx];
-    int remaining = WAVEOUT_BUF_SAMPLES;
-    int out_offset = 0;
-
-    while (remaining > 0) {
-        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-
-        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-        /* Test tone (skip if muted) */
-        if (g_test_tone.active && !g_audio_muted) {
-            for (int i = 0; i < chunk; i++) {
-                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                d->monitor.frame_buf[i][0] = s;
-                d->monitor.frame_buf[i][1] = s;
-                g_test_tone.phase += g_test_tone.phase_inc;
-                if (g_test_tone.phase >= 2.0 * M_PI)
-                    g_test_tone.phase -= 2.0 * M_PI;
-            }
-        }
-
-        /* Mix software voices (skip if muted) */
-        if (!g_audio_muted)
-            mixer_render(d->monitor.frame_buf, chunk);
-
-        /* Copy to waveOut buffer */
-        memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-        out_offset += chunk;
-        remaining -= chunk;
-    }
-
-    /* Submit to waveOut */
-    hdr->dwFlags &= ~WHDR_DONE;
-    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
-
-    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
-    g_waveout.frames_written++;
 }
 
 /* ============================================================
@@ -459,7 +338,7 @@ static void *mcpx_apu_frame_thread(void *arg)
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
         if (apu_active && !g_test_tone.active) {
-            /* Full pipeline: VP voices → DSP → monitor → waveOut */
+            /* Full pipeline: VP voices → DSP → monitor → audio output */
             se_frame(d);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
@@ -546,7 +425,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     /* Init software mixer for DirectSound bridge */
     mixer_init();
 
-    /* Init monitor (waveOut output) */
+    /* Init monitor (audio output) */
     Error *local_err = NULL;
     mcpx_apu_monitor_init(d, &local_err);
     if (local_err) {
@@ -641,10 +520,10 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
 }
 
 /* ============================================================
- * APU Test Tone - Direct waveOut sine generator
+ * APU Test Tone - Direct audio-output sine generator
  *
  * Bypasses the VP pipeline entirely and writes a 440Hz sine wave
- * directly to the monitor frame_buf. This verifies that waveOut
+ * directly to the monitor frame_buf. This verifies that audio output
  * output works correctly.
  * ============================================================ */
 
@@ -672,7 +551,7 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d)
     g_test_tone.amplitude = 6000;  /* ~18% of full scale */
     g_test_tone.active = true;
 
-    /* Make sure waveOut is running - enable SECTL and resume APU thread */
+    /* Make sure audio output is running - enable SECTL and resume APU thread */
     qemu_mutex_lock(&d->lock);
     d->regs[NV_PAPU_SECTL] = NV_PAPU_SECTL_XCNTMODE & ~NV_PAPU_SECTL_XCNTMODE_OFF;
     d->regs[NV_PAPU_FECTL] = NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
@@ -688,7 +567,7 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d)
 }
 
 /* ============================================================
- * Software mixer - mixes DirectSound buffers to waveOut
+ * Software mixer - mixes DirectSound buffers to the audio output
  *
  * This bypasses the VP hardware voice pipeline entirely.
  * DirectSound buffers register PCM data here, and the APU

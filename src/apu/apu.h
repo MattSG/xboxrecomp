@@ -35,7 +35,7 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d);
  * Software mixer - DirectSound buffer bridge
  *
  * DirectSound buffers register here. The APU frame thread
- * mixes active buffers directly into the waveOut output,
+ * mixes active buffers directly into the audio output,
  * bypassing the VP hardware voice pipeline.
  * ============================================================ */
 
