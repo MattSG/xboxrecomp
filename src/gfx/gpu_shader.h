@@ -18,4 +18,16 @@ SDL_GPUShader *xgpu_compile_hlsl(SDL_GPUDevice *device, const char *hlsl,
                                  const char *entry, int is_fragment,
                                  const char *name);
 
+/* The same, also reporting how many samplers and uniform buffers the shader
+ * declares: SDL_GPU wants exactly those bound, no more and no fewer. */
+typedef struct XGpuShader {
+    SDL_GPUShader *shader;
+    Uint32         num_samplers;
+    Uint32         num_uniform_buffers;
+} XGpuShader;
+
+int xgpu_compile_hlsl_ex(SDL_GPUDevice *device, const char *hlsl, const char *entry,
+                         int is_fragment, const char *name, XGpuShader *out);
+void xgpu_release_shader(SDL_GPUDevice *device, XGpuShader *s);
+
 #endif

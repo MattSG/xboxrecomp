@@ -198,6 +198,12 @@ static void flush_if_idle(XGpu *g)
 int xgpu_upload_buffer(XGpu *g, SDL_GPUBuffer *buf, Uint32 offset,
                        const void *data, Uint32 size)
 {
+    return xgpu_upload_buffer_ex(g, buf, offset, data, size, 0);
+}
+
+int xgpu_upload_buffer_ex(XGpu *g, SDL_GPUBuffer *buf, Uint32 offset,
+                          const void *data, Uint32 size, int cycle)
+{
     SDL_GPUTransferBuffer *tb;
     SDL_GPUTransferBufferLocation src;
     SDL_GPUBufferRegion dst;
@@ -214,7 +220,7 @@ int xgpu_upload_buffer(XGpu *g, SDL_GPUBuffer *buf, Uint32 offset,
     SDL_zero(src); SDL_zero(dst);
     src.transfer_buffer = tb; src.offset = at;
     dst.buffer = buf; dst.offset = offset; dst.size = size;
-    SDL_UploadToGPUBuffer(cp, &src, &dst, false);
+    SDL_UploadToGPUBuffer(cp, &src, &dst, cycle != 0);
     flush_if_idle(g);
     return 1;
 }

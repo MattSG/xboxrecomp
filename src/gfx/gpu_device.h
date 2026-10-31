@@ -85,6 +85,12 @@ void *xgpu_stage(XGpu *g, Uint32 size, SDL_GPUTransferBuffer **tb, Uint32 *offse
 int xgpu_upload_buffer(XGpu *g, SDL_GPUBuffer *buf, Uint32 offset,
                        const void *data, Uint32 size);
 
+/* The same with a cycle flag: true lets SDL swap in a fresh backing store if
+ * the GPU is still reading the old one (earlier recorded draws keep theirs).
+ * Used for the dynamic vertex ring. */
+int xgpu_upload_buffer_ex(XGpu *g, SDL_GPUBuffer *buf, Uint32 offset,
+                          const void *data, Uint32 size, int cycle);
+
 /* Copies a w*h*d block of texels into mip level `mip` of `layer`. `row_bytes`
  * is the source row pitch in bytes; for block-compressed formats w/h are the
  * block-aligned texel size and rows are block rows (the caller passes the

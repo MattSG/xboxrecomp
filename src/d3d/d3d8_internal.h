@@ -306,11 +306,61 @@ void    d3d8_shaders_prepare_draw(DWORD handle);
 HRESULT d3d8_states_init(void);
 void    d3d8_states_shutdown(void);
 
-/* Apply current D3D8 render states as D3D11 state objects */
-void    d3d8_states_apply(void);
+/* The fixed-function half of a pipeline, as a memcmp-comparable key. */
+typedef struct D3D8StateKey {
+    Uint8 blend_enable, src_color, dst_color, src_alpha, dst_alpha, blend_op, color_mask;
+    Uint8 depth_test, depth_write, depth_func;
+    Uint8 stencil_enable, stencil_read, stencil_write;
+    Uint8 stencil_func, stencil_fail, stencil_zfail, stencil_pass;
+    Uint8 fill, cull;
+} D3D8StateKey;
 
-/* Create sampler state from TSS and apply to slot */
-void    d3d8_states_apply_sampler(DWORD stage);
+void            d3d8_states_get_key(D3D8StateKey *key);
+SDL_GPUSampler *d3d8_states_sampler(DWORD stage);
+
+/* ================================================================
+ * Pipeline cache and draw dispatch (d3d8_pipeline.c)
+ * ================================================================ */
+
+#include "gfx/gpu_shader.h"
+
+#define D3D8_MAX_ATTRS 16
+
+/* Vertex input for one vertex buffer (slot 0). Attribute locations are the
+ * shader generators' convention; the stride comes from the stream at draw. */
+typedef struct D3D8VertexLayout {
+    Uint32                 num_attrs;
+    SDL_GPUVertexAttribute attrs[D3D8_MAX_ATTRS];
+} D3D8VertexLayout;
+
+typedef struct D3D8Draw {
+    SDL_GPUPrimitiveType prim;
+    SDL_GPUBuffer       *vb;
+    Uint32               vb_offset, vb_stride;
+    SDL_GPUBuffer       *ib;                /* NULL = not indexed */
+    Uint32               ib_offset;
+    int                  ib32;              /* 32-bit indices */
+    Uint32               count;             /* vertices or indices */
+    Uint32               first;             /* first vertex or first index */
+    Sint32               base_vertex;
+} D3D8Draw;
+
+HRESULT d3d8_pipe_init(void);
+void    d3d8_pipe_shutdown(void);
+void    d3d8_pipe_begin_frame(void);
+void    d3d8_pipe_set_vs(const XGpuShader *vs);
+void    d3d8_pipe_set_ps(const XGpuShader *ps);
+void    d3d8_pipe_set_layout(const D3D8VertexLayout *layout);
+/* Data for uniform buffer `slot` (HLSL register bN); pushed at the next draw. */
+void    d3d8_pipe_set_uniforms(int fragment, Uint32 slot, const void *data, Uint32 size);
+/* Copies *UP draw data into the streaming ring. */
+int     d3d8_pipe_stream(const void *data, Uint32 size, SDL_GPUBuffer **buf, Uint32 *offset);
+int     d3d8_pipe_draw(const D3D8Draw *draw);
+
+/* Supplied by d3d8_device.c: what the next draw renders into, and the viewport. */
+void    d3d8_GetCurrentTargets(XGpuTargets *t, SDL_GPUTextureFormat *color_fmt,
+                               SDL_GPUTextureFormat *depth_fmt, Uint32 *w, Uint32 *h);
+void    d3d8_GetViewport(D3DVIEWPORT8 *vp);
 
 #endif /* _WIN32 -- end of D3D11 backend section */
 
