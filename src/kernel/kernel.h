@@ -36,9 +36,21 @@ typedef UCHAR KIRQL, *PKIRQL;
 typedef CCHAR KPROCESSOR_MODE;
 typedef LONG KPRIORITY;
 
-/* Processor modes */
-#define KernelMode  0
-#define UserMode    1
+/* Processor modes.
+ *
+ * Enum constants, not #defines. "KernelMode" and "UserMode" are ordinary
+ * words, and the Windows SDK uses both as struct member names: WINBOOL
+ * KernelMode in <rpcasync.h>, and the KernelMode/UserMode bitfields of
+ * SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION in <winnt.h>. An
+ * object-like macro rewrites those declarations to "WINBOOL 0;" in any
+ * translation unit that reaches an SDK header after this one -- which is
+ * every kernel .c file under MinGW. Enum constants sit in the ordinary
+ * identifier namespace; struct members have their own, so the names coexist.
+ * The values are what they were. */
+enum {
+    KernelMode = 0,
+    UserMode   = 1
+};
 
 /* IRQL levels (Xbox uses same NT IRQL model) */
 #define PASSIVE_LEVEL   0
@@ -79,6 +91,9 @@ typedef LONG KPRIORITY;
 #ifndef STATUS_INVALID_HANDLE
 #define STATUS_INVALID_HANDLE           ((NTSTATUS)0xC0000008L)
 #endif
+#ifndef STATUS_INVALID_INFO_CLASS
+#define STATUS_INVALID_INFO_CLASS       ((NTSTATUS)0xC0000003L)
+#endif
 #ifndef STATUS_INVALID_PARAMETER
 #define STATUS_INVALID_PARAMETER        ((NTSTATUS)0xC000000DL)
 #endif
@@ -106,6 +121,14 @@ typedef LONG KPRIORITY;
 #ifndef STATUS_OBJECT_PATH_NOT_FOUND
 #define STATUS_OBJECT_PATH_NOT_FOUND    ((NTSTATUS)0xC000003AL)
 #endif
+#ifndef STATUS_MUTANT_NOT_OWNED
+#define STATUS_MUTANT_NOT_OWNED         ((NTSTATUS)0xC0000046L)
+#endif
+
+#ifndef STATUS_INVALID_DEVICE_REQUEST
+#define STATUS_INVALID_DEVICE_REQUEST   ((NTSTATUS)0xC0000010L)
+#endif
+
 #ifndef STATUS_INSUFFICIENT_RESOURCES
 #define STATUS_INSUFFICIENT_RESOURCES   ((NTSTATUS)0xC000009AL)
 #endif
@@ -365,6 +388,16 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
 #define NonPagedPool    0
 #define PagedPool       1
 
+/* Contiguous / physical memory window. Mapped by xbox_MemoryLayoutInit;
+ * MmAllocateContiguousMemory hands back addresses inside it, and
+ * MmClaimGpuInstanceMemory reports GPU instance memory at its top. Shared so
+ * the layout and the bridges cannot disagree about where it is. */
+#define XBOX_CONTIG_BASE 0x80000000u
+#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+
+/* Default GPU instance size, used when a caller asks to claim everything. */
+#define XBOX_GPU_INSTANCE_DEFAULT (128u * 1024u)
+
 /* File access masks */
 #define XBOX_FILE_READ_DATA         0x0001
 #define XBOX_FILE_WRITE_DATA        0x0002
@@ -453,9 +486,16 @@ typedef VOID (*PIO_APC_ROUTINE)(
  * Set the kernel thunk table address for the current game.
  * Call this BEFORE xbox_kernel_bridge_init(). The address is parsed
  * from the XBE header's KernelImageThunkAddress field.
- * If not called, the default (Burnout 3's 0x0036B7C0) is used.
+ * If not called, the default (a legacy title's 0x0036B7C0) is used.
  */
 void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
+
+/**
+ * Get the kernel thunk table address and entry count currently in effect.
+ * Set during memory layout init from the XBE header. *xbox_va/*count are
+ * zeroed if never configured.
+ */
+void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count);
 
 extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
@@ -468,6 +508,25 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
+
+/**
+ * Per-title kernel ordinal remap.
+ *
+ * The bridge routes ordinals with one hardcoded table -- the ordinal ABI of the
+ * XDK it was written against (Halo's 3911 / Crimson's 5659). A title built with
+ * a different XDK numbers the same kernel functions differently: Burnout 3's
+ * XDK 5849 has HalRequestSoftwareInterrupt at 49 where the older XDKs have
+ * HalReturnToFirmware. Without this, swapping such a title onto the shared kernel
+ * misroutes it (Burnout 3 exited via HalReturnToFirmware during engine setup).
+ *
+ * `map[title_ordinal] = canonical_ordinal` translates a title's ordinals into
+ * the kernel's canonical space before every routing decision. An entry of 0
+ * (or a title_ordinal past `count`) means identity -- no title needs a real
+ * ordinal 0. Call BEFORE xbox_kernel_bridge_init. A title whose XDK already
+ * matches the kernel calls nothing and gets identity, so existing titles are
+ * unaffected. Generate the map with tools/kernel_audit/gen_ordinal_remap.py.
+ */
+void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
 
 /* ============================================================================
  * Path Translation (kernel_path.c)
@@ -492,6 +551,9 @@ typedef char  xbox_host_char;
  * Returns TRUE on success, FALSE if the path couldn't be translated.
  * host_path_buf must be at least MAX_PATH characters (not bytes).
  */
+/* Host path produced by the most recent xbox_translate_path call. */
+const wchar_t *xbox_LastHostPath(void);
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
 /* ============================================================================
@@ -522,6 +584,9 @@ NTSTATUS __stdcall xbox_RtlUnicodeStringToAnsiString(
 
 BOOLEAN __stdcall xbox_RtlEqualString(PXBOX_ANSI_STRING String1, PXBOX_ANSI_STRING String2, BOOLEAN CaseInSensitive);
 ULONG   __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pattern);
+
+/* Name contended CRT locks by index instead of by address. */
+void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count);
 
 VOID    __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
@@ -621,6 +686,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan);
 
 NTSTATUS __stdcall xbox_NtFsControlFile(
@@ -672,7 +738,13 @@ NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState);
 NTSTATUS __stdcall xbox_NtCreateSemaphore(PHANDLE SemaphoreHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, LONG InitialCount, LONG MaximumCount);
 NTSTATUS __stdcall xbox_NtReleaseSemaphore(HANDLE SemaphoreHandle, LONG ReleaseCount, PLONG PreviousCount);
 NTSTATUS __stdcall xbox_NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
+NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(HANDLE Handle, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(ULONG Count, HANDLE Handles[], ULONG WaitType, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
+NTSTATUS __stdcall xbox_NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
+NTSTATUS __stdcall xbox_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
+NTSTATUS __stdcall xbox_NtClearEvent(HANDLE EventHandle);
+NTSTATUS __stdcall xbox_NtCreateMutant(PHANDLE MutantHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, BOOLEAN InitialOwner);
+NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount);
 
 LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
@@ -704,6 +776,16 @@ VOID    __stdcall xbox_HalInitiateShutdown(void);
 BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
+/* Non-zero while any thread holds IRQL at or above DISPATCH_LEVEL.
+ * Device models ask before delivering an interrupt; raising IRQL masks the
+ * line for the whole processor on hardware, not just for one thread. */
+int     xbox_IrqlBlocksInterrupts(void);
+int     xbox_IrqlRaisedCount(void);
+
+/* Total crossings of the DISPATCH boundary, and who is holding it up.
+ * A depth that is non-zero while this stops moving is stuck, not busy. */
+int     xbox_IrqlTransitions(void);
+void    xbox_IrqlDumpHolders(void);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 
@@ -730,6 +812,9 @@ extern volatile ULONG xbox_KeTickCount;
 
 extern XBOX_HARDWARE_INFO      xbox_HardwareInfo;
 extern XBOX_KRNL_VERSION       xbox_KrnlVersion;
+
+/* Override the reported kernel version (ordinal 324). */
+void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qfe);
 extern UCHAR                   xbox_EEPROMKey[16];
 extern UCHAR                   xbox_HDKey[16];
 extern UCHAR                   xbox_SignatureKey[16];
@@ -766,6 +851,7 @@ VOID     __stdcall xbox_IoDeleteDevice(PVOID DeviceObject);
 
 extern PVOID xbox_IoDeviceObjectType;
 extern PVOID xbox_IoCompletionObjectType;
+extern PVOID xbox_IoFileObjectType;
 
 VOID    __stdcall xbox_IoInitializeIrp(PVOID Irp, USHORT PacketSize, CCHAR StackSize);
 VOID    __stdcall xbox_IoStartNextPacket(PVOID DeviceObject, BOOLEAN Cancelable);
@@ -776,6 +862,18 @@ VOID    __stdcall xbox_IoMarkIrpMustComplete(PVOID Irp);
 NTSTATUS __stdcall xbox_IoSynchronousDeviceIoControlRequest(ULONG IoControlCode, PVOID DeviceObject, PVOID InputBuffer, ULONG InputBufferLength, PVOID OutputBuffer, ULONG OutputBufferLength, PULONG ReturnedOutputBufferLength, BOOLEAN InternalDeviceIoControl);
 NTSTATUS __stdcall xbox_IoBuildDeviceIoControlRequest(ULONG IoControlCode, PVOID DeviceObject, PVOID InputBuffer, ULONG InputBufferLength, PVOID OutputBuffer, ULONG OutputBufferLength, BOOLEAN InternalDeviceIoControl, HANDLE Event, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
 NTSTATUS __stdcall xbox_IoSynchronousFsdRequest(ULONG MajorFunction, PVOID DeviceObject, PVOID Buffer, ULONG Length, PLARGE_INTEGER StartingOffset);
+PVOID   __stdcall xbox_IoBuildSynchronousFsdRequest(ULONG MajorFunction, PVOID DeviceObject, PVOID Buffer, ULONG Length, PLARGE_INTEGER StartingOffset, HANDLE Event, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
+NTSTATUS __stdcall xbox_IoInvalidDeviceRequest(PVOID DeviceObject, PVOID Irp);
+
+/* __fastcall on Xbox -- the 'f' suffix. Wrong convention corrupts the stack. */
+NTSTATUS __fastcall xbox_IofCallDriver(PVOID DeviceObject, PVOID Irp);
+VOID     __fastcall xbox_IofCompleteRequest(PVOID Irp, CCHAR PriorityBoost);
+
+NTSTATUS __stdcall xbox_IoCreateSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName, PXBOX_ANSI_STRING DeviceName);
+/* Target of a link registered by xbox_IoCreateSymbolicLink, or NULL.
+ * Looked up by exact link name, e.g. "\\??\\Z:". */
+const char* xbox_LookupSymbolicLink(const char* link);
+NTSTATUS __stdcall xbox_IoDeleteSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName);
 
 /* ============================================================================
  * Crypto (kernel_crypto.c)
@@ -821,6 +919,18 @@ VOID    __stdcall xbox_AvSetDisplayMode(PVOID RegisterBase, ULONG Step, ULONG Mo
 NTSTATUS __stdcall xbox_HalReadSMBusValue(UCHAR SlaveAddress, UCHAR CommandCode, BOOLEAN ReadWordValue, PULONG DataValue);
 NTSTATUS __stdcall xbox_HalWriteSMBusValue(UCHAR SlaveAddress, UCHAR CommandCode, BOOLEAN WriteWordValue, ULONG DataValue);
 
+VOID    __stdcall xbox_HalRegisterShutdownNotification(PVOID ShutdownRegistration, BOOLEAN Register);
+VOID       __stdcall xbox_DbgBreakPoint(void);
+ULONGLONG  __stdcall xbox_KeQueryInterruptTime(void);
+BOOLEAN __stdcall xbox_KeDisconnectInterrupt(PXBOX_KINTERRUPT Interrupt);
+
+/* HAL data exports -- ordinals 40/41/42 and 356/357 are variables, not calls. */
+extern ULONG            xbox_HalDiskCachePartitionCount;
+extern XBOX_ANSI_STRING xbox_HalDiskModelNumber;
+extern XBOX_ANSI_STRING xbox_HalDiskSerialNumber;
+extern ULONG            xbox_HalBootSMCVideoMode;
+extern PVOID            xbox_IdexChannelObject;
+
 /* EEPROM / Non-Volatile Settings */
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength);
 NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, PVOID Value, ULONG ValueLength);
@@ -833,6 +943,20 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define AV_PACK_HDTV            0x04
 #define AV_PACK_VGA             0x05
 #define AV_PACK_SVIDEO          0x06
+
+/* ---- Video standard, the second byte of the AVPACK query result ----
+ *
+ * AvSendTVEncoderOption(AV_OPTION_QUERY_AVPACK) does not return the pack type
+ * alone: D3D reads the same word for the pack (0x000000FF), the video standard
+ * (0x0000FF00) and the refresh rate (0x00C00000), and its mode table is keyed
+ * on all three. Returning a bare pack byte leaves the standard as 0, which
+ * matches no row in that table and fails device creation. */
+#define AV_STANDARD_NTSC_M      0x01
+#define AV_STANDARD_NTSC_J      0x02
+#define AV_STANDARD_PAL_I       0x03
+#define AV_STANDARD_SHIFT       8
+#define AV_REFRESH_60Hz         0x00400000
+#define AV_REFRESH_50Hz         0x00800000
 
 /* ---- AV option codes for AvSendTVEncoderOption ---- */
 #define AV_OPTION_QUERY_MODE            0x01
@@ -877,19 +1001,29 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define SMC_CMD_LED_STATES      0x08    /* LED states */
 #define SMC_CMD_SCRATCH         0x1B    /* Scratch register */
 
-/* ---- EEPROM non-volatile setting indices ---- */
-#define XC_TIMEZONE_BIAS           0x01
-#define XC_TZ_STD_NAME            0x02
-#define XC_TZ_STD_DATE           0x03
-#define XC_TZ_STD_BIAS           0x04
-#define XC_TZ_DLT_NAME           0x05
-#define XC_TZ_DLT_DATE           0x06
-#define XC_TZ_DLT_BIAS           0x07
-#define XC_LANGUAGE               0x08
-#define XC_VIDEO                  0x09
-#define XC_AUDIO                  0x0A
-#define XC_PARENTAL_CONTROL       0x0B
-#define XC_PARENTAL_PASSWORD      0x0C
+/* ---- EEPROM non-volatile setting indices ----
+ *
+ * XC_VALUE_INDEX, as the kernel numbers them. The block from TIMEZONE_BIAS
+ * through the parental-control entries used to be listed one higher than it
+ * actually is, while ONLINE_IP_ADDRESS onward were already right - so a title
+ * asking for 0x0A (parental control: games) was answered with XC_AUDIO's
+ * flags. Halo compares its XBE certificate's GameRatings against that value
+ * and boots to the dashboard when it loses the comparison, which it always
+ * did against 0x00010001.
+ */
+#define XC_TIMEZONE_BIAS          0x00
+#define XC_TZ_STD_NAME            0x01
+#define XC_TZ_DLT_NAME            0x02
+#define XC_TZ_STD_DATE            0x03
+#define XC_TZ_DLT_DATE            0x04
+#define XC_TZ_STD_BIAS            0x05
+#define XC_TZ_DLT_BIAS            0x06
+#define XC_LANGUAGE               0x07
+#define XC_VIDEO                  0x08
+#define XC_AUDIO                  0x09
+#define XC_P_CONTROL_GAMES        0x0A
+#define XC_P_CONTROL_PASSWORD     0x0B
+#define XC_P_CONTROL_MOVIES       0x0C
 #define XC_ONLINE_IP_ADDRESS      0x0D
 #define XC_ONLINE_DNS_ADDRESS     0x0E
 #define XC_ONLINE_DEFAULT_GATEWAY 0x0F
@@ -897,6 +1031,10 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_MISC                   0x11
 #define XC_DVD_REGION             0x12
 #define XC_MAX_OS                 0xFF
+
+/* Older spellings kept so existing call sites still build. */
+#define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
+#define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
 
 /* Video standard flags in XC_VIDEO */
 #define XC_VIDEO_FLAGS_WIDESCREEN   0x01

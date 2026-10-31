@@ -10,7 +10,7 @@
  * - I3DL2 environmental reverb
  *
  * The game uses 40 DirectSound entry points with 68 total calls.
- * This layer translates those calls to XAudio2.
+ * This layer translates those calls to the software mixer (SDL3 audio output).
  */
 
 #ifndef BURNOUT3_DSOUND_XBOX_H
@@ -177,7 +177,7 @@ struct IDirectSoundBuffer8 {
  * ================================================================ */
 
 /**
- * Create the DirectSound-compatible interface backed by XAudio2.
+ * Create the DirectSound-compatible interface backed by the software mixer (SDL3 audio output).
  * Replaces DirectSoundCreate().
  */
 HRESULT xbox_DirectSoundCreate(void *pGuid, IDirectSound8 **ppDS, void *pUnkOuter);

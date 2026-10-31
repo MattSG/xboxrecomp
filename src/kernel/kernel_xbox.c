@@ -19,7 +19,9 @@
  * Game code accesses them directly via the thunk table.
  * ============================================================================ */
 
-/* Hardware info - report a standard 1.0 retail Xbox */
+/* Hardware info - default report is a standard retail Xbox.
+ * A target may override via xbox_kernel_set_version() or by patching the
+ * global directly; no title-specific values are baked in. */
 XBOX_HARDWARE_INFO xbox_HardwareInfo = {
     .Flags       = 0x00000020,  /* Retail Xbox */
     .GpuRevision = 0xD2,       /* NV2A D2 revision */
@@ -27,13 +29,24 @@ XBOX_HARDWARE_INFO xbox_HardwareInfo = {
     .Reserved    = {0, 0}
 };
 
-/* Kernel version - match XDK 5849 (the version Burnout 3 was built against) */
+/* Kernel version - default is a stock retail value. Titles built against a
+ * different XDK can report their own through xbox_kernel_set_version(). */
 XBOX_KRNL_VERSION xbox_KrnlVersion = {
     .Major = 1,
     .Minor = 0,
     .Build = 5849,
     .Qfe   = 1
 };
+
+/* Override the kernel version reported to game code (ordinal 324).
+ * Match the XDK revision the target title was built with if it checks it. */
+void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qfe)
+{
+    xbox_KrnlVersion.Major = major;
+    xbox_KrnlVersion.Minor = minor;
+    xbox_KrnlVersion.Build = build;
+    xbox_KrnlVersion.Qfe   = qfe;
+}
 
 /* Crypto keys - zeroed, not needed for PC operation.
  * These are unique per-console on real hardware. */
@@ -141,16 +154,20 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_AUDIO:
-        /* Stereo + Dolby Digital enabled (0x00000001 = stereo, 0x00010000 = AC3) */
+        /* Stereo PCM matches the two-channel host output. 1 means mono;
+         * advertising AC3 requires an encoded-output path. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 0x00010001;
+            *(PULONG)Value = 0x00000000;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
         break;
 
-    case XC_PARENTAL_CONTROL:
-        /* No parental controls */
+    case XC_P_CONTROL_GAMES:
+    case XC_P_CONTROL_MOVIES:
+        /* Unrestricted. Titles compare their XBE certificate's rating against
+         * this and refuse to run (Halo boots to the dashboard) if the console
+         * is configured more strictly, so 0 means "no restriction". */
         if (ValueLength >= sizeof(ULONG)) {
             *(PULONG)Value = 0;
             if (Type) *Type = 4;

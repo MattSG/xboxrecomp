@@ -23,6 +23,34 @@ cmake --build build --config Release
 
 This produces six static libraries in `build/src/*/Release/`. See the [README](README.md) for the full architecture diagram and library descriptions.
 
+### macOS
+
+The toolkit and its tests build and run here too — the runtime's Win32 calls go
+through the POSIX shims in `src/platform/`. One command sets everything up:
+
+```bash
+bash tools/macos/setup.sh
+```
+
+That creates a `.venv` with the Python dependencies and installs a `py` shell
+function, so the `py -3` commands in these docs work as written — enough to run
+`py -3 -m pytest tools/`. The conformance suite additionally needs container
+images, which are large and slow to build, so they are opt-in:
+
+```bash
+bash tools/macos/setup.sh --test        # adds the images (~2.2 GB, ~10 min)
+```
+
+The Docker containers exist because conformance executes code as **real 32-bit x86** and
+compares it against the lifted C. Apple Silicon has no such CPU — Rosetta
+translates x86-64 only, and macOS dropped 32-bit support in Catalina — so a
+`linux/386` container supplies one. What is substituted is the toolchain, never
+the comparison. Two of the images carry MSVC under Wine, which the corpus and
+XBE phases need because those exist to exercise MSVC's *own* codegen; see
+[tools/conformance/msvc-wine/](tools/conformance/msvc-wine/).
+
+After setup the suite runs exactly as it does on Windows, with the same commands.
+
 ## Project Structure
 
 The repository has two halves:
@@ -80,7 +108,7 @@ When adding instruction support:
 
 The runtime libraries are where most per-game work happens. Key areas:
 
-- **D3D8 render states** (`src/d3d/`) -- Xbox D3D8 has many states not yet translated to D3D11. Each game tends to hit different subsets.
+- **D3D8 render states** (`src/d3d/`) -- Xbox D3D8 has many states not yet translated to SDL_GPU. Each game tends to hit different subsets.
 - **Audio** (`src/audio/`, `src/apu/`) -- DirectSound buffer management, 3D audio positioning, ADPCM decoding.
 - **NV2A GPU** (`src/nv2a/`) -- push buffer command parsing, texture formats, vertex shader microcode.
 - **Input** (`src/input/`) -- rumble/vibration, multiple controllers, keyboard/mouse for debug builds.
@@ -101,7 +129,35 @@ Every Xbox game has its own asset formats. If you reverse-engineer a texture for
 
 ## Testing
 
-There is no automated test suite (yet). Testing is manual:
+The Python side of the toolchain has a test suite. Run it before opening a PR
+(on macOS or Linux, run [setup](#macos-and-linux) once first):
+
+```
+py -3 -m pytest tools/       # unit tests
+py -3 -m tools.conformance   # differential: lifted C vs the real CPU
+```
+
+The unit tests are fast and need no game files — the lifter tests assemble real byte
+sequences and check the C that comes out. If you fix a lift, add the case.
+
+`pytest tools/` reports **1 skipped**, and that is the expected result anywhere
+without a 32-bit MSVC. The skip is `test_conformance.py`, which wraps the
+differential suite: it needs an assembler and a CPU to compare against, and it
+will not reach for the containers on its own, because building and running them
+is far too heavy a side effect for a unit-test pass. That check is not going
+unrun — `py -3 -m tools.conformance` is where it lives off Windows.
+
+To run it from pytest anyway, opt in explicitly:
+
+```
+XBOXRECOMP_PYTEST_DOCKER=1 py -3 -m pytest tools/
+```
+
+That needs the container images (`bash tools/macos/setup.sh --test`) and takes
+longer. The unit tests are fast and need no game files — the lifter tests assemble real byte
+sequences and check the C that comes out. If you fix a lift, add the case.
+
+Running a game is still manual:
 
 1. Build the runtime libraries.
 2. Build a game project that uses them (Burnout 3, Wreckless, Blood Wake, or your own).
@@ -110,6 +166,13 @@ There is no automated test suite (yet). Testing is manual:
 
 The VEH crash handler and ICALL trace ring buffer are your primary debugging tools. When a game crashes, the handler prints the faulting address, all Xbox register values, and recent indirect call targets.
 
+## Where to ask
+
+**[The sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** is the
+community hub for these projects. Worth a look before starting something
+substantial — it is the quickest way to find out whether someone is already on
+it, or already stuck on it.
+
 ## Reporting Bugs and Submitting Findings
 
 - **Bug reports**: Open a GitHub issue with the game name, the error output (crash log, ICALL failures), and the steps to reproduce.
@@ -117,6 +180,36 @@ The VEH crash handler and ICALL trace ring buffer are your primary debugging too
 - **Lifter failures**: If the lifter produces incorrect C for a function, include the original disassembly and the generated C output.
 - **Pull requests**: Fork the repo, make your changes on a branch, and open a PR. Describe what you changed and which game(s) you tested with.
 
+## Credit
+
+Contributors are listed in **[CONTRIBUTORS.md](CONTRIBUTORS.md)**, and that
+includes people who only ever filed an issue. A good bug report is a
+contribution — several of the entries there are exactly that. If you land
+something and your name doesn't appear, that's our mistake: open a PR against
+the file, or just say so on the issue.
+
 ## License
 
 This project is licensed under the **MIT License**. By submitting a contribution, you agree that your work will be released under the same license.
+
+The exception is the xemu-derived code under `src/apu/` and
+`src/nv2a/nv2a_regs.h`, which is LGPL-2.1-or-later and stays that way — see
+[NOTICE](NOTICE). If you patch those files, your change is LGPL too, and the
+existing copyright headers must stay intact.
+
+### Where your code comes from
+
+Contributions must be your own work, or come from a source whose licence is
+compatible with MIT (MIT, BSD, zlib, Apache-2.0, public domain). Specifically:
+
+- **Don't port code from GPL projects** -- Cxbx-Reloaded, the GPL parts of
+  xemu, MAME's GPL drivers, or other Xbox recompilation projects under the GPL.
+  Rewriting it line by line doesn't change that. Reading one to understand how
+  the hardware behaves is fine; carrying its code or structure across is not.
+  A fix you saw in another project is best submitted as a description of the
+  bug, and we'll write it fresh.
+- **If something came from elsewhere, say so in the PR**, with a link, and
+  keep any copyright header. A licence problem found at review costs a
+  comment; one found after release means untangling history.
+- The same applies to AI-assisted code: if it looks like it reproduces an
+  existing project, check where it came from before submitting it.

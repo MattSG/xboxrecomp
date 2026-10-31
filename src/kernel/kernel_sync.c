@@ -204,6 +204,26 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
+NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
+    HANDLE Handle,
+    KPROCESSOR_MODE WaitMode,
+    BOOLEAN Alertable,
+    PLARGE_INTEGER Timeout)
+{
+    DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    DWORD result;
+
+    /*
+     * Same as NtWaitForSingleObject but with an explicit wait mode. We run
+     * everything in one host process with no kernel/user split, so WaitMode
+     * has nothing to select and is ignored.
+     */
+    (void)WaitMode;
+
+    result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    return xbox_wait_result_to_ntstatus(result, 1);
+}
+
 NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     ULONG Count,
     HANDLE Handles[],
@@ -544,4 +564,72 @@ BOOLEAN __stdcall xbox_KeSynchronizeExecution(
         return FALSE;
 
     return routine(SynchronizeContext);
+}
+
+/* ============================================================================
+ * Events (continued)
+ * ============================================================================ */
+
+NTSTATUS __stdcall xbox_NtClearEvent(HANDLE EventHandle)
+{
+    if (!ResetEvent(EventHandle)) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
+            "NtClearEvent: ResetEvent failed (error %u)", GetLastError());
+        return STATUS_INVALID_HANDLE;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* ============================================================================
+ * Mutants (mutexes)
+ * ============================================================================ */
+
+NTSTATUS __stdcall xbox_NtCreateMutant(
+    PHANDLE MutantHandle,
+    PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+    BOOLEAN InitialOwner)
+{
+    HANDLE hMutex;
+
+    (void)ObjectAttributes;
+
+    if (!MutantHandle)
+        return STATUS_INVALID_PARAMETER;
+
+    hMutex = CreateMutexW(NULL, InitialOwner, NULL);
+    if (!hMutex) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
+            "NtCreateMutant: CreateMutexW failed (error %u)", GetLastError());
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    *MutantHandle = hMutex;
+
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_SYNC,
+        "NtCreateMutant: handle=%p initial_owner=%d", hMutex, InitialOwner);
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount)
+{
+    /*
+     * ReleaseMutex reports the previous count only through its own bookkeeping,
+     * which Win32 does not expose. Callers overwhelmingly use PreviousCount as
+     * an ignore-me out-param; report 0 (the count before this release took it
+     * to unheld) rather than leaving the caller's storage uninitialised.
+     */
+    if (!ReleaseMutex(MutantHandle)) {
+        DWORD err = GetLastError();
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
+            "NtReleaseMutant: ReleaseMutex failed (error %u)", err);
+        /* Releasing a mutex this thread does not own is the common failure. */
+        return (err == ERROR_NOT_OWNER) ? STATUS_MUTANT_NOT_OWNED
+                                        : STATUS_INVALID_HANDLE;
+    }
+
+    if (PreviousCount)
+        *PreviousCount = 0;
+
+    return STATUS_SUCCESS;
 }

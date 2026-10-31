@@ -1,7 +1,7 @@
 /*
  * NV2A Push Buffer Replay — Multi-State Menu System
  *
- * Replays captured push buffer data through the PGRAPH→D3D11 translator.
+ * Replays captured push buffer data through the PGRAPH→D3D8 translator.
  * Supports multiple menu states captured from xemu, switching between them
  * based on the game's actual menu navigation state.
  *
@@ -16,7 +16,7 @@
  *   7 = driver_details  (Progress / Rewards / Records / Profile / Settings / Training / Extras)
  */
 
-#include "nv2a_pgraph_d3d11.h"
+#include "nv2a_pgraph_d3d8.h"
 #include "nv2a_state.h"
 #include <stdio.h>
 #include <string.h>
@@ -129,7 +129,7 @@ static int detect_menu_state(void)
 }
 
 /*
- * Parse and dispatch push buffer commands through the D3D11 translator.
+ * Parse and dispatch push buffer commands through the PGRAPH translator.
  */
 static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
 {
@@ -151,7 +151,7 @@ static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
             if (count == 0 || pos + 1 + count > num_dwords) { pos++; continue; }
 
             for (uint32_t i = 0; i < count; i++) {
-                pgraph_d3d11_method(subchannel, method + i * 4, data[pos + 1 + i]);
+                pgraph_d3d8_method(subchannel, method + i * 4, data[pos + 1 + i]);
                 method_count++;
             }
             pos += 1 + count;
@@ -166,7 +166,7 @@ static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
             if (count == 0 || pos + 1 + count > num_dwords) { pos++; continue; }
 
             for (uint32_t i = 0; i < count; i++) {
-                pgraph_d3d11_method(subchannel, method, data[pos + 1 + i]);
+                pgraph_d3d8_method(subchannel, method, data[pos + 1 + i]);
                 method_count++;
             }
             pos += 1 + count;
@@ -176,8 +176,8 @@ static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
 
     g_replay_frame++;
     if (g_replay_frame <= 5 || (g_replay_frame % 300) == 0) {
-        PgraphD3D11Stats stats;
-        pgraph_d3d11_get_stats(&stats);
+        PgraphD3D8Stats stats;
+        pgraph_d3d8_get_stats(&stats);
         fprintf(stderr, "[PB-REPLAY] Frame %u [%s]: %u methods, %u draws, "
                 "translator draws=%u verts=%u\n",
                 g_replay_frame, menu_names[g_current_menu],
@@ -185,7 +185,7 @@ static void replay_pushbuffer(const uint32_t *data, uint32_t num_dwords)
                 stats.draw_calls, stats.vertices_submitted);
     }
 
-    pgraph_d3d11_flush();
+    pgraph_d3d8_flush();
 }
 
 extern int fe_menu_get_pb_state(void);
@@ -194,48 +194,55 @@ extern int fe_menu_get_pb_state(void);
 static const char *main_items[] = { "WORLD TOUR", "SINGLE EVENT", "MULTIPLAYER", "XBOX LIVE", "DRIVER DETAILS" };
 static const char *single_items[] = { "RACE", "TIME ATTACK", "ROAD RAGE", "CRASH" };
 
+/* Find the game's window for title updates. Any top-level window whose
+ * title ends with "- Static Recompilation" matches; falls back to the active
+ * window. The lookup is generic, not tied to one title. */
+static BOOL CALLBACK find_recomp_window(HWND hwnd, LPARAM lParam)
+{
+    (void)lParam;
+    char title[256];
+    if (GetWindowTextA(hwnd, title, sizeof(title)) > 0) {
+        size_t len = strlen(title);
+        const char *suffix = "- Static Recompilation";
+        size_t slen = strlen(suffix);
+        if (len >= slen && strcmp(title + len - slen, suffix) == 0) {
+            *(HWND *)lParam = hwnd;
+            return FALSE;  /* stop enumerating */
+        }
+    }
+    return TRUE;
+}
+
+static HWND find_recomp_window_hwnd(void)
+{
+    HWND hwnd = NULL;
+    EnumWindows(find_recomp_window, (LPARAM)&hwnd);
+    return hwnd;
+}
+
 static void update_menu_title(int menu, int cursor)
 {
     char title[256];
+    const char *name = (menu >= 0 && menu < MENU_COUNT) ? menu_names[menu] : "Unknown";
     const char *sel = "";
 
     switch (menu) {
     case MENU_MAIN:
-        if (cursor < 5) sel = main_items[cursor];
-        snprintf(title, sizeof(title), "Burnout 3 — Main Menu [%s]", sel);
-        break;
     case MENU_SINGLE_EVENT:
-        if (cursor < 4) sel = single_items[cursor];
-        snprintf(title, sizeof(title), "Burnout 3 — Single Event [%s]", sel);
-        break;
-    case MENU_WORLD_TOUR:
-        snprintf(title, sizeof(title), "Burnout 3 — World Tour");
-        break;
-    case MENU_RACE_SETUP:
-        snprintf(title, sizeof(title), "Burnout 3 — Race Setup");
-        break;
-    case MENU_TIME_ATTACK:
-        snprintf(title, sizeof(title), "Burnout 3 — Time Attack");
-        break;
-    case MENU_ROAD_RAGE:
-        snprintf(title, sizeof(title), "Burnout 3 — Road Rage");
-        break;
-    case MENU_CRASH_SELECT:
-        snprintf(title, sizeof(title), "Burnout 3 — Crash Select");
-        break;
-    case MENU_DRIVER_DETAILS:
-        snprintf(title, sizeof(title), "Burnout 3 — Driver Details");
+        sel = (menu == MENU_MAIN && cursor < 5) ? main_items[cursor]
+            : (cursor < 4)                      ? single_items[cursor] : "";
         break;
     default:
-        snprintf(title, sizeof(title), "Burnout 3: Takedown");
         break;
     }
 
+    if (sel[0])
+        snprintf(title, sizeof(title), "Push Buffer Replay - %s [%s]", name, sel);
+    else
+        snprintf(title, sizeof(title), "Push Buffer Replay - %s", name);
+
     /* Find and update the game window */
-    HWND hwnd = FindWindowA(NULL, NULL);
-    /* Try known window class or enumerate */
-    hwnd = FindWindowA("Burnout3Class", NULL);
-    if (!hwnd) hwnd = FindWindowA(NULL, "Burnout 3: Takedown - Static Recompilation");
+    HWND hwnd = find_recomp_window_hwnd();
     if (!hwnd) hwnd = GetActiveWindow();
     if (hwnd) SetWindowTextA(hwnd, title);
 }
@@ -257,8 +264,8 @@ void nv2a_pb_replay_frame(void)
     }
 
     /* Inject inherited texture state (font atlas) */
-    pgraph_d3d11_method(0, 0x1B00, 0x021C4100);
-    pgraph_d3d11_method(0, 0x1B08, 0x40010303);
+    pgraph_d3d8_method(0, 0x1B00, 0x021C4100);
+    pgraph_d3d8_method(0, 0x1B08, 0x40010303);
 
     /* Replay the current menu state's push buffer */
     const uint32_t *pb = menu_pb_data[g_current_menu];
@@ -278,20 +285,20 @@ void nv2a_pb_replay_frame(void)
                               MENU_PB_DWORDS - CHYRON_END_DWORD);
 
             /* Re-draw chyron on top with scroll animation */
-            pgraph_d3d11_method(0, 0x1B00, 0x021C4100);
-            pgraph_d3d11_method(0, 0x1B08, 0x40010303);
+            pgraph_d3d8_method(0, 0x1B00, 0x021C4100);
+            pgraph_d3d8_method(0, 0x1B08, 0x40010303);
 
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             double elapsed = (double)(now.QuadPart - g_replay_start_time.QuadPart)
                            / (double)g_replay_freq.QuadPart;
-            pgraph_d3d11_set_chyron_scroll((uint32_t)(elapsed * 50.0));
+            pgraph_d3d8_set_chyron_scroll((uint32_t)(elapsed * 50.0));
 
-            pgraph_d3d11_method(0, 0x17FC, 6);
+            pgraph_d3d8_method(0, 0x17FC, 6);
             for (uint32_t i = 0; i < CHYRON_INLINE_COUNT; i++)
-                pgraph_d3d11_method(0, 0x1818, menu_pushbuffer_data[CHYRON_INLINE_DATA + i]);
-            pgraph_d3d11_method(0, 0x17FC, 0);
-            pgraph_d3d11_set_chyron_scroll(0);
+                pgraph_d3d8_method(0, 0x1818, menu_pushbuffer_data[CHYRON_INLINE_DATA + i]);
+            pgraph_d3d8_method(0, 0x17FC, 0);
+            pgraph_d3d8_set_chyron_scroll(0);
         } else {
             /* Other menus: replay the full captured push buffer */
             replay_pushbuffer(pb, dwords);
@@ -321,7 +328,7 @@ void nv2a_pb_replay_set_active(int active)
 
     if (active) {
         init_pb_table();
-        pgraph_d3d11_init();
+        pgraph_d3d8_init();
         QueryPerformanceFrequency(&g_replay_freq);
         QueryPerformanceCounter(&g_replay_start_time);
         fprintf(stderr, "[PB-REPLAY] Multi-state replay ENABLED (%d menu states)\n", MENU_COUNT);

@@ -10,7 +10,7 @@ add_library(xbox_apu STATIC
     apu_vp.c
     apu_dsp.c
     apu_mmio_hook.c
-    apu_xaudio2.c
+    apu_audio_out.c
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -33,10 +33,4 @@ if(MSVC)
     )
 endif()
 
-if(WIN32)
-    target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm)
-else()
-    # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
-    find_package(SDL2 REQUIRED)
-    target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
-endif()
+target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 $<$<NOT:$<PLATFORM_ID:Windows>>:m>)

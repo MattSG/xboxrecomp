@@ -153,10 +153,18 @@ def _parse_hex(s: str) -> int:
 
 
 def _find_analysis_json(xbe_path: Path) -> Optional[Path]:
-    """Auto-detect the analysis JSON file location.
+    """Auto-detect the analysis JSON for this XBE.
 
-    Matches any ``*_analysis.json`` written by ``tools.xbe_parser --json``,
-    so the name is per-game rather than hardcoded to one title.
+    Written by ``tools.xbe_parser --json``, so the name is per-game rather than
+    hardcoded to one title.
+
+    The exact ``<stem>_analysis.json`` always wins. A bare ``*_analysis.json``
+    glob is only accepted when the directory holds a single XBE: a disc that
+    ships one binary per region keeps them side by side -- Wreckless has seven
+    in one folder -- and taking the first sorted match there hands DSTEAL_JP.xbe
+    the analysis written for default.xbe. Different entry point, different
+    section layout, no warning. Data from the wrong binary is worse than none,
+    because everything downstream still runs.
     """
     search_dirs = [
         # Same directory as XBE
@@ -167,6 +175,16 @@ def _find_analysis_json(xbe_path: Path) -> Optional[Path]:
         xbe_path.parent.parent / "tools" / "xbe_parser",
     ]
     for d in search_dirs:
+        exact = d / (xbe_path.stem + "_analysis.json")
+        if exact.exists():
+            return exact
+    for d in search_dirs:
+        try:
+            ambiguous = len(list(d.glob("*.xbe"))) > 1
+        except OSError:
+            continue
+        if ambiguous:
+            continue
         # sorted() so the pick is deterministic when a dir holds several
         for p in sorted(d.glob("*_analysis.json")):
             return p
@@ -199,9 +217,19 @@ def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImag
     # Find and load analysis JSON
     json_path = Path(analysis_json) if analysis_json else _find_analysis_json(xbe_file)
     if json_path is None or not json_path.exists():
+        # Name the file it wants and the command that writes it. The old
+        # message said only "run the XBE parser first", which left the reader
+        # to guess both the filename and where it goes -- one did, passed
+        # `--json JSON`, and then had to pass `--analysis-json JSON` here to
+        # get past it. Auto-detection needs the exact name.
+        wanted = xbe_file.parent / (xbe_file.stem + "_analysis.json")
         raise FileNotFoundError(
-            f"Analysis JSON not found. Run the XBE parser first, or specify "
-            f"--analysis-json path. Searched near: {xbe_file}"
+            f"Analysis JSON not found: {wanted}\n"
+            f"  Write it with:  py -3 -m tools.xbe_parser {xbe_file} "
+            f"--json {wanted}\n"
+            f"  The name matters -- this step looks for "
+            f"<xbe stem>_analysis.json beside the XBE. A file somewhere else, "
+            f"or under another name, needs --analysis-json <path>."
         )
 
     with open(json_path) as f:

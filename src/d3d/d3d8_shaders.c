@@ -1,7 +1,7 @@
 /**
- * D3D8 Fixed-Function Pipeline Emulation via D3D11 Shaders
+ * D3D8 Fixed-Function Pipeline Emulation via SDL_GPU Shaders
  *
- * Emulates the Xbox D3D8 fixed-function pipeline using D3D11
+ * Emulates the Xbox D3D8 fixed-function pipeline using
  * programmable shaders. Handles:
  *   - FVF-based vertex formats (XYZ, XYZRHW, Normal, Diffuse, Specular, TexCoord×4)
  *   - World/View/Projection transform
@@ -11,18 +11,20 @@
  *   - Vertex fog (linear/exp/exp2)
  *   - Alpha test
  *
- * Shader source is compiled at init time using D3DCompile.
+ * Shader source is compiled when first needed (HLSL -> SPIR-V -> the
+ * backend's format, see gfx/gpu_shader.c). SDL_GPU resource spaces: vertex
+ * uniform buffers are space1, fragment textures/samplers space2 and fragment
+ * uniform buffers space3; vertex attributes and the VS->PS varyings carry
+ * explicit locations because SPIR-V matches them by number, not semantic.
  * When NV2A register combiners are active, the combiner module
  * overrides the pixel shader (d3d8_combiners.c).
  */
 
 #include "d3d8_internal.h"
-#include <d3dcompiler.h>
+#include "d3d8_fvf.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
-
-#pragma comment(lib, "d3dcompiler.lib")
 
 /* ================================================================
  * HLSL vertex shader (embedded)
@@ -36,7 +38,7 @@
  * ================================================================ */
 
 static const char g_vs_source[] =
-    "cbuffer TransformCB : register(b0) {\n"
+    "cbuffer TransformCB : register(b0, space1) {\n"
     "    float4x4 WorldViewProj;\n"
     "    float4x4 World;\n"
     "    float4x4 WorldInvTranspose;\n"
@@ -44,10 +46,14 @@ static const char g_vs_source[] =
     "    uint     Flags;\n"
     "    float    _pad0;\n"
     "    float4   EyePos;\n"
-    "    float4   FogParams;\n"  /* x=start, y=end, z=density, w=mode (0=none,1=linear,2=exp,3=exp2) */
+    "    float4   FogParams;\n"  /* x=start, y=end, z=density, w=vertex fog mode (0=none,1=exp,2=exp2,3=linear) */
+    "    float4x4 WorldView;\n"             /* world*view (camera space) */
+    "    float4x4 WorldViewInvTranspose;\n" /* inverse-transpose(world*view), for camera-space normals */
+    "    float4x4 TexMat[4];\n"             /* per-stage texture matrices */
+    "    uint4    TexCoordIndex;\n"         /* per-stage D3DTSS_TEXCOORDINDEX (TCI + set select) */
     "};\n"
     "\n"
-    "cbuffer LightingCB : register(b1) {\n"
+    "cbuffer LightingCB : register(b1, space1) {\n"
     "    float4 GlobalAmbient;\n"
     "    float4 MatDiffuse;\n"
     "    float4 MatAmbient;\n"
@@ -68,28 +74,28 @@ static const char g_vs_source[] =
     "};\n"
     "\n"
     "struct VS_IN {\n"
-    "    float4 pos      : POSITION;\n"
-    "    float3 normal   : NORMAL;\n"
-    "    float4 diffuse  : COLOR0;\n"
-    "    float4 specular : COLOR1;\n"
-    "    float2 tex0     : TEXCOORD0;\n"
-    "    float2 tex1     : TEXCOORD1;\n"
-    "    float2 tex2     : TEXCOORD2;\n"
-    "    float2 tex3     : TEXCOORD3;\n"
+    "    [[vk::location(0)]] float4 pos      : POSITION;\n"
+    "    [[vk::location(1)]] float3 normal   : NORMAL;\n"
+    "    [[vk::location(2)]] float4 diffuse  : COLOR0;\n"
+    "    [[vk::location(3)]] float4 specular : COLOR1;\n"
+    "    [[vk::location(4)]] float4 tex0     : TEXCOORD0;\n"
+    "    [[vk::location(5)]] float4 tex1     : TEXCOORD1;\n"
+    "    [[vk::location(6)]] float4 tex2     : TEXCOORD2;\n"
+    "    [[vk::location(7)]] float4 tex3     : TEXCOORD3;\n"
     "};\n"
     "\n"
     "struct VS_OUT {\n"
     "    float4 pos      : SV_POSITION;\n"
-    "    float4 diffuse  : COLOR0;\n"
-    "    float4 specular : COLOR1;\n"
-    "    float2 tex0     : TEXCOORD0;\n"
-    "    float2 tex1     : TEXCOORD1;\n"
-    "    float2 tex2     : TEXCOORD2;\n"
-    "    float2 tex3     : TEXCOORD3;\n"
-    "    float  fog      : TEXCOORD4;\n"
+    "    [[vk::location(0)]] float4 diffuse  : COLOR0;\n"
+    "    [[vk::location(1)]] float4 specular : COLOR1;\n"
+    "    [[vk::location(2)]] float3 tex0     : TEXCOORD0;\n"
+    "    [[vk::location(3)]] float3 tex1     : TEXCOORD1;\n"
+    "    [[vk::location(4)]] float3 tex2     : TEXCOORD2;\n"
+    "    [[vk::location(5)]] float3 tex3     : TEXCOORD3;\n"
+    "    [[vk::location(6)]] float  fog      : TEXCOORD4;\n"
+    "    [[vk::location(7)]] float4 viewpos  : TEXCOORD5;\n"   /* view-space position (per-pixel fog) */
     "};\n"
     "\n"
-    /* Flags bits */
     "// Flags: bit0=pretransformed, bit1=hasDiffuse, bit2=hasSpecular, bit3=hasNormal\n"
     "//        bit4=lighting, bit8-11=texCount\n"
     "#define FLAG_PRETRANSFORMED 0x01u\n"
@@ -98,49 +104,99 @@ static const char g_vs_source[] =
     "#define FLAG_HAS_NORMAL     0x08u\n"
     "#define FLAG_LIGHTING       0x10u\n"
     "\n"
+    "// D3DFOGMODE: 0=NONE, 1=EXP, 2=EXP2, 3=LINEAR\n"
     "float compute_fog(float dist) {\n"
     "    uint mode = (uint)FogParams.w;\n"
-    "    if (mode == 1u) {\n"  /* LINEAR */
-    "        return saturate((FogParams.y - dist) / (FogParams.y - FogParams.x));\n"
-    "    } else if (mode == 2u) {\n"  /* EXP */
+    "    if (mode == 1u) {\n"  /* EXP */
     "        return saturate(exp(-FogParams.z * dist));\n"
-    "    } else if (mode == 3u) {\n"  /* EXP2 */
+    "    } else if (mode == 2u) {\n"  /* EXP2 */
     "        float e = FogParams.z * dist;\n"
     "        return saturate(exp(-e * e));\n"
+    "    } else if (mode == 3u) {\n"  /* LINEAR */
+    "        return saturate((FogParams.y - dist) / max(FogParams.y - FogParams.x, 1e-6));\n"
     "    }\n"
     "    return 1.0;\n"  /* no fog */
     "}\n"
     "\n"
+    // Generate the texture coordinate for a stage per D3DTSS_TEXCOORDINDEX.
+    // Low 16 bits = source texcoord set (PASSTHRU), high bits = TCI mode.
+    "float4 gen_tex(uint stage, VS_IN input, float3 posCam, float3 nrmCam) {\n"
+    "    uint tci = TexCoordIndex[stage];\n"
+    "    uint mode = tci & 0x000F0000u;\n"
+    "    uint src  = tci & 0x0000FFFFu;\n"
+    "    float4 uv;\n"
+    "    if (mode == 0x00010000u) {\n"       /* TCI_CAMERASPACENORMAL */
+    "        uv = float4(nrmCam, 1.0);\n"
+    "    } else if (mode == 0x00020000u) {\n"   /* TCI_CAMERASPACEPOSITION */
+    "        uv = float4(posCam, 1.0);\n"
+    "    } else if (mode == 0x00030000u) {\n"   /* TCI_CAMERASPACEREFLECTIONVECTOR */
+    "        float3 V = normalize(-posCam);\n"
+    "        float3 N = normalize(nrmCam);\n"
+    "        uv = float4(reflect(V, N), 1.0);\n"
+    "    } else if (mode == 0x00040000u) {\n"   /* TCI_SPHEREMAP */
+    "        float3 n = normalize(nrmCam);\n"
+    "        float m = 2.0 * sqrt(n.x*n.x + n.y*n.y + (n.z + 1.0)*(n.z + 1.0));\n"
+    "        uv = float4(n.x / m + 0.5, n.y / m + 0.5, 0.0, 1.0);\n"
+    "    } else {\n"                             /* TCI_PASSTHRU: use texcoord set [src] */
+    "        if (src == 1u) uv = input.tex1;\n"
+    "        else if (src == 2u) uv = input.tex2;\n"
+    "        else if (src == 3u) uv = input.tex3;\n"
+    "        else               uv = input.tex0;\n"
+    "    }\n"
+    "    return mul(uv, TexMat[stage]);\n"
+    "}\n"
+    "\n"
     "VS_OUT main(VS_IN input) {\n"
     "    VS_OUT o;\n"
-    "    o.tex0 = input.tex0;\n"
-    "    o.tex1 = input.tex1;\n"
-    "    o.tex2 = input.tex2;\n"
-    "    o.tex3 = input.tex3;\n"
     "    o.fog = 1.0;\n"
     "    o.specular = float4(0, 0, 0, 0);\n"
+    "    o.viewpos = float4(0, 0, 0, 1);\n"
     "\n"
     "    if (Flags & FLAG_PRETRANSFORMED) {\n"
     "        o.pos.x = (input.pos.x / ScreenSize.x) * 2.0 - 1.0;\n"
     "        o.pos.y = 1.0 - (input.pos.y / ScreenSize.y) * 2.0;\n"
     "        o.pos.z = input.pos.z;\n"
     "        o.pos.w = 1.0;\n"
+    /* Recover clip W for perspective interpolation without changing screen XYZ.
+     * RHW = 0 is degenerate and titles do emit it for 2D overlays that do not
+     * care; dividing by it culls the whole quad, so leave those alone. */
+    "        if (input.pos.w != 0.0) o.pos /= input.pos.w;\n"
+    "        o.tex0 = input.tex0.xyz;\n"
+    "        o.tex1 = input.tex1.xyz;\n"
+    "        o.tex2 = input.tex2.xyz;\n"
+    "        o.tex3 = input.tex3.xyz;\n"
     "        o.diffuse = (Flags & FLAG_HAS_DIFFUSE) ? input.diffuse.bgra : float4(1,1,1,1);\n"
     "        if (Flags & FLAG_HAS_SPECULAR) o.specular = input.specular.bgra;\n"
     "        return o;\n"
     "    }\n"
     "\n"
     "    o.pos = mul(float4(input.pos.xyz, 1.0), WorldViewProj);\n"
+    "    float4 viewPos4 = mul(float4(input.pos.xyz, 1.0), WorldView);\n"
+    "    o.viewpos = viewPos4;\n"
+    "    float3 posCam = viewPos4.xyz;\n"
+    "    float3 nrmCam = float3(0, 0, 1);\n"
     "\n"
     "    // Vertex colors\n"
     "    float4 vertDiffuse = (Flags & FLAG_HAS_DIFFUSE) ? input.diffuse.bgra : float4(1,1,1,1);\n"
     "    float4 vertSpecular = float4(0,0,0,0);\n"
     "    if (Flags & FLAG_HAS_SPECULAR) vertSpecular = input.specular.bgra;\n"
     "\n"
+    "    // World-space normal (lighting) and camera-space normal (TCI / fog)\n"
+    "    float3 worldNormal = float3(0, 0, 1);\n"
+    "    if (Flags & FLAG_HAS_NORMAL) {\n"
+    "        worldNormal = normalize(mul(input.normal, (float3x3)WorldInvTranspose));\n"
+    "        nrmCam = normalize(mul(input.normal, (float3x3)WorldViewInvTranspose));\n"
+    "    }\n"
+    "\n"
+    "    // Texture coordinates: per-stage TEXCOORDINDEX + texture matrix\n"
+    "    o.tex0 = gen_tex(0, input, posCam, nrmCam).xyz;\n"
+    "    o.tex1 = gen_tex(1, input, posCam, nrmCam).xyz;\n"
+    "    o.tex2 = gen_tex(2, input, posCam, nrmCam).xyz;\n"
+    "    o.tex3 = gen_tex(3, input, posCam, nrmCam).xyz;\n"
+    "\n"
     "    // Lighting\n"
     "    if ((Flags & FLAG_LIGHTING) && (Flags & FLAG_HAS_NORMAL)) {\n"
     "        float3 worldPos = mul(float4(input.pos.xyz, 1.0), World).xyz;\n"
-    "        float3 worldNormal = normalize(mul(input.normal, (float3x3)WorldInvTranspose));\n"
     "        float3 viewDir = normalize(EyePos.xyz - worldPos);\n"
     "\n"
     "        float4 litDiffuse = MatEmissive + MatAmbient * GlobalAmbient;\n"
@@ -188,7 +244,7 @@ static const char g_vs_source[] =
     "        o.specular = vertSpecular;\n"
     "    }\n"
     "\n"
-    "    // Fog\n"
+    "    // Vertex fog (FOGVERTEXMODE)\n"
     "    if ((uint)FogParams.w != 0u) {\n"
     "        float3 worldPos = mul(float4(input.pos.xyz, 1.0), World).xyz;\n"
     "        float fogDist = length(EyePos.xyz - worldPos);\n"
@@ -208,45 +264,46 @@ static const char g_vs_source[] =
  * - Alpha test
  * ================================================================ */
 
-static const char g_ps_source[] =
-    "Texture2D    tex0 : register(t0);\n"
-    "Texture2D    tex1 : register(t1);\n"
-    "Texture2D    tex2 : register(t2);\n"
-    "Texture2D    tex3 : register(t3);\n"
-    "SamplerState samp0 : register(s0);\n"
-    "SamplerState samp1 : register(s1);\n"
-    "SamplerState samp2 : register(s2);\n"
-    "SamplerState samp3 : register(s3);\n"
-    "\n"
-    "cbuffer PixelCB : register(b0) {\n"
+static const char g_ps_body[] =
+    "cbuffer PixelCB : register(b0, space3) {\n"
     "    float4 TexFactor;\n"
     "    float4 FogColor;\n"
+    "    float4 FogParams;\n"      /* x=start, y=end, z=density, w=table fog mode (D3DFOGMODE) */
     "    float  AlphaRef;\n"
     "    uint   AlphaFunc;\n"
-    "    uint   PSFlags;\n"      /* bit 0: alpha test, bit 1: fog, bit 2: specular add */
+    "    uint   PSFlags;\n"        /* bit 0: alpha test, bit 1: vertex fog, bit 2: specular add, bit 3: table fog, bit 4: range fog */
     "    uint   _pad0;\n"
     "    // Per-stage: x=colorop, y=colorarg1, z=colorarg2, w=alphaop\n"
     "    uint4  StageColor[4];\n"
     "    // Per-stage: x=alphaarg1, y=alphaarg2, z=0, w=0\n"
     "    uint4  StageAlpha[4];\n"
+    "    uint4  AlphaOnly;\n"
     "};\n"
     "\n"
     "struct PS_IN {\n"
     "    float4 pos      : SV_POSITION;\n"
-    "    float4 diffuse  : COLOR0;\n"
-    "    float4 specular : COLOR1;\n"
-    "    float2 tex0     : TEXCOORD0;\n"
-    "    float2 tex1     : TEXCOORD1;\n"
-    "    float2 tex2     : TEXCOORD2;\n"
-    "    float2 tex3     : TEXCOORD3;\n"
-    "    float  fog      : TEXCOORD4;\n"
+    "    [[vk::location(0)]] float4 diffuse  : COLOR0;\n"
+    "    [[vk::location(1)]] float4 specular : COLOR1;\n"
+    "    [[vk::location(2)]] float3 tex0     : TEXCOORD0;\n"
+    "    [[vk::location(3)]] float3 tex1     : TEXCOORD1;\n"
+    "    [[vk::location(4)]] float3 tex2     : TEXCOORD2;\n"
+    "    [[vk::location(5)]] float3 tex3     : TEXCOORD3;\n"
+    "    [[vk::location(6)]] float  fog      : TEXCOORD4;\n"
+    "    [[vk::location(7)]] float4 viewpos  : TEXCOORD5;\n"
     "};\n"
     "\n"
-    "float4 sample_tex(uint stage, PS_IN input) {\n"
-    "    if (stage == 0) return tex0.Sample(samp0, input.tex0);\n"
-    "    if (stage == 1) return tex1.Sample(samp1, input.tex1);\n"
-    "    if (stage == 2) return tex2.Sample(samp2, input.tex2);\n"
-    "    return tex3.Sample(samp3, input.tex3);\n"
+    "// D3DFOGMODE: 0=NONE, 1=EXP, 2=EXP2, 3=LINEAR\n"
+    "float compute_pfog(float dist) {\n"
+    "    uint mode = (uint)FogParams.w;\n"
+    "    if (mode == 1u) {\n"  /* EXP */
+    "        return saturate(exp(-FogParams.z * dist));\n"
+    "    } else if (mode == 2u) {\n"  /* EXP2 */
+    "        float e = FogParams.z * dist;\n"
+    "        return saturate(exp(-e * e));\n"
+    "    } else if (mode == 3u) {\n"  /* LINEAR */
+    "        return saturate((FogParams.y - dist) / max(FogParams.y - FogParams.x, 1e-6));\n"
+    "    }\n"
+    "    return 1.0;\n"
     "}\n"
     "\n"
     /* Resolve a texture argument value */
@@ -261,7 +318,7 @@ static const char g_ps_source[] =
     "    else if (base == 4u) val = specular;\n"  /* D3DTA_SPECULAR */
     "    else val = current;\n"
     "    if (arg & 0x10u) val = 1.0 - val;\n"     /* D3DTA_COMPLEMENT */
-    "    if (arg & 0x20u) val = val.aaaa;\n"       /* D3DTA_ALPHAREPLICATE */
+    "    if (arg & 0x20u) val = val.aaaa;\n"      /* D3DTA_ALPHAREPLICATE */
     "    return val;\n"
     "}\n"
     "\n"
@@ -293,11 +350,9 @@ static const char g_ps_source[] =
     "    float4 current = input.diffuse;\n"
     "    float4 texels[4];\n"
     "\n"
-    "    // Pre-sample all textures\n"
-    "    texels[0] = tex0.Sample(samp0, input.tex0);\n"
-    "    texels[1] = tex1.Sample(samp1, input.tex1);\n"
-    "    texels[2] = tex2.Sample(samp2, input.tex2);\n"
-    "    texels[3] = tex3.Sample(samp3, input.tex3);\n"
+    "    // Pre-sample all textures\n";
+
+static const char g_ps_tail[] =
     "\n"
     "    // Process up to 4 texture stages\n"
     "    [unroll] for (uint i = 0; i < 4; i++) {\n"
@@ -347,8 +402,14 @@ static const char g_ps_source[] =
     "        current.rgb = saturate(current.rgb + input.specular.rgb);\n"
     "\n"
     "    // Fog blending\n"
-    "    if (PSFlags & 2u)\n"
+    "    if (PSFlags & 2u)\n"  /* vertex fog: input.fog is the fog factor */
     "        current.rgb = lerp(FogColor.rgb, current.rgb, input.fog);\n"
+    "\n"
+    "    if (PSFlags & 8u) {\n"  /* table fog: compute fog per-pixel from view-space depth */
+    "        float dist = (PSFlags & 16u) ? length(input.viewpos.xyz) : -input.viewpos.z;\n"
+    "        float f = compute_pfog(dist);\n"
+    "        current.rgb = lerp(FogColor.rgb, current.rgb, f);\n"
+    "    }\n"
     "\n"
     "    // Alpha test\n"
     "    if (PSFlags & 1u) {\n"
@@ -366,16 +427,120 @@ static const char g_ps_source[] =
     "    return current;\n"
     "}\n";
 
+/* Build the fixed-function pixel shader source for a texture signature.
+ *
+ * The signature packs 2 bits per stage (stages 0..3, low bits first):
+ *   0 = 2D texture   (Texture2D,  float2 sample coord)
+ *   1 = cube texture (TextureCUBE, float3 sample coord)
+ *   2 = 3D texture   (Texture3D,  float3 sample coord)
+ * Texture object declarations must match the dimension of the texture bound
+ * at each stage, otherwise the sample is invalid.
+ */
+#define FF_PS_SRC_SIZE 16384
+
+static void build_ps_source(UINT sig, char *buf, int bufsize)
+{
+    int off = 0;
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        UINT dim = (sig >> (i * 2)) & 3u;
+        const char *decl = (dim == 1u) ? "TextureCube" :
+                           (dim == 2u) ? "Texture3D" : "Texture2D";
+        off += snprintf(buf + off, bufsize - off, "%s tex%d : register(t%d, space2);\n",
+                        decl, i, i);
+        off += snprintf(buf + off, bufsize - off,
+                        "SamplerState samp%d : register(s%d, space2);\n", i, i);
+    }
+    off += snprintf(buf + off, bufsize - off, "%s", g_ps_body);
+
+    for (i = 0; i < 4; i++) {
+        UINT dim = (sig >> (i * 2)) & 3u;
+        off += snprintf(buf + off, bufsize - off,
+                        "    texels[%d] = tex%d.Sample(samp%d, input.tex%d.%s);\n",
+                        i, i, i, i, dim ? "xyz" : "xy");
+        /* Xbox A8 samples white RGB; DXGI A8 supplies zero RGB. */
+        off += snprintf(buf + off, bufsize - off,
+                        "    if (AlphaOnly[%d]) texels[%d].rgb = 1.0;\n", i, i);
+    }
+    off += snprintf(buf + off, bufsize - off, "%s", g_ps_tail);
+}
+
 /* ================================================================
  * Compiled shader objects
  * ================================================================ */
 
-static ID3D11VertexShader  *g_vs = NULL;
-static ID3D11PixelShader   *g_ps = NULL;
-static ID3DBlob            *g_vs_blob = NULL;
-static ID3D11Buffer        *g_vs_cb = NULL;      /* VS transform CB (b0) */
-static ID3D11Buffer        *g_vs_light_cb = NULL; /* VS lighting CB (b1) */
-static ID3D11Buffer        *g_ps_cb = NULL;       /* PS constant buffer */
+static XGpuShader g_vs;                 /* the fixed-function vertex shader */
+
+/* Fixed-function PS cache, keyed by per-stage texture signature.
+ * The texture object declarations must match the dimensions of the SRVs
+ * bound at each stage, so the PS is recompiled when the set of
+ * 2D/cube/volume textures changes. Practically only a handful of
+ * signatures ever occur. */
+#define FF_PS_CACHE_SIZE 16
+
+typedef struct {
+    UINT       sig;
+    XGpuShader ps;
+} FfPsCacheEntry;
+
+static FfPsCacheEntry g_ff_ps_cache[FF_PS_CACHE_SIZE];
+static int g_ff_ps_cache_count = 0;
+
+/* Get (compiling if needed) the fixed-function pixel shader for a texture
+ * signature. Returns NULL and logs on compile failure. */
+static const XGpuShader *ff_ps_get_shader(UINT sig)
+{
+    XGpuShader ps;
+    char *src;
+    int i, ok;
+
+    for (i = 0; i < g_ff_ps_cache_count; i++) {
+        if (g_ff_ps_cache[i].sig == sig)
+            return &g_ff_ps_cache[i].ps;
+    }
+
+    src = (char *)malloc(FF_PS_SRC_SIZE);
+    if (!src) return NULL;
+    build_ps_source(sig, src, FF_PS_SRC_SIZE);
+    ok = xgpu_compile_hlsl_ex(d3d8_GetGpu()->device, src, "main", 1, "ps_ffp", &ps);
+    free(src);
+    if (!ok) {
+        fprintf(stderr, "D3D8: PS compile failed (sig 0x%02X)\n", sig);
+        return NULL;
+    }
+
+    if (g_ff_ps_cache_count >= FF_PS_CACHE_SIZE) {
+        /* Evict the oldest entry */
+        xgpu_release_shader(d3d8_GetGpu()->device, &g_ff_ps_cache[0].ps);
+        memmove(&g_ff_ps_cache[0], &g_ff_ps_cache[1],
+                (FF_PS_CACHE_SIZE - 1) * sizeof(FfPsCacheEntry));
+        g_ff_ps_cache_count--;
+    }
+    g_ff_ps_cache[g_ff_ps_cache_count].sig = sig;
+    g_ff_ps_cache[g_ff_ps_cache_count].ps = ps;
+    return &g_ff_ps_cache[g_ff_ps_cache_count++].ps;
+}
+
+/* Compute the per-stage texture signature from the textures currently
+ * bound to the pixel shader stages. */
+static UINT ff_ps_compute_signature(void)
+{
+    UINT sig = 0;
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        IDirect3DBaseTexture8 *tex = d3d8_GetStageTexture(i);
+        UINT dim = 0;
+        if (tex) {
+            D3DRESOURCETYPE type = IDirect3DBaseTexture8_GetType(tex);
+            if (type == D3DRTYPE_CUBETEXTURE)      dim = 1;
+            else if (type == D3DRTYPE_VOLUMETEXTURE) dim = 2;
+        }
+        sig |= dim << (i * 2);
+    }
+    return sig;
+}
 
 /* VS transform constant buffer layout (must match HLSL TransformCB) */
 typedef struct {
@@ -387,6 +552,10 @@ typedef struct {
     float _pad0;
     float eye_pos[4];
     float fog_params[4];         /* start, end, density, mode */
+    float world_view[16];        /* World*View, camera space (column-major) */
+    float world_view_inv_transpose[16]; /* inverse-transpose(World*View) */
+    float tex_mat[4][16];        /* per-stage texture matrices (column-major) */
+    UINT  texcoord_index[4];     /* per-stage D3DTSS_TEXCOORDINDEX */
 } VSTransformConstants;
 
 /* VS lighting constant buffer layout (must match HLSL LightingCB) */
@@ -414,137 +583,107 @@ typedef struct {
 typedef struct {
     float tex_factor[4];
     float fog_color[4];
+    float fog_params[4];         /* start, end, density, table fog mode (D3DFOGMODE) */
     float alpha_ref;
     UINT  alpha_func;
-    UINT  ps_flags;              /* bit 0: alpha test, bit 1: fog, bit 2: specular add */
+    UINT  ps_flags;              /* bit 0: alpha test, bit 1: vertex fog, bit 2: specular add, bit 3: table fog, bit 4: range fog */
     UINT  _pad0;
     UINT  stage_color[4][4];     /* [stage][x=colorop, y=arg1, z=arg2, w=alphaop] */
     UINT  stage_alpha[4][4];     /* [stage][x=alphaarg1, y=alphaarg2, z=0, w=0] */
+    UINT  alpha_only[4];
 } PSConstants;
 
 /* ================================================================
- * Input layout cache (FVF → ID3D11InputLayout)
+ * Vertex layout cache (FVF -> D3D8VertexLayout)
  * ================================================================ */
 
 #define MAX_LAYOUT_CACHE 32
 
 typedef struct {
-    DWORD               fvf;
-    ID3D11InputLayout  *layout;
+    DWORD            fvf;
+    D3D8VertexLayout layout;
 } LayoutCacheEntry;
 
 static LayoutCacheEntry g_layout_cache[MAX_LAYOUT_CACHE];
 static int g_layout_cache_count = 0;
 
-/* Calculate vertex stride from FVF */
-static UINT fvf_stride(DWORD fvf)
+/* Number of floats in texcoord set `t` (0-3) according to the FVF.
+ * Each set uses 2 bits at bit position (16 + t*2); 0 means default (2). */
+static UINT fvf_texcoord_size(DWORD fvf, UINT t)
 {
-    UINT stride = 0;
-    if (fvf & D3DFVF_XYZ)    stride += 12;
-    if (fvf & D3DFVF_XYZRHW) stride += 16;
-    if (fvf & D3DFVF_NORMAL) stride += 12;
-    if (fvf & D3DFVF_DIFFUSE) stride += 4;
-    if (fvf & D3DFVF_SPECULAR) stride += 4;
-    stride += ((fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT) * 8;
-    return stride;
+    DWORD field = (fvf >> (16 + t * 2)) & 0x3;
+    return field == 0 ? 2 : field;
+}
+
+static void add_attr(D3D8VertexLayout *l, Uint32 location, SDL_GPUVertexElementFormat fmt, Uint32 offset)
+{
+    SDL_GPUVertexAttribute *a = &l->attrs[l->num_attrs++];
+    a->location = location;
+    a->buffer_slot = 0;
+    a->format = fmt;
+    a->offset = offset;
 }
 
 /*
- * Build input layout for a given FVF.
+ * Build the vertex layout for a given FVF. Locations follow the VS_IN
+ * declaration: 0 position, 1 normal, 2 diffuse, 3 specular, 4-7 texcoords.
  *
  * The vertex shader declares all 8 inputs. For FVF components that are
- * missing, we add dummy elements at offset 0 — the shader ignores them
+ * missing, we add dummy elements at offset 0 -- the shader ignores them
  * via the Flags constant buffer.
  */
-static ID3D11InputLayout *get_or_create_layout(DWORD fvf)
+static const D3D8VertexLayout *get_or_create_layout(DWORD fvf)
 {
-    D3D11_INPUT_ELEMENT_DESC elems[16];
-    UINT elem_count = 0;
+    D3D8VertexLayout l;
     UINT offset = 0;
-    HRESULT hr;
     int i;
 
     for (i = 0; i < g_layout_cache_count; i++) {
         if (g_layout_cache[i].fvf == fvf)
-            return g_layout_cache[i].layout;
+            return &g_layout_cache[i].layout;
     }
 
-    /* POSITION */
-    if (fvf & D3DFVF_XYZRHW) {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++; offset += 16;
-    } else if (fvf & D3DFVF_XYZ) {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++; offset += 12;
-    } else {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++;
-    }
+    memset(&l, 0, sizeof(l));
 
-    /* NORMAL */
-    if (fvf & D3DFVF_NORMAL) {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++; offset += 12;
-    } else {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++;
-    }
+    add_attr(&l, 0, d3d8_fvf_transformed(fvf) ? SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4
+                                              : SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offset);
+    offset = d3d8_fvf_position_bytes(fvf);
 
-    /* COLOR0 (Diffuse) */
-    if (fvf & D3DFVF_DIFFUSE) {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++; offset += 4;
-    } else {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++;
-    }
+    if (fvf & D3DFVF_NORMAL) { add_attr(&l, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, offset); offset += 12; }
+    else                     { add_attr(&l, 1, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 0); }
 
-    /* COLOR1 (Specular) */
-    if (fvf & D3DFVF_SPECULAR) {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"COLOR", 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++; offset += 4;
-    } else {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"COLOR", 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++;
-    }
+    if (fvf & D3DFVF_DIFFUSE) { add_attr(&l, 2, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, offset); offset += 4; }
+    else                      { add_attr(&l, 2, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, 0); }
 
-    /* TEXCOORD0-3 */
+    if (fvf & D3DFVF_SPECULAR) { add_attr(&l, 3, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, offset); offset += 4; }
+    else                       { add_attr(&l, 3, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, 0); }
+
     {
         UINT tex_count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+        static const SDL_GPUVertexElementFormat tc_fmt[5] = {
+            SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,   /* 2 (default) */
+            SDL_GPU_VERTEXELEMENTFORMAT_FLOAT,    /* 1 */
+            SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,   /* 2 */
+            SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3,   /* 3 */
+            SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4    /* 4 */
+        };
         UINT t;
         for (t = 0; t < 4; t++) {
             if (t < tex_count) {
-                elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"TEXCOORD", t, DXGI_FORMAT_R32G32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
-                elem_count++; offset += 8;
+                UINT size = fvf_texcoord_size(fvf, t);
+                add_attr(&l, 4 + t, tc_fmt[size], offset);
+                offset += size * 4;
             } else {
-                elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"TEXCOORD", t, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
-                elem_count++;
+                add_attr(&l, 4 + t, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, 0);
             }
         }
     }
 
-    {
-        ID3D11InputLayout *layout = NULL;
-        hr = ID3D11Device_CreateInputLayout(
-            d3d8_GetD3D11Device(),
-            elems, elem_count,
-            ID3D10Blob_GetBufferPointer(g_vs_blob),
-            ID3D10Blob_GetBufferSize(g_vs_blob),
-            &layout);
-
-        if (FAILED(hr)) {
-            fprintf(stderr, "D3D8: CreateInputLayout failed for FVF 0x%lX: 0x%08lX\n", fvf, hr);
-            layout = NULL;
-        }
-
-        if (g_layout_cache_count < MAX_LAYOUT_CACHE) {
-            g_layout_cache[g_layout_cache_count].fvf = fvf;
-            g_layout_cache[g_layout_cache_count].layout = layout;
-            g_layout_cache_count++;
-        }
-
-        return layout;
-    }
+    if (g_layout_cache_count >= MAX_LAYOUT_CACHE)
+        g_layout_cache_count = 0;           /* tiny cache: recycle from the start */
+    g_layout_cache[g_layout_cache_count].fvf = fvf;
+    g_layout_cache[g_layout_cache_count].layout = l;
+    return &g_layout_cache[g_layout_cache_count++].layout;
 }
 
 /* ================================================================
@@ -630,65 +769,17 @@ static void mat4_inverse(float *out, const float *m)
 
 HRESULT d3d8_shaders_init(void)
 {
-    ID3DBlob *errors = NULL;
-    D3D11_BUFFER_DESC cbd;
-    HRESULT hr;
-
     /* Compile vertex shader */
-    hr = D3DCompile(g_vs_source, strlen(g_vs_source), "vs_ffp",
-                    NULL, NULL, "main", "vs_5_0", 0, 0, &g_vs_blob, &errors);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: VS compile failed: %s\n",
-                errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
-        if (errors) ID3D10Blob_Release(errors);
-        return hr;
+    if (!xgpu_compile_hlsl_ex(d3d8_GetGpu()->device, g_vs_source, "main", 0, "vs_ffp", &g_vs)) {
+        fprintf(stderr, "D3D8: VS compile failed\n");
+        return E_FAIL;
     }
 
-    hr = ID3D11Device_CreateVertexShader(d3d8_GetD3D11Device(),
-        ID3D10Blob_GetBufferPointer(g_vs_blob),
-        ID3D10Blob_GetBufferSize(g_vs_blob),
-        NULL, &g_vs);
-    if (FAILED(hr)) return hr;
-
-    /* Compile pixel shader */
-    {
-        ID3DBlob *ps_blob = NULL;
-        hr = D3DCompile(g_ps_source, strlen(g_ps_source), "ps_ffp",
-                        NULL, NULL, "main", "ps_5_0", 0, 0, &ps_blob, &errors);
-        if (FAILED(hr)) {
-            fprintf(stderr, "D3D8: PS compile failed: %s\n",
-                    errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
-            if (errors) ID3D10Blob_Release(errors);
-            return hr;
-        }
-
-        hr = ID3D11Device_CreatePixelShader(d3d8_GetD3D11Device(),
-            ID3D10Blob_GetBufferPointer(ps_blob),
-            ID3D10Blob_GetBufferSize(ps_blob),
-            NULL, &g_ps);
-        ID3D10Blob_Release(ps_blob);
-        if (FAILED(hr)) return hr;
-    }
-
-    /* Create VS transform constant buffer (b0) */
-    memset(&cbd, 0, sizeof(cbd));
-    cbd.ByteWidth = (sizeof(VSTransformConstants) + 15) & ~15;
-    cbd.Usage = D3D11_USAGE_DYNAMIC;
-    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_vs_cb);
-    if (FAILED(hr)) return hr;
-
-    /* Create VS lighting constant buffer (b1) */
-    cbd.ByteWidth = (sizeof(VSLightingConstants) + 15) & ~15;
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_vs_light_cb);
-    if (FAILED(hr)) return hr;
-
-    /* Create PS constant buffer */
-    cbd.ByteWidth = (sizeof(PSConstants) + 15) & ~15;
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_ps_cb);
-    if (FAILED(hr)) return hr;
+    /* Compile the default (all-2D) pixel shader */
+    g_ff_ps_cache_count = 0;
+    memset(g_ff_ps_cache, 0, sizeof(g_ff_ps_cache));
+    if (!ff_ps_get_shader(0))
+        return E_FAIL;
 
     fprintf(stderr, "D3D8: Fixed-function shaders compiled OK (multi-texture + lighting + fog)\n");
     return S_OK;
@@ -696,66 +787,60 @@ HRESULT d3d8_shaders_init(void)
 
 void d3d8_shaders_shutdown(void)
 {
+    XGpu *g = d3d8_GetGpu();
     int i;
-    for (i = 0; i < g_layout_cache_count; i++) {
-        if (g_layout_cache[i].layout)
-            ID3D11InputLayout_Release(g_layout_cache[i].layout);
-    }
-    g_layout_cache_count = 0;
 
-    if (g_ps_cb)       { ID3D11Buffer_Release(g_ps_cb); g_ps_cb = NULL; }
-    if (g_vs_light_cb) { ID3D11Buffer_Release(g_vs_light_cb); g_vs_light_cb = NULL; }
-    if (g_vs_cb)       { ID3D11Buffer_Release(g_vs_cb); g_vs_cb = NULL; }
-    if (g_ps)          { ID3D11PixelShader_Release(g_ps); g_ps = NULL; }
-    if (g_vs)          { ID3D11VertexShader_Release(g_vs); g_vs = NULL; }
-    if (g_vs_blob)     { ID3D10Blob_Release(g_vs_blob); g_vs_blob = NULL; }
+    g_layout_cache_count = 0;
+    for (i = 0; i < g_ff_ps_cache_count; i++)
+        xgpu_release_shader(g->device, &g_ff_ps_cache[i].ps);
+    g_ff_ps_cache_count = 0;
+    xgpu_release_shader(g->device, &g_vs);
 }
 
 /* ================================================================
  * Pre-draw binding
  * ================================================================ */
 
-void d3d8_shaders_prepare_draw(DWORD fvf)
+static void ff_vs_prepare_draw(DWORD fvf)
 {
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    ID3D11InputLayout *layout;
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    const D3D8VertexLayout *layout;
     const D3DMATRIX *world, *view, *proj;
     const DWORD *rs;
-    HRESULT hr;
     UINT tex_count;
 
-    if (!ctx || !g_vs || !g_ps) return;
+    if (!g_vs.shader) return;
 
     rs = d3d8_GetRenderStates();
     tex_count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+    (void)tex_count;
 
-    /* Bind shaders */
-    ID3D11DeviceContext_VSSetShader(ctx, g_vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(ctx, g_ps, NULL, 0);
+    d3d8_pipe_set_vs(&g_vs);
 
-    /* Bind input layout */
     layout = get_or_create_layout(fvf);
     if (layout)
-        ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+        d3d8_pipe_set_layout(layout);
 
     /* ---- VS Transform CB (b0) ---- */
-    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vs_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        VSTransformConstants *cb = (VSTransformConstants *)mapped.pData;
+    {
+        VSTransformConstants cb_local;
+        VSTransformConstants *cb = &cb_local;
+        UINT i;
         memset(cb, 0, sizeof(*cb));
 
-        if (fvf & D3DFVF_XYZRHW) {
+        if (d3d8_fvf_transformed(fvf)) {
             float identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
             memcpy(cb->wvp, identity, sizeof(identity));
             memcpy(cb->world, identity, sizeof(identity));
             memcpy(cb->world_inv_transpose, identity, sizeof(identity));
+            memcpy(cb->world_view, identity, sizeof(identity));
+            memcpy(cb->world_view_inv_transpose, identity, sizeof(identity));
             cb->screen_w = (float)d3d8_GetBackbufferWidth();
             cb->screen_h = (float)d3d8_GetBackbufferHeight();
             cb->flags = 0x01; /* pre-transformed */
         } else {
             float wv[16], wvp[16], wvp_t[16], world_t[16];
             float world_inv[16], world_inv_t[16];
+            float wv_t[16], wv_inv[16], wv_inv_t[16];
 
             world = d3d8_GetTransform(D3DTS_WORLD);
             view  = d3d8_GetTransform(D3DTS_VIEW);
@@ -773,6 +858,13 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
             mat4_inverse(world_inv, (const float *)world);
             mat4_transpose(world_inv_t, world_inv);
             memcpy(cb->world_inv_transpose, world_inv_t, sizeof(world_inv_t));
+
+            /* WorldView (camera space) and its inverse-transpose */
+            mat4_transpose(wv_t, wv);
+            memcpy(cb->world_view, wv_t, sizeof(wv_t));
+            mat4_inverse(wv_inv, wv);
+            mat4_transpose(wv_inv_t, wv_inv);
+            memcpy(cb->world_view_inv_transpose, wv_inv_t, sizeof(wv_inv_t));
 
             cb->screen_w = (float)d3d8_GetBackbufferWidth();
             cb->screen_h = (float)d3d8_GetBackbufferHeight();
@@ -803,16 +895,36 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
             cb->fog_params[0] = fog_start;
             cb->fog_params[1] = fog_end;
             cb->fog_params[2] = fog_density;
-            cb->fog_params[3] = (float)rs[D3DRS_FOGTABLEMODE];
+            if (rs[D3DRS_FOGTABLEMODE] != D3DFOG_NONE) {
+                /* Table fog is applied per-pixel in the PS; disable VS fog. */
+                cb->fog_params[3] = (float)D3DFOG_NONE;
+            } else {
+                cb->fog_params[3] = (float)rs[D3DRS_FOGVERTEXMODE];
+            }
         }
 
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vs_cb, 0);
+        /* Per-stage texture matrices and texcoord indices */
+        for (i = 0; i < 4; i++) {
+            const float *tm = (const float *)d3d8_GetTransform(D3DTS_TEXTURE0 + i);
+            const DWORD *ts = d3d8_GetTSS(i);
+            if (tm) {
+                float tm_t[16];
+                mat4_transpose(tm_t, tm);
+                memcpy(cb->tex_mat[i], tm_t, sizeof(tm_t));
+            } else {
+                memset(cb->tex_mat[i], 0, sizeof(cb->tex_mat[i]));
+                cb->tex_mat[i][0] = cb->tex_mat[i][5] = cb->tex_mat[i][10] = cb->tex_mat[i][15] = 1.0f;
+            }
+            cb->texcoord_index[i] = ts ? ts[D3DTSS_TEXCOORDINDEX] : (UINT)i;
+        }
+
+        d3d8_pipe_set_uniforms(0, 0, cb, sizeof(*cb));
     }
 
     /* ---- VS Lighting CB (b1) ---- */
-    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vs_light_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        VSLightingConstants *lb = (VSLightingConstants *)mapped.pData;
+    {
+        VSLightingConstants lb_local;
+        VSLightingConstants *lb = &lb_local;
         const D3DMATERIAL8 *mat = d3d8_GetMaterial();
         UINT i, active_count = 0;
         memset(lb, 0, sizeof(*lb));
@@ -871,13 +983,28 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
         }
         lb->num_lights = active_count;
 
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vs_light_cb, 0);
+        d3d8_pipe_set_uniforms(0, 1, lb, sizeof(*lb));
     }
+}
+
+void d3d8_shaders_prepare_draw(DWORD handle)
+{
+    const XGpuShader *ps;
+    const DWORD *rs;
+
+    if (!d3d8_vsh_prepare_draw(handle))
+        ff_vs_prepare_draw(handle);
+
+    /* Pixel state is independent of whether the vertex shader is programmable. */
+    ps = ff_ps_get_shader(ff_ps_compute_signature());
+    if (!ps) return;
+    d3d8_pipe_set_ps(ps);
+    rs = d3d8_GetRenderStates();
 
     /* ---- PS Constant Buffer ---- */
-    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_ps_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        PSConstants *pc = (PSConstants *)mapped.pData;
+    {
+        PSConstants pc_local;
+        PSConstants *pc = &pc_local;
         UINT stage;
         memset(pc, 0, sizeof(*pc));
 
@@ -897,7 +1024,22 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
             pc->fog_color[1] = ((fc >>  8) & 0xFF) / 255.0f;
             pc->fog_color[2] = ((fc >>  0) & 0xFF) / 255.0f;
             pc->fog_color[3] = 1.0f;
-            pc->ps_flags |= 2; /* fog enabled */
+
+            if (rs[D3DRS_FOGTABLEMODE] != D3DFOG_NONE) {
+                /* Table fog: compute the factor per-pixel from view-space depth */
+                float fog_start, fog_end, fog_density;
+                memcpy(&fog_start, &rs[D3DRS_FOGSTART], sizeof(float));
+                memcpy(&fog_end, &rs[D3DRS_FOGEND], sizeof(float));
+                memcpy(&fog_density, &rs[D3DRS_FOGDENSITY], sizeof(float));
+                pc->fog_params[0] = fog_start;
+                pc->fog_params[1] = fog_end;
+                pc->fog_params[2] = fog_density;
+                pc->fog_params[3] = (float)rs[D3DRS_FOGTABLEMODE];
+                pc->ps_flags |= 8; /* table fog */
+                if (rs[D3DRS_RANGEFOGENABLE]) pc->ps_flags |= 16; /* range fog */
+            } else {
+                pc->ps_flags |= 2; /* vertex fog (factor computed in the VS) */
+            }
         }
 
         /* Alpha test */
@@ -913,7 +1055,9 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
 
         /* Per-stage texture state */
         for (stage = 0; stage < 4; stage++) {
+            D3DFORMAT format = d3d8_base_format(d3d8_GetStageTexture(stage));
             const DWORD *tss = d3d8_GetTSS(stage);
+            pc->alpha_only[stage] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
             if (!tss) {
                 pc->stage_color[stage][0] = D3DTOP_DISABLE;
                 continue;
@@ -932,13 +1076,6 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
             pc->stage_alpha[stage][1] = tss[D3DTSS_ALPHAARG2] ? tss[D3DTSS_ALPHAARG2] : D3DTA_CURRENT;
         }
 
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_ps_cb, 0);
+        d3d8_pipe_set_uniforms(1, 0, pc, sizeof(*pc));
     }
-
-    /* Bind constant buffers */
-    {
-        ID3D11Buffer *vs_cbs[2] = { g_vs_cb, g_vs_light_cb };
-        ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 2, vs_cbs);
-    }
-    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_ps_cb);
 }

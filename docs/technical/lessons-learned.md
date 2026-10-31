@@ -87,9 +87,9 @@ The Burnout 3 binary has 2.73 MB of code. The game code, CRT, RenderWare engine,
 
 This is painstaking work and we still have functions whose origin we are not sure about.
 
-### D3D8 to D3D11 Gap
+### D3D8 to modern GPU API gap
 
-Xbox D3D8's fixed-function pipeline (texture stage states, material lighting, fog) has no equivalent in D3D11. Everything must be emulated through HLSL shaders. The challenge is not writing the shaders -- it is knowing which D3D8 state combinations the game actually uses, and ensuring the shader produces matching output.
+Xbox D3D8's fixed-function pipeline (texture stage states, material lighting, fog) has no equivalent in D3D12, Vulkan or Metal. Everything must be emulated through HLSL shaders. The challenge is not writing the shaders -- it is knowing which D3D8 state combinations the game actually uses, and ensuring the shader produces matching output.
 
 The COLOROP state alone has 25 possible values (DISABLE, SELECTARG1, SELECTARG2, MODULATE, MODULATE2X, MODULATE4X, ADD, ADDSIGNED, SUBTRACT, etc.), and there are 4 texture stages with multiple arguments each. Implementing all combinations is not practical; we implement only the combinations the game uses and add more as needed.
 

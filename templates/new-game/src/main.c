@@ -31,8 +31,10 @@
  */
 
 #include <windows.h>
+#include <dbghelp.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <math.h>
 
@@ -52,9 +54,25 @@
 
 /* ── Global register state (defined in xbox_memory_layout.c) ── */
 
-extern uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern uint32_t g_ebx, g_esi, g_edi;
-extern uint32_t g_seh_ebp;
+/* RECOMP_TLS is not optional here. The runtime defines these thread-local, and
+ * a plain `extern` referencing a __declspec(thread) variable does not resolve
+ * to the calling thread's copy -- it resolves to the image's TLS template. The
+ * host side then writes g_esp somewhere the generated code never reads, so the
+ * guest starts with every register at zero and faults immediately, having
+ * apparently ignored the setup that visibly ran. */
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern RECOMP_TLS uint32_t g_seh_ebp;
+/* x87 and SSE state. Global for the same reason the volatile GPRs are: one
+ * guest routine can lift to several C functions, so a value written in one
+ * body is read in the next. Defined in xbox_memory_layout.c like the rest of
+ * the register file. */
+extern RECOMP_TLS double g_fp_stack[8];
+extern RECOMP_TLS int g_fp_top;
+extern RECOMP_TLS uint16_t g_fp_control_word;
+extern RECOMP_TLS int g_fp_cmp;
+extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
+extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── XBE Constants ─────────────────────────────────────────── */
@@ -88,6 +106,126 @@ extern void xbe_entry_point(void);
  *   - Add dumps of game-specific globals (heap handles, state flags)
  *   - Add SEH simulation if your game uses __try/__except
  */
+/* Name the guest function a fault happened in, and recover the call chain.
+ *
+ * Recompiled code faults as ordinary native code, so the exception record
+ * carries a host RIP and nothing else -- there is no guest program counter to
+ * report, and the host address changes every build. Two things recover the
+ * guest view:
+ *
+ *   - every generated function is a real symbol in the image (sub_005A03C0
+ *     and so on), so the linker's PDB already maps host address back to guest
+ *     function. dbghelp turns an anonymous RIP into that name.
+ *
+ *   - every lifted call pushes its guest return address onto the guest stack
+ *     before jumping, so the stack still holds the chain. Scanning up from esp
+ *     for values inside the code sections recovers it.
+ *
+ * ponytail: the stack scan is a scan, not a frame walk -- these are FPO frames
+ * with no reliable ebp chain, so there is nothing to walk. It over-reports,
+ * since addresses from returned-from calls linger below esp, but naming the
+ * guest function is the whole question at a fault.
+ *
+ * Requires linking dbghelp and keeping the .pdb beside the .exe.
+ */
+static void print_guest_context(void *rip)
+{
+    /* SYMBOL_INFO is variable-length: the name is written past the struct, so
+     * it must be over-allocated with MaxNameLen set to the slack. */
+    char buf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+    DWORD64 disp = 0;
+
+    memset(buf, 0, sizeof(buf));
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 255;
+    if (SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)rip, &disp, sym))
+        fprintf(stderr, "  in %s+0x%llX\n",
+                sym->Name, (unsigned long long)disp);
+
+    if (g_xbox_mem_offset && g_esp) {
+        const uint32_t *sp =
+            (const uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
+        int shown = 0, i;
+        fprintf(stderr, "  guest stack (return addresses, innermost first):\n");
+        for (i = 0; i < 256 && shown < 24; i++) {
+            uint32_t v = sp[i];
+            if (v > g_xbox_code_lo && v < g_xbox_code_hi) {
+                fprintf(stderr, "    [esp+%-4d] 0x%08X\n", i * 4, v);
+                shown++;
+            }
+        }
+        /* When the frame is gone, say so, and fall back on what is left.
+         *
+         * A fault inside a block copy leaves no return address in range: the
+         * copy is a host memmove and its caller's frame is further up than
+         * this reaches. Worse, a copy that ran past its buffer overwrites the
+         * stack itself, so the list comes out empty exactly when it is most
+         * needed -- and an empty list under a promising heading reads like
+         * "nothing to see" rather than "the evidence is destroyed". */
+        if (!shown)
+            fprintf(stderr, "    (no return addresses in range)\n");
+
+        /* Everything below only pays for itself when the scan came back
+         * empty. A crash where the chain was recovered already says what
+         * happened, and burying that under another twenty lines makes the
+         * common report worse to read. */
+        if (!shown) {
+            uint32_t k;
+
+            /* The indirect-call history, which the stack cannot overwrite.
+             * recomp_manual.c prints this too, but only from
+             * recomp_icall_fail_log -- a page fault inside a block copy
+             * never reaches that path, and this is the same information by
+             * the route the fault actually took.
+             *
+             * Declared here rather than included: main.c does not pull in
+             * recomp_types.h, and recomp_manual.c spells it the same way. */
+            extern volatile uint32_t g_icall_trace[16];
+            extern volatile uint32_t g_icall_trace_idx;
+
+            fprintf(stderr, "  recent ICALL targets:");
+            for (k = 0; k < 16; k++)
+                fprintf(stderr, " %08X",
+                        g_icall_trace[(g_icall_trace_idx + k) & 15]);
+            fprintf(stderr, "\n");
+
+            /* The frame unfiltered. The pointers and lengths handed to
+             * whatever faulted live here and look nothing like code, so the
+             * filter above drops exactly what is wanted. On the crash this
+             * was written for, one of these words was the end of the mapped
+             * RAM mirror -- which is what identified the fault as a copy
+             * running off its buffer rather than a stray pointer. */
+            for (i = 0; i < 20; i++)
+                fprintf(stderr, "    raw[esp+%-4d] 0x%08X\n", i * 4, sp[i]);
+        }
+    }
+}
+
+/* The emulated APU.
+ *
+ * Two entry points that had no callers anywhere in the tree. apu_mmio_hook.c
+ * documents apu_hook_handle_mmio as "called from VEH in main.c" and no main.c
+ * called it; apu_decode_and_handle's first line is `if (!g_apu_state) return
+ * false` and nothing assigned g_apu_state. So with RECOMP_AC97_READY set the
+ * APU's registers were unmapped to be trapped, and every trap was then
+ * declined and surfaced as an access violation on the first register
+ * DirectSound touched.
+ *
+ * Declared rather than included so this does not depend on src/apu being on
+ * the include path. */
+typedef struct MCPXAPUState MCPXAPUState;
+extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
+extern MCPXAPUState *g_apu_state;
+extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                                 uint32_t fault_xbox_va, int is_write);
+
+/* The trapped span, matching what MemoryLayoutInit unmaps: the APU's own
+ * 512 KB, not the whole MCPX aperture. AC'97 above it stays plain memory,
+ * which is what the codec-ready bit needs. */
+#define APU_TRAP_BASE 0xFE800000u
+#define APU_TRAP_END  0xFE880000u
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -104,6 +242,26 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             return EXCEPTION_CONTINUE_SEARCH;
         }
 
+        /* APU registers -> the emulated APU.
+         *
+         * The other half of RECOMP_AC97_READY: reporting the codec ready is
+         * what lets DirectSoundCreate past its first gate, and from there it
+         * drives the APU directly, so the registers have to fault to be seen.
+         * "Handled" means the access was decoded and the instruction stepped
+         * over, so execution resumes instead of unwinding. */
+        {
+            uint32_t xbox_va =
+                (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+
+            if (xbox_va >= APU_TRAP_BASE && xbox_va < APU_TRAP_END
+                    && apu_hook_handle_mmio(
+                           ep->ContextRecord, fault_addr, xbox_va,
+                           ep->ExceptionRecord->ExceptionInformation[0]
+                               ? 1 : 0)) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)ep->ContextRecord->Rip,
             (unsigned long long)fault_addr,
@@ -114,6 +272,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             g_ebx, g_esi, g_edi);
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
             (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+        print_guest_context((void *)ep->ContextRecord->Rip);
 
         /*
          * TODO: Add game-specific diagnostics here. Examples:
@@ -164,6 +323,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */
+    /* Load symbols up front rather than from inside the handler: at fault
+     * time the process is already in a bad way, and SymInitialize
+     * allocates. Failure is not fatal -- the handler prints no name. */
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
 
     /* Step 1: Load XBE */
@@ -187,6 +351,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
+
+    /* Bring up the emulated APU.
+     *
+     * Gated on the same variable that unmaps its registers, because the two
+     * halves are useless apart: a trap with no model declines every access,
+     * and a model nothing traps into never sees a register. The APU walks
+     * Xbox physical RAM to find voice buffers, so it gets the guest RAM
+     * base. */
+    if (getenv("RECOMP_AC97_READY")) {
+        g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
+        fprintf(stderr, "[BOOT] emulated APU %s\n",
+                g_apu_state ? "up" : "FAILED to initialise");
+    }
 
     /* Step 3: Initialize Xbox kernel */
     printf("Initializing Xbox kernel replacement...\n");
@@ -222,6 +399,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("\n=== Initialization complete ===\n");
     printf("Entry point: 0x%08X\n", YOUR_GAME_ENTRY_POINT);
     printf("ESP: 0x%08X\n", g_esp);
+
+    /* Build the flat dispatch table before the guest runs.
+     *
+     * Without this recomp_lookup falls back to a binary search over the
+     * whole function table -- roughly log2(n) branches on *every*
+     * indirect call, which for a 45,000-function C++ title is about 16
+     * every time the game goes through a vtable. Half-Life 2 spent most
+     * of its static initialisation inside recomp_lookup for exactly this
+     * reason, and it read as a hang.
+     *
+     * Optional by design: if the allocation fails the search still works,
+     * so a failure is worth one line and not a fatal error. */
+    if (!recomp_dispatch_init())
+        fprintf(stderr, "[BOOT] flat dispatch unavailable; "
+                        "indirect calls will use the binary search\n");
+
+    /* Arm the hang watchdog. Does nothing unless RECOMP_WATCHDOG_SECS is set,
+     * and must be called from this thread -- the guest registers it samples are
+     * thread-local, so it has to be handed the copies belonging to the thread
+     * that runs guest code.
+     *
+     * Not optional boilerplate: without this call RECOMP_WATCHDOG_SECS is
+     * silently inert, and the one diagnostic that tells a hang from slowness
+     * does nothing while appearing to be set. */
+    xbox_WatchdogStart();
 
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");

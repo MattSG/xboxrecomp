@@ -8,11 +8,11 @@
  *   1. Parse: 128-bit instruction words -> NV2AVshInstruction structs
  *   2. Analyze: determine which input registers (v0-v15) are read
  *   3. Generate HLSL: emit HLSL code mapping NV2A ops to HLSL intrinsics
- *   4. Compile: D3DCompile -> ID3D11VertexShader
+ *   4. Compile: HLSL -> SPIR-V -> backend format (SDL_GPU vertex shader)
  *   5. Cache: hash microcode -> reuse compiled shader on subsequent draws
  *
  * The generated HLSL uses:
- *   - cbuffer at b1: 192 float4 constants (c0-c191)
+ *   - cbuffer at b0 (space1, vertex uniform slot 0): 192 float4 constants (c0-c191)
  *   - Input semantics: ATTR0-ATTR15 mapped to v0-v15
  *   - Output semantics: SV_POSITION, COLOR0/1, TEXCOORD0-3, FOG, PSIZE
  */
@@ -208,17 +208,13 @@ static int g_vsh_slot_count = 0;
 static NV2AVSConstants g_vsh_constants;
 static BOOL g_vsh_constants_dirty = TRUE;
 
-/* D3D11 constant buffer for VS constants */
-static ID3D11Buffer *g_vsh_cb = NULL;
-
 /* Shader cache: maps microcode hash to compiled shader + input layout */
 typedef struct {
     uint32_t            hash;
     int                 in_use;
-    ID3D11VertexShader *vs;
-    ID3DBlob           *vs_blob;      /* Bytecode for input layout creation */
-    ID3D11InputLayout  *layouts[16];  /* Cached layouts per input mask subset */
-    uint16_t            layout_masks[16];
+    XGpuShader          vs;
+    D3D8VertexLayout    layouts[16];  /* Cached layouts per input mask subset */
+    uint32_t            layout_masks[16];  /* inputs_read | (texcoord-field<<16) */
     int                 layout_count;
     uint16_t            inputs_read;  /* Which v registers are read */
 } VshCacheEntry;
@@ -844,7 +840,7 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
 }
 
 /**
- * Map NV2A input register index to a D3D11 input semantic.
+ * Map NV2A input register index to a vertex attribute.
  *
  * Xbox NV2A vertex shader input registers map to vertex attributes:
  *   v0  = Position
@@ -885,7 +881,7 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
     sb_append(&sb,
         "/* Auto-generated NV2A vertex shader */\n"
         "\n"
-        "cbuffer VSH_Constants : register(b1) {\n"
+        "cbuffer VSH_Constants : register(b0, space1) {\n"
         "    float4 c[%d];\n"
         "};\n"
         "\n", NV2A_VS_MAX_CONSTANTS);
@@ -894,7 +890,7 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
     sb_append(&sb, "struct VS_IN {\n");
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
         if (inputs & (1u << i)) {
-            sb_append(&sb, "    float4 v%d : ATTR%d;\n", i, i);
+            sb_append(&sb, "    [[vk::location(%d)]] float4 v%d : ATTR%d;\n", i, i, i);
         }
     }
     sb_append(&sb, "};\n\n");
@@ -903,16 +899,18 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
     sb_append(&sb,
         "struct VS_OUT {\n"
         "    float4 oPos : SV_POSITION;\n"
-        "    float4 oD0  : COLOR0;\n"
-        "    float4 oD1  : COLOR1;\n"
-        "    float4 oT0  : TEXCOORD0;\n"
-        "    float4 oT1  : TEXCOORD1;\n"
-        "    float4 oT2  : TEXCOORD2;\n"
-        "    float4 oT3  : TEXCOORD3;\n"
-        "    float  oFog : FOG;\n"
-        "    float  oPts : PSIZE;\n"
-        "    float4 oB0  : TEXCOORD4;\n"
-        "    float4 oB1  : TEXCOORD5;\n"
+        /* Locations match the fixed-function vertex shader's outputs, so
+         * either pixel shader can follow either vertex shader. */
+        "    [[vk::location(0)]] float4 oD0  : COLOR0;\n"
+        "    [[vk::location(1)]] float4 oD1  : COLOR1;\n"
+        "    [[vk::location(2)]] float4 oT0  : TEXCOORD0;\n"
+        "    [[vk::location(3)]] float4 oT1  : TEXCOORD1;\n"
+        "    [[vk::location(4)]] float4 oT2  : TEXCOORD2;\n"
+        "    [[vk::location(5)]] float4 oT3  : TEXCOORD3;\n"
+        "    [[vk::location(6)]] float  oFog : FOG;\n"
+        "    [[vk::location(7)]] float4 oB0  : TEXCOORD4;\n"
+        "    [[vk::location(8)]] float4 oB1  : TEXCOORD5;\n"
+        "    [[vk::location(9)]] float  oPts : PSIZE;\n"
         "};\n\n");
 
     /* Main function */
@@ -1032,81 +1030,71 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
 /**
  * Default format for each input register.
  * This is the common Xbox convention; games may vary.
+ * Texcoord registers 8-11 use the FVF-declared size (float1/2/3/4).
  */
-static DXGI_FORMAT default_input_format(int vreg)
+static UINT vsh_fvf_texcoord_size(DWORD fvf, UINT t)
 {
+    DWORD field = (fvf >> (16 + t * 2)) & 0x3;
+    return field == 0 ? 2 : field;
+}
+
+static SDL_GPUVertexElementFormat default_input_format(int vreg, DWORD fvf)
+{
+    static const SDL_GPUVertexElementFormat by_size[5] = {
+        SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT,
+        SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3,
+        SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4 };
+
     switch (vreg) {
-    case 0:  return DXGI_FORMAT_R32G32B32_FLOAT;    /* Position (xyz) */
-    case 1:  return DXGI_FORMAT_R32G32B32A32_FLOAT;  /* Blend weights */
-    case 2:  return DXGI_FORMAT_R32G32B32_FLOAT;     /* Normal */
-    case 3:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Diffuse (D3DCOLOR) */
-    case 4:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Specular (D3DCOLOR) */
-    case 5:  return DXGI_FORMAT_R32_FLOAT;            /* Fog */
-    case 6:  return DXGI_FORMAT_R32_FLOAT;            /* Point size */
-    case 7:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Back specular */
-    case 8:  return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 0 */
-    case 9:  return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 1 */
-    case 10: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 2 */
-    case 11: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 3 */
-    default: return DXGI_FORMAT_R32G32B32A32_FLOAT;   /* Generic */
+    case 0:  return SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;      /* Position (xyz) */
+    case 1:  return SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4;      /* Blend weights */
+    case 2:  return SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;      /* Normal */
+    case 3:  return SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM; /* Diffuse (D3DCOLOR) */
+    case 4:  return SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM; /* Specular (D3DCOLOR) */
+    case 5:  return SDL_GPU_VERTEXELEMENTFORMAT_FLOAT;       /* Fog */
+    case 6:  return SDL_GPU_VERTEXELEMENTFORMAT_FLOAT;       /* Point size */
+    case 7:  return SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM; /* Back specular */
+    case 8: case 9: case 10: case 11:                          /* Texcoords: FVF-declared size */
+        return by_size[vsh_fvf_texcoord_size(fvf, (UINT)(vreg - 8))];
+    default: return SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4;      /* Generic */
     }
 }
 
-static UINT input_format_size(DXGI_FORMAT fmt)
+static UINT input_format_size(SDL_GPUVertexElementFormat fmt)
 {
     switch (fmt) {
-    case DXGI_FORMAT_R32_FLOAT:            return 4;
-    case DXGI_FORMAT_R32G32_FLOAT:         return 8;
-    case DXGI_FORMAT_R32G32B32_FLOAT:      return 12;
-    case DXGI_FORMAT_R32G32B32A32_FLOAT:   return 16;
-    case DXGI_FORMAT_R8G8B8A8_UNORM:       return 4;
-    default:                                return 16;
+    case SDL_GPU_VERTEXELEMENTFORMAT_FLOAT:       return 4;
+    case SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2:      return 8;
+    case SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3:      return 12;
+    case SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4:      return 16;
+    case SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM: return 4;
+    default:                                      return 16;
     }
 }
 
-static ID3D11InputLayout *create_vsh_input_layout(
-    uint16_t inputs_read, ID3DBlob *vs_blob)
+static int create_vsh_input_layout(uint16_t inputs_read, DWORD fvf, D3D8VertexLayout *out)
 {
-    D3D11_INPUT_ELEMENT_DESC elems[NV2A_VS_MAX_INPUTS];
-    UINT elem_count = 0;
     UINT offset = 0;
-    ID3D11InputLayout *layout = NULL;
-    HRESULT hr;
     int i;
 
+    memset(out, 0, sizeof(*out));
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
+        SDL_GPUVertexElementFormat fmt;
+        SDL_GPUVertexAttribute *a;
+
         if (!(inputs_read & (1u << i)))
             continue;
-
-        DXGI_FORMAT fmt = default_input_format(i);
-
-        elems[elem_count].SemanticName      = "ATTR";
-        elems[elem_count].SemanticIndex      = (UINT)i;
-        elems[elem_count].Format             = fmt;
-        elems[elem_count].InputSlot          = 0;
-        elems[elem_count].AlignedByteOffset  = offset;
-        elems[elem_count].InputSlotClass     = D3D11_INPUT_PER_VERTEX_DATA;
-        elems[elem_count].InstanceDataStepRate = 0;
-        elem_count++;
-
+        if (out->num_attrs >= D3D8_MAX_ATTRS)
+            break;
+        fmt = default_input_format(i, fvf);
+        a = &out->attrs[out->num_attrs++];
+        a->location = (Uint32)i;               /* matches [[vk::location(i)]] in VS_IN */
+        a->buffer_slot = 0;
+        a->format = fmt;
+        a->offset = offset;
         offset += input_format_size(fmt);
     }
-
-    if (elem_count == 0) return NULL;
-
-    hr = ID3D11Device_CreateInputLayout(
-        d3d8_GetD3D11Device(),
-        elems, elem_count,
-        ID3D10Blob_GetBufferPointer(vs_blob),
-        ID3D10Blob_GetBufferSize(vs_blob),
-        &layout);
-
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8 VSH: CreateInputLayout failed: 0x%08lX\n", hr);
-        return NULL;
-    }
-
-    return layout;
+    return out->num_attrs != 0;
 }
 
 /* ================================================================
@@ -1145,16 +1133,8 @@ static VshCacheEntry *cache_insert(uint32_t hash)
     /* Cache full: evict the first probed entry */
     {
         VshCacheEntry *evict = &g_vsh_cache[idx];
-        int j;
 
-        if (evict->vs)
-            ID3D11VertexShader_Release(evict->vs);
-        if (evict->vs_blob)
-            ID3D10Blob_Release(evict->vs_blob);
-        for (j = 0; j < evict->layout_count; j++) {
-            if (evict->layouts[j])
-                ID3D11InputLayout_Release(evict->layouts[j]);
-        }
+        xgpu_release_shader(d3d8_GetGpu()->device, &evict->vs);
         memset(evict, 0, sizeof(*evict));
         evict->hash   = hash;
         evict->in_use = 1;
@@ -1174,8 +1154,7 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     NV2AVshProgram program;
     char hlsl_buf[16384];  /* 16KB should be enough for any VS */
     int hlsl_len;
-    ID3DBlob *code = NULL, *errors = NULL;
-    HRESULT hr;
+    XGpuShader code;
     VshCacheEntry *entry;
 
     /* Parse microcode */
@@ -1188,42 +1167,20 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
         return NULL;
     }
 
-    /* Compile HLSL to bytecode */
-    hr = D3DCompile(hlsl_buf, (SIZE_T)hlsl_len, "nv2a_vsh",
-                    NULL, NULL, "main", "vs_5_0",
-                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                    &code, &errors);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8 VSH: Compile failed: %s\n",
-                errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
+    /* Compile HLSL */
+    if (!xgpu_compile_hlsl_ex(d3d8_GetGpu()->device, hlsl_buf, "main", 0, "nv2a_vsh", &code)) {
         fprintf(stderr, "--- Generated HLSL ---\n%s\n--- End ---\n", hlsl_buf);
-        if (errors) ID3D10Blob_Release(errors);
         return NULL;
     }
-    if (errors) ID3D10Blob_Release(errors);
 
     /* Insert into cache */
     entry = cache_insert(hash);
     if (!entry) {
-        ID3D10Blob_Release(code);
+        xgpu_release_shader(d3d8_GetGpu()->device, &code);
         return NULL;
     }
 
-    /* Create D3D11 vertex shader */
-    hr = ID3D11Device_CreateVertexShader(
-        d3d8_GetD3D11Device(),
-        ID3D10Blob_GetBufferPointer(code),
-        ID3D10Blob_GetBufferSize(code),
-        NULL, &entry->vs);
-
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8 VSH: CreateVertexShader failed: 0x%08lX\n", hr);
-        ID3D10Blob_Release(code);
-        entry->in_use = 0;
-        return NULL;
-    }
-
-    entry->vs_blob     = code;
+    entry->vs          = code;
     entry->inputs_read = program.inputs_read;
     entry->layout_count = 0;
 
@@ -1235,29 +1192,28 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
 
 /**
  * Get the input layout for a cache entry.
- * Creates and caches the layout on first request per input mask.
+ * Creates and caches the layout on first request per (input mask, texcoord sizes).
  */
-static ID3D11InputLayout *get_cached_layout(VshCacheEntry *entry)
+static const D3D8VertexLayout *get_cached_layout(VshCacheEntry *entry, DWORD fvf)
 {
     uint16_t mask = entry->inputs_read;
+    uint32_t key = (uint32_t)mask | (((uint32_t)(fvf >> 16) & 0xFFFF) << 16);
     int i;
 
-    /* Check if we already created a layout for this mask */
+    /* Check if we already created a layout for this mask+texcoord layout */
     for (i = 0; i < entry->layout_count; i++) {
-        if (entry->layout_masks[i] == mask)
-            return entry->layouts[i];
+        if (entry->layout_masks[i] == key)
+            return &entry->layouts[i];
     }
 
     /* Create new layout */
     if (entry->layout_count >= 16)
-        return entry->layouts[0]; /* Fallback to first */
+        return &entry->layouts[0]; /* Fallback to first */
 
-    ID3D11InputLayout *layout = create_vsh_input_layout(mask, entry->vs_blob);
-    entry->layouts[entry->layout_count]      = layout;
-    entry->layout_masks[entry->layout_count] = mask;
-    entry->layout_count++;
-
-    return layout;
+    if (!create_vsh_input_layout(mask, fvf, &entry->layouts[entry->layout_count]))
+        return NULL;
+    entry->layout_masks[entry->layout_count] = key;
+    return &entry->layouts[entry->layout_count++];
 }
 
 /* ================================================================
@@ -1266,27 +1222,11 @@ static ID3D11InputLayout *get_cached_layout(VshCacheEntry *entry)
 
 HRESULT d3d8_vsh_init(void)
 {
-    D3D11_BUFFER_DESC cbd;
-    HRESULT hr;
-
     memset(g_vsh_slots, 0, sizeof(g_vsh_slots));
     memset(g_vsh_cache, 0, sizeof(g_vsh_cache));
     memset(&g_vsh_constants, 0, sizeof(g_vsh_constants));
     g_vsh_slot_count = 0;
     g_vsh_constants_dirty = TRUE;
-
-    /* Create the constant buffer for VS constants (192 * float4 = 3072 bytes) */
-    memset(&cbd, 0, sizeof(cbd));
-    cbd.ByteWidth      = sizeof(NV2AVSConstants);
-    cbd.Usage           = D3D11_USAGE_DYNAMIC;
-    cbd.BindFlags       = D3D11_BIND_CONSTANT_BUFFER;
-    cbd.CPUAccessFlags  = D3D11_CPU_ACCESS_WRITE;
-
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_vsh_cb);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8 VSH: Failed to create constant buffer: 0x%08lX\n", hr);
-        return hr;
-    }
 
     fprintf(stderr, "D3D8 VSH: Vertex shader translator initialized\n");
     return S_OK;
@@ -1294,25 +1234,15 @@ HRESULT d3d8_vsh_init(void)
 
 void d3d8_vsh_shutdown(void)
 {
-    int i, j;
+    int i;
 
-    /* Release all cached shaders and layouts */
+    /* Release all cached shaders */
     for (i = 0; i < NV2A_VS_CACHE_SIZE; i++) {
         VshCacheEntry *e = &g_vsh_cache[i];
-        if (!e->in_use) continue;
-        if (e->vs)      ID3D11VertexShader_Release(e->vs);
-        if (e->vs_blob) ID3D10Blob_Release(e->vs_blob);
-        for (j = 0; j < e->layout_count; j++) {
-            if (e->layouts[j])
-                ID3D11InputLayout_Release(e->layouts[j]);
-        }
+        if (e->in_use)
+            xgpu_release_shader(d3d8_GetGpu()->device, &e->vs);
     }
     memset(g_vsh_cache, 0, sizeof(g_vsh_cache));
-
-    if (g_vsh_cb) {
-        ID3D11Buffer_Release(g_vsh_cb);
-        g_vsh_cb = NULL;
-    }
 
     memset(g_vsh_slots, 0, sizeof(g_vsh_slots));
     g_vsh_slot_count = 0;
@@ -1408,20 +1338,14 @@ BOOL d3d8_vsh_is_programmable(DWORD handle)
 
 BOOL d3d8_vsh_prepare_draw(DWORD handle)
 {
-    ID3D11DeviceContext *ctx;
     int slot;
     NV2AVshSlot *vsh;
     uint32_t hash;
     VshCacheEntry *entry;
-    ID3D11InputLayout *layout;
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr;
+    const D3D8VertexLayout *layout;
 
     if (!d3d8_vsh_is_programmable(handle))
         return FALSE;
-
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx) return FALSE;
 
     /* Resolve handle to shader slot */
     slot = (int)(handle - 0x10000);
@@ -1445,26 +1369,17 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     }
 
     /* Bind the vertex shader */
-    ID3D11DeviceContext_VSSetShader(ctx, entry->vs, NULL, 0);
+    d3d8_pipe_set_vs(&entry->vs);
 
-    /* Bind the input layout */
-    layout = get_cached_layout(entry);
+    /* Vertex layout (sizes texcoords from the bound stream FVF) */
+    layout = get_cached_layout(entry, d3d8_GetCurrentFVF());
     if (layout)
-        ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+        d3d8_pipe_set_layout(layout);
 
-    /* Update constant buffer if dirty */
-    if (g_vsh_constants_dirty) {
-        hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vsh_cb,
-                                     0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (SUCCEEDED(hr)) {
-            memcpy(mapped.pData, &g_vsh_constants, sizeof(g_vsh_constants));
-            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_cb, 0);
-        }
-        g_vsh_constants_dirty = FALSE;
-    }
-
-    /* Bind constant buffer to slot b1 */
-    ID3D11DeviceContext_VSSetConstantBuffers(ctx, 1, 1, &g_vsh_cb);
+    /* The constants are pushed with every draw (SDL_GPU push constants live in
+     * the command buffer), so the dirty flag only records that they changed. */
+    d3d8_pipe_set_uniforms(0, 0, &g_vsh_constants, sizeof(g_vsh_constants));
+    g_vsh_constants_dirty = FALSE;
 
     return TRUE;
 }

@@ -1,13 +1,13 @@
-# xbox_input — Xbox Gamepad to XInput
+# xbox_input — Xbox Gamepad on SDL3
 
-Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGetState` with a slightly different structure layout than the XInput API on Windows. This layer translates between them.
+Maps the Xbox controller API to SDL3 gamepads, the same on every host. The original Xbox used `XInputGetState` with a slightly different structure layout than other pad APIs; this layer translates between them. `RECOMP_KEYBOARD=1` adds a keyboard stand-in for port 0.
 
 ## Files
 
 | File | LOC | Purpose |
 |------|-----|---------|
 | `xinput_xbox.h` | 189 | Public header — types, button constants, function prototypes |
-| `xinput_device.c` | 23 | Implementation (maps Xbox calls to Windows XInput) |
+| `xinput_device.c` | 23 | Implementation (maps Xbox calls to SDL3 gamepads) |
 
 ## Quick Start
 
@@ -112,7 +112,7 @@ XBOX_ANALOG_BUTTON_THRESHOLD  30   // Recommended press threshold
 
 ### Xbox → Modern Controller Mapping
 
-| Xbox Button | XInput Equivalent | Notes |
+| Xbox Button | SDL3 Gamepad Button | Notes |
 |-------------|------------------|-------|
 | A | A | Green button |
 | B | B | Red button |

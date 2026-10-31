@@ -38,7 +38,35 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return ObjectAttributes->ObjectName->Buffer;
 }
 
+/* Xbox volume geometry.
+ *
+ * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
+ * not cosmetic. A title's CRT startup asks for FileFsSizeInformation and
+ * multiplies SectorsPerAllocationUnit by BytesPerSector, then *requires* the
+ * product to equal the cluster size it was built for. Half-Life 2 checks for
+ * 0x4000 and returns STATUS_DEVICE_NOT_READY (0xC000014F) otherwise, which
+ * aborts CRT init before main ever runs -- the process then exits cleanly,
+ * which reads as a title that did nothing rather than one that failed.
+ *
+ * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
+#define XBOX_BYTES_PER_SECTOR       512u
+#define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
 /* ======================================================================== */
+/* Shared by both backends. kernel_bridge.c calls xbox_LastFileError()
+ * unconditionally, so defining it only under _WIN32 leaves every POSIX link
+ * with an undefined symbol -- invisible until something links an executable,
+ * because a static archive never resolves its own references.
+ *
+ * The POSIX backend does not populate this yet, so it reads 0 there; that is a
+ * missing detail rather than a missing symbol, and it is visible here. */
+uint32_t g_xbox_last_file_error;
+
+uint32_t xbox_LastFileError(void)
+{
+    return g_xbox_last_file_error;
+}
+
 #if defined(_WIN32)
 /* ====================  Win32 backend  =================================== */
 /* ======================================================================== */
@@ -93,6 +121,17 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     const char* xbox_path = get_xbox_path(ObjectAttributes);
     if (!xbox_path)
         return FALSE;
+    if (ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
+        !(xbox_path[0] && xbox_path[1] == ':')) {
+        /* XDeleteSaveGame opens each child relative to its save directory. */
+        DWORD used = GetFinalPathNameByHandleW(ObjectAttributes->RootDirectory,
+            win_path, buf_size, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (!used || used >= buf_size || used + 1 >= buf_size) return FALSE;
+        if (win_path[used - 1] != L'\\') win_path[used++] = L'\\';
+        int count = MultiByteToWideChar(CP_ACP, 0, xbox_path, -1,
+            win_path + used, (int)(buf_size - used));
+        return count != 0;
+    }
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
@@ -105,7 +144,6 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
-    DWORD existing_attrs;
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
@@ -116,14 +154,35 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
-    existing_attrs = GetFileAttributesW(win_path);
-    if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) ||
-        (existing_attrs != INVALID_FILE_ATTRIBUTES &&
-         (existing_attrs & FILE_ATTRIBUTE_DIRECTORY))) {
+    /* A partition device opened as a directory.
+     *
+     * The path layer maps \Device\Harddisk0\PartitionN to a PartitionN.img
+     * backing file, but a title asking for free space opens the partition with
+     * FILE_DIRECTORY_FILE | FILE_OPEN_FOR_FREE_SPACE_QUERY -- it wants the
+     * volume, not the bytes. Opening a regular file as a directory fails, and
+     * the title reads STATUS_OBJECT_PATH_NOT_FOUND as "no such volume".
+     *
+     * Half-Life 2's CRT probes partition0 this way during startup and treats
+     * the failure as fatal. Redirecting to the directory that holds the image
+     * gives a handle that is valid for exactly what the caller is going to do
+     * with it, which is NtQueryVolumeInformationFile. */
+    if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
+        !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
+        WCHAR *slash = wcsrchr(win_path, L'\\');
+        if (slash && slash != win_path) {
+            *slash = 0;
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                     "NtCreateFile: directory open of a device image, "
+                     "using its containing directory instead");
+        }
+    }
+
+    if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
-        h = CreateFileW(win_path, 0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+        h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
+            xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
         if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
@@ -137,7 +196,17 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
-        XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %S (err=%u)", win_path, err);
+        /* Kept for the caller's trace. An NTSTATUS says "it did not open";
+         * only the Win32 error distinguishes a title probing for a file that
+         * is genuinely absent from one it cannot open because this runtime
+         * already holds it open with a share mode the second open forbids --
+         * and those need opposite responses. */
+        g_xbox_last_file_error = (uint32_t)err;
+        /* A warning, not a compiled-out trace: a failed open is how a title
+         * silently decides a volume or asset is missing, and in a Release
+         * build that decision was invisible. */
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                 "NtCreateFile FAILED: %S (err=%u)", win_path, err);
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
             IoStatusBlock->Information = 0;
@@ -346,8 +415,12 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
-            if (!SetFilePointerEx(FileHandle, info->CurrentByteOffset, NULL, FILE_BEGIN))
+            if (!SetFilePointerEx(FileHandle, info->CurrentByteOffset, NULL, FILE_BEGIN)) {
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                    "SetFilePosition failed: offset=%lld err=%u",
+                    (long long)info->CurrentByteOffset.QuadPart, GetLastError());
                 return STATUS_UNSUCCESSFUL;
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -357,11 +430,39 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             SetFilePointerEx(FileHandle, zero, &cur, FILE_CURRENT);
             SetFilePointerEx(FileHandle, info->EndOfFile, NULL, FILE_BEGIN);
             if (!SetEndOfFile(FileHandle)) {
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                    "SetEndOfFile failed: size=%lld err=%u",
+                    (long long)info->EndOfFile.QuadPart, GetLastError());
                 SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
                 return STATUS_UNSUCCESSFUL;
             }
             if (cur.QuadPart <= info->EndOfFile.QuadPart)
                 SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
+        case XboxFileAllocationInformation: {
+            /* Reserve space for a file. Halo's save path calls this before
+             * writing, and an unimplemented class here returned
+             * STATUS_NOT_IMPLEMENTED, which the title turned into DOS error
+             * 317 and reported as "couldn't open or create saved game file".
+             *
+             * Same payload shape as EndOfFile: one LARGE_INTEGER. Windows
+             * FileAllocationInfo is the direct equivalent; if the filesystem
+             * declines it, fall back to setting the size, since the caller
+             * only needs the space to exist. */
+            PXBOX_FILE_END_OF_FILE_INFORMATION info =
+                (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            FILE_ALLOCATION_INFO fai;
+            fai.AllocationSize = info->EndOfFile;
+            if (!SetFileInformationByHandle(FileHandle, FileAllocationInfo,
+                                            &fai, sizeof(fai))) {
+                LARGE_INTEGER cur, zero = {0};
+                SetFilePointerEx(FileHandle, zero, &cur, FILE_CURRENT);
+                SetFilePointerEx(FileHandle, info->EndOfFile, NULL, FILE_BEGIN);
+                SetEndOfFile(FileHandle);
+                SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -389,8 +490,14 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             return STATUS_SUCCESS;
         }
         default:
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                "NtSetInformationFile: unhandled class %d", FileInformationClass);
+            /* stderr, not xbox_log: WARN is filtered out by default, and an
+             * unimplemented info class is exactly the kind of silent gap that
+             * surfaces far away. Halo's save path hits one, gets
+             * STATUS_NOT_IMPLEMENTED, converts it to DOS error 317 and asserts
+             * "couldn't open or create saved game file". */
+            fprintf(stderr, "  [FILE] NtSetInformationFile: unhandled class %d\n",
+                    (int)FileInformationClass);
+            fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
 }
@@ -408,14 +515,14 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
-                info->BytesPerSector = 512;
-                info->SectorsPerAllocationUnit = 32;
+                info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
             } else {
-                info->BytesPerSector = 512;
-                info->SectorsPerAllocationUnit = 32;
+                info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
@@ -510,6 +617,7 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
     DIR_CONTEXT* ctx;
@@ -518,6 +626,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+    IoStatusBlock->Information = 0;
+    if (FileInformationClass != XboxFileDirectoryInformation) {
+        IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
+        return STATUS_INVALID_INFO_CLASS;
+    }
 
     ctx = find_or_create_dir_context(FileHandle, TRUE);
     if (!ctx)
@@ -556,6 +669,18 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
         ctx->first_done = TRUE;
     } else {
+        if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
+            FindClose(ctx->find_handle);
+            ctx->find_handle = NULL;
+            ctx->file_handle = NULL;
+            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+            return STATUS_NO_MORE_FILES;
+        }
+    }
+
+    /* FATX enumeration never exposes the host's dot directories. */
+    while (!wcscmp(ctx->find_data.cFileName, L".") ||
+           !wcscmp(ctx->find_data.cFileName, L"..")) {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
@@ -906,8 +1031,14 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         default:
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                "NtSetInformationFile: unhandled class %d", FileInformationClass);
+            /* stderr, not xbox_log: WARN is filtered out by default, and an
+             * unimplemented info class is exactly the kind of silent gap that
+             * surfaces far away. Halo's save path hits one, gets
+             * STATUS_NOT_IMPLEMENTED, converts it to DOS error 317 and asserts
+             * "couldn't open or create saved game file". */
+            fprintf(stderr, "  [FILE] NtSetInformationFile: unhandled class %d\n",
+                    (int)FileInformationClass);
+            fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
 }
@@ -925,8 +1056,10 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
-            info->BytesPerSector = 512;
-            info->SectorsPerAllocationUnit = 32;
+            /* Xbox geometry, not the host's -- see the note on
+             * XBOX_SECTORS_PER_CLUSTER above. */
+            info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+            info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
             if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
@@ -999,11 +1132,17 @@ static BOOL s_dir_cs_init = FALSE;
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
     (void)Event; (void)ApcRoutine; (void)ApcContext;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+    IoStatusBlock->Information = 0;
+    if (FileInformationClass != XboxFileDirectoryInformation) {
+        IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
+        return STATUS_INVALID_INFO_CLASS;
+    }
 
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
     EnterCriticalSection(&s_dir_cs);
@@ -1054,6 +1193,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
         if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
             break;
     }

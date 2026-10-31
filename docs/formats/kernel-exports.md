@@ -31,10 +31,10 @@ Each entry shows: **ordinal**, function prototype, description, and suggested Wi
 
 | Ord | Function | Description |
 |-----|----------|-------------|
-| 15 | `PVOID ExAllocatePool(ULONG NumberOfBytes)` | Allocate from kernel pool (NonPagedPool). |
-| 16 | `PVOID ExAllocatePoolWithTag(ULONG NumberOfBytes, ULONG Tag)` | Pool allocation with debug tag. |
-| 24 | `ULONG ExQueryPoolBlockSize(PVOID PoolBlock)` | Query size of a pool allocation. |
-| 167 | `PVOID MmMapIoSpace(ULONG_PTR PhysicalAddress, ULONG NumberOfBytes, ULONG Protect)` | Map physical address to virtual. Used for NV2A GPU register access. |
+| 14 | `PVOID ExAllocatePool(ULONG NumberOfBytes)` | Allocate from kernel pool (NonPagedPool). |
+| 15 | `PVOID ExAllocatePoolWithTag(ULONG NumberOfBytes, ULONG Tag)` | Pool allocation with debug tag. |
+| 23 | `ULONG ExQueryPoolBlockSize(PVOID PoolBlock)` | Query size of a pool allocation. |
+| 177 | `PVOID MmMapIoSpace(ULONG_PTR PhysicalAddress, ULONG NumberOfBytes, ULONG Protect)` | Map physical address to virtual. Used for NV2A GPU register access. |
 | 173 | `ULONG_PTR MmGetPhysicalAddress(PVOID BaseAddress)` | Get physical address of virtual address. |
 | 181 | `NTSTATUS MmQueryStatistics(PMM_STATISTICS MemoryStatistics)` | Get memory usage statistics. |
 | 180 | `ULONG MmQueryAllocationSize(PVOID BaseAddress)` | Query allocation size. |
@@ -79,10 +79,10 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 
 | Ord | Function | Description |
 |-----|----------|-------------|
-| 67 | `NTSTATUS IoCreateFile(...)` | Extended file creation (internal). |
-| 62 | `NTSTATUS IoBuildDeviceIoControlRequest(...)` | Build an IRP for device I/O. |
-| 86 | `NTSTATUS IoSynchronousDeviceIoControlRequest(...)` | Synchronous device I/O. |
-| 87 | `NTSTATUS IoSynchronousFsdRequest(...)` | Synchronous FSD request. |
+| 66 | `NTSTATUS IoCreateFile(...)` | Extended file creation (internal). |
+| 61 | `NTSTATUS IoBuildDeviceIoControlRequest(...)` | Build an IRP for device I/O. |
+| 84 | `NTSTATUS IoSynchronousDeviceIoControlRequest(...)` | Synchronous device I/O. |
+| 85 | `NTSTATUS IoSynchronousFsdRequest(...)` | Synchronous FSD request. |
 | 203 | `NTSTATUS NtOpenSymbolicLinkObject(PHANDLE LinkHandle, POBJECT_ATTRIBUTES ObjectAttributes)` | Open a symbolic link. |
 | 215 | `NTSTATUS NtQuerySymbolicLinkObject(HANDLE LinkHandle, PANSI_STRING LinkTarget, PULONG ReturnedLength)` | Read symbolic link target. Games use this to resolve drive letters. |
 
@@ -94,13 +94,13 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 |-----|----------|-------------|
 | 255 | `NTSTATUS PsCreateSystemThreadEx(PHANDLE ThreadHandle, ULONG ThreadExtraSize, ULONG KernelStackSize, ULONG TlsDataSize, PULONG ThreadId, PVOID StartContext1, PVOID StartContext2, BOOLEAN CreateSuspended, BOOLEAN DebugStack, PSYSTEM_ROUTINE StartRoutine)` | Create a kernel thread. Primary thread creation API. |
 | 258 | `NTSTATUS PsTerminateSystemThread(NTSTATUS ExitStatus)` | Terminate the current thread. |
-| 256 | `NTSTATUS KeDelayExecutionThread(KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Interval)` | Sleep the current thread (negative = relative time in 100ns units). |
+| 99 | `NTSTATUS KeDelayExecutionThread(KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Interval)` | Sleep the current thread (negative = relative time in 100ns units). |
 | 143 | `LONG KeSetBasePriorityThread(PVOID Thread, LONG Increment)` | Set thread base priority. |
 | 124 | `LONG KeQueryBasePriorityThread(PVOID Thread)` | Get thread base priority. |
 | 238 | `NTSTATUS NtYieldExecution(void)` | Yield CPU to another thread. |
 | 197 | `NTSTATUS NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHandle, ULONG Options)` | Duplicate a kernel handle. |
-| 302 | `NTSTATUS NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount)` | Resume a suspended thread. Returns previous suspend count. |
-| 304 | `NTSTATUS NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount)` | Suspend a thread. Returns previous suspend count. |
+| 224 | `NTSTATUS NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount)` | Resume a suspended thread. Returns previous suspend count. |
+| 231 | `NTSTATUS NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount)` | Suspend a thread. Returns previous suspend count. |
 
 **Win32 replacement**: `CreateThread` (note Xbox uses `__stdcall` for thread procs), `ExitThread`, `Sleep`, `SetThreadPriority`, `SwitchToThread`, `ResumeThread`, `SuspendThread`.
 
@@ -114,8 +114,8 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 | 225 | `NTSTATUS NtSetEvent(HANDLE EventHandle, PLONG PreviousState)` | Signal an event. |
 | 193 | `NTSTATUS NtCreateSemaphore(PHANDLE SemaphoreHandle, POBJECT_ATTRIBUTES ObjectAttributes, LONG InitialCount, LONG MaximumCount)` | Create a semaphore. |
 | 222 | `NTSTATUS NtReleaseSemaphore(HANDLE SemaphoreHandle, LONG ReleaseCount, PLONG PreviousCount)` | Release a semaphore. |
-| 234 | `NTSTATUS NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable, PLARGE_INTEGER Timeout)` | Wait on a single sync object. |
-| 233 | `NTSTATUS NtWaitForMultipleObjectsEx(ULONG Count, HANDLE Handles[], ULONG WaitType, BOOLEAN Alertable, PLARGE_INTEGER Timeout)` | Wait on multiple sync objects. |
+| 233 | `NTSTATUS NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable, PLARGE_INTEGER Timeout)` | Wait on a single sync object. |
+| 235 | `NTSTATUS NtWaitForMultipleObjectsEx(ULONG Count, HANDLE Handles[], ULONG WaitType, BOOLEAN Alertable, PLARGE_INTEGER Timeout)` | Wait on multiple sync objects. |
 
 **Win32 replacement**: `CreateEvent`, `SetEvent`, `CreateSemaphore`, `ReleaseSemaphore`, `WaitForSingleObject`, `WaitForMultipleObjects`. Nearly 1:1 mapping.
 
@@ -146,7 +146,7 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 | 113 | `VOID KeInitializeTimerEx(PKTIMER Timer, TIMER_TYPE Type)` | Initialize a kernel timer. |
 | 149 | `BOOLEAN KeSetTimer(PKTIMER Timer, LARGE_INTEGER DueTime, PKDPC Dpc)` | Set a one-shot timer. |
 | 150 | `BOOLEAN KeSetTimerEx(PKTIMER Timer, LARGE_INTEGER DueTime, LONG Period, PKDPC Dpc)` | Set a periodic timer. |
-| 99 | `BOOLEAN KeCancelTimer(PKTIMER Timer)` | Cancel a timer. |
+| 97 | `BOOLEAN KeCancelTimer(PKTIMER Timer)` | Cancel a timer. |
 | 107 | `VOID KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine, PVOID DeferredContext)` | Initialize a Deferred Procedure Call. |
 | 119 | `BOOLEAN KeInsertQueueDpc(PKDPC Dpc, PVOID Arg1, PVOID Arg2)` | Queue a DPC for execution. |
 | 137 | `BOOLEAN KeRemoveQueueDpc(PKDPC Dpc)` | Remove a queued DPC. |
@@ -157,12 +157,12 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 
 | Ord | Function | Description |
 |-----|----------|-------------|
-| 49 | `VOID HalRequestSoftwareInterrupt(KIRQL RequestIrql)` | Request a software interrupt. |
-| 40 | `VOID HalClearSoftwareInterrupt(KIRQL RequestIrql)` | Clear a software interrupt. |
-| 41 | `VOID HalDisableSystemInterrupt(ULONG BusInterruptLevel, KIRQL Irql)` | Disable a hardware interrupt. |
+| 48 | `VOID HalRequestSoftwareInterrupt(KIRQL RequestIrql)` | Request a software interrupt. |
+| 38 | `VOID HalClearSoftwareInterrupt(KIRQL RequestIrql)` | Clear a software interrupt. |
+| 39 | `VOID HalDisableSystemInterrupt(ULONG BusInterruptLevel, KIRQL Irql)` | Disable a hardware interrupt. |
 | 44 | `ULONG HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql)` | Get interrupt vector for a bus IRQ. |
-| 46 | `ULONG HalReadSMCTrayState(PULONG TrayState, PULONG ChangeCount)` | Read DVD tray state from SMC. |
-| 47 | `VOID HalReadWritePCISpace(ULONG BusNumber, ULONG SlotNumber, ULONG RegisterNumber, PVOID Buffer, ULONG Length, BOOLEAN Write)` | Read/write PCI configuration space. |
+| 9 | `ULONG HalReadSMCTrayState(PULONG TrayState, PULONG ChangeCount)` | Read DVD tray state from SMC. |
+| 46 | `VOID HalReadWritePCISpace(ULONG BusNumber, ULONG SlotNumber, ULONG RegisterNumber, PVOID Buffer, ULONG Length, BOOLEAN Write)` | Read/write PCI configuration space. |
 | 126 | `LARGE_INTEGER KeQueryPerformanceCounter(void)` | High-resolution timer (same as QPC). |
 | 127 | `LARGE_INTEGER KeQueryPerformanceFrequency(void)` | Performance counter frequency. |
 | 128 | `VOID KeQuerySystemTime(PLARGE_INTEGER CurrentTime)` | Get current system time (100ns since 1601). |
@@ -173,8 +173,8 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 | 129 | `KIRQL KeRaiseIrqlToDpcLevel(void)` | Raise to DISPATCH_LEVEL. |
 | 142 | `NTSTATUS KeSaveFloatingPointState(PVOID State)` | Save FPU/SSE state. |
 | 139 | `NTSTATUS KeRestoreFloatingPointState(PVOID State)` | Restore FPU/SSE state. |
-| 97 | `VOID KeBugCheck(ULONG BugCheckCode)` | Trigger kernel bugcheck (BSOD). |
-| 98 | `VOID KeBugCheckEx(ULONG BugCheckCode, ULONG_PTR P1, ULONG_PTR P2, ULONG_PTR P3, ULONG_PTR P4)` | Extended bugcheck with parameters. |
+| 95 | `VOID KeBugCheck(ULONG BugCheckCode)` | Trigger kernel bugcheck (BSOD). |
+| 96 | `VOID KeBugCheckEx(ULONG BugCheckCode, ULONG_PTR P1, ULONG_PTR P2, ULONG_PTR P3, ULONG_PTR P4)` | Extended bugcheck with parameters. |
 | 358 | `BOOLEAN HalIsResetOrShutdownPending(void)` | Check if reset/shutdown requested. |
 | 360 | `VOID HalInitiateShutdown(void)` | Initiate system shutdown. |
 
@@ -189,15 +189,15 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 | 324 | `XboxKrnlVersion` | Kernel version (major.minor.build.qfe). |
 | 164 | `LaunchDataPage` | Pointer to launch data page (title ID, launch path). |
 | 259 | `PsThreadObjectType` | Thread object type pointer. |
-| 17 | `ExEventObjectType` | Event object type pointer. |
-| 328 | `XeImageFileName` | ANSI_STRING with XBE filename. |
+| 16 | `ExEventObjectType` | Event object type pointer. |
+| 326 | `XeImageFileName` | ANSI_STRING with XBE filename. |
 | 323 | `XboxHDKey` | 16-byte hard drive key. |
 | 325 | `XboxSignatureKey` | 16-byte title signature key. |
-| 326 | `XboxLANKey` | 16-byte LAN encryption key. |
-| 327 | `XboxAlternateSignatureKeys` | 16x16-byte alternate signature keys. |
-| 357 | `XePublicKeyData` | 284-byte RSA public key data. |
-| 65 | `IoCompletionObjectType` | I/O completion object type. |
-| 71 | `IoDeviceObjectType` | I/O device object type. |
+| 353 | `XboxLANKey` | 16-byte LAN encryption key. |
+| 354 | `XboxAlternateSignatureKeys` | 16x16-byte alternate signature keys. |
+| 355 | `XePublicKeyData` | 284-byte RSA public key data. |
+| 64 | `IoCompletionObjectType` | I/O completion object type. |
+| 70 | `IoDeviceObjectType` | I/O device object type. |
 
 **Win32 replacement**: Allocate static structures with plausible values. `KeTickCount` should be updated from `GetTickCount()`. Hardware info flags = 0x20000000 (no HDD, has DVD). Kernel version = 1.0.5849.1 (or match your target XDK).
 
@@ -215,7 +215,7 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 | 305 | `VOID RtlTimeToTimeFields(PLARGE_INTEGER Time, PTIME_FIELDS Fields)` | Convert NT time to time fields. |
 | 312 | `VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp, PVOID ExceptionRecord, PVOID ReturnValue)` | SEH stack unwinding. |
 | 302 | `VOID RtlRaiseException(PVOID ExceptionRecord)` | Raise an exception. |
-| 354 | `VOID RtlRip(PCHAR ApiName, PCHAR Expression, PCHAR Message)` | Debug assertion failure (debug builds). |
+| 352 | `VOID RtlRip(PCHAR ApiName, PCHAR Expression, PCHAR Message)` | Debug assertion failure (debug builds). |
 
 **Win32 replacement**: Most Rtl functions have direct Win32 equivalents or can be reimplemented trivially. String functions use ANSI_STRING (Length + MaximumLength + Buffer). SEH unwinding (`RtlUnwind`) is complex but rarely exercised in normal gameplay.
 
@@ -242,10 +242,10 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 
 | Ord | Function | Description |
 |-----|----------|-------------|
-| 337 | `VOID XcSHAInit(PSHA_CONTEXT Context)` | Initialize SHA-1 context. |
-| 338 | `VOID XcSHAUpdate(PSHA_CONTEXT Context, const UCHAR* Input, ULONG Length)` | Update SHA-1 hash. |
-| 339 | `VOID XcSHAFinal(PSHA_CONTEXT Context, UCHAR* Digest)` | Finalize SHA-1 hash. |
-| 340 | `VOID XcRC4Key(PRC4_CONTEXT Context, ULONG KeyLength, const UCHAR* Key)` | Initialize RC4 key schedule. |
+| 335 | `VOID XcSHAInit(PSHA_CONTEXT Context)` | Initialize SHA-1 context. |
+| 336 | `VOID XcSHAUpdate(PSHA_CONTEXT Context, const UCHAR* Input, ULONG Length)` | Update SHA-1 hash. |
+| 337 | `VOID XcSHAFinal(PSHA_CONTEXT Context, UCHAR* Digest)` | Finalize SHA-1 hash. |
+| 338 | `VOID XcRC4Key(PRC4_CONTEXT Context, ULONG KeyLength, const UCHAR* Key)` | Initialize RC4 key schedule. |
 
 **Win32 replacement**: Use Windows CNG (`BCryptCreateHash` etc.) or a lightweight SHA-1/RC4 implementation. Most games only use crypto for save game signing and Xbox Live authentication, both of which can be stubbed.
 
@@ -253,8 +253,8 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 
 | Ord | Function | Description |
 |-----|----------|-------------|
-| 7 | `ULONG DbgPrint(const char* Format, ...)` | Debug printf (__cdecl, variadic). On real hardware, outputs to kernel debugger serial port. |
-| 5 | `BOOLEAN KdDebuggerNotPresent` | Data export: TRUE on retail (no debugger attached). Game code checks this to skip debug output. |
+| 8 | `ULONG DbgPrint(const char* Format, ...)` | Debug printf (__cdecl, variadic). On real hardware, outputs to kernel debugger serial port. |
+| 89 | `BOOLEAN KdDebuggerNotPresent` | Data export: TRUE on retail (no debugger attached). Game code checks this to skip debug output. |
 | 8 | (unknown) | Unknown ordinal 8. Appears in some games' thunk tables. Stub as no-op. |
 
 **Win32 replacement**: `DbgPrint` maps to `fprintf(stderr, ...)` or your logging system. Note __cdecl calling convention (caller cleans stack), unlike most kernel functions which use __stdcall. `KdDebuggerNotPresent` should be a static `BOOLEAN = TRUE`.
@@ -277,13 +277,13 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 | 3 | `VOID AvSetDisplayMode(PVOID RegisterBase, ULONG Step, ULONG Mode, ULONG Format, ULONG Pitch, ULONG FrameBuffer)` | Set display mode. |
 | 4 | `VOID AvSetSavedDataAddress(ULONG Address)` | Save display configuration. |
 
-**Win32 replacement**: All display/AV functions should be no-ops. Display mode is handled by your D3D backend (D3D11 or D3D12 window creation).
+**Win32 replacement**: All display/AV functions should be no-ops. Display mode is handled by your graphics backend (window and device creation).
 
 ## Port I/O
 
 | Ord | Function | Description |
 |-----|----------|-------------|
-| 335 | `VOID WRITE_PORT_BUFFER_USHORT(PUSHORT Port, PUSHORT Buffer, ULONG Count)` | Write to I/O port (16-bit). |
-| 336 | `VOID WRITE_PORT_BUFFER_ULONG(PULONG Port, PULONG Buffer, ULONG Count)` | Write to I/O port (32-bit). |
+| 333 | `VOID WRITE_PORT_BUFFER_USHORT(PUSHORT Port, PUSHORT Buffer, ULONG Count)` | Write to I/O port (16-bit). |
+| 334 | `VOID WRITE_PORT_BUFFER_ULONG(PULONG Port, PULONG Buffer, ULONG Count)` | Write to I/O port (32-bit). |
 
 **Win32 replacement**: No-ops. Port I/O is for direct hardware access (SMBus, GPU, etc.) which is irrelevant on PC.

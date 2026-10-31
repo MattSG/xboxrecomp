@@ -20,13 +20,21 @@ set(KERNEL_SOURCES
     kernel_thunks.c
     kernel_bridge.c
     xbox_memory_layout.c
+    icall_feedback.c
+    recomp_trace.c
+    nv2a_pb_scan.c
+    nv2a_pb_exec.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 
+# See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
+# CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().
+get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+
 target_include_directories(xbox_kernel PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
+    ${XBOXRECOMP_SRC_DIR}
 )
 
 if(WIN32)

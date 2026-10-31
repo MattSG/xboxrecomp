@@ -17,8 +17,9 @@ OS_RELEASE="${OS_RELEASE:-/etc/os-release}"
 
 # Same dependencies throughout, spelled per distro:
 #   build toolchain + cmake + pkg-config
-#   SDL2    - window, input, audio
-#   OpenGL headers + libepoxy - GL loader for the d3d8 backend
+#   SDL3 and SDL_shadercross are fetched and built by CMake (cmake/xbox_sdl3.cmake);
+#           what they need from the system is git, python3 and the window-system,
+#           audio and Vulkan development headers listed below.
 #   OpenSSL - crypto, replaces bcrypt
 #   ffmpeg  - video decode/demux/scale
 detect_family() {
@@ -37,30 +38,40 @@ detect_family() {
 
 family=$(detect_family) || {
     echo "Could not identify the distro from $OS_RELEASE." >&2
-    echo "Install these by hand: a C toolchain, cmake, pkg-config, SDL2," >&2
-    echo "OpenGL headers, libepoxy, OpenSSL, and ffmpeg (all with headers)." >&2
+    echo "Install these by hand: a C/C++ toolchain, cmake, git, python3, pkg-config," >&2
+    echo "OpenSSL and ffmpeg (with headers), and the X11/Wayland, ALSA/PulseAudio," >&2
+    echo "udev and Vulkan development headers SDL3 builds against." >&2
     exit 1
 }
 
 case "$family" in
     debian)
-        PKGS=(cmake build-essential pkg-config libsdl2-dev libgl1-mesa-dev
-              libepoxy-dev libssl-dev libavcodec-dev libavformat-dev
-              libavutil-dev libswscale-dev)
+        PKGS=(cmake build-essential git python3 pkg-config libssl-dev
+              libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+              libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev
+              libxss-dev libxfixes-dev libwayland-dev libxkbcommon-dev
+              libdrm-dev libgbm-dev libasound2-dev libpulse-dev libudev-dev
+              libvulkan-dev)
         echo "Detected Debian/Ubuntu. Installing ${#PKGS[@]} packages..."
         sudo apt-get update
         sudo apt-get install -y "${PKGS[@]}"
         ;;
     arch)
-        # base-devel covers gcc/make/pkgconf; ffmpeg and mesa ship headers.
-        # sdl2 resolves to sdl2-compat on current Arch.
-        PKGS=(base-devel cmake sdl2 mesa libepoxy openssl ffmpeg)
+        # base-devel covers gcc/make/pkgconf; ffmpeg ships headers.
+        PKGS=(base-devel cmake git python openssl ffmpeg libx11 libxext
+              libxrandr libxcursor libxi libxss libxfixes wayland libxkbcommon
+              libdrm mesa alsa-lib libpulse systemd-libs vulkan-headers
+              vulkan-icd-loader)
         echo "Detected Arch. Installing ${#PKGS[@]} packages..."
         sudo pacman -S --needed "${PKGS[@]}"
         ;;
     fedora)
-        PKGS=(cmake gcc make pkgconf-pkg-config SDL2-devel mesa-libGL-devel
-              libepoxy-devel openssl-devel ffmpeg-devel)
+        PKGS=(cmake gcc gcc-c++ make git python3 pkgconf-pkg-config openssl-devel
+              ffmpeg-devel libX11-devel libXext-devel libXrandr-devel
+              libXcursor-devel libXi-devel libXScrnSaver-devel libXfixes-devel
+              wayland-devel libxkbcommon-devel libdrm-devel mesa-libgbm-devel
+              alsa-lib-devel pulseaudio-libs-devel systemd-devel vulkan-headers
+              vulkan-loader-devel)
         echo "Detected Fedora/RHEL. Installing ${#PKGS[@]} packages..."
         echo "(ffmpeg-devel needs RPM Fusion enabled.)"
         sudo dnf install -y "${PKGS[@]}"

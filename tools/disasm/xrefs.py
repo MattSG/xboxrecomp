@@ -17,7 +17,8 @@ class XRefType(Enum):
     CALL = "call"               # Direct function call
     JUMP = "jump"               # Unconditional jump
     COND_JUMP = "cond_jump"     # Conditional jump
-    DATA_READ = "data_read"     # Memory read reference
+    DATA_READ = "data_read"     # Memory read reference, e.g. mov reg, [addr]
+    DATA_IMM = "data_imm"       # Address taken as an immediate, e.g. push offset addr
     KERNEL_CALL = "kernel_call" # Call through kernel thunk
 
 
@@ -115,6 +116,7 @@ def build_xrefs(engine: DisasmEngine, image: BinaryImage) -> XRefTracker:
     - Direct jumps (jmp rel32)
     - Conditional jumps (jcc rel8/rel32)
     - Data memory references (mov reg, [abs_addr] etc.)
+    - Address-taken immediates (push offset x, mov reg, offset x)
 
     Args:
         engine: The disassembly engine with decoded instructions.
@@ -191,6 +193,16 @@ def build_xrefs(engine: DisasmEngine, image: BinaryImage) -> XRefTracker:
                 from_addr=insn.address,
                 to_addr=insn.memory_ref,
                 xref_type=XRefType.DATA_READ,
+            ))
+
+        # Address-taken-as-immediate references (push offset x, mov reg, offset x).
+        # String literals are referenced this way almost exclusively, so without
+        # this the xref database sees virtually none of them.
+        if not (insn.is_call or insn.is_branch) and insn.imm_ref is not None:
+            tracker.add(XRef(
+                from_addr=insn.address,
+                to_addr=insn.imm_ref,
+                xref_type=XRefType.DATA_IMM,
             ))
 
     return tracker

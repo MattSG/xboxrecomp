@@ -8,7 +8,7 @@
  * honestly on POSIX so the Xbox-specific HLE code above it is unchanged and
  * stays verifiable.
  *
- * Linux-only: on Windows these come from the real <windows.h>.
+ * Linux/MacOS only: on Windows these come from the real <windows.h>.
  */
 
 #ifndef WIN32_COMPAT_H
@@ -29,6 +29,7 @@ extern "C" {
 #define WAIT_IO_COMPLETION   0x000000C0u
 #define WAIT_TIMEOUT         0x00000102u
 #define WAIT_FAILED          0xFFFFFFFFu
+#define MAXIMUM_WAIT_OBJECTS 64
 #ifndef INFINITE
 #define INFINITE             0xFFFFFFFFu
 #endif
@@ -55,6 +56,8 @@ extern "C" {
 #define MEM_RESERVE    0x00002000u
 #define MEM_DECOMMIT   0x00004000u
 #define MEM_RELEASE    0x00008000u
+#define MEM_FREE       0x00010000u
+#define MEM_PRIVATE    0x00020000u
 #define MEM_TOP_DOWN   0x00100000u
 #define PAGE_NOACCESS          0x01u
 #define PAGE_READONLY          0x02u
@@ -75,6 +78,7 @@ typedef VOID  (WINAPI *WAITORTIMERCALLBACK)(PVOID lpParameter, BOOLEAN TimerOrWa
 typedef void  *LPSECURITY_ATTRIBUTES;
 typedef void  *PTP_CALLBACK_INSTANCE;
 typedef VOID  (WINAPI *PTP_SIMPLE_CALLBACK)(PTP_CALLBACK_INSTANCE Instance, PVOID Context);
+typedef BOOL  (WINAPI *PINIT_ONCE_FN)(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context);
 
 /* ---- Last-error -------------------------------------------------------- */
 DWORD GetLastError(void);
@@ -86,6 +90,7 @@ LONG InterlockedDecrement(volatile LONG *Addend);
 LONG InterlockedExchange(volatile LONG *Target, LONG Value);
 LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
 
 /* ---- Critical sections ------------------------------------------------- */
@@ -95,6 +100,16 @@ VOID EnterCriticalSection(LPCRITICAL_SECTION cs);
 VOID LeaveCriticalSection(LPCRITICAL_SECTION cs);
 BOOL TryEnterCriticalSection(LPCRITICAL_SECTION cs);
 VOID DeleteCriticalSection(LPCRITICAL_SECTION cs);
+
+/* ---- Slim reader/writer locks ------------------------------------------ */
+VOID InitializeSRWLock(PSRWLOCK lock);
+VOID AcquireSRWLockShared(PSRWLOCK lock);
+VOID ReleaseSRWLockShared(PSRWLOCK lock);
+VOID AcquireSRWLockExclusive(PSRWLOCK lock);
+VOID ReleaseSRWLockExclusive(PSRWLOCK lock);
+
+/* ---- One-time initialisation ------------------------------------------- */
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *context);
 
 /* ---- Condition variables (paired with a CRITICAL_SECTION) ----------- */
 VOID InitializeConditionVariable(PCONDITION_VARIABLE cv);
@@ -170,6 +185,13 @@ BOOL   ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULO
 BOOL   TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
                                    PVOID context, PVOID env);
 
+/* ---- Waitable timers --------------------------------------------------- */
+typedef VOID (*PTIMERAPCROUTINE)(PVOID arg, DWORD lowValue, DWORD highValue);
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name);
+BOOL   SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
+                        PTIMERAPCROUTINE completion, PVOID arg, BOOL resume);
+BOOL   CancelWaitableTimer(HANDLE h);
+
 /* ---- Heap ------------------------------------------------------------- */
 HANDLE GetProcessHeap(void);
 HANDLE HeapCreate(DWORD options, SIZE_T initial, SIZE_T maximum);
@@ -198,6 +220,8 @@ BOOL  QueryPerformanceFrequency(PLARGE_INTEGER freq);
 VOID  OutputDebugStringA(LPCSTR str);
 VOID  OutputDebugStringW(LPCWSTR str);
 VOID  ExitProcess(UINT exitCode);
+BOOL  IsDebuggerPresent(void);
+VOID  DebugBreak(void);
 BOOL  TerminateProcess(HANDLE process, UINT exitCode);
 VOID  SecureZeroMemory(PVOID ptr, SIZE_T cnt);
 unsigned int _clearfp(void);   /* clear pending FPU exception flags */
@@ -236,6 +260,7 @@ HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share,
 BOOL   ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped);
 BOOL   WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlapped);
 DWORD  GetFileSize(HANDLE h, LPDWORD high);
+BOOL   GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
 BOOL   FlushFileBuffers(HANDLE h);
 
 /* ---- Keyboard + window helpers (stubs on POSIX) --------------------- */
@@ -243,6 +268,9 @@ SHORT GetAsyncKeyState(int vKey);
 HWND  FindWindowA(LPCSTR className, LPCSTR windowName);
 HWND  GetActiveWindow(void);
 BOOL  SetWindowTextA(HWND hwnd, LPCSTR text);
+int   GetWindowTextA(HWND hwnd, LPSTR text, int count);
+typedef BOOL (CALLBACK *WNDENUMPROC)(HWND hwnd, LPARAM lParam);
+BOOL  EnumWindows(WNDENUMPROC enumProc, LPARAM lParam);
 
 /* MessageBox + flags (stderr stub on POSIX). */
 int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
@@ -361,7 +389,9 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_INSUFFICIENT_BUFFER     122u
 #define ERROR_ALREADY_EXISTS          183u
 #define ERROR_MORE_DATA               234u
+#define ERROR_NOT_OWNER               288u
 #define ERROR_MR_MID_NOT_FOUND        317u
+#define ERROR_INVALID_ADDRESS         487u
 #define ERROR_IO_PENDING              997u
 #define ERROR_CANCELLED               1223u
 #define ERROR_NO_SYSTEM_RESOURCES     1450u
@@ -474,6 +504,11 @@ void  _aligned_free(void *ptr);
 int _stricmp(const char *a, const char *b);
 int _strnicmp(const char *a, const char *b, SIZE_T n);
 
+/* ---- MSVC CRT "safe" variants ---------------------------------------- */
+/* strtok_s takes the same (str, delim, context) arguments as POSIX strtok_r
+ * and returns the same thing, so the name is all that differs. */
+#define strtok_s strtok_r
+
 /* ---- Wide-string helpers (operate on the 16-bit Xbox WCHAR) ----------
  * Named xbox_wcs* (not macros over wcs*) so they never collide with the
  * 32-bit-wchar_t CRT functions in <wchar.h>. On Windows xbox_winnt.h maps
@@ -486,48 +521,6 @@ WCHAR *xbox_wcscpy(WCHAR *dst, const WCHAR *src);
 /* ---- Time conversion ------------------------------------------------- */
 BOOL SystemTimeToFileTime(const SYSTEMTIME *st, LPFILETIME ft);
 BOOL FileTimeToSystemTime(const FILETIME *ft, LPSYSTEMTIME st);
-
-/* ---- Multimedia (winmm) shim: waveOut stubs that always report failure.
- * The APU has a waveOut fallback path; on Linux it just stays inactive
- * and the (real) SDL2 audio path will replace it later. */
-typedef DWORD  MMRESULT;
-typedef void  *HWAVEOUT;
-#define MMSYSERR_NOERROR     0
-#define MMSYSERR_INVALPARAM 11
-#define WAVE_FORMAT_PCM      1
-#define WAVE_MAPPER          ((UINT)-1)
-#define CALLBACK_NULL        0x00000000
-#define WHDR_DONE            0x00000001
-#define WHDR_INQUEUE         0x00000010
-
-typedef struct tWAVEFORMATEX {
-    WORD  wFormatTag, nChannels;
-    DWORD nSamplesPerSec, nAvgBytesPerSec;
-    WORD  nBlockAlign, wBitsPerSample, cbSize;
-} WAVEFORMATEX;
-
-typedef struct tWAVEHDR {
-    LPSTR     lpData;
-    DWORD     dwBufferLength;
-    DWORD     dwBytesRecorded;
-    DWORD_PTR dwUser;
-    DWORD     dwFlags;
-    DWORD     dwLoops;
-    struct tWAVEHDR *lpNext;
-    DWORD_PTR reserved;
-} WAVEHDR;
-
-static inline MMRESULT waveOutOpen(HWAVEOUT *h, UINT id, const WAVEFORMATEX *f,
-                                   DWORD_PTR cb, DWORD_PTR inst, DWORD flags)
-{ (void)h;(void)id;(void)f;(void)cb;(void)inst;(void)flags; return MMSYSERR_INVALPARAM; }
-static inline MMRESULT waveOutPrepareHeader(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
-{ (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
-static inline MMRESULT waveOutUnprepareHeader(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
-{ (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
-static inline MMRESULT waveOutWrite(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
-{ (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
-static inline MMRESULT waveOutReset(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
-static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
 
 #ifdef __cplusplus
 }

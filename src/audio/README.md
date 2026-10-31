@@ -58,7 +58,7 @@ Game calls SetBufferData() or Lock()/Unlock()
 
 Game calls Play()
   → apu_mixer_play(voice, looping)
-  → Voice is mixed into waveOut output at 48kHz
+  → Voice is mixed into the SDL3 audio output at 48kHz
 ```
 
 ## IDirectSound8 Methods

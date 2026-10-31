@@ -9,7 +9,7 @@
  */
 
 #include "nv2a_state.h"
-#include "nv2a_pgraph_d3d11.h"
+#include "nv2a_pgraph_d3d8.h"
 
 /* ============================================================
  * Global state
@@ -537,8 +537,8 @@ static int g_pgraph_in_begin = 0;
 #define M_SET_COLOR_CLEAR_VALUE 0x01D4
 #define M_SET_BEGIN_END         0x17FC
 #define M_INLINE_ARRAY          0x1818
-#define M_FLIP_INCREMENT_WRITE  0x0114
-#define M_FLIP_STALL            0x0118
+#define M_FLIP_INCREMENT_WRITE  NV097_FLIP_INCREMENT_WRITE
+#define M_FLIP_STALL            NV097_FLIP_STALL
 #define M_SET_VIEWPORT_OFFSET   0x0A20
 #define M_SET_VIEWPORT_SCALE    0x0AF0
 
@@ -547,9 +547,9 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
 {
     g_pgraph_method_count++;
 
-    /* Route through D3D11 translator first */
-    if (pgraph_d3d11_method(subchannel, method, param)) {
-        /* Handled by D3D11 translator — still store in regs for state queries */
+    /* Route through PGRAPH translator first */
+    if (pgraph_d3d8_method(subchannel, method, param)) {
+        /* Handled by PGRAPH translator — still store in regs for state queries */
         if (method < 0x2000 * 4) {
             d->pgraph.regs[method / 4] = param;
         }

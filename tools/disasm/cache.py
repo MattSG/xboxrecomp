@@ -71,7 +71,14 @@ class AnalysisCache:
         h = hashlib.sha256()
         h.update(repr(bool(text_only)).encode())
         h.update(repr(sorted(extra_sections or [])).encode())
-        h.update(repr(sorted(map(repr, seed_functions or []))).encode())
+        h.update(repr(sorted(seed_functions or [])).encode())
+        # The disassembler's own source is an input. Without this a change to a
+        # detection pass hands back the previous run's functions.json and reads
+        # as "the change did nothing" -- the same silent wrong answer the option
+        # fingerprint above exists to prevent, just harder to spot.
+        for src in sorted(Path(__file__).parent.glob("*.py")):
+            h.update(src.name.encode())
+            h.update(src.read_bytes())
         return h.hexdigest()
 
     def is_valid(self, xbe_path: str, analysis_json_path: str,

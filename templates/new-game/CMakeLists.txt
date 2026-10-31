@@ -42,7 +42,11 @@ add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 # Collect generated recompiled code.
 # The recomp pipeline outputs files into src/recomp/gen/.
 # With --split 1000, you get gen_0000.c, gen_0001.c, etc.
-file(GLOB RECOMP_GEN_SOURCES "src/recomp/gen/*.c")
+# CONFIGURE_DEPENDS so re-running the recompiler picks up added/removed files
+# without a manual re-configure. A plain GLOB is evaluated once at configure
+# time, so a newly generated file (an extra chunk, recomp_stubs_unresolved.c)
+# is silently left out of the build and shows up as unresolved externals.
+file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 
 # Core game sources
 set(GAME_SOURCES
@@ -74,14 +78,17 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${XBOXRECOMP_DIR}/include
 )
 
-# Windows SDK libraries needed at link time
+# Windows libraries needed at link time. Graphics, audio and input come in
+# through the xboxrecomp target (SDL3 and SDL_shadercross).
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    d3d11
-    dxgi
-    dxguid
-    xinput
-    winmm
+    # Lets the fault handler resolve the host RIP back to the generated
+    # function's symbol, i.e. to the guest function that faulted.
+    dbghelp
 )
+
+# The runtime compiles shaders at run time with DXC, which loads dxcompiler.dll
+# and dxil.dll from beside the executable; copy them there.
+xbox_copy_dxc(${PROJECT_NAME})
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)

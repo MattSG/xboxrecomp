@@ -10,13 +10,16 @@ from typing import Optional
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_OP_IMM, CS_OP_MEM
 
 
+# LOOP family: ECX is the counter, not a flag. They branch, so they end a
+# block like any other conditional jump, but they need their own lifting.
+LOOP_JUMPS = frozenset({"loop", "loope", "loopne"})
+
 # x86 conditional jump mnemonics
 COND_JUMPS = frozenset({
     "jo", "jno", "jb", "jnb", "jae", "je", "jz", "jne", "jnz",
     "jbe", "ja", "jnae", "jna", "js", "jns", "jp", "jnp",
     "jl", "jge", "jle", "jg", "jcxz", "jecxz",
-    "loop", "loope", "loopne",
-})
+}) | LOOP_JUMPS
 
 
 @dataclass
@@ -36,6 +39,7 @@ class Instruction:
     jump_target: Optional[int] = None
     memory_refs: list = field(default_factory=list)
     imm_values: list = field(default_factory=list)
+    regs_written: list = field(default_factory=list)
 
     @property
     def is_call(self):
@@ -80,6 +84,10 @@ class Operand:
     mem_scale: int = 1
     mem_disp: int = 0
     mem_size: int = 0  # operand size in bytes
+    # Segment override, when the instruction carries one. Only fs matters on
+    # Xbox -- it is how a title reaches the TIB -- but dropping the prefix put
+    # fs:[0] at linear address 0, which is also where a null pointer lands.
+    mem_seg: str = None
 
 
 @dataclass
@@ -130,6 +138,8 @@ def _parse_operand(cs, cs_op, insn_obj):
             mem_scale=cs_op.mem.scale,
             mem_disp=cs_op.mem.disp & 0xFFFFFFFF if cs_op.mem.disp >= 0 else cs_op.mem.disp,
             mem_size=cs_op.size,
+            mem_seg=(_reg_names.get(cs_op.mem.segment)
+                     if getattr(cs_op.mem, "segment", 0) else None),
         )
     else:
         # Register operand
@@ -144,51 +154,127 @@ class Disassembler:
         self._cs.detail = True
         _init_reg_names(self._cs)
 
-    def disassemble_function(self, raw_bytes, start_va, end_va):
+    def _decode_instruction(self, cs_insn):
+        """Convert one Capstone instruction into the translator model."""
+        insn = Instruction(
+            address=cs_insn.address,
+            size=cs_insn.size,
+            mnemonic=cs_insn.mnemonic,
+            op_str=cs_insn.op_str,
+            bytes_hex=cs_insn.bytes.hex(),
+        )
+
+        try:
+            ops = cs_insn.operands
+        except Exception:
+            ops = []
+        try:
+            _, written = cs_insn.regs_access()
+            insn.regs_written = [
+                _reg_names.get(reg, self._cs.reg_name(reg))
+                for reg in written
+                if _reg_names.get(reg, self._cs.reg_name(reg))
+            ]
+        except Exception:
+            insn.regs_written = []
+        for cs_op in ops:
+            op = _parse_operand(self._cs, cs_op, cs_insn)
+            insn.operands.append(op)
+
+            if cs_op.type == CS_OP_IMM:
+                val = cs_op.imm & 0xFFFFFFFF
+                insn.imm_values.append(val)
+                if insn.is_call:
+                    insn.call_target = val
+                elif insn.is_branch:
+                    insn.jump_target = val
+            elif cs_op.type == CS_OP_MEM:
+                if (cs_op.mem.base == 0 and cs_op.mem.index == 0
+                        and cs_op.mem.disp != 0):
+                    insn.memory_refs.append(cs_op.mem.disp & 0xFFFFFFFF)
+
+        return insn
+
+    def disassemble_function(self, raw_bytes, start_va, end_va, resync=None):
         """
         Disassemble bytes for a single function.
         Returns list of Instruction objects.
+
+        `resync` are addresses known to be instruction starts even if a linear
+        decode disagrees -- switch-table targets, in practice. A jump table
+        embedded in .text is data, and decoding it as instructions leaves the
+        stream misaligned: the bogus instruction covering the last table entry
+        swallows the real one just past it, so no instruction (and therefore no
+        basic block, and therefore no label) ever starts at the first case.
+        The switch then compiles to a goto with no destination, which the
+        translator turns into a no-op, and the case silently falls through to
+        an unresolved indirect branch at run time.
+
+        Decoding restarts at each such address and discards whatever instruction
+        straddled it. The garbage decoded from the table itself is left alone:
+        it is unreachable, because the block before it ends at the indirect
+        jump.
         """
         size = end_va - start_va
         if size <= 0 or size > len(raw_bytes):
             return []
 
-        instructions = []
+        decoded = {}
         for cs_insn in self._cs.disasm(raw_bytes[:size], start_va):
-            insn = Instruction(
-                address=cs_insn.address,
-                size=cs_insn.size,
-                mnemonic=cs_insn.mnemonic,
-                op_str=cs_insn.op_str,
-                bytes_hex=cs_insn.bytes.hex(),
-            )
+            decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
-            # Parse operands (detail mode is enabled on the Cs object)
-            try:
-                ops = cs_insn.operands
-            except Exception:
-                ops = []
-            for cs_op in ops:
-                op = _parse_operand(self._cs, cs_op, cs_insn)
-                insn.operands.append(op)
+        for point in sorted(resync or ()):
+            if not (start_va <= point < end_va) or point in decoded:
+                continue
+            for addr in [a for a, i in decoded.items()
+                         if a < point < a + i.size]:
+                del decoded[addr]
+            for cs_insn in self._cs.disasm(raw_bytes[point - start_va:size],
+                                           point):
+                if cs_insn.address in decoded:
+                    break          # rejoined a stream we already have
+                decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
-                if cs_op.type == CS_OP_IMM:
-                    val = cs_op.imm & 0xFFFFFFFF
-                    insn.imm_values.append(val)
-                    if insn.is_call:
-                        insn.call_target = val
-                    elif insn.is_branch:
-                        insn.jump_target = val
-                elif cs_op.type == CS_OP_MEM:
-                    if cs_op.mem.base == 0 and cs_op.mem.index == 0 and cs_op.mem.disp != 0:
-                        insn.memory_refs.append(cs_op.mem.disp & 0xFFFFFFFF)
+        return [decoded[a] for a in sorted(decoded)]
 
-            instructions.append(insn)
+    def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
+                        stop_addresses=None, stop_mnemonics=()):
+        """Decode reachable instruction streams from an explicit worklist."""
+        size = end_va - start_va
+        if size <= 0 or size > len(raw_bytes):
+            return []
 
-        return instructions
+        decoded = {}
+        stop_addresses = set(stop_addresses or ())
+        worklist = list(entry_points)
+        while worklist:
+            entry = worklist.pop()
+            if not (start_va <= entry < end_va) or entry in decoded:
+                continue
+            offset = entry - start_va
+            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
+                if cs_insn.address != entry and cs_insn.address in stop_addresses:
+                    break
+                if cs_insn.address >= end_va or cs_insn.address in decoded:
+                    break
+                insn = self._decode_instruction(cs_insn)
+                decoded[insn.address] = insn
+
+                if (insn.is_cond_jump and insn.jump_target is not None
+                        and start_va <= insn.jump_target < end_va):
+                    worklist.append(insn.jump_target)
+                if insn.is_jump:
+                    if (insn.jump_target is not None
+                            and start_va <= insn.jump_target < end_va):
+                        worklist.append(insn.jump_target)
+                    break
+                if insn.is_ret or insn.mnemonic in stop_mnemonics:
+                    break
+
+        return [decoded[addr] for addr in sorted(decoded)]
 
     def build_basic_blocks(self, instructions, func_start, func_end,
-                           extra_leaders=None):
+                           extra_leaders=None, stop_mnemonics=()):
         """
         Partition instructions into basic blocks.
         A new block starts at:
@@ -210,7 +296,7 @@ class Disassembler:
                     leaders.add(insn.jump_target)
                 # Instruction after the branch is also a leader
                 leaders.add(insn.end_address)
-            elif insn.is_call:
+            elif insn.is_call or insn.mnemonic in stop_mnemonics:
                 # Instruction after call is a leader (call might not return)
                 leaders.add(insn.end_address)
 
@@ -236,7 +322,7 @@ class Disassembler:
                 idx += 1
 
                 # Block ends at terminators
-                if insn.is_ret or insn.is_jump:
+                if insn.is_ret or insn.is_jump or insn.mnemonic in stop_mnemonics:
                     break
                 if insn.is_cond_jump:
                     break
@@ -244,7 +330,7 @@ class Disassembler:
             # Determine successors
             if bb.instructions:
                 last = bb.last_insn
-                if last.is_ret:
+                if last.is_ret or last.mnemonic in stop_mnemonics:
                     pass  # No successors
                 elif last.is_jump:
                     if last.jump_target and func_start <= last.jump_target < func_end:

@@ -12,8 +12,16 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
 #if defined(_WIN32)
 #include <intrin.h>
+#endif
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma intrinsic(_ReturnAddress)
+#define IRQL_CALLER() _ReturnAddress()
+#else
+#define IRQL_CALLER() __builtin_return_address(0)
 #endif
 
 /* ============================================================================
@@ -31,6 +39,133 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+/* How many threads are holding IRQL at or above DISPATCH_LEVEL.
+ *
+ * The level itself is per-thread, which is right for a guest that asks "what
+ * is my IRQL". It is wrong for the question a device model has to answer:
+ * raising IRQL on hardware masks the interrupt for the whole processor, and
+ * the title raises it precisely to keep an ISR out of structures it is in the
+ * middle of editing. With the level thread-local, a controller thread sees
+ * PASSIVE_LEVEL, calls the ISR anyway, and the two race over exactly the
+ * state the guest was protecting -- which surfaces as an intermittent fault
+ * on a garbage pointer, far from the code that dropped it.
+ *
+ * A count rather than a flag, because several threads can be raised at once
+ * and the last one out is what re-opens the gate. */
+static volatile LONG g_irql_raised_count = 0;
+
+/* Non-zero while any thread is at or above DISPATCH_LEVEL. Device models call
+ * this before delivering an interrupt; OHCI and the NV2A are level-triggered,
+ * so a deferred interrupt is delivered on the next poll rather than lost. */
+int xbox_IrqlBlocksInterrupts(void)
+{
+    return InterlockedCompareExchange(&g_irql_raised_count, 0, 0) != 0;
+}
+
+/* The raw depth, for callers that want to report it. A count that only ever
+ * grows is a leak somewhere in the raise/lower pairs, and the number says so
+ * where a yes/no cannot. */
+int xbox_IrqlRaisedCount(void)
+{
+    return (int)InterlockedCompareExchange(&g_irql_raised_count, 0, 0);
+}
+
+static int  s_trace = -1;
+static volatile LONG s_traced = 0;
+
+/* Every crossing of the DISPATCH boundary, ever.
+ *
+ * The depth on its own cannot tell a leaked raise from a guest that is
+ * genuinely sitting there: both read non-zero for as long as you look. A
+ * count that stops moving says the first; one that races says the second.
+ * That distinction is the whole difference between "the title is busy" and
+ * "no device will ever get an interrupt again". */
+static volatile LONG s_transitions = 0;
+
+int xbox_IrqlTransitions(void)
+{
+    return (int)InterlockedCompareExchange(&s_transitions, 0, 0);
+}
+
+/* Which threads are holding the boundary up, and where they raised.
+ *
+ * A depth that stops changing has to be attributed to code, and the raise
+ * that did it happened seconds earlier on a thread that has since gone
+ * quiet -- there is nothing left to look at by the time anyone notices.
+ * Keeping the caller's address per raised thread turns the number into a
+ * name: these are host addresses inside the recompiled image, so nm resolves
+ * them to the generated function, which is the guest function. */
+#define IRQL_HOLDERS 8
+static struct { volatile LONG tid; void *ra; } s_holders[IRQL_HOLDERS];
+
+static void irql_holder_add(void *ra)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    int i;
+
+    for (i = 0; i < IRQL_HOLDERS; i++)
+        if (InterlockedCompareExchange(&s_holders[i].tid, me, 0) == 0) {
+            s_holders[i].ra = ra;
+            return;
+        }
+}
+
+static void irql_holder_drop(void)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    int i;
+
+    for (i = 0; i < IRQL_HOLDERS; i++)
+        if (InterlockedCompareExchange(&s_holders[i].tid, 0, me) == me)
+            return;
+}
+
+void xbox_IrqlDumpHolders(void)
+{
+    int i;
+
+    fprintf(stderr, "  [IRQLHOLD] depth=%d transitions=%d, raised threads:\n",
+            xbox_IrqlRaisedCount(), xbox_IrqlTransitions());
+    for (i = 0; i < IRQL_HOLDERS; i++) {
+        LONG t = InterlockedCompareExchange(&s_holders[i].tid, 0, 0);
+        if (t)
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p\n",
+                    (unsigned long)t, s_holders[i].ra);
+    }
+    fflush(stderr);
+}
+
+static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+{
+    int was = (old_level >= DISPATCH_LEVEL);
+    int now = (new_level >= DISPATCH_LEVEL);
+    LONG d;
+
+    if (now == was)
+        return;
+
+    d = now ? InterlockedIncrement(&g_irql_raised_count)
+            : InterlockedDecrement(&g_irql_raised_count);
+    InterlockedIncrement(&s_transitions);
+    if (now)
+        irql_holder_add(ra);
+    else
+        irql_holder_drop();
+
+    /* RECOMP_IRQL_TRACE prints the first few transitions. The pairing is what
+     * matters: a raise to 2 followed by a lower from 2 nets out, and a lower
+     * whose old level is not the level the raise set is a calling-convention
+     * bug upstream of here, not a title doing something exotic. */
+    if (s_trace < 0)
+        s_trace = getenv("RECOMP_IRQL_TRACE") ? 1 : 0;
+    if (s_trace && InterlockedIncrement(&s_traced) <= 20) {
+        fprintf(stderr, "  [IRQL] tid %lu %s %d->%d depth=%ld\n",
+                (unsigned long)GetCurrentThreadId(),
+                now ? "raise" : "lower", old_level, new_level, (long)d);
+        fflush(stderr);
+    }
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
@@ -45,6 +180,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
+    irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
     return old;
 }
@@ -56,11 +192,31 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
     if (NewIrql > g_current_irql) {
+        /* A lower that raises the count.
+         *
+         * irql_track works on the edge, so this call crosses the boundary
+         * upwards and increments. The pair that would bring it back down has
+         * already happened, so the depth is now permanently one too high --
+         * and the count is what every device model reads before delivering.
+         * One of these ends interrupts for the rest of the run.
+         *
+         * Loud rather than a filtered warning because of that consequence:
+         * the symptom is a device going silent minutes later, with nothing
+         * connecting it back to here. */
+        static volatile LONG n;
+        if (InterlockedIncrement(&n) <= 20) {
+            fprintf(stderr, "  [IRQLBUG] tid %lu KfLowerIrql(%d) while at %d"
+                    " -- counted as a raise, depth is now stuck\n",
+                    (unsigned long)GetCurrentThreadId(),
+                    (int)NewIrql, (int)g_current_irql);
+            fflush(stderr);
+        }
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
             g_current_irql, NewIrql);
     }
 
+    irql_track(g_current_irql, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
 }
 
@@ -70,6 +226,8 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
+
+    irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
     g_current_irql = DISPATCH_LEVEL;
     return old;
 }
@@ -118,10 +276,56 @@ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
  * January 1, 1601). Direct Win32 mapping.
  * ============================================================================ */
 
+static LONGLONG s_time_anchor_100ns;
+static LONGLONG s_time_anchor_counts;
+static LONGLONG s_time_freq_counts;
+static INIT_ONCE s_time_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK anchor_system_time(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    FILETIME ft;
+    LARGE_INTEGER f, now;
+    (void)once; (void)param; (void)ctx;
+    QueryPerformanceFrequency(&f);
+    GetSystemTimeAsFileTime(&ft);
+    QueryPerformanceCounter(&now);
+    s_time_freq_counts = f.QuadPart ? f.QuadPart : 1;
+    s_time_anchor_100ns = ((LONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    s_time_anchor_counts = now.QuadPart;
+    return TRUE;
+}
+
 VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
 {
-    if (CurrentTime)
-        GetSystemTimeAsFileTime((LPFILETIME)CurrentTime);
+    /* Anchored once to the wall clock, advanced by the performance counter.
+     *
+     * GetSystemTimeAsFileTime alone moves in steps of about 15.6 ms, the
+     * host's scheduler tick. The console's clock is far finer, and a title
+     * that busy-waits on this -- reading it until enough time has passed --
+     * spins for the whole of each step instead of a few iterations.
+     *
+     * Measured on Shin Megami Tensei: Nine: one such wait called this
+     * **11.8 million times in two seconds**, which is most of what the
+     * title was doing at that moment, and it came out of the spin in a
+     * state where it no longer polled the gamepad.
+     *
+     * The anchor keeps the absolute value right; the counter supplies the
+     * resolution between ticks.
+     *
+     * Whole seconds and the remainder are scaled separately: scaling the
+     * whole count by 10^7 overflows after about a day at 10 MHz. */
+    LARGE_INTEGER now;
+    LONGLONG delta;
+
+    if (!CurrentTime)
+        return;
+
+    InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
+    QueryPerformanceCounter(&now);
+    delta = now.QuadPart - s_time_anchor_counts;
+    CurrentTime->QuadPart = s_time_anchor_100ns
+        + (delta / s_time_freq_counts) * 10000000LL
+        + (delta % s_time_freq_counts) * 10000000LL / s_time_freq_counts;
 }
 
 /* ============================================================================
@@ -356,6 +560,24 @@ BOOLEAN __stdcall xbox_KeConnectInterrupt(PXBOX_KINTERRUPT Interrupt)
     return TRUE;
 }
 
+BOOLEAN __stdcall xbox_KeDisconnectInterrupt(PXBOX_KINTERRUPT Interrupt)
+{
+    BOOLEAN was_connected;
+
+    if (!Interrupt)
+        return FALSE;
+
+    /* Returns the PREVIOUS connected state, not success. */
+    was_connected = Interrupt->Connected;
+    Interrupt->Connected = FALSE;
+
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
+        "KeDisconnectInterrupt: interrupt=%p was_connected=%d",
+        Interrupt, (int)was_connected);
+
+    return was_connected;
+}
+
 /* ============================================================================
  * Miscellaneous Port I/O Stubs
  * ============================================================================ */
@@ -421,8 +643,21 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
 
     switch (Option) {
     case AV_OPTION_QUERY_AVPACK:
-        /* Report HDTV/Component pack - allows games to offer 480p/720p */
-        *Result = AV_PACK_HDTV;
+        /* Pack type, video standard and refresh rate, in one word.
+         *
+         * D3D keys its display-mode table on all three: the row flags carry
+         * the pack in 0x000000FF, the standard in 0x0000FF00 and the refresh
+         * in 0x00C00000 (Half-Life 2's 640x480 60Hz row is 0x00480104).
+         * Returning the pack alone left the standard as 0, which matches no
+         * row, so the mode scan ran off the end of the table and device
+         * creation failed with E_FAIL.
+         *
+         * HDTV pack keeps 480p/720p available to titles that offer them;
+         * NTSC-M and 60Hz are the North American retail default, and match
+         * the region reported by ExQueryNonVolatileSetting. */
+        *Result = AV_PACK_HDTV
+                | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
+                | AV_REFRESH_60Hz;
         break;
 
     case AV_OPTION_QUERY_MODE:
@@ -594,6 +829,68 @@ NTSTATUS __stdcall xbox_HalWriteSMBusValue(
 }
 
 /* ============================================================================
+ * HAL Data Exports
+ *
+ * Ordinals 40, 41 and 42 are variables, not functions. Games read them
+ * directly through the thunk table, so the thunk must hand back the address
+ * of real storage -- pointing these at a function is what produced garbage
+ * disk metadata before.
+ *
+ * The strings are counted (Length/MaximumLength), not NUL-terminated, matching
+ * the kernel's STRING type. Values describe the virtual disk we present; no
+ * real hardware is queried.
+ * ============================================================================ */
+
+ULONG xbox_HalDiskCachePartitionCount = 3;
+
+static char g_disk_model[]  = "XBOXRECOMP VIRTUAL HDD";
+static char g_disk_serial[] = "XR0000000000";
+
+XBOX_ANSI_STRING xbox_HalDiskModelNumber = {
+    sizeof(g_disk_model) - 1,
+    sizeof(g_disk_model) - 1,
+    g_disk_model
+};
+
+XBOX_ANSI_STRING xbox_HalDiskSerialNumber = {
+    sizeof(g_disk_serial) - 1,
+    sizeof(g_disk_serial) - 1,
+    g_disk_serial
+};
+
+/*
+ * Video mode the SMC reported at boot. 0 lets title code fall back to querying
+ * the AV pack, which we answer properly in AvGetSavedDataAddress/SMBus.
+ */
+ULONG xbox_HalBootSMCVideoMode = 0;
+
+/*
+ * IDE channel object. Real kernels export a device object for the ATA channel;
+ * drivers only ever pass it back to us, so identity is all that is required.
+ */
+static ULONG g_idex_channel_data = 0x49444558; /* 'IDEX' */
+PVOID xbox_IdexChannelObject = &g_idex_channel_data;
+
+/* ============================================================================
+ * Shutdown Notification
+ * ============================================================================ */
+
+VOID __stdcall xbox_HalRegisterShutdownNotification(
+    PVOID ShutdownRegistration,
+    BOOLEAN Register)
+{
+    /*
+     * Registers a callback to run on reboot/shutdown. We never initiate an
+     * Xbox-style shutdown -- HalReturnToFirmware terminates the process -- so
+     * the callback would never fire. Recorded in the log so a title relying on
+     * shutdown cleanup is visible rather than silently ignored.
+     */
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
+        "HalRegisterShutdownNotification: %s registration=%p (never invoked)",
+        Register ? "register" : "unregister", ShutdownRegistration);
+}
+
+/* ============================================================================
  * Unknown Ordinal Stubs
  * ============================================================================ */
 
@@ -610,4 +907,76 @@ VOID __stdcall xbox_Unknown_23(void)
 VOID __stdcall xbox_Unknown_42(void)
 {
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL, "Unknown ordinal 42 called (stubbed)");
+}
+
+/* ============================================================================
+ * Debug / Timing
+ * ============================================================================ */
+
+VOID __stdcall xbox_DbgBreakPoint(void)
+{
+    /*
+     * Titles call this from assertion paths. Under a debugger this should
+     * break; without one, raising a breakpoint exception would terminate the
+     * process on a condition the title may well survive. Log loudly and
+     * continue, and only actually break when a debugger is attached to catch it.
+     */
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL, "DbgBreakPoint called by title");
+
+    if (IsDebuggerPresent())
+        DebugBreak();
+}
+
+ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
+{
+    /*
+     * Time since boot in NT 100ns units. GetTickCount64 is milliseconds, so
+     * scale by 10,000. Resolution is coarser than the real kernel's, but it is
+     * monotonic, which is the property callers actually depend on.
+     */
+    return (ULONGLONG)GetTickCount64() * 10000ULL;
+}
+
+/* ============================================================================
+ * Time stamp counter
+ *
+ * Xbox's QueryPerformanceCounter is a bare `rdtsc`, and its
+ * QueryPerformanceFrequency returns the CPU clock as a constant the title
+ * compiles in: Half-Life 2's is 0x2BB5C755 (733,333,333 Hz) at 0x0059C6C7.
+ * So a frame timer computes seconds as counter / 733333333.
+ *
+ * Returning the host's own TSC would make that division wrong by the ratio of
+ * the two clocks -- a 3.5 GHz host would have the guest believe nearly five
+ * seconds had passed for every real one. Scaling the host's performance
+ * counter to the console's rate keeps the guest's arithmetic honest.
+ *
+ * Monotonic and shared by every thread, which is what a TSC is. The first
+ * call establishes the origin so the counter starts near zero rather than at
+ * whatever the host had been running for.
+ * ========================================================================= */
+#define XBOX_TSC_HZ 733333333ull
+
+uint64_t xbox_ReadTimeStampCounter(void)
+{
+    static LARGE_INTEGER freq;
+    static LARGE_INTEGER origin;
+    LARGE_INTEGER now;
+
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&origin);
+        if (freq.QuadPart == 0)
+            freq.QuadPart = 1;
+    }
+    QueryPerformanceCounter(&now);
+
+    {
+        uint64_t ticks = (uint64_t)(now.QuadPart - origin.QuadPart);
+        /* Split the scaling so a long run cannot overflow: whole seconds
+         * first, then the remainder. */
+        uint64_t secs = ticks / (uint64_t)freq.QuadPart;
+        uint64_t rem  = ticks % (uint64_t)freq.QuadPart;
+        return secs * XBOX_TSC_HZ
+             + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
+    }
 }

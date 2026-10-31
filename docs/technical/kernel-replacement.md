@@ -199,7 +199,7 @@ The recompiled game runs single-threaded. The first PsCreateSystemThreadEx call 
 
 | Xbox Function | Implementation |
 |---------------|---------------|
-| AvSetDisplayMode | Sets resolution (stored for D3D11 init) |
+| AvSetDisplayMode | Sets resolution (stored for GPU device init) |
 | AvGetSavedDataAddress | Returns pointer to AV data area |
 | D3DDevice_CreateXXX | Routed through D3D8 compatibility layer |
 
@@ -220,11 +220,11 @@ Allocating the NV2A register page via VEH prevents the access violation, but the
 
 | Xbox Function | Win32 Equivalent |
 |---------------|-----------------|
-| XInputGetState | XInputGetState (almost identical API) |
-| XInputGetCapabilities | XInputGetCapabilities |
-| XInputSetState | XInputSetState (rumble) |
+| XInputGetState | SDL_GetGamepadButton / SDL_GetGamepadAxis (via xbox_InputGetState) |
+| XInputGetCapabilities | SDL_GetGamepads (device present) |
+| XInputSetState | SDL_RumbleGamepad |
 
-Xbox input is nearly 1:1 with the Win32 XInput API. The main difference is the Xbox controller struct layout.
+Xbox input maps almost 1:1 onto SDL3 gamepads. The main difference is the Xbox controller struct layout.
 
 ### Audio (~5 ordinals)
 
@@ -234,7 +234,11 @@ Xbox input is nearly 1:1 with the Win32 XInput API. The main difference is the X
 | DirectSoundCreateBuffer | Returns stub buffer |
 | DirectSoundDoWork | No-op |
 
-Audio is fully stubbed in the current implementation. XAudio2 integration is planned but not yet implemented.
+These rows describe the HLE path only. Most titles link the XDK's own
+DirectSound, which is ordinary recompiled code driving the AC'97 and MCPX APU
+directly; `src/apu/` emulates the APU (SDL3 audio output). A title whose codec
+probe fails there can skip its whole engine init -- see "Runs, Never Draws a
+Frame" in `docs/pipeline/06-debugging.md` and `RECOMP_AC97_READY`.
 
 ### HAL and System (~20 ordinals)
 
@@ -268,12 +272,16 @@ One of the most important kernel interactions is file loading. The game uses a r
 static void bridge_resource_load(void) {
     // Read filename from Xbox .rdata (use pristine XBE copy to avoid corruption)
     uint32_t name_va = MEM32(entry_ptr + 0);
+    // VA -> file offset must come from the title's section table; the values
+    // below are this build's .rdata for illustration only.
     size_t file_offset = (name_va - 0x36B7C0) + 0x35C000;
     const char *name = (const char *)(g_xbe_data + file_offset);
 
     // Open and read from game data directory
+    // The game directory defaults to the current working directory's "game"
+    // subfolder (see kernel_path.c); override per-title as needed.
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "Burnout 3 Takedown/%s", name);
+    snprintf(path, sizeof(path), "game/%s", name);
     FILE *f = fopen(path, "rb");
 
     // Write file data directly into the resource VA buffer

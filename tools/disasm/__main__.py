@@ -19,7 +19,7 @@ from .disasm import Disassembler
 def main():
     parser = argparse.ArgumentParser(
         prog="tools.disasm",
-        description="Burnout 3 XBE Disassembly Tool - "
+        description="Xbox XBE Disassembly Tool - "
                     "Static analysis and function detection for Xbox executables",
     )
 
@@ -37,7 +37,7 @@ def main():
     parser.add_argument(
         "--analysis-json",
         default=None,
-        help="Path to burnout3_analysis.json (auto-detected if not specified)",
+        help="Path to the XBE analysis JSON (auto-detected if not specified)",
     )
     parser.add_argument(
         "--text-only",
@@ -68,17 +68,39 @@ def main():
     )
     parser.add_argument(
         "--seed-functions",
+        action="append",
         default=None,
+        metavar="JSON",
         help="JSON file with additional function entry points to seed the detector. "
              "Format: array of objects with 'start' field (hex address string). "
-             "Use identified_functions.json from func_id to feed back vtable thunks.",
+             "Use icall_targets.json from tools.recomp.icall_feedback, which holds "
+             "indirect-branch targets the title was measured reaching. "
+             "NOT identified_functions.json from func_id: that is inference, not "
+             "measurement, and it carries addresses that sit at a valid instruction "
+             "boundary *inside* an existing function. The mid-instruction guard below "
+             "does not catch those, and each one clamps the end of the function it "
+             "sits in -- on the Xbox dashboard it cut __heap_init short of its "
+             "epilogue, so the CRT heap was never initialised and nothing said so. "
+             "Repeatable: pass it once per file. Hand-maintained seed lists and "
+             "machine-generated ones stay separate files rather than being merged "
+             "into each other.",
     )
 
     args = parser.parse_args()
 
     try:
+        # Derive the section layout from the XBE being analyzed.
+        from . import config
+        config.configure_from_xbe(args.xbe_path)
+
         extra = [s.strip() for s in args.extra_sections.split(",")] if args.extra_sections else []
-        seed_funcs = _load_seed_functions(args.seed_functions) if args.seed_functions else []
+        seed_funcs = []
+        for _seed_path in (args.seed_functions or []):
+            _got = _load_seed_functions(_seed_path)
+            seed_funcs.extend(_got)
+            if args.verbose:
+                print(f"  Seed file {_seed_path}: {len(_got)} addresses")
+        seed_funcs = sorted(set(seed_funcs))
         disassembler = Disassembler(
             xbe_path=args.xbe_path,
             analysis_json=args.analysis_json,
@@ -110,23 +132,14 @@ def main():
 
 
 def _load_seed_functions(path):
-    """Load function starts and explicit forced ranges from a JSON file.
-
-    A start-only entry is a candidate function address.  Only entries with an
-    explicit end are forced ranges; treating a missing end as ``start`` leaves
-    a zero-length forced function that still truncates its preceding function.
-    """
+    """Load seed function addresses from a JSON file."""
     import json
     with open(path) as f:
         data = json.load(f)
     addrs = []
     for entry in data:
         if isinstance(entry, dict) and "start" in entry:
-            start = int(entry["start"], 16)
-            if "end" in entry:
-                addrs.append((start, int(entry["end"], 16)))
-            else:
-                addrs.append(start)
+            addrs.append(int(entry["start"], 16))
         elif isinstance(entry, int):
             addrs.append(entry)
     return addrs

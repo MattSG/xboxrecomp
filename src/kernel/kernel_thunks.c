@@ -1,15 +1,16 @@
 /*
  * kernel_thunks.c - Xbox Kernel Thunk Table & Initialization
  *
- * Wires the 147-entry kernel thunk table at VA 0x0036B7C0 to our
- * xbox_* function/data implementations.
+ * Wires the kernel thunk table (an array whose address/size come from the
+ * loaded XBE, not a hardcoded title) to our xbox_* function/data
+ * implementations.
  *
  * The Xbox kernel thunk table is an array of function/data pointers that
  * game code calls through via indirect calls: call [thunk_addr].
  * Each entry corresponds to a kernel export ordinal.
  *
  * This file provides:
- *   - xbox_kernel_thunk_table[] - the 147 pointer slots
+ *   - xbox_kernel_thunk_table[] - the pointer slots
  *   - xbox_resolve_ordinal() - maps ordinal → function/data pointer
  *   - xbox_kernel_init() - fills the thunk table and initializes subsystems
  *   - xbox_kernel_shutdown() - cleanup
@@ -17,10 +18,13 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+
+extern ptrdiff_t g_xbox_mem_offset;
 
 /* ============================================================================
  * Thunk Table Storage
@@ -85,73 +89,97 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...)
  * Maps each Xbox kernel ordinal to our implementation address.
  * Returns 0 for unimplemented ordinals (logged as warnings).
  *
- * Ordinals are from the Xbox kernel export table. Each one maps to
- * either a function pointer or a data pointer.
+ * Ordinals follow the canonical Xbox kernel export table (see
+ * tools/xbe_parser/xbe_parser.py, verified against xboxdevwiki.net/Kernel).
+ * That table includes DATA exports -- ExEventObjectType (16),
+ * HalDiskModelNumber (41), IoFileObjectType (71), KdDebuggerEnabled (88) and
+ * others -- which occupy ordinals but are variables, not callable functions.
+ * Numbering the callable exports sequentially and skipping those slots shifts
+ * every later ordinal and silently dispatches the wrong function; that bug is
+ * what this table was corrected from. When adding an ordinal, take it from the
+ * export table, never by counting.
+ *
+ * Where no implementation exists the case is omitted entirely, so the default
+ * arm logs it, rather than pointing at a neighbouring function.
  * ============================================================================ */
 
 ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
 {
     switch (ordinal) {
-
-    /* ---- Display / AV ---- */
+    /* ---- Av ---- */
     case   1: return (ULONG_PTR)xbox_AvGetSavedDataAddress;
     case   2: return (ULONG_PTR)xbox_AvSendTVEncoderOption;
     case   3: return (ULONG_PTR)xbox_AvSetDisplayMode;
     case   4: return (ULONG_PTR)xbox_AvSetSavedDataAddress;
 
-    /* ---- Unknown stubs ---- */
-    case   8: return (ULONG_PTR)xbox_Unknown_8;
-    case  23: return (ULONG_PTR)xbox_Unknown_23;
-    case  42: return (ULONG_PTR)xbox_Unknown_42;
+    /* ---- Debug ---- */
+    case   5: return (ULONG_PTR)xbox_DbgBreakPoint;
+    case   8: return (ULONG_PTR)xbox_Unknown_8;  /* DbgPrint */
 
-    /* ---- Pool Allocator ---- */
-    case  15: return (ULONG_PTR)xbox_ExAllocatePool;
-    case  16: return (ULONG_PTR)xbox_ExAllocatePoolWithTag;
-    case  17: return (ULONG_PTR)&xbox_ExEventObjectType;         /* data */
-    case  24: return (ULONG_PTR)xbox_ExQueryPoolBlockSize;
-    case  25: return (ULONG_PTR)xbox_ExQueryNonVolatileSetting;
+    /* ---- Executive / pool ---- */
+    case  14: return (ULONG_PTR)xbox_ExAllocatePool;
+    case  15: return (ULONG_PTR)xbox_ExAllocatePoolWithTag;
+    case  16: return (ULONG_PTR)&xbox_ExEventObjectType;
+    case  17: return (ULONG_PTR)xbox_ExFreePool;
+    case  23: return (ULONG_PTR)xbox_ExQueryPoolBlockSize;
+    case  24: return (ULONG_PTR)xbox_ExQueryNonVolatileSetting;
     case  29: return (ULONG_PTR)xbox_ExSaveNonVolatileSetting;
 
     /* ---- HAL ---- */
-    case  40: return (ULONG_PTR)xbox_HalClearSoftwareInterrupt;
-    case  41: return (ULONG_PTR)xbox_HalDisableSystemInterrupt;
+    case   9: return (ULONG_PTR)xbox_HalReadSMCTrayState;
+    case  38: return (ULONG_PTR)xbox_HalClearSoftwareInterrupt;
+    case  39: return (ULONG_PTR)xbox_HalDisableSystemInterrupt;
+    case  40: return (ULONG_PTR)&xbox_HalDiskCachePartitionCount;
+    case  41: return (ULONG_PTR)&xbox_HalDiskModelNumber;
+    case  42: return (ULONG_PTR)&xbox_HalDiskSerialNumber;
     case  44: return (ULONG_PTR)xbox_HalGetInterruptVector;
     case  45: return (ULONG_PTR)xbox_HalReadSMBusValue;
-    case  46: return (ULONG_PTR)xbox_HalReadSMCTrayState;
-    case  47: return (ULONG_PTR)xbox_HalReadWritePCISpace;
-    case  49: return (ULONG_PTR)xbox_HalRequestSoftwareInterrupt;
-    case  50: return (ULONG_PTR)xbox_HalReturnToFirmware;
-    case  51: return (ULONG_PTR)xbox_HalWriteSMBusValue;
+    case  46: return (ULONG_PTR)xbox_HalReadWritePCISpace;
+    case  47: return (ULONG_PTR)xbox_HalRegisterShutdownNotification;
+    case  48: return (ULONG_PTR)xbox_HalRequestSoftwareInterrupt;
+    case  49: return (ULONG_PTR)xbox_HalReturnToFirmware;
+    case  50: return (ULONG_PTR)xbox_HalWriteSMBusValue;
+    case 356: return (ULONG_PTR)&xbox_HalBootSMCVideoMode;
     case 358: return (ULONG_PTR)xbox_HalIsResetOrShutdownPending;
     case 360: return (ULONG_PTR)xbox_HalInitiateShutdown;
 
-    /* ---- I/O Manager ---- */
-    case  62: return (ULONG_PTR)xbox_IoBuildDeviceIoControlRequest;
-    case  65: return (ULONG_PTR)&xbox_IoCompletionObjectType;    /* data */
-    case  67: return (ULONG_PTR)xbox_IoCreateFile;
-    case  69: return (ULONG_PTR)xbox_IoDeleteDevice;
-    case  71: return (ULONG_PTR)&xbox_IoDeviceObjectType;        /* data */
-    case  74: return (ULONG_PTR)xbox_IoInitializeIrp;
-    case  81: return (ULONG_PTR)xbox_IoSetIoCompletion;
-    case  83: return (ULONG_PTR)xbox_IoStartNextPacket;
-    case  84: return (ULONG_PTR)xbox_IoStartNextPacketByKey;
-    case  85: return (ULONG_PTR)xbox_IoStartPacket;
-    case  86: return (ULONG_PTR)xbox_IoSynchronousDeviceIoControlRequest;
-    case  87: return (ULONG_PTR)xbox_IoSynchronousFsdRequest;
+    /* ---- I/O manager ---- */
+    case  61: return (ULONG_PTR)xbox_IoBuildDeviceIoControlRequest;
+    case  62: return (ULONG_PTR)xbox_IoBuildSynchronousFsdRequest;
+    case  64: return (ULONG_PTR)&xbox_IoCompletionObjectType;
+    case  65: return (ULONG_PTR)xbox_IoCreateDevice;
+    case  66: return (ULONG_PTR)xbox_IoCreateFile;
+    case  67: return (ULONG_PTR)xbox_IoCreateSymbolicLink;
+    case  68: return (ULONG_PTR)xbox_IoDeleteDevice;
+    case  69: return (ULONG_PTR)xbox_IoDeleteSymbolicLink;
+    case  70: return (ULONG_PTR)&xbox_IoDeviceObjectType;
+    case  71: return (ULONG_PTR)xbox_IoFileObjectType;
+    case  73: return (ULONG_PTR)xbox_IoInitializeIrp;
+    case  74: return (ULONG_PTR)xbox_IoInvalidDeviceRequest;
+    case  79: return (ULONG_PTR)xbox_IoSetIoCompletion;
+    case  81: return (ULONG_PTR)xbox_IoStartNextPacket;
+    case  82: return (ULONG_PTR)xbox_IoStartNextPacketByKey;
+    case  83: return (ULONG_PTR)xbox_IoStartPacket;
+    case  84: return (ULONG_PTR)xbox_IoSynchronousDeviceIoControlRequest;
+    case  85: return (ULONG_PTR)xbox_IoSynchronousFsdRequest;
+    case  86: return (ULONG_PTR)xbox_IofCallDriver;
+    case  87: return (ULONG_PTR)xbox_IofCompleteRequest;
     case 359: return (ULONG_PTR)xbox_IoMarkIrpMustComplete;
 
-    /* ---- Kernel Synchronization ---- */
-    case  95: return (ULONG_PTR)xbox_KeAlertThread;
-    case  97: return (ULONG_PTR)xbox_KeBugCheck;
-    case  98: return (ULONG_PTR)xbox_KeBugCheckEx;
-    case  99: return (ULONG_PTR)xbox_KeCancelTimer;
-    /* case 100: kernel exports KeDisconnectInterrupt here, not KeConnectInterrupt; xbox_KeDisconnectInterrupt is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
+    /* ---- Kernel core ---- */
+    case  93: return (ULONG_PTR)xbox_KeAlertThread;
+    case  95: return (ULONG_PTR)xbox_KeBugCheck;
+    case  96: return (ULONG_PTR)xbox_KeBugCheckEx;
+    case  97: return (ULONG_PTR)xbox_KeCancelTimer;
+    case  98: return (ULONG_PTR)xbox_KeConnectInterrupt;
+    case  99: return (ULONG_PTR)xbox_KeDelayExecutionThread;
+    case 100: return (ULONG_PTR)xbox_KeDisconnectInterrupt;
     case 107: return (ULONG_PTR)xbox_KeInitializeDpc;
     case 109: return (ULONG_PTR)xbox_KeInitializeInterrupt;
     case 113: return (ULONG_PTR)xbox_KeInitializeTimerEx;
     case 119: return (ULONG_PTR)xbox_KeInsertQueueDpc;
     case 124: return (ULONG_PTR)xbox_KeQueryBasePriorityThread;
+    case 125: return (ULONG_PTR)xbox_KeQueryInterruptTime;
     case 126: return (ULONG_PTR)xbox_KeQueryPerformanceCounter;
     case 127: return (ULONG_PTR)xbox_KeQueryPerformanceFrequency;
     case 128: return (ULONG_PTR)xbox_KeQuerySystemTime;
@@ -165,38 +193,39 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case 150: return (ULONG_PTR)xbox_KeSetTimerEx;
     case 151: return (ULONG_PTR)xbox_KeStallExecutionProcessor;
     case 153: return (ULONG_PTR)xbox_KeSynchronizeExecution;
-    case 156: return (ULONG_PTR)&xbox_KeTickCount;               /* data */
+    case 156: return (ULONG_PTR)&xbox_KeTickCount;
     case 158: return (ULONG_PTR)xbox_KeWaitForMultipleObjects;
     case 159: return (ULONG_PTR)xbox_KeWaitForSingleObject;
     case 160: return (ULONG_PTR)xbox_KfRaiseIrql;
     case 161: return (ULONG_PTR)xbox_KfLowerIrql;
 
-    /* ---- Launch Data ---- */
-    case 164: return (ULONG_PTR)&xbox_LaunchDataPage;            /* data: pointer to page */
-
-    /* ---- Memory Management ---- */
+    /* ---- Memory manager ---- */
     case 165: return (ULONG_PTR)xbox_MmAllocateContiguousMemory;
     case 166: return (ULONG_PTR)xbox_MmAllocateContiguousMemoryEx;
+    case 167: return (ULONG_PTR)xbox_MmAllocateSystemMemory;
     case 168: return (ULONG_PTR)xbox_MmClaimGpuInstanceMemory;
     case 169: return (ULONG_PTR)xbox_MmCreateKernelStack;
     case 170: return (ULONG_PTR)xbox_MmDeleteKernelStack;
     case 171: return (ULONG_PTR)xbox_MmFreeContiguousMemory;
+    case 172: return (ULONG_PTR)xbox_MmFreeSystemMemory;
     case 173: return (ULONG_PTR)xbox_MmGetPhysicalAddress;
     case 175: return (ULONG_PTR)xbox_MmLockUnlockBufferPages;
     case 176: return (ULONG_PTR)xbox_MmLockUnlockPhysicalPage;
+    case 177: return (ULONG_PTR)xbox_MmMapIoSpace;
     case 178: return (ULONG_PTR)xbox_MmPersistContiguousMemory;
     case 179: return (ULONG_PTR)xbox_MmQueryAddressProtect;
     case 180: return (ULONG_PTR)xbox_MmQueryAllocationSize;
     case 181: return (ULONG_PTR)xbox_MmQueryStatistics;
     case 182: return (ULONG_PTR)xbox_MmSetAddressProtect;
+    case 183: return (ULONG_PTR)xbox_MmUnmapIoSpace;
 
-    /* ---- NT Virtual Memory ---- */
+    /* ---- Native API ---- */
     case 184: return (ULONG_PTR)xbox_NtAllocateVirtualMemory;
-
-    /* ---- NT File I/O ---- */
+    case 186: return (ULONG_PTR)xbox_NtClearEvent;
     case 187: return (ULONG_PTR)xbox_NtClose;
     case 189: return (ULONG_PTR)xbox_NtCreateEvent;
     case 190: return (ULONG_PTR)xbox_NtCreateFile;
+    case 192: return (ULONG_PTR)xbox_NtCreateMutant;
     case 193: return (ULONG_PTR)xbox_NtCreateSemaphore;
     case 195: return (ULONG_PTR)xbox_NtDeleteFile;
     case 196: return (ULONG_PTR)xbox_NtDeviceIoControlFile;
@@ -213,36 +242,37 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case 217: return (ULONG_PTR)xbox_NtQueryVirtualMemory;
     case 218: return (ULONG_PTR)xbox_NtQueryVolumeInformationFile;
     case 219: return (ULONG_PTR)xbox_NtReadFile;
+    case 221: return (ULONG_PTR)xbox_NtReleaseMutant;
     case 222: return (ULONG_PTR)xbox_NtReleaseSemaphore;
+    case 224: return (ULONG_PTR)xbox_NtResumeThread;
     case 225: return (ULONG_PTR)xbox_NtSetEvent;
     case 226: return (ULONG_PTR)xbox_NtSetInformationFile;
     case 228: return (ULONG_PTR)xbox_NtSetSystemTime;
+    case 231: return (ULONG_PTR)xbox_NtSuspendThread;
     case 233: return (ULONG_PTR)xbox_NtWaitForSingleObject;
-    /* case 234: kernel exports NtWaitForSingleObjectEx here, not NtWaitForSingleObject; xbox_NtWaitForSingleObjectEx is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
+    case 234: return (ULONG_PTR)xbox_NtWaitForSingleObjectEx;
+    case 235: return (ULONG_PTR)xbox_NtWaitForMultipleObjectsEx;
     case 236: return (ULONG_PTR)xbox_NtWriteFile;
     case 238: return (ULONG_PTR)xbox_NtYieldExecution;
 
-    /* ---- Object Manager ---- */
+    /* ---- Object manager ---- */
     case 246: return (ULONG_PTR)xbox_ObReferenceObjectByHandle;
     case 247: return (ULONG_PTR)xbox_ObReferenceObjectByName;
     case 250: return (ULONG_PTR)xbox_ObfDereferenceObject;
+    case 251: return (ULONG_PTR)xbox_ObfReferenceObject;
 
-    /* ---- Network / PHY ---- */
-    case 252: return (ULONG_PTR)xbox_PhyGetLinkState;
-    case 253: return (ULONG_PTR)xbox_PhyInitialize;
-
-    /* ---- Threading ---- */
+    /* ---- Process / thread ---- */
     case 255: return (ULONG_PTR)xbox_PsCreateSystemThreadEx;
     case 258: return (ULONG_PTR)xbox_PsTerminateSystemThread;
-    case 259: return (ULONG_PTR)&xbox_PsThreadObjectType;       /* data */
+    case 259: return (ULONG_PTR)&xbox_PsThreadObjectType;
 
-    /* ---- Runtime Library ---- */
+    /* ---- Runtime library ---- */
     case 260: return (ULONG_PTR)xbox_RtlAnsiStringToUnicodeString;
     case 269: return (ULONG_PTR)xbox_RtlCompareMemoryUlong;
     case 277: return (ULONG_PTR)xbox_RtlEnterCriticalSection;
     case 279: return (ULONG_PTR)xbox_RtlEqualString;
     case 289: return (ULONG_PTR)xbox_RtlInitAnsiString;
+    case 290: return (ULONG_PTR)xbox_RtlInitUnicodeString;
     case 291: return (ULONG_PTR)xbox_RtlInitializeCriticalSection;
     case 294: return (ULONG_PTR)xbox_RtlLeaveCriticalSection;
     case 301: return (ULONG_PTR)xbox_RtlNtStatusToDosError;
@@ -251,47 +281,55 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case 305: return (ULONG_PTR)xbox_RtlTimeToTimeFields;
     case 308: return (ULONG_PTR)xbox_RtlUnicodeStringToAnsiString;
     case 312: return (ULONG_PTR)xbox_RtlUnwind;
-    case 354: return (ULONG_PTR)xbox_AlternateSignatureKeys;
+    case 352: return (ULONG_PTR)xbox_RtlRip;
+    case 361: return (ULONG_PTR)xbox_RtlSnprintf;
+    case 362: return (ULONG_PTR)xbox_RtlSprintf;
+    case 363: return (ULONG_PTR)xbox_RtlVsnprintf;
+    case 364: return (ULONG_PTR)xbox_RtlVsprintf;
 
-    /* ---- Xbox Identity (data exports) ---- */
-    case 322: return (ULONG_PTR)&xbox_HardwareInfo;              /* data */
-    case 323: return (ULONG_PTR)xbox_HDKey;                      /* data (array) */
-    case 324: return (ULONG_PTR)&xbox_KrnlVersion;               /* data */
-    case 325: return (ULONG_PTR)xbox_SignatureKey;                /* data (array) */
-    case 326: return (ULONG_PTR)&xbox_XeImageFileName;           /* data (XBOX_ANSI_STRING) */
-    /* case 327: kernel exports XeLoadSection here, not AlternateSignatureKeys; xbox_XeLoadSection is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
-    /* case 328: kernel exports XeUnloadSection here, not XeImageFileName; xbox_XeUnloadSection is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
-    case 355: return (ULONG_PTR)xbox_XePublicKeyData;            /* data (UCHAR[284]) */
-    /* case 356: kernel exports HalBootSMCVideoMode here, not AlternateSignatureKeys; xbox_HalBootSMCVideoMode is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
-    /* case 357: kernel exports IdexChannelObject here, not XePublicKeyData; xbox_IdexChannelObject is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
-
-    /* ---- Port I/O ---- */
-    case 335: return (ULONG_PTR)xbox_XcSHAInit;
-    case 336: return (ULONG_PTR)xbox_XcSHAUpdate;
+    /* ---- Ports / misc HW ---- */
+    case 252: return (ULONG_PTR)xbox_PhyGetLinkState;
+    case 253: return (ULONG_PTR)xbox_PhyInitialize;
+    case 333: return (ULONG_PTR)xbox_WRITE_PORT_BUFFER_USHORT;
+    case 334: return (ULONG_PTR)xbox_WRITE_PORT_BUFFER_ULONG;
+    case 357: return (ULONG_PTR)xbox_IdexChannelObject;
 
     /* ---- Crypto ---- */
+    case 335: return (ULONG_PTR)xbox_XcSHAInit;
+    case 336: return (ULONG_PTR)xbox_XcSHAUpdate;
     case 337: return (ULONG_PTR)xbox_XcSHAFinal;
     case 338: return (ULONG_PTR)xbox_XcRC4Key;
-    /* case 339: kernel exports XcRC4Crypt here, not XcSHAFinal; xbox_XcRC4Crypt is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
-    /* case 340: kernel exports XcHMAC here, not XcRC4Key; xbox_XcHMAC is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
+    case 339: return (ULONG_PTR)xbox_XcRC4Crypt;
+    case 340: return (ULONG_PTR)xbox_XcHMAC;
+    case 341: return (ULONG_PTR)xbox_XcPKEncPublic;
+    case 342: return (ULONG_PTR)xbox_XcPKDecPrivate;
+    case 343: return (ULONG_PTR)xbox_XcPKGetKeyLen;
     case 344: return (ULONG_PTR)xbox_XcVerifyPKCS1Signature;
     case 345: return (ULONG_PTR)xbox_XcModExp;
-    /* case 346: kernel exports XcDESKeyParity here, not XcVerifyPKCS1Signature; xbox_XcDESKeyParity is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
+    case 346: return (ULONG_PTR)xbox_XcDESKeyParity;
     case 347: return (ULONG_PTR)xbox_XcKeyTable;
-    /* case 349: kernel exports XcBlockCryptCBC here, not XcKeyTable; xbox_XcBlockCryptCBC is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
-    case 353: return (ULONG_PTR)xbox_LANKey;
+    case 348: return (ULONG_PTR)xbox_XcBlockCrypt;
+    case 349: return (ULONG_PTR)xbox_XcBlockCryptCBC;
+    case 350: return (ULONG_PTR)xbox_XcCryptService;
+    case 351: return (ULONG_PTR)xbox_XcUpdateCrypto;
 
-    /* ---- Threading (continued) ---- */
-    /* case 256: kernel exports PsQueryStatistics here, not KeDelayExecutionThread; xbox_PsQueryStatistics is not implemented. Left unresolved rather than
-       dispatching the wrong function. */
+    /* ---- Loader / image ---- */
+    case 326: return (ULONG_PTR)&xbox_XeImageFileName;
+    case 327: return (ULONG_PTR)xbox_XeLoadSection;
+    case 328: return (ULONG_PTR)xbox_XeUnloadSection;
+    case 355: return (ULONG_PTR)xbox_XePublicKeyData;
+
+    /* ---- Xbox globals ---- */
+    case 321: return (ULONG_PTR)xbox_EEPROMKey;
+    case 322: return (ULONG_PTR)&xbox_HardwareInfo;
+    case 323: return (ULONG_PTR)xbox_HDKey;
+    case 324: return (ULONG_PTR)&xbox_KrnlVersion;
+    case 325: return (ULONG_PTR)xbox_SignatureKey;
+    case 353: return (ULONG_PTR)xbox_LANKey;
+    case 354: return (ULONG_PTR)xbox_AlternateSignatureKeys;
+
+    /* ---- Unclassified ---- */
+    case 164: return (ULONG_PTR)&xbox_LaunchDataPage;
 
     default:
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THUNK,
@@ -301,10 +339,13 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
 }
 
 /* ============================================================================
- * Ordinal List
+ * Fallback Ordinal List
  *
- * The 147 ordinals imported by Burnout 3, in thunk table order.
- * Extracted from the XBE kernel thunk table at VA 0x0036B7C0.
+ * Reference import set kept in thunk-table order, used only when the XBE has
+ * not been loaded into Xbox memory (no memory layout, no parsed thunk table).
+ * When it is loaded, xbox_kernel_init() reads the actual ordinals out of the
+ * mapped thunk table, so this fallback's specific titles never matter at
+ * runtime -- it exists to keep the table populated when there is no XBE.
  * ============================================================================ */
 
 static const ULONG g_thunk_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE] = {
@@ -354,6 +395,8 @@ void xbox_kernel_init(void)
 {
     ULONG resolved = 0;
     ULONG unresolved = 0;
+    uint32_t thunk_base = 0;
+    uint32_t thunk_count = 0;
 
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
@@ -377,9 +420,27 @@ void xbox_kernel_init(void)
         xbox_KrnlVersion.Major, xbox_KrnlVersion.Minor,
         xbox_KrnlVersion.Build, xbox_KrnlVersion.Qfe);
 
-    /* Fill thunk table */
+    /* Fill thunk table.
+     *
+     * The slot->ordinal mapping normally comes from the in-memory thunk table
+     * of the loaded XBE (0x80000000|ordinal per entry, same source the kernel
+     * bridge reads). That makes the table match any title's import order.
+     * Without a mapped XBE, fall back to the static reference list below. */
+    xbox_kernel_get_thunk_address(&thunk_base, &thunk_count);
     for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        ULONG ordinal = g_thunk_ordinals[i];
+        ULONG ordinal;
+
+        if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
+            uint32_t entry = *(volatile uint32_t *)
+                ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
+            if (entry == 0) {
+                break;  /* rest of the table is empty */
+            }
+            ordinal = entry & 0x7FFFFFFF;
+        } else {
+            ordinal = g_thunk_ordinals[i];
+        }
+
         ULONG_PTR ptr = xbox_resolve_ordinal(ordinal);
 
         if (ptr) {
