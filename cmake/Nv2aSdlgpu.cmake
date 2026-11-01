@@ -14,7 +14,7 @@
 #
 # Uses the runtime's own rules (cmake/Sdl3.cmake, cmake/Dxc.cmake,
 # cmake/Nv2aHlsl.cmake); nothing is copied here.
-include_guard(GLOBAL)
+include_guard(DIRECTORY)
 
 get_filename_component(_xbr_sdlgpu_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 include(${_xbr_sdlgpu_root}/cmake/Nv2aHlsl.cmake)

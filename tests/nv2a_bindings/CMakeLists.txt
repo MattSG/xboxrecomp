@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(nv2a_bindings C)
+# Renderer fixtures need a caller-owned converter; production supplies its own.
+if(NOT DEFINED XBOXRECOMP_NV2A_SHADER_DIR)
+    set(XBOXRECOMP_NV2A_SHADER_DIR "${CMAKE_CURRENT_LIST_DIR}/../fixtures/depth-view")
+endif()
+
 enable_testing()
 if(WIN32)
     include(../../cmake/Nv2aHlsl.cmake)   # the renderer's embedded HLSL

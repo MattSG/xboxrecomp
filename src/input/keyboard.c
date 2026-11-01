@@ -195,16 +195,10 @@ void xbox_InputKeyboardBindings(InputBindings *b)
  * the D-pad, Space is A and Esc or a right click is B. Those keys leave their
  * own bindings alone meanwhile, so A in a menu is left, not a stick. */
 static int (*s_in_menu)(void);
-static volatile int s_menu;
 
 void xbox_InputSetMenuProbe(int (*in_menu)(void))
 {
     s_in_menu = in_menu;
-}
-
-int xbox_InputKeyboardMenu(void)
-{
-    return s_menu;
 }
 
 static int menu_keys_enabled(void)
@@ -215,6 +209,12 @@ static int menu_keys_enabled(void)
         on = (v && *v && *v != '0') ? 1 : 0;
     }
     return on;
+}
+
+int xbox_InputKeyboardMenu(void)
+{
+    /* A native mouse press can precede the next controller poll. */
+    return menu_keys_enabled() && (!s_in_menu || s_in_menu());
 }
 
 void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
@@ -256,7 +256,6 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
         down[XBOX_VK_SPACE] = down[XBOX_VK_LBUTTON] = 0;
         down[XBOX_VK_ESCAPE] = down[XBOX_VK_RBUTTON] = 0;
     }
-    s_menu = menu;
 
     memset(out, 0, sizeof *out);
     /* Buttons set their bit, analog keys read 255 (a title that reads

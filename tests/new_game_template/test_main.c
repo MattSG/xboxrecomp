@@ -16,6 +16,7 @@ static int WINAPI fixture_message(HWND w,LPCSTR text,LPCSTR title,UINT type)
 RECOMP_TLS uint32_t g_eax,g_ecx,g_edx,g_esp,g_ebx,g_esi,g_edi,g_seh_ebp;
 ptrdiff_t g_xbox_mem_offset;
 uint32_t g_xbox_code_lo,g_xbox_code_hi;
+uint32_t g_xbox_stack_base=0x00300000,g_xbox_stack_size=0x100000;
 volatile uint32_t g_icall_trace[16],g_icall_trace_idx;
 static const char *mode;
 static char order[32];

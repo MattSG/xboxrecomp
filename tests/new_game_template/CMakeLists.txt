@@ -7,8 +7,12 @@ endif()
 set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 add_executable(new_game_template_test test_main.c)
-target_link_libraries(new_game_template_test PRIVATE xboxrecomp dbghelp)
-target_include_directories(new_game_template_test PRIVATE ../../include)
+target_link_libraries(new_game_template_test PRIVATE dbghelp)
+# The runtime boundaries are mocked; linking its real definitions conflicts
+# with those mocks and makes this control-flow fixture depend on the runtime.
+target_include_directories(new_game_template_test PRIVATE ../../include
+    ../../src ../../src/kernel ../../src/d3d ../../src/audio ../../src/input
+    ../../src/host ../../src/apu ../../src/nv2a ../../templates/runtime)
 if(MSVC)
     target_compile_options(new_game_template_test PRIVATE /UNDEBUG)
 endif()

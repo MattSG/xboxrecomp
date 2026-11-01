@@ -1,4 +1,4 @@
-# SDL3 for the SDL3 GPU renderer and its window, the audio output off Windows, and the game controllers everywhere.
+# SDL3 for the SDL3 GPU renderer and its window, the audio output, and the game controllers everywhere.
 # An installed SDL3 (3.2 or newer) is used when CMake finds one; otherwise the
 # pinned release is downloaded and built as a static library.
 #

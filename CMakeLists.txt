@@ -21,33 +21,14 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-# The host renderer. D3D11 is Windows-only and the default there; SDL3_GPU
-# (Vulkan, Direct3D 12 or Metal through SDL3) is the one choice elsewhere.
-# SDL3_GPU also moves the window and its input to SDL3, and off Windows the
-# audio output and game controllers too.
-if(WIN32)
-    set(_xbr_renderer_default D3D11)
-else()
-    set(_xbr_renderer_default SDL3_GPU)
-endif()
-set(XBOXRECOMP_RENDERER "${_xbr_renderer_default}" CACHE STRING "Host renderer: D3D11 or SDL3_GPU")
-set_property(CACHE XBOXRECOMP_RENDERER PROPERTY STRINGS D3D11 SDL3_GPU)
-if(XBOXRECOMP_RENDERER STREQUAL "SDL3_GPU")
-    set(XBOXRECOMP_SDL3 ON)
-    include(Sdl3)
-    include(Dxc)
-elseif(XBOXRECOMP_RENDERER STREQUAL "D3D11")
-    if(NOT WIN32)
-        message(FATAL_ERROR "XBOXRECOMP_RENDERER=D3D11 needs Windows; use SDL3_GPU")
-    endif()
-    set(XBOXRECOMP_SDL3 OFF)
-else()
-    message(FATAL_ERROR "XBOXRECOMP_RENDERER must be D3D11 or SDL3_GPU, not ${XBOXRECOMP_RENDERER}")
-endif()
-message(STATUS "xboxrecomp renderer: ${XBOXRECOMP_RENDERER}")
-if(XBOXRECOMP_SDL3)
-    add_compile_definitions(XBOXRECOMP_SDL3=1)
-endif()
+# All host graphics, input and audio use SDL3.
+set(XBOXRECOMP_RENDERER "SDL3_GPU" CACHE STRING "Host renderer" FORCE)
+set(XBOXRECOMP_SDL3 ON)
+include(Sdl3)
+include(Dxc)
+include(cmake/xbox_sdl3.cmake)
+include(cmake/xbox_ffmpeg.cmake)
+add_compile_definitions(XBOXRECOMP_SDL3=1)
 
 # Common definitions for all targets
 add_compile_definitions(

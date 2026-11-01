@@ -2,7 +2,7 @@
  * Xbox Direct3D 8 Compatibility Layer - Type Definitions
  *
  * Defines the Xbox D3D8 types, enums, and COM interface structures
- * used by recompiled Xbox graphics code.
+ * used by the statically-linked RenderWare Xbox driver code.
  *
  * Xbox D3D8 differs from PC D3D8 in several ways:
  * - Push buffer (command buffer) based rendering
@@ -12,11 +12,11 @@
  * - No CAPS querying (known fixed hardware)
  *
  * This header provides the ABI-compatible types so that translated
- * guest code can compile against the shared graphics implementation.
+ * game/RW code can compile against our SDL_GPU-backed implementation.
  */
 
-#ifndef XBOXRECOMP_D3D8_XBOX_H
-#define XBOXRECOMP_D3D8_XBOX_H
+#ifndef BURNOUT3_D3D8_XBOX_H
+#define BURNOUT3_D3D8_XBOX_H
 
 #include <stdint.h>
 #include "platform/xbox_winnt.h"
@@ -568,7 +568,7 @@ typedef enum D3DMULTISAMPLE_TYPE {
     D3DMULTISAMPLE_4_SAMPLES = D3DMULTISAMPLE_4_SAMPLES_MULTISAMPLE_LINEAR,
 } D3DMULTISAMPLE_TYPE;
 
-/* Resolve an Xbox multisample type to a D3D11 sample count.
+/* Resolve an Xbox multisample type to a sample count.
  * NONE (0x0011) yields 1; 2/4/9-sample grids map to their X*Y counts. */
 static inline UINT d3d8_msaa_sample_count(D3DMULTISAMPLE_TYPE ms)
 {
@@ -1138,7 +1138,7 @@ struct IDirect3D8 {
  * ================================================================ */
 
 /**
- * Create the D3D8-compatible interface backed by D3D11.
+ * Create the D3D8-compatible interface backed by SDL_GPU.
  * This replaces the Xbox Direct3DCreate8() call.
  */
 IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion);
@@ -1157,7 +1157,7 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
 /**
  * Present frame and pump window messages.
- * Called from recompiled game code (replaces the game's own Present path).
+ * Called from recompiled game code (replaces RW driver Present path).
  */
 void d3d8_PresentFrame(void);
 
@@ -1165,4 +1165,4 @@ void d3d8_PresentFrame(void);
 }
 #endif
 
-#endif /* XBOXRECOMP_D3D8_XBOX_H */
+#endif /* BURNOUT3_D3D8_XBOX_H */

@@ -25,7 +25,9 @@ static int fail_sampler;
 #define CREATED_LOG 8192
 static struct { SDL_GPUSampler *smp; SDL_GPUSamplerCreateInfo info; } created[CREATED_LOG];
 static unsigned created_n;
-static SDL_GPUTextureSamplerBinding bound[9];
+/* Four 2D, four cube, four volume stages and one reserved slot. */
+#define SAMPLER_BINDINGS 13
+static SDL_GPUTextureSamplerBinding bound[SAMPLER_BINDINGS];
 static unsigned bind_calls;
 
 static SDL_GPUSampler *test_create_sampler(SDL_GPUDevice *dev, const SDL_GPUSamplerCreateInfo *info)
@@ -45,7 +47,7 @@ static SDL_GPUSampler *test_create_sampler(SDL_GPUDevice *dev, const SDL_GPUSamp
 static void test_bind_fragment_samplers(SDL_GPURenderPass *rp, Uint32 first,
                                         const SDL_GPUTextureSamplerBinding *b, Uint32 n)
 {
-    if (first == 0 && n == 9) {
+    if (first == 0 && n == SAMPLER_BINDINGS) {
         memcpy(bound, b, sizeof bound);
         bind_calls++;
     }

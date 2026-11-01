@@ -15,7 +15,7 @@ target_include_directories(xbox_video PUBLIC
 # xbox_nv2a: the window scans out the PVIDEO overlay (nv2a_mmio_hook.c).
 target_link_libraries(xbox_video PUBLIC xbox_d3d8 xbox_input xbox_nv2a platform)
 if(WIN32)
-    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32 dbghelp winmm)
+    target_link_libraries(xbox_video PUBLIC ole32 dbghelp winmm)
 endif()
 
 # The renderer's HLSL, one source for both renderers (see nv2a_bindings.hlsli).
@@ -42,3 +42,5 @@ else()
     target_link_libraries(xbox_video PUBLIC SDL3::SDL3)
     target_compile_definitions(xbox_video PUBLIC XBOXRECOMP_SDL3=1)
 endif()
+
+target_link_libraries(xbox_video PUBLIC xbox::ffmpeg)

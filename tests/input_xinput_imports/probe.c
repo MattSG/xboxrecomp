@@ -5,6 +5,10 @@
 #include <windows.h>
 #include "xinput_xbox.h"
 
+int xbox_FramebufferHostInputCaptured(void) { return 0; }
+int xbox_FramebufferMouse(float *x, float *y) { *x = *y = 0; return 0; }
+void xbox_FramebufferSetMousePressHandler(int (*handler)(float, float)) { (void)handler; }
+
 int main(void)
 {
     XBOX_INPUT_STATE state;

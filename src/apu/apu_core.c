@@ -459,33 +459,12 @@ static struct {
  * Monitor - Audio output (XAudio2 primary, waveOut fallback)
  * ============================================================ */
 
-#if defined(_WIN32)
-#include <mmsystem.h>
-#pragma comment(lib, "winmm.lib")
-#endif
-/* On Linux, waveOut* are inert stubs from win32_compat.h: the APU's
- * waveOut fallback path stays inactive and never produces audio. */
-
-/* Ring of waveOut buffers for double-buffering */
-#define WAVEOUT_NUM_BUFS 4
-#define WAVEOUT_BUF_SAMPLES 256  /* One real DSP output frame, 5.33ms at 48kHz. */
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
 /* monitor.queued_bytes_low/high are the pacing marks in bytes of stereo
  * s16 output; pacing compares them in samples (SAMPLE_BYTES each), so a
  * device buffer that is not a multiple of the 256-sample EP period keeps
  * exact marks. */
 #define SAMPLE_BYTES (2 * (int)sizeof(int16_t))
-
-typedef struct {
-    HWAVEOUT hwo;
-    WAVEHDR  hdrs[WAVEOUT_NUM_BUFS];
-    int16_t  bufs[WAVEOUT_NUM_BUFS][WAVEOUT_BUF_SAMPLES][2];
-    int      next_buf;
-    bool     initialized;
-    int      frames_written;
-} WaveOutState;
-
-static WaveOutState g_waveout = { 0 };
 
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 {
@@ -520,58 +499,14 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
                             " expect underruns\n");
         return;
     }
-    fprintf(stderr, "[APU] %s unavailable, falling back to waveOut\n", XA2_BACKEND_NAME);
-
-    WAVEFORMATEX wfx = { 0 };
-    wfx.wFormatTag      = WAVE_FORMAT_PCM;
-    wfx.nChannels       = 2;
-    wfx.nSamplesPerSec  = 48000;
-    wfx.wBitsPerSample  = 16;
-    wfx.nBlockAlign     = wfx.nChannels * wfx.wBitsPerSample / 8;
-    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
-
-    MMRESULT mr = waveOutOpen(&g_waveout.hwo, WAVE_MAPPER, &wfx,
-                               0, 0, CALLBACK_NULL);
-    if (mr != MMSYSERR_NOERROR) {
-        fprintf(stderr, "[APU] waveOutOpen failed (error %u)\n", mr);
-        g_waveout.initialized = false;
-        return;
-    }
-
-    /* Prepare all headers */
-    for (int i = 0; i < WAVEOUT_NUM_BUFS; i++) {
-        memset(&g_waveout.hdrs[i], 0, sizeof(WAVEHDR));
-        g_waveout.hdrs[i].lpData = (LPSTR)g_waveout.bufs[i];
-        g_waveout.hdrs[i].dwBufferLength = WAVEOUT_BUF_SAMPLES * 2 * sizeof(int16_t);
-        waveOutPrepareHeader(g_waveout.hwo, &g_waveout.hdrs[i], sizeof(WAVEHDR));
-    }
-
-    g_waveout.next_buf = 0;
-    g_waveout.initialized = true;
-    g_waveout.frames_written = 0;
-
-    fprintf(stderr, "[APU] waveOut audio output initialized (48kHz stereo 16-bit, %d buffers)\n",
-            WAVEOUT_NUM_BUFS);
+    fprintf(stderr, "[APU] SDL audio unavailable; output disabled\n");
 }
 
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 {
     (void)d;
     apu_wav_close();
-    if (xa2_is_active()) {
-        xa2_shutdown();
-        return;
-    }
-    if (!g_waveout.initialized) return;
-
-    waveOutReset(g_waveout.hwo);
-    for (int i = 0; i < WAVEOUT_NUM_BUFS; i++) {
-        waveOutUnprepareHeader(g_waveout.hwo, &g_waveout.hdrs[i], sizeof(WAVEHDR));
-    }
-    waveOutClose(g_waveout.hwo);
-    g_waveout.initialized = false;
-    fprintf(stderr, "[APU] waveOut audio output shut down (%d frames written)\n",
-            g_waveout.frames_written);
+    xa2_shutdown();
 }
 
 /* ============================================================
@@ -815,40 +750,6 @@ static void mix_into(int16_t dst[][2], const int16_t src[][2], int n)
     }
 }
 
-/* Hand one EP period (MIXER_FRAME_SAMPLES samples) to the waveOut arm. The
- * device buffers are larger than a period, so periods accumulate in the
- * current buffer and it is written when full: every sample rendered is
- * written once, none is rendered twice. */
-static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
-{
-    static int fill;                     /* samples already in next_buf */
-    int idx = g_waveout.next_buf;
-    WAVEHDR *hdr = &g_waveout.hdrs[idx];
-
-    if (fill == 0) {
-        /* Wait if this buffer is still playing (with timeout) */
-        int wait_loops = 0;
-        while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
-            qemu_mutex_unlock(&d->lock);
-            Sleep(1);
-            qemu_mutex_lock(&d->lock);
-            if (++wait_loops > 50) break;
-        }
-    }
-
-    memcpy(g_waveout.bufs[idx][fill], period,
-           MIXER_FRAME_SAMPLES * 2 * sizeof(int16_t));
-    fill += MIXER_FRAME_SAMPLES;
-    if (fill < WAVEOUT_BUF_SAMPLES)
-        return;
-
-    hdr->dwFlags &= ~WHDR_DONE;
-    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
-    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
-    g_waveout.frames_written++;
-    fill = 0;
-}
-
 /* Called once per 32-sample frame; acts on the last frame of each EP period
  * (8 frames, 256 samples, 5.33 ms).
  *
@@ -908,8 +809,6 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
         return;
     }
-    if (g_waveout.initialized)
-        waveout_submit(d, (const int16_t (*)[2])period);
 }
 
 /* ============================================================

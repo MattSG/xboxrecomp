@@ -1,7 +1,7 @@
 /**
- * SDL3 Audio Output Backend (POSIX hosts)
+ * SDL3 Audio Output Backend
  *
- * The xa2_* contract of apu_xaudio2.h on macOS and Linux: the APU frame
+ * The xa2_* contract of apu_xaudio2.h on every host: the APU frame
  * thread hands over one EP period (256 stereo frames) at a time, and the
  * device queue paces it (mcpx_apu_pace_step reads xa2_queued_samples).
  * An SDL audio stream bound to the default device is the queue; its device
@@ -23,10 +23,8 @@
 #include <string.h>
 #include "apu_xaudio2.h"
 
-#if !defined(_WIN32)
 
 #include <SDL3/SDL.h>
-#include <time.h>
 
 #define SDLA_SAMPLE_RATE   48000
 #define SDLA_CHANNELS      2
@@ -66,9 +64,7 @@ static int env_int(const char *name, int def, int lo, int hi)
 
 static int64_t now_ms(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return (int64_t)SDL_GetTicks();
 }
 
 int xa2_init(void)
@@ -253,5 +249,3 @@ uint64_t xa2_samples_played(void)
     queued = bytes > 0 ? (uint64_t)bytes / (SDLA_CHANNELS * sizeof(int16_t)) : 0;
     return g_samples_queued > queued ? g_samples_queued - queued : 0;
 }
-
-#endif /* !_WIN32 */

@@ -119,7 +119,7 @@ void xbox_InputKeyboardBindings(struct InputBindings *b);
 /* 0 when RECOMP_KEYBOARD is off, else 1 with *out filled by
  * xbox_InputKeyboardState(). */
 int  xbox_InputKeyboardPoll(XBOX_INPUT_STATE *out);
-/* Whether the last keyboard state applied RECOMP_MENU_KEYS navigation. */
+/* Whether RECOMP_MENU_KEYS navigation is active in the current context. */
 int  xbox_InputKeyboardMenu(void);
 
 /* The map, row by row (tests, and the table in README.md). */

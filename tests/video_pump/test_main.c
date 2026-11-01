@@ -1,22 +1,13 @@
 /* Exercise the actual pump with synthetic decoder/device operations.
  * No real decoding, rendering or window is claimed by this contract check. */
 #define COBJMACROS
-#include <windows.h>
+#include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "video/video_player.h"
 #include "d3d/d3d8_xbox.h"
 
-static HWND WINAPI fake_window(DWORD a, LPCSTR b, LPCSTR c, DWORD d,
-    int e, int f, int g, int h, HWND i, HMENU j, HINSTANCE k, LPVOID l)
-{
-    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;
-    (void)i;(void)j;(void)k;(void)l;
-    return (HWND)(uintptr_t)1;
-}
-#define CreateWindowExA fake_window
 #include "../../src/video/video_pump.c"
-#undef CreateWindowExA
 
 static unsigned presented, updates, limit, callbacks, dumps, failures;
 static HRESULT __stdcall fake_scene(IDirect3DDevice8 *self) { (void)self; return S_OK; }
@@ -61,15 +52,15 @@ static void on_present(unsigned frame)
 }
 static void run(unsigned frames)
 {
-    presented=callbacks=dumps=0;limit=frames;s_playing=1;
-    strcpy_s(s_path,sizeof(s_path),"synthetic");
+    presented=callbacks=dumps=0;limit=frames;SDL_SetAtomicInt(&s_playing,1);
+    SDL_strlcpy(s_path,"synthetic",sizeof(s_path));
     vp_thread(NULL);
     if (presented!=frames || xbox_VideoIsPlaying()) failures++;
 }
 int main(void)
 {
     /* Legacy environment alone must no longer select frames 60/80. */
-    _putenv_s("RECOMP_FMV_DUMP","must-not-be-written");
+    SDL_SetEnvironmentVariable(SDL_GetEnvironment(),"RECOMP_FMV_DUMP","must-not-be-written",true);
     run(82);if (callbacks || dumps) failures++;
     xbox_VideoSetPresentHandler(on_present);
     run(7);if (callbacks!=7 || dumps!=2) failures++;

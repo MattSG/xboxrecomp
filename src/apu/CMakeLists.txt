@@ -12,7 +12,6 @@ add_library(xbox_apu STATIC
     dsp/dsp_dma.c
     dsp/interp/dsp_cpu.c
     apu_mmio_hook.c
-    apu_xaudio2.c
     apu_sdl.c
     apu_wav.c
 )
@@ -61,16 +60,4 @@ if(XBOXRECOMP_DSP_PROGRAM_DIR)
     set_source_files_properties(dsp/interp/dsp_cpu.c PROPERTIES OBJECT_DEPENDS ${dsp_recomp_inc})
 endif()
 
-if(WIN32)
-    # xaudio2_8 for XAudio2Create, which apu_xaudio2.c calls directly.
-    # It was missing: nothing had ever referenced this library from a linked
-    # target, so the archive was built and never pulled in, and the first
-    # target to actually call into the APU failed at link with an undefined
-    # XAudio2Create rather than at build time here.
-    target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
-else()
-    # POSIX (macOS, Linux): platform layer (Win32 primitives on POSIX),
-    # SDL3 for the audio device (apu_sdl.c) and libm
-    include(Sdl3)
-    target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
-endif()
+target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 $<$<NOT:$<PLATFORM_ID:Windows>>:m>)

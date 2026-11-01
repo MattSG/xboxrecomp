@@ -11,6 +11,8 @@ else()
     target_compile_options(keymap-test PRIVATE -UNDEBUG)
 endif()
 target_include_directories(keymap-test PRIVATE ../../src)
+include(../../cmake/Sdl3.cmake)
+target_link_libraries(keymap-test PRIVATE SDL3::SDL3)
 if(NOT WIN32)
     # The pad is SDL3 here; the test never opens a gamepad, but the TU links SDL
     # and the POSIX Win32 primitives (_stricmp, GetTickCount64) it is built on.

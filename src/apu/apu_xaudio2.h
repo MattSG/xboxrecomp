@@ -8,11 +8,7 @@
 
 /* The device backend behind these functions: XAudio2 on Windows
  * (apu_xaudio2.c), SDL3 on POSIX hosts (apu_sdl.c). Same contract. */
-#if defined(_WIN32)
-#define XA2_BACKEND_NAME "XAudio2"
-#else
 #define XA2_BACKEND_NAME "SDL"
-#endif
 
 /* Initialize the device backend. Returns 1 on success, 0 on failure. */
 int xa2_init(void);
