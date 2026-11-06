@@ -1206,11 +1206,11 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
         # Conditional tail call: same frame bridge as the unconditional tail
         # jmp in _lift_jmp, applied only on the taken path.
         if target in lifter.manual_functions:
-            return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; "
+            return (f"if ({cond_expr}) {{ g_ebp = ebp; g_seh_ebp = ebp; "
                     f"RECOMP_ITAIL(0x{target:08X}u); return; }}"
                     f" /* {jcc}: {desc}, manual tail */")
         name = lifter._call_target_name(target)
-        return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
+        return (f"if ({cond_expr}) {{ g_ebp = ebp; g_seh_ebp = ebp; {name}(); return; }}"
                 f" /* {jcc}: {desc} */")
     return f"if ({cond_expr}) goto loc_{target:08X}; /* {jcc}: {desc} */"
 
@@ -2043,14 +2043,7 @@ class Lifter:
         if (ops[0].type == "reg" and ops[0].reg == "ebp" and
                 ops[1].type == "reg" and ops[1].reg == "esp"):
             out.append("g_ebp = ebp; /* publish frame for frameless callees */")
-            # g_seh_ebp too. A callee with no prologue inherits through
-            # g_seh_ebp, not g_ebp, but only tail jumps and the SEH helpers
-            # ever wrote it -- so one reached by an ordinary call read whatever
-            # frame the last tail jump had left behind. Wreckless hit this in
-            # setjmp: it saved that stale ebp into the jmp_buf, and the longjmp
-            # that should have resumed the catch restored a frame two calls
-            # dead, so the exception unwound past every handler and off the top
-            # of the stack.
+            # Keep the SEH/setjmp frame exchange in step with architectural EBP.
             out.append("g_seh_ebp = ebp;")
         return out
 
@@ -2742,7 +2735,7 @@ class Lifter:
         if self.publishes_ebp:
             prefix = "g_ebp = ebp; g_seh_ebp = ebp; "
         elif self.func_start in self.SEH_HELPERS:
-            prefix = "g_seh_ebp = ebp; "
+            prefix = "g_ebp = ebp; g_seh_ebp = ebp; "
         # Exit trace, for functions that return with a register the caller
         # relied on holding something else. Entry tracing alone cannot show
         # that: it tells you what went in, never what came back. Emitted at the
@@ -2913,7 +2906,7 @@ class Lifter:
                 # Bridge ebp so the target function can inherit our frame pointer.
                 if insn.jump_target in self.manual_functions:
                     tail = (
-                        f"g_seh_ebp = ebp; "
+                        f"g_ebp = ebp; g_seh_ebp = ebp; "
                         f"RECOMP_ITAIL(0x{insn.jump_target:08X}u); return; "
                         f"/* manual tail jmp 0x{insn.jump_target:08X} */"
                     )
@@ -2925,7 +2918,7 @@ class Lifter:
                         ]
                     return [self._forced_tail(tail)]
                 name = self._call_target_name(insn.jump_target)
-                tail = (f"g_seh_ebp = ebp; {name}(); return; "
+                tail = (f"g_ebp = ebp; g_seh_ebp = ebp; {name}(); return; "
                         f"/* tail jmp 0x{insn.jump_target:08X} */")
                 if self.trace_exit_name:
                     # Tag the exit so a trace says which one was taken. A
@@ -2945,7 +2938,7 @@ class Lifter:
                 lines = [f"{{ uint32_t _jt = {target_expr}; /* switch: {len(switch_targets)} entries, {len(unique_targets)} targets */"]
                 for t in unique_targets:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
-                lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
+                lines.append(f"g_ebp = ebp; g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
                 return lines
             # `jmp <reg>` where the register was loaded with an address
             # inside this same function: a hand-written continuation chain,
@@ -2970,11 +2963,11 @@ class Lifter:
                              f" {len(inside)} targets */"]
                     for t in inside:
                         lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
-                    lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
+                    lines.append("g_ebp = ebp; g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
                     return lines
             target = _fmt_operand_read(ops[0])
             return [self._forced_tail(
-                f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return;"
+                f"g_ebp = ebp; g_seh_ebp = ebp; RECOMP_ITAIL({target}); return;"
                 f" /* indirect tail jmp */")]
         return ["/* jmp: no target */"]
 
@@ -2989,7 +2982,7 @@ class Lifter:
             if target:
                 if self._is_external_target(target):
                     name = self._call_target_name(target)
-                    return [f"if ({cond}) {{ g_seh_ebp = ebp; {name}(); return; }} /* {jcc} */"]
+                    return [f"if ({cond}) {{ g_ebp = ebp; g_seh_ebp = ebp; {name}(); return; }} /* {jcc} */"]
                 return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
             return [f"/* {jcc} - no target */"]
 
@@ -3015,7 +3008,7 @@ class Lifter:
         if target:
             if self._is_external_target(target):
                 name = self._call_target_name(target)
-                return [f"if ({cond} /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
+                return [f"if ({cond} /* {jcc}: {desc} */) {{ g_ebp = ebp; g_seh_ebp = ebp; {name}(); return; }}"]
             return [f"if ({cond} /* {jcc}: {desc} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 
