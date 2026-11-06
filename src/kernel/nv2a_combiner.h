@@ -1,13 +1,8 @@
 /**
  * NV2A register combiners, evaluated per pixel for the software rasteriser.
  *
- * Every pixel the NV2A writes goes through its register combiners: up to
- * eight general stages and a final stage that mix the vertex colours, the
- * four texture results, two constants per stage and fog. D3D's fixed-function
- * texture stages compile to them too, so a title never draws without them.
- * The executor used to stand in with "texel * diffuse" from stage 0, which is
- * right for a menu quad and wrong for anything that mixes two textures --
- * Burnout 3 composites its whole 3D scene into the frame that way.
+ * Up to eight general stages and a final stage combine caller-supplied
+ * vertex colours, textures, constants and fog.
  *
  * The encoding (ICW/OCW bit layout, input mappings, output scale/bias, mux,
  * final combiner) follows xemu's pixel-shader generator

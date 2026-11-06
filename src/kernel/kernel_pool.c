@@ -1,12 +1,6 @@
-/*
- * kernel_pool.c - Xbox Pool Allocator
- *
- * Implements ExAllocatePool, ExAllocatePoolWithTag, ExFreePool,
- * ExQueryPoolBlockSize using the Win32 process heap.
- *
- * On Xbox, pool memory is kernel-mode nonpaged/paged pool.
- * Since we run entirely in user mode on Windows, we just use HeapAlloc.
- */
+/* Native process-heap pool adapters. Returned addresses are host pointers;
+ * guest-facing callers need separate address-space marshaling. Pool tags are
+ * diagnostic only; these wrappers do not model Xbox paged/nonpaged pools. */
 
 #include "kernel.h"
 

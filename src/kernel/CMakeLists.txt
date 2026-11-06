@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 # Xbox Kernel Replacement Layer
-# Replaces 147 Xbox kernel imports with Win32 equivalents.
+# Host implementations and guest ABI bridges for Xbox kernel operations.
 # Memory layout, file I/O, threading, synchronization, crypto, HAL.
 
 set(KERNEL_SOURCES
@@ -22,6 +22,7 @@ set(KERNEL_SOURCES
     kernel_thunks.c
     kernel_bridge.c
     xbox_memory_layout.c
+    guest_state.c
     guest_vmem.c
     icall_feedback.c
     recomp_trace.c
@@ -31,6 +32,16 @@ set(KERNEL_SOURCES
     nv2a_flip_hold.c
     nv2a_vsh_interp.c
     nv2a_combiner.c
+    nv2a_wbc_flush.c
+    icall_diagnostics.c
+    host_write_watch.c
+    crash_report.c
+    nv2a_pb_recovery.c
+    recomp_lookup_cache.c
+    xbox_std_string.c
+    guest_call.c
+    guest_strings.c
+    guest_read.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
@@ -53,9 +64,15 @@ else()
     find_package(OpenSSL REQUIRED)
     target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
 endif()
+# Kernel GPU execution and memory-layout scanout use the video backend.
+# The two libraries need each other; CMake repeats such a cycle on the link
+# line, which single-pass linkers (GNU ld) need.
+target_link_libraries(xbox_kernel PUBLIC xbox_video)
 
 if(MSVC)
-    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
+    # RelWithDebInfo defaults to /Ob1. The optimized software rasterizer needs
+    # normal automatic inlining of small per-pixel helpers as well.
+    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /Ob2 /GS- /Gy)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
