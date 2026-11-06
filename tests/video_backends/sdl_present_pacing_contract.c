@@ -6,6 +6,7 @@
 
 typedef uint32_t Uint32;
 typedef uint64_t Uint64;
+typedef int SDL_AtomicInt;
 typedef struct SDL_GPUTexture { int unused; } SDL_GPUTexture;
 typedef struct SDL_Window { int unused; } SDL_Window;
 typedef struct SDL_GPUCommandBuffer { int unused; } SDL_GPUCommandBuffer;
@@ -13,18 +14,19 @@ typedef struct SDL_GPUBlitInfo {
     struct { SDL_GPUTexture *texture; Uint32 w, h; } source, destination;
     int load_op, filter;
 } SDL_GPUBlitInfo;
-typedef struct Surface { uint32_t gen; int cpu_present_pending; } Surface;
+typedef struct Surface { uint32_t gen; int cpu_present_pending; SDL_GPUTexture *tex; } Surface;
 typedef struct XboxOverlay { int unused; } XboxOverlay;
 
 #define SDL_GPU_LOADOP_DONT_CARE 0
 #define SDL_GPU_FILTER_LINEAR 0
 #define RECOMP_PROFILE_BEGIN(name) ((void)0)
 #define RECOMP_PROFILE_END() ((void)0)
+#define RECOMP_PROFILE_FRAME() ((void)0)
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL line %d: %s (events=%s)\n",__LINE__,#x,events); exit(1); } } while (0)
 
-enum { PROF_PACE };
+enum { PROF_PACE, PROF_WRITEBACK, PROF_PRESENT };
 static int s_prof_on;
-static int64_t s_prof[1];
+static int64_t s_prof[3];
 static char events[64];
 static size_t event_count;
 static unsigned pace_calls, submit_calls;
@@ -41,9 +43,9 @@ static SDL_GPUTexture *s_kept = &kept_texture;
 static uint32_t s_kept_w = 640, s_kept_h = 480;
 static uint64_t s_last_present;
 static FILE *s_frame_csv_file;
-static int s_repeat, s_interp_req;
+static int s_repeat, s_interp_req, s_manual_present;
 static float s_interp_t;
-static struct { int (*idle_present)(uint32_t,uint32_t,int); } s_overlay;
+static struct { void (*frame)(void); int (*idle_present)(uint32_t,uint32_t,int); } s_overlay;
 static unsigned s_frame;
 static uint64_t s_last_flip;
 static Surface shown_surface = {0, 0};
@@ -58,6 +60,7 @@ static void fail(const char *name) { (void)name; }
 static void fbw_sdl_pump(void) {}
 static int SDL_GetAtomicInt(int *p) { return *p; }
 static void SDL_SetAtomicInt(int *p,int v) { *p=v; }
+static void request_complete(int *p) { SDL_SetAtomicInt(p, 0); }
 static int64_t qpc(void) { return clock_ticks; }
 static Uint64 SDL_GetTicks(void) { return test_now; }
 static int SDL_WaitAndAcquireGPUSwapchainTexture(SDL_GPUCommandBuffer *c, SDL_Window *w,
@@ -74,13 +77,19 @@ static void frame_csv_init(void) {}
 static void frame_csv_present(int64_t timestamp) { (void)timestamp; }
 static void submit(void *f) { (void)f; submit_calls++; event('S'); }
 static void pace_vblank(void) { pace_calls++; event('W'); clock_ticks+=7; }
-static void frame_csv(int64_t ticks) { CHECK(ticks==7); event('F'); }
+static void frame_csv(int64_t ticks) { CHECK(ticks==(s_manual_present?0:7)); event('F'); }
 static void present_surface(Surface *s,void *p) { (void)s; (void)p; event('X'); }
 static int nv2a_pb_replay(float t) { (void)t; return 1; }
 static int xbox_FramebufferOverlay(XboxOverlay *o) { (void)o; return 0; }
 static int xbox_FramebufferScanSource(uint32_t *v,uint32_t *p) { (void)v;(void)p; return 0; }
 static Surface *scan_surface(uint32_t v,uint32_t p) { (void)v;(void)p; return NULL; }
 static void surface_sync(Surface *s,int f) { (void)s;(void)f; }
+static uint32_t phys(uint32_t v) { return v; }
+static Surface *surface_find(uint32_t v) { (void)v; return &shown_surface; }
+static void writeback_surfaces(void) { event('D'); }
+static int keep_surface(Surface *s) { CHECK(s==&shown_surface); event('K'); return 1; }
+static void prof_report(void) {}
+static void display_config(int immediate) { CHECK(!immediate); }
 
 #define getenv test_getenv
 #include "production_pacing.inc"
@@ -93,7 +102,7 @@ static void reset(void)
 {
     memset(events,0,sizeof events); event_count=0; pace_calls=submit_calls=0;
     clock_ticks=1000; test_now=100; s_last_present=0; s_frame=0;
-    s_repeat=s_interp_req=0; s_wb_pending=0; s_init_state=1;
+    s_repeat=s_interp_req=0; s_wb_pending=0; s_init_state=1; s_manual_present=0;
 }
 static void real_flip(void)
 {
@@ -110,6 +119,16 @@ int main(int argc,char **argv)
     reset(); s_repeat=1; nv2a_d3d_tick();
     CHECK(strcmp(events,after_policy?"ABOSWF":"ABOWSF")==0);
     CHECK(pace_calls==1 && submit_calls==1 && !s_repeat);
+    reset(); s_manual_present=s_repeat=1; nv2a_d3d_tick();
+    CHECK(!strcmp(events,"ABOSF") && !pace_calls && !s_repeat);
+    reset(); nv2a_d3d_manual_present(1);
+    nv2a_d3d_flip_present(0x10000,2560,1);
+    CHECK(!strcmp(events,"DKS") && !pace_calls && s_frame==1);
+    s_repeat=1; nv2a_d3d_tick();
+    CHECK(!pace_calls && !s_repeat && s_frame==2);
+    nv2a_d3d_manual_present(0);
+    nv2a_d3d_flip_present(0x10000,2560,1);
+    CHECK(pace_calls==1 && s_frame==3);
     reset(); test_now=1000; s_last_flip=100;
     s_overlay.idle_present=NULL; nv2a_d3d_tick(); CHECK(!event_count);
     reset(); test_now=1000; s_last_flip=100;

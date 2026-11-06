@@ -23,6 +23,8 @@ static SDL_Joystick *attach(SDL_JoystickID *id)
     SDL_VirtualJoystickDesc desc;
     SDL_INIT_INTERFACE(&desc);
     desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    desc.vendor_id = 0x1209;
+    desc.product_id = 0xF00D;
     desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
     desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
     desc.Rumble = rumble;
@@ -41,7 +43,7 @@ static int wait_present(int want)
     return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     SDL_JoystickID id;
     SDL_Joystick *js;
@@ -51,6 +53,23 @@ int main(void)
     XBOX_VIBRATION vib = { 0x8000, 0x4000 };
 
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    /* Keep physical controllers from occupying the virtual test port. */
+    SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, "0x1209/0xF00D");
+    if (argc == 2 && !strcmp(argv[1], "--cold-start")) {
+        XBOX_INPUT_STATE state;
+        CHECK(SDL_Init(SDL_INIT_JOYSTICK));
+        js = attach(&id);
+        CHECK(js != NULL);
+        CHECK(!SDL_WasInit(SDL_INIT_GAMEPAD));
+        /* Direct-to-game startup never calls the launcher or InputInit. */
+        CHECK(xbox_InputGetState(0, &state) == ERROR_SUCCESS);
+        CHECK(SDL_WasInit(SDL_INIT_GAMEPAD));
+        SDL_CloseJoystick(js);
+        SDL_DetachVirtualJoystick(id);
+        SDL_Quit();
+        printf("Cold-start pad contract: %u checks, %u failures\n", checks, failures);
+        return failures != 0;
+    }
     CHECK(SDL_Init(SDL_INIT_GAMEPAD));
     CHECK(xbox_InputHostPad(0, &buttons, &lt, &rt, &lx, &ly, &rx, &ry) == ERROR_DEVICE_NOT_CONNECTED);
 
@@ -92,12 +111,34 @@ int main(void)
     CHECK(xbox_InputSetState(0, &vib) == ERROR_SUCCESS);
     SDL_Delay(30);
     CHECK(rumble_low == 0x8000 && rumble_high == 0x4000);
+    /* Xbox motor speeds latch until replaced, even without a keepalive. */
+    SDL_Delay(1150);
+    SDL_UpdateGamepads();
+    CHECK(rumble_low == 0x8000 && rumble_high == 0x4000);
+    g_sdl_rumble_refresh[0] = 0; /* Exercise renewal without a 30 s test wait. */
+    xbox_InputHostPad(0, &buttons, 0, 0, 0, 0, 0, 0);
+    CHECK(g_sdl_rumble_refresh[0] > SDL_GetTicks());
+    CHECK(rumble_low == 0x8000 && rumble_high == 0x4000);
+    /* Both motors retain intermediate strengths on ramp-up and ramp-down. */
+    {
+        static const Uint16 levels[] = { 1, 8192, 32768, 65535, 24576, 4096 };
+        for (unsigned i = 0; i < sizeof levels / sizeof levels[0]; ++i) {
+            vib.wLeftMotorSpeed = levels[i];
+            vib.wRightMotorSpeed = 65535 - levels[i];
+            CHECK(xbox_InputSetState(0, &vib) == ERROR_SUCCESS);
+            SDL_UpdateGamepads();
+            CHECK(rumble_low == vib.wLeftMotorSpeed && rumble_high == vib.wRightMotorSpeed);
+        }
+    }
     vib.wLeftMotorSpeed = vib.wRightMotorSpeed = 0;
     xbox_InputSetState(0, &vib);
     SDL_Delay(30);
     CHECK(rumble_low == 0 && rumble_high == 0);
 
     /* Unplug: the port reports no device; the title's calls fail rather than reading a dead pad. */
+    vib.wLeftMotorSpeed = 8192;
+    vib.wRightMotorSpeed = 16384;
+    CHECK(xbox_InputSetState(0, &vib) == ERROR_SUCCESS);
     SDL_CloseJoystick(js);
     SDL_DetachVirtualJoystick(id);
     CHECK(wait_present(0));
@@ -107,6 +148,7 @@ int main(void)
     js = attach(&id);
     CHECK(js != NULL);
     CHECK(wait_present(1));
+    CHECK(g_sdl_rumble[0].wLeftMotorSpeed == 0 && g_sdl_rumble[0].wRightMotorSpeed == 0);
     xbox_InputHostPad(0, &buttons, &lt, &rt, &lx, &ly, &rx, &ry);
     CHECK(buttons == 0 && lt == 0 && rt == 0);
 

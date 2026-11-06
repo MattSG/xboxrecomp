@@ -194,6 +194,8 @@ void nv2a_d3d_tick(void);
 /* Shows the last flipped frame again, paced like a flip, and returns once it
  * is shown: a title thread's frame with nothing new to draw. */
 void nv2a_d3d_repeat_frame(void);
+/* Caller owns presentation deadlines; native flips still complete and write back. */
+void nv2a_d3d_manual_present(int enabled);
 
 /* A frame between the title's own: the executor's last recorded frame with
  * its vertex-program constants part way (t) from the frame before. need_new:

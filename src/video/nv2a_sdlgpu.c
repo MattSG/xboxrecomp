@@ -3151,13 +3151,12 @@ static int present_kept_image(FlipPacing *pacing)
     return shown;
 }
 
-static void present_surface(Surface *s, FlipPacing *pacing)
+static int keep_surface(Surface *s)
 {
     PresentConsts pc;
     uint32_t w, h;
-    s_last_present = SDL_GetTicks();
     if (!s)
-        return;
+        return 0;
     memset(&pc, 0, sizeof pc);
     prepare_overlay(&pc);
     if (getenv("RECOMP_CAPTURE_SURFACE")) {
@@ -3173,18 +3172,27 @@ static void present_surface(Surface *s, FlipPacing *pacing)
         }
     }
     if (!s_window || !client_size(&w, &h)) {
-        if (pacing) pace_flip(pacing);
-        return;
+        return 0;
     }
     if (!s_kept || s_kept_w != w || s_kept_h != h) {
         release_texture(&s_kept);
         s_kept = make_texture(w, h, 1, 0, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, USAGE_TARGET);
         s_kept_w = w; s_kept_h = h;
-        if (!s_kept) return;
+        if (!s_kept) return 0;
     }
     composite(s_kept, w, h, s, &pc, 1);
     if (!getenv("RECOMP_CAPTURE_SURFACE"))
         capture_image(s_kept, w, h);
+    return 1;
+}
+
+static void present_surface(Surface *s, FlipPacing *pacing)
+{
+    s_last_present = SDL_GetTicks();
+    if (!keep_surface(s)) {
+        if (s && pacing) pace_flip(pacing);
+        return;
+    }
     if (present_kept_image(pacing))
         s->cpu_present_pending = 0;
 }
@@ -3303,10 +3311,17 @@ static Surface *scan_surface(uint32_t va, uint32_t pitch)
     return s;
 }
 
+static SDL_AtomicInt s_manual_present;
+void nv2a_d3d_manual_present(int enabled)
+{
+    SDL_SetAtomicInt(&s_manual_present, enabled != 0);
+}
+
 void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
 {
     Surface *s;
     FlipPacing pacing = { 0, 0 };
+    show = show && !SDL_GetAtomicInt(&s_manual_present);
     if (!nv2a_d3d_init())
         return;
     fbw_sdl_pump();
@@ -3322,6 +3337,11 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
         writeback_surfaces();
         t1 = s_prof_on > 0 ? qpc() : 0;
         if (show) present_surface(s, &pacing);
+        else if (SDL_GetAtomicInt(&s_manual_present) && keep_surface(s)) {
+            /* Freeze this completed frame before the guest reuses its target. */
+            flush_batch();
+            submit(NULL);
+        }
         if (s_prof_on > 0) {
             s_prof[PROF_WRITEBACK] += t1 - t0;
             s_prof[PROF_PRESENT] += qpc() - t1 - pacing.ticks;
@@ -3411,7 +3431,7 @@ void nv2a_d3d_tick(void)
         return;
     }
     if (SDL_GetAtomicInt(&s_repeat)) {
-        FlipPacing pacing = { 0, 0 };
+        FlipPacing pacing = { SDL_GetAtomicInt(&s_manual_present) != 0, 0 };
         if (!present_kept_image(&pacing))
             present_surface(s_shown, &pacing);
         pace_flip(&pacing);
