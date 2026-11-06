@@ -392,6 +392,15 @@ static void pad_buttons(const XINPUT_GAMEPAD *g, XBOX_GAMEPAD *out)
     out->bAnalogButtons[XBOX_BUTTON_RTRIGGER] = pad_source(g, map[15]);
 }
 
+/* The bundled SDL3 pad path below defines backend_Input*; the public
+ * xbox_Input* entry points at the end of the file route to a registered host
+ * pad provider first, then to it. */
+#define xbox_InputInit            backend_InputInit
+#define xbox_InputGetState        backend_InputGetState
+#define xbox_InputSetState        backend_InputSetState
+#define xbox_InputIsConnected     backend_InputIsConnected
+#define xbox_InputGetCapabilities backend_InputGetCapabilities
+
 void xbox_InputInit(void)
 {
 #ifndef XBOX_INPUT_HOST_PAD
@@ -511,5 +520,74 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
     pCaps->Type = 1;      /* XINPUT_DEVTYPE_GAMEPAD */
     pCaps->SubType = 1;   /* XINPUT_DEVSUBTYPE_GAMEPAD */
+    return ERROR_SUCCESS;
+}
+
+#undef xbox_InputInit
+#undef xbox_InputGetState
+#undef xbox_InputSetState
+#undef xbox_InputIsConnected
+#undef xbox_InputGetCapabilities
+
+/* ---- host pad provider -------------------------------------------------- */
+
+static const XBOX_HOST_PAD_PROVIDER *s_pad_provider;
+
+void xbox_InputSetHostPadProvider(const XBOX_HOST_PAD_PROVIDER *provider)
+{
+    s_pad_provider = provider;
+}
+
+void xbox_InputInit(void)
+{
+    if (s_pad_provider) {
+        if (s_pad_provider->init) s_pad_provider->init();
+        return;
+    }
+    backend_InputInit();
+}
+
+DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    DWORD r;
+    if (!s_pad_provider)
+        return backend_InputGetState(dwPort, pState);
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    memset(pState, 0, sizeof(*pState));
+    r = s_pad_provider->get_state(dwPort, pState);
+    if (r == ERROR_SUCCESS && dwPort == 0)
+        keyboard_merge(pState);
+    return r;
+}
+
+DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+{
+    if (!s_pad_provider)
+        return backend_InputSetState(dwPort, pVibration);
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    return s_pad_provider->set_state ? s_pad_provider->set_state(dwPort, pVibration)
+                                     : ERROR_SUCCESS;
+}
+
+BOOL xbox_InputIsConnected(DWORD dwPort)
+{
+    XBOX_INPUT_STATE st;
+    if (!s_pad_provider)
+        return backend_InputIsConnected(dwPort);
+    return dwPort < XBOX_MAX_CONTROLLERS &&
+           s_pad_provider->get_state(dwPort, &st) == ERROR_SUCCESS;
+}
+
+DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
+{
+    if (!s_pad_provider)
+        return backend_InputGetCapabilities(dwPort, dwFlags, pCaps);
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps || !xbox_InputIsConnected(dwPort))
+        return ERROR_DEVICE_NOT_CONNECTED;
+    memset(pCaps, 0, sizeof(*pCaps));
+    pCaps->Type = 1;     /* XINPUT_DEVTYPE_GAMEPAD */
+    pCaps->SubType = 1;  /* XINPUT_DEVSUBTYPE_GAMEPAD */
     return ERROR_SUCCESS;
 }

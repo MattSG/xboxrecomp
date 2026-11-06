@@ -24,6 +24,7 @@ int main(void)
     if (!mem) return 10;
     g_xbox_mem_offset = (ptrdiff_t)mem;
     *(uint32_t *)(mem + 0x10000) = 0x800000C4;          /* ordinal 196 */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 5;
     xbox_kernel_set_thunk_address(0x10000, 1);
     xbox_kernel_bridge_init();
 

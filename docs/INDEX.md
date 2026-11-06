@@ -29,6 +29,8 @@ One per stage, in the order you run them.
 
 ### Recompiled code
 
+- [Host Backends and Hooks](technical/host-backends.md) - Replace the renderer, window, audio and pads; the hook points
+- [Fork Delta](technical/fork-delta.md) - What the MattSG fork adds over upstream, and what this branch takes
 - [The Register Model](technical/register-model.md) — Why global registers work and how the stack is simulated
 - [Indirect Call Dispatch](technical/indirect-calls.md) — The RECOMP_ICALL problem and how to solve it
 - [SEH and Exception Handling](technical/seh-handling.md) — Structured exception handling in recompiled code
