@@ -10239,7 +10239,7 @@ static void bridge_NtCreateTimer(void)
 
     (void)STACK_ARG(1);
 
-    if (STACK_ARG(0) && !bridge_buf_ok(STACK_ARG(0), 4, "NtCreateTimer")) {
+    if (STACK_ARG(0) && !bridge_buf_ok(STACK_ARG(0), 4, 1, "NtCreateTimer")) {
         g_eax = 0xC0000005u;                /* STATUS_ACCESS_VIOLATION */
         return;
     }
@@ -10428,8 +10428,8 @@ static void bridge_NtSetTimerEx(void)
         g_eax = 0xC0000008u;                /* STATUS_INVALID_HANDLE */
         return;
     }
-    if (!bridge_buf_ok(due_va, 8, "NtSetTimerEx")
-            || (prev_va && !bridge_buf_ok(prev_va, 1, "NtSetTimerEx"))) {
+    if (!bridge_buf_ok(due_va, 8, 0, "NtSetTimerEx")
+            || (prev_va && !bridge_buf_ok(prev_va, 1, 1, "NtSetTimerEx"))) {
         g_eax = 0xC0000005u;                /* STATUS_ACCESS_VIOLATION */
         return;
     }

@@ -5168,6 +5168,7 @@ int nv2a_pb_replay(float t)
     }
     s_replaying = 0;
     pb_state(&saved, 0);
+    return 1;
 }
 
 static int s_exec_inited;
