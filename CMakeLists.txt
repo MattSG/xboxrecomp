@@ -16,6 +16,33 @@ project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Recompiled x86 code relies on what MSVC does anyway: signed arithmetic wraps
+# like the CPU's, and guest memory is read through whatever pointer type an
+# instruction implies. GCC and Clang optimise both away as undefined
+# behaviour unless told not to.
+if(NOT MSVC)
+    add_compile_options(-fwrapv -fno-strict-aliasing)
+endif()
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# Host backends. Each host-facing module has a function-level contract, so an
+# embedding project can bring its own implementation (an SDL3 window, GPU
+# renderer, pad and audio stack, say) and leave the bundled one out:
+#   XBOXRECOMP_RENDERER=EXTERNAL     renderer + window: nv2a_d3d11.h, fb_window.h
+#   XBOXRECOMP_APU_OUTPUT=EXTERNAL   audio device: apu_xaudio2.h (xa2_*)
+#   XBOXRECOMP_BUILD_D3D8=OFF        D3D8 layer: an xbox_d3d8 target of its own
+# D3D11 is the bundled renderer and window, available on Windows; elsewhere the
+# embedding project provides them.
+if(WIN32)
+    set(_xbr_renderer_default D3D11)
+else()
+    set(_xbr_renderer_default EXTERNAL)
+endif()
+set(XBOXRECOMP_RENDERER "${_xbr_renderer_default}" CACHE STRING "Host renderer: D3D11 or EXTERNAL")
+set_property(CACHE XBOXRECOMP_RENDERER PROPERTY STRINGS D3D11 EXTERNAL)
+include(xbox_ffmpeg)
+
 # Common definitions for all targets
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
@@ -63,8 +90,14 @@ add_subdirectory(src/usb)
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
 
+# Network: Ethernet controller, NAT and peer tunnel
+add_subdirectory(src/net)
+
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
+
+# Host bring-up: MMIO routing to the APU/USB/NV2A models, window and device
+add_subdirectory(src/host)
 
 # ── Umbrella target ───────────────────────────────────────────
 
@@ -77,9 +110,11 @@ list(APPEND XBOXRECOMP_LIBS
     xbox_dsound
     xbox_input
     xbox_usb
+    xbox_net
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_host
 )
 add_library(xboxrecomp INTERFACE)
 if(UNIX AND NOT APPLE)
