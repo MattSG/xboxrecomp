@@ -47,6 +47,8 @@ void xbox_InputSetKeyboardHook(XBOX_KEYBOARD_HOOK hook)
 static SDL_Gamepad *g_sdl_pads[XBOX_MAX_CONTROLLERS];
 static XINPUT_GAMEPAD g_sdl_last[XBOX_MAX_CONTROLLERS];
 static DWORD g_sdl_packet[XBOX_MAX_CONTROLLERS];
+static XBOX_VIBRATION g_sdl_rumble[XBOX_MAX_CONTROLLERS];
+static Uint64 g_sdl_rumble_refresh[XBOX_MAX_CONTROLLERS];
 
 /* The pads are read from the title's threads and from launchers and overlays
  * (xbox_InputHostPad), so the open handles and the packet counters sit behind
@@ -84,15 +86,30 @@ static SDL_Gamepad *sdl_pad(DWORD port)
     }
 #endif
     SDL_Gamepad *pad = g_sdl_pads[port];
-    if (pad && SDL_GamepadConnected(pad))
+    if (pad && SDL_GamepadConnected(pad)) {
+        /* Xbox output reports latch; SDL effects expire. Renew held speeds
+         * while the title polls, including when it sends no new output. */
+        if ((g_sdl_rumble[port].wLeftMotorSpeed || g_sdl_rumble[port].wRightMotorSpeed)
+            && SDL_GetTicks() >= g_sdl_rumble_refresh[port]) {
+            if (SDL_RumbleGamepad(pad, g_sdl_rumble[port].wLeftMotorSpeed,
+                                 g_sdl_rumble[port].wRightMotorSpeed, 60000))
+                g_sdl_rumble_refresh[port] = SDL_GetTicks() + 30000;
+        }
         return pad;
+    }
     if (pad) {
         SDL_CloseGamepad(pad);
         g_sdl_pads[port] = NULL;
+        memset(&g_sdl_rumble[port], 0, sizeof g_sdl_rumble[port]);
     }
     if (SDL_GetTicks() < next_scan[port])
         return NULL;
     next_scan[port] = SDL_GetTicks() + 1000; /* hot-plug check, not every poll */
+    /* Direct-to-game startup may not have visited a launcher or InputInit. */
+    if (!SDL_WasInit(SDL_INIT_GAMEPAD) && !SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+        fprintf(stderr, "[INPUT] SDL gamepad init failed: %s\n", SDL_GetError());
+        return NULL;
+    }
     {
         int count = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&count);
@@ -170,9 +187,11 @@ static void host_pad_rumble(DWORD port, WORD left, WORD right)
     SDL_Gamepad *pad;
     pad_lock();
     pad = sdl_pad(port);
-    /* SDL rumble runs for a duration; titles resend it continuously. */
-    if (pad)
-        SDL_RumbleGamepad(pad, left, right, 1000);
+    if (pad && SDL_RumbleGamepad(pad, left, right, 60000)) {
+        g_sdl_rumble[port].wLeftMotorSpeed = left;
+        g_sdl_rumble[port].wRightMotorSpeed = right;
+        g_sdl_rumble_refresh[port] = SDL_GetTicks() + 30000;
+    }
     pad_unlock();
 }
 #else

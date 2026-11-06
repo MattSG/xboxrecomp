@@ -3940,10 +3940,10 @@ static void pace_flip(FlipPacing *pacing)
     if (s_prof_on > 0) s_prof[PROF_PACE] += pacing->ticks;
 }
 
-static void present_surface(Surface *s, FlipPacing *pacing)
+static void composite_surface(Surface *s, FlipPacing *pacing, int show)
 {
     PresentConsts pc;
-    s_last_present = GetTickCount();
+    if (show) s_last_present = GetTickCount();
     if (!s)
         return;
     RECOMP_PROFILE_BEGIN("D3D11 present");
@@ -3981,6 +3981,12 @@ static void present_surface(Surface *s, FlipPacing *pacing)
             }
             composite(rtv, s_swap_w, s_swap_h, s, &pc, 1);
             keep_image(bb);                 /* game image only */
+            if (!show) {
+                ID3D11RenderTargetView_Release(rtv);
+                ID3D11Texture2D_Release(bb);
+                RECOMP_PROFILE_END();
+                return;
+            }
             xbox_FramebufferRenderHostOverlay(s_dev, s_ctx, rtv);
             unbind_targets();
             if (!getenv("RECOMP_CAPTURE_SURFACE"))
@@ -4002,6 +4008,11 @@ static void present_surface(Surface *s, FlipPacing *pacing)
         }
     }
     RECOMP_PROFILE_END();
+}
+
+static void present_surface(Surface *s, FlipPacing *pacing)
+{
+    composite_surface(s, pacing, 1);
 }
 
 /* The flip completes at the display's next vertical blank, as it does on the
@@ -4140,10 +4151,17 @@ static Surface *scan_surface(uint32_t va, uint32_t pitch)
 
 /* show 0: the frame is finished (written back, counted) but not put on
  * screen -- an interpolating executor shows replays of it instead. */
+static volatile LONG s_manual_present;
+void nv2a_d3d_manual_present(int enabled)
+{
+    InterlockedExchange(&s_manual_present, enabled != 0);
+}
+
 void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
 {
     Surface *s;
     FlipPacing pacing = { 0 };
+    show = show && !InterlockedCompareExchange(&s_manual_present, 0, 0);
     if (!nv2a_d3d_init())
         return;
     if (s_overlay.frame) s_overlay.frame();
@@ -4159,6 +4177,8 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
         t1 = s_prof_on > 0 ? qpc() : 0;
         if (show)
             present_surface(s, &pacing);
+        else if (InterlockedCompareExchange(&s_manual_present, 0, 0))
+            composite_surface(s, NULL, 0);
         if (s_prof_on > 0) {
             s_prof[PROF_WRITEBACK] += t1 - t0;
             s_prof[PROF_PRESENT] += qpc() - t1 - pacing.ticks;
@@ -4278,7 +4298,7 @@ void nv2a_d3d_tick(void)
         if (!present_kept())
             present_surface(s_shown, NULL);
         t0 = qpc();
-        pace_vblank();
+        if (!InterlockedCompareExchange(&s_manual_present, 0, 0)) pace_vblank();
         frame_csv(qpc() - t0);
         s_frame++;
         request_complete(&s_repeat);
@@ -4335,6 +4355,7 @@ void nv2a_d3d_tick(void) {}
 void nv2a_d3d_flip_present(uint32_t a, uint32_t p, int show) { (void)a; (void)p; (void)show; }
 void nv2a_d3d_interp_frame(float t, int need_new) { (void)t; (void)need_new; }
 void nv2a_d3d_repeat_frame(void) {}
+void nv2a_d3d_manual_present(int enabled) { (void)enabled; }
 void nv2a_d3d_kick(void) {}
 void nv2a_d3d_draw_ub(const NvD3DState *st, int t, const NvD3DAttrib a[16], const float d[16][4],
                       int pr, const uint32_t *i, uint32_t n, uint32_t lo, uint32_t hi,

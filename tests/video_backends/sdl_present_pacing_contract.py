@@ -16,7 +16,8 @@ def production_bodies(source):
     if pacing is None:
         raise ValueError("Missing production FlipPacing type")
     bodies = [pacing.group()]
-    for name in ("pace_after_present", "pace_flip", "present_kept_image", "nv2a_d3d_tick"):
+    for name in ("pace_after_present", "pace_flip", "present_kept_image",
+                 "nv2a_d3d_manual_present", "nv2a_d3d_flip_present", "nv2a_d3d_tick"):
         match = re.search(r"^(?:static )?(?:int|void) " + name + r"\([^\n]*\)\n\{.*?^\}",
                           source, re.M | re.S)
         if match is None:

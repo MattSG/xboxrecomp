@@ -133,8 +133,12 @@ typedef long LONG;
 static ID3D11DeviceContext *s_ctx;
 static NvOverlayHooks s_overlay;            /* frame hook unset: no-op */
 static volatile LONG s_repeat;              /* repeat path is not exercised */
+static volatile LONG s_manual_present;
 static LONG InterlockedExchange(volatile LONG *target, LONG value)
 { LONG old = *target; *target = value; return old; }
+static LONG InterlockedCompareExchange(volatile LONG *target, LONG value, LONG expected)
+{ LONG old = *target; if (old == expected) *target = value; return old; }
+static void request_complete(volatile LONG *target) { InterlockedExchange(target, 0); }
 static int s_depth_hazed;
 static volatile LONG s_interp_req;
 static uint32_t s_interp_seen;
@@ -147,7 +151,8 @@ static void unbind_targets(void) { }
 static void xbox_FramebufferRenderHostOverlay(int device, ID3D11DeviceContext *context,
                                               ID3D11RenderTargetView *target)
 { (void)device; (void)context; (void)target; }
-static int present_kept(void) { return 0; }
+static int kept_available;
+static int present_kept(void) { if (kept_available) ++present_calls; return kept_available; }
 
 #define getenv test_getenv
 #include "production_pacing.inc"
@@ -170,6 +175,8 @@ static void reset(void)
     s_frame_csv_file = tmpfile(); CHECK(s_frame_csv_file != NULL);
     s_frame_csv_present = s_frame_csv_present_prev = s_frame_csv_present_interval = 0;
     s_cap_tex = NULL; s_cap_rtv = NULL; s_cap_w = s_cap_h = 0;
+    s_manual_present = 0;
+    kept_available = 0;
 }
 
 static void successful_flip(const char *expected)
@@ -219,6 +226,16 @@ static void flip_cases(void)
     reset(); init_ok = 0;
     nv2a_d3d_flip(0x10000, 2560);
     CHECK(!events[0] && !pace_calls && !present_calls && !s_frame);
+
+    reset(); nv2a_d3d_manual_present(1);
+    nv2a_d3d_flip(0x10000, 2560);
+    CHECK(!strcmp(events, "BC") && s_frame == 1 && s_shown == &surface);
+    CHECK(!pace_calls && !present_calls && !csv_calls);
+    kept_available = 1; s_repeat = 1; nv2a_d3d_tick();
+    CHECK(present_calls == 1 && !pace_calls && csv_calls == 1 && !s_repeat);
+    nv2a_d3d_manual_present(0);
+    nv2a_d3d_flip(0x10000, 2560);
+    CHECK(present_calls == 2 && pace_calls == 1);
 }
 
 static void tick_cases(void)
