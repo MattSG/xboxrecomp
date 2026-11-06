@@ -3492,7 +3492,7 @@ class FunctionTranslator:
             if fallthrough_target in debug_slide_bypasses.values():
                 lines.append(f"loc_{fallthrough_target:08X}: ;")
             ft_name = self.lifter._call_target_name(fallthrough_target)
-            lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
+            lines.append(f"    g_ebp = ebp; g_seh_ebp = ebp; {ft_name}(); return;"
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
             lines.append(f"")
 
