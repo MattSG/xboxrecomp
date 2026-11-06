@@ -1,11 +1,5 @@
 # Host backends and hooks
 
-> **On `main`:** the SDL3 renderer, window, pads and audio are still bundled,
-> so only the hooks below and `xbox_InputSetHostPadProvider` are available here.
-> The `XBOXRECOMP_RENDERER=EXTERNAL` / `XBOXRECOMP_APU_OUTPUT=EXTERNAL` options and
-> `tests/external_backends` live on `hooks/host-extension-points`, the branch for
-> upstream, which has no SDL3 code.
-
 A recompiled title links the runtime libraries and supplies the rest of the
 host itself: its window, its GPU API, its audio device, its pads. Every
 host-facing module has a function-level contract, and CMake can leave the

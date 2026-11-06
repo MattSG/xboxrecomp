@@ -27,24 +27,14 @@ include(${PROJECT_SOURCE_DIR}/cmake/Nv2aHlsl.cmake)
 set(_hlsl_dir ${NV2A_HLSL_DIR})
 set(_gen ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
+# The host renderer and window behind nv2a_d3d11.h (the renderer contract) and
+# fb_window.h (the window contract). D3D11 is the bundled implementation;
+# EXTERNAL leaves both to the embedding project (an SDL3 GPU renderer, say),
+# which links its own target providing the nv2a_d3d_* and fbw_* functions.
 if(XBOXRECOMP_RENDERER STREQUAL "D3D11")
     # nv2a_d3d11.c compiles the parts, in order, at run time.
     target_sources(xbox_video PRIVATE fb_window_win32.c nv2a_d3d11.c)
     xbr_embed_nv2a_hlsl(xbox_video)
-else()
-    # Each SDL3 GPU shader is compiled ahead of time from its compile unit
-    # (shaders/sdlgpu/) to SPIR-V (Vulkan) and, on Windows, DXIL (Direct3D 12),
-    # embedded as byte arrays nv2a_sdlgpu.c includes.
-    # Shader rules: cmake/Nv2aSdlgpu.cmake (shared with the backend's tests).
-    include(${PROJECT_SOURCE_DIR}/cmake/Nv2aSdlgpu.cmake)
-    xbr_sdlgpu_shaders(${_gen} _shader_headers)
-    if(NV2A_DEPTH_VIEW_SHADER)
-        target_compile_definitions(xbox_video PRIVATE XBOXRECOMP_DEPTH_VIEW_SHADER=1)
-    endif()
-    target_sources(xbox_video PRIVATE fb_window_sdl.c nv2a_sdlgpu.c ${_shader_headers})
-    target_include_directories(xbox_video PRIVATE ${_gen})
-    target_link_libraries(xbox_video PUBLIC SDL3::SDL3)
-    target_compile_definitions(xbox_video PUBLIC XBOXRECOMP_SDL3=1)
 endif()
 
 target_link_libraries(xbox_video PUBLIC xbox::ffmpeg)

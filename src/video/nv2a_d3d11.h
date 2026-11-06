@@ -1,4 +1,9 @@
 /**
+ * The NV2A renderer contract (nv2a_d3d_*), implemented by nv2a_d3d11.c or,
+ * with XBOXRECOMP_RENDERER=EXTERNAL, by the embedding project. The
+ * description below is of the D3D11 implementation; another API satisfies the
+ * same functions. The window it presents into is the fb_window.h contract.
+ *
  * D3D11 renderer for the NV2A pushbuffer executor.
  *
  * The executor (src/kernel/nv2a_pb_exec.c) decodes the title's GPU command
@@ -168,6 +173,9 @@ void nv2a_d3d_clear(const NvD3DState *st, uint32_t flags, uint32_t color,
 
 /* The title finished a frame in this surface: put it on screen. */
 void nv2a_d3d_flip(uint32_t surface_addr, uint32_t pitch);
+/* The same, for a caller that decides whether the frame is shown (show = 0
+ * still completes the flip and its write-back): the executor's path. */
+void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show);
 
 /* A new pushbuffer segment is about to execute. */
 void     nv2a_d3d_kick(void);

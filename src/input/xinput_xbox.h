@@ -2,13 +2,17 @@
  * Xbox Input Compatibility Layer - Type Definitions
  *
  * Defines the Xbox XPP (Xbox Peripheral Port) input types and
- * translates them to the host input backend. The Xbox controller API
+ * translates them to Windows XInput. The Xbox controller API
  * differs from XInput in structure layout and polling model.
  *
+ * The game uses 9 XPP entry points with 12 total calls:
+ * - Controller state polling
+ * - Vibration/force feedback
+ * - Device enumeration
  */
 
-#ifndef XBOXRECOMP_XINPUT_XBOX_H
-#define XBOXRECOMP_XINPUT_XBOX_H
+#ifndef BURNOUT3_XINPUT_XBOX_H
+#define BURNOUT3_XINPUT_XBOX_H
 
 #include <stdint.h>
 #include "platform/xbox_winnt.h"
@@ -80,29 +84,15 @@ typedef struct XBOX_INPUT_CAPABILITIES {
 
 /**
  * Initialize the input system.
- * Maps Xbox controller ports to host controller slots.
+ * Maps Xbox controller ports to XInput slots.
  */
 void xbox_InputInit(void);
-
-/* A port's contextual keys (RECOMP_KEYBOARD=1): the hook may
- * change the keyboard pad after the default keys are read. `menu` is TRUE
- * while RECOMP_MENU_KEYS navigation applies; xbox_FramebufferKeyDown reads
- * a key. Configure before input polling starts. It runs on the input thread,
- * so it must be fast and safe to call from that thread. */
-typedef void (*XBOX_KEYBOARD_HOOK)(XBOX_INPUT_STATE *state, BOOL menu);
-void xbox_InputSetKeyboardHook(XBOX_KEYBOARD_HOOK hook);
 
 /**
  * Get the state of a controller.
  * Port: 0-3 (Xbox controller ports)
  */
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
-
-/* RECOMP_MENU_KEYS applies only while in_menu() returns nonzero. */
-void xbox_InputSetMenuProbe(int (*in_menu)(void));
-/* Register before polling. A nonzero result consumes a menu click so the
- * title can dispatch it on its guest thread instead of receiving pad A. */
-void xbox_InputSetMenuClickHandler(int (*click)(float x, float y));
 
 /**
  * Set controller vibration.
@@ -113,15 +103,6 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
  * Check if a controller is connected.
  */
 BOOL xbox_InputIsConnected(DWORD dwPort);
-
-/* The host pad on a port, as the XInput layout (wButtons are the XINPUT_GAMEPAD_*
- * bits, triggers 0-255, sticks up-positive), without the keyboard and mouse the
- * title's state merges in. For launchers and overlays that need the raw pad
- * through the same SDL3 path. Returns 0 when read, ERROR_DEVICE_NOT_CONNECTED
- * (1167) when the port has no pad. Starts SDL's gamepad subsystem on first use. */
-uint32_t xbox_InputHostPad(uint32_t port, uint16_t *buttons,
-                           uint8_t *left_trigger, uint8_t *right_trigger,
-                           int16_t *lx, int16_t *ly, int16_t *rx, int16_t *ry);
 
 /**
  * Get controller capabilities.
@@ -170,4 +151,4 @@ int xbox_InputAnyOpen(void);
 }
 #endif
 
-#endif /* XBOXRECOMP_XINPUT_XBOX_H */
+#endif /* BURNOUT3_XINPUT_XBOX_H */

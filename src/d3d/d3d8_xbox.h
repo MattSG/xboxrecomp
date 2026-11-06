@@ -12,7 +12,7 @@
  * - No CAPS querying (known fixed hardware)
  *
  * This header provides the ABI-compatible types so that translated
- * game/RW code can compile against our SDL_GPU-backed implementation.
+ * game/RW code can compile against our D3D11-backed implementation.
  */
 
 #ifndef BURNOUT3_D3D8_XBOX_H
@@ -568,7 +568,7 @@ typedef enum D3DMULTISAMPLE_TYPE {
     D3DMULTISAMPLE_4_SAMPLES = D3DMULTISAMPLE_4_SAMPLES_MULTISAMPLE_LINEAR,
 } D3DMULTISAMPLE_TYPE;
 
-/* Resolve an Xbox multisample type to a sample count.
+/* Resolve an Xbox multisample type to a D3D11 sample count.
  * NONE (0x0011) yields 1; 2/4/9-sample grids map to their X*Y counts. */
 static inline UINT d3d8_msaa_sample_count(D3DMULTISAMPLE_TYPE ms)
 {
@@ -1138,7 +1138,7 @@ struct IDirect3D8 {
  * ================================================================ */
 
 /**
- * Create the D3D8-compatible interface backed by SDL_GPU.
+ * Create the D3D8-compatible interface backed by D3D11.
  * This replaces the Xbox Direct3DCreate8() call.
  */
 IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion);
