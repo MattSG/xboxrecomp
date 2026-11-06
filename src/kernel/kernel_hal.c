@@ -43,10 +43,15 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+int xbox_IrqlCurrent(void)
+{
+    return (int)g_current_irql;
+}
+
 /* The current IRQL, where guest code reads it: KPCR.Irql, fs:[0x24].
  *
  * The XDK does not always ask the kernel. DirectSound's lock
- * (sub_002F4175 in Burnout 3) reads fs:[0x24] directly and skips its
+ * (sub_002F4175 in a title) reads fs:[0x24] directly and skips its
  * critical section at raised IRQL, because a DPC must never block. Nothing
  * wrote that byte, so it read 0 everywhere: DirectSound's DPC took the
  * critical section, blocked against the thread that held it, and the title
@@ -834,6 +839,42 @@ void xbox_IrqReport(void)
     fflush(stderr);
 }
 
+/* With the gate off, DISPATCH_LEVEL is still exclusive, as it is on the
+ * Xbox's one processor.
+ *
+ * Counting raised threads only lets a device model decline to *start* an
+ * interrupt. The timer thread drained DPCs without even asking, and nothing
+ * stopped a routine already running from overlapping a thread that raised
+ * after it began. The guest's USB driver raises to keep its DPC out of the URB
+ * lists it is editing; its DPC ran anyway, completed a URB twice -- the second
+ * time calling a "callback" in freed heap -- and the writes into the freed
+ * block surfaced later as a crash in HeapFree at the start of dice.bik.
+ *
+ * Taken on every crossing into DISPATCH_LEVEL or above, by guest threads and
+ * by the host threads that run ISRs and DPCs (xbox_IrqlEnterInterrupt), and
+ * dropped on the crossing back. Recursive, so an ISR that queues work on its
+ * own thread does not deadlock itself. */
+static CRITICAL_SECTION g_dispatch_lock;
+/* Device-level callbacks serialize with KeSynchronizeExecution without
+ * taking the DPC gate. This lets a real ISR preempt a guest at DISPATCH_LEVEL
+ * while preventing concurrent hardware callbacks from sharing guest state. */
+static CRITICAL_SECTION g_isr_lock;
+static INIT_ONCE g_dispatch_lock_once = INIT_ONCE_STATIC_INIT;
+/* How many times this thread holds g_dispatch_lock, so a lowering never
+ * releases a lock the thread does not own (a device interrupt skips it). */
+static XBOX_THREAD_LOCAL int g_dispatch_owned;
+/* Device interrupts this thread is running without the lock. */
+static XBOX_THREAD_LOCAL int g_isr_unlocked;
+
+static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_dispatch_lock);
+    InitializeCriticalSection(&g_isr_lock);
+    return TRUE;
+}
+
+
 static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
                              int gate)
 {
@@ -852,10 +893,22 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
         xbox_IrqSafePoint();
     t_irql_counted = now;
 
-    if (now && gate && xbox_DispatchGateOn()) {
-        gate_enter();
-        t_dispatch_gate_held = 1;
+    if (xbox_DispatchGateOn()) {
+        if (now && gate) {
+            gate_enter();
+            t_dispatch_gate_held = 1;
+        }
+    } else {
+        InitOnceExecuteOnce(&g_dispatch_lock_once, dispatch_lock_init, NULL, NULL);
+        if (now) {
+            EnterCriticalSection(&g_dispatch_lock);
+            g_dispatch_owned++;
+        } else if (g_dispatch_owned) {
+            g_dispatch_owned--;
+            LeaveCriticalSection(&g_dispatch_lock);
+        }
     }
+
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
     InterlockedIncrement(&s_transitions);
@@ -908,9 +961,44 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  *
  * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
  * DPC, the device level for an ISR -- and code checks: see irql_publish. */
+/* A device interrupt preempts DISPATCH_LEVEL on the console: it does not
+ * wait for g_dispatch_lock. DirectSound raises to DISPATCH_LEVEL to stop a
+ * voice and spins there until the APU's interrupt reports it stopped; the
+ * interrupt, waiting for the lock that spinning thread held, ran only after
+ * DirectSound's 0.5 s timeout -- a title froze for half a second now and then.
+ * A DPC is what must not overlap a raised thread (the USB double completion
+ * above), so a DPC run from such an interrupt takes the lock for its run.
+ * Return values carry these two cases in bits 8 and 9 for the leave. */
+#define IRQL_ISR_UNLOCKED 0x100
+#define IRQL_DPC_LOCKED   0x200
+#define IRQL_ISR_LOCKED   0x400
+
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
+    if (level > DISPATCH_LEVEL) {
+        InitOnceExecuteOnce(&g_dispatch_lock_once, dispatch_lock_init, NULL, NULL);
+        EnterCriticalSection(&g_isr_lock);
+        saved |= IRQL_ISR_LOCKED;
+    }
+    /* With the gate on, the gate decides instead (irql_track_gated). */
+    if (level > DISPATCH_LEVEL && g_current_irql < DISPATCH_LEVEL &&
+        !xbox_DispatchGateOn()) {
+        InterlockedIncrement(&g_irql_raised_count);    /* devices still hold off */
+        g_isr_unlocked++;
+        g_current_irql = (KIRQL)level;
+        irql_publish();
+        return saved | IRQL_ISR_UNLOCKED;
+    }
+    if (level == DISPATCH_LEVEL && g_isr_unlocked && !g_dispatch_owned &&
+        !xbox_DispatchGateOn()) {
+        InitOnceExecuteOnce(&g_dispatch_lock_once, dispatch_lock_init, NULL, NULL);
+        EnterCriticalSection(&g_dispatch_lock);
+        g_dispatch_owned++;
+        g_current_irql = (KIRQL)level;
+        irql_publish();
+        return saved | IRQL_DPC_LOCKED;
+    }
     if (g_current_irql != (KIRQL)level) {
         /* A DPC (DISPATCH_LEVEL) goes through the gate; a device ISR does
          * not (see s_dispatch_gate). */
@@ -924,11 +1012,44 @@ int xbox_IrqlEnterInterrupt(int level)
 
 void xbox_IrqlLeaveInterrupt(int saved)
 {
-    if (g_current_irql != (KIRQL)saved) {
+    int isr_locked = saved & IRQL_ISR_LOCKED;
+    saved &= ~IRQL_ISR_LOCKED;
+    if (saved & IRQL_ISR_UNLOCKED) {
+        g_isr_unlocked--;
+        InterlockedDecrement(&g_irql_raised_count);
+        g_current_irql = (KIRQL)(saved & 0xFF);
+        irql_publish();
+    } else if (saved & IRQL_DPC_LOCKED) {
+        g_dispatch_owned--;
+        LeaveCriticalSection(&g_dispatch_lock);
+        g_current_irql = (KIRQL)(saved & 0xFF);
+        irql_publish();
+    } else if (g_current_irql != (KIRQL)saved) {
         irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
         g_current_irql = (KIRQL)saved;
         irql_publish();
     }
+    if (isr_locked)
+        LeaveCriticalSection(&g_isr_lock);
+}
+
+/* Wait until no device interrupt is running.
+ *
+ * A device interrupt runs beside a thread at DISPATCH_LEVEL here (see
+ * xbox_IrqlEnterInterrupt), where on the console it would have run between
+ * two of that thread's instructions. DirectSound guards its voice lists with
+ * a counter its interrupt checks before unlinking an idle voice; with the two
+ * truly concurrent, the interrupt could pass the check just before the title
+ * raised the counter, and both then edited the lists at once (a removed voice
+ * left linked: the list loops, and every voice stop waits out DirectSound's
+ * 0.5 s timeout). The title calls this right after raising such a counter:
+ * an interrupt that began before it either saw the counter or is finished
+ * when this returns, as on the console. */
+void xbox_IrqlSyncInterrupts(void)
+{
+    InitOnceExecuteOnce(&g_dispatch_lock_once, dispatch_lock_init, NULL, NULL);
+    EnterCriticalSection(&g_isr_lock);
+    LeaveCriticalSection(&g_isr_lock);
 }
 
 /* Whether this thread is at DISPATCH_LEVEL or above, or holds the one-CPU
@@ -940,10 +1061,6 @@ int xbox_IrqlThisThreadBlocksDpcs(void)
            || g_current_irql >= DISPATCH_LEVEL;
 }
 
-int xbox_IrqlCurrent(void)
-{
-    return (int)g_current_irql;
-}
 
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
@@ -1323,12 +1440,14 @@ VOID __stdcall xbox_HalDisableSystemInterrupt(ULONG BusInterruptLevel, KIRQL Irq
     (void)Irql;
 }
 
+/* The vector is the bus level, as the bridged entry answers
+ * (bridge_HalGetInterruptVector): device models find their routine by it,
+ * and 0 for every device put the NIC's on the same vector as everyone's. */
 ULONG __stdcall xbox_HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql)
 {
-    (void)BusInterruptLevel;
     if (Irql)
-        *Irql = PASSIVE_LEVEL;
-    return 0;
+        *Irql = (KIRQL)BusInterruptLevel;
+    return BusInterruptLevel;
 }
 
 /* ============================================================================
@@ -1527,21 +1646,63 @@ VOID __stdcall xbox_AvSetSavedDataAddress(ULONG Address)
     g_av_saved_data_address = Address;
 }
 
+/* The last scanout AvSetDisplayMode was given. Only valid once set. The
+ * framebuffer address is not kept here: the bridge already records the resolved
+ * one through xbox_SetDisplayFramebuffer. */
+static struct {
+    int set;
+    ULONG mode, format, pitch;
+} g_av_scanout;
+
 VOID __stdcall xbox_AvSetDisplayMode(
     PVOID RegisterBase, ULONG Step, ULONG Mode,
     ULONG Format, ULONG Pitch, ULONG FrameBuffer)
 {
     (void)RegisterBase;
     (void)Step;
-    (void)Format;
-    (void)Pitch;
-    (void)FrameBuffer;
 
     g_av_display_mode = Mode;
+    g_av_scanout.set = 1;
+    g_av_scanout.mode = Mode;
+    g_av_scanout.format = Format;
+    g_av_scanout.pitch = Pitch;
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "AvSetDisplayMode: step=%u mode=0x%X format=0x%X pitch=%u fb=0x%X",
         Step, Mode, Format, Pitch, FrameBuffer);
+}
+
+/* Size of the scanout the title last set. Returns 0 when AvSetDisplayMode has
+ * never been called, or when its format or standard is one this table does not
+ * decode; the caller must then not assume a size.
+ *
+ * Width is the pitch over the bytes per pixel of the format. Format values are
+ * the LIN D3DFMT codes from the Xbox table in d3d8_xbox.h; that the title passes
+ * those to AvSetDisplayMode is unverified (unknown codes are refused).
+ * Height comes from the standard in Mode's 0x0000FF00 byte: the Mode word has
+ * no resolution field (see AV_STANDARD_SHIFT), so a 720p title reading as 480
+ * lines is the known limit here. */
+int xbox_GetDisplayMode(uint32_t *pitch, uint32_t *bpp_out, uint32_t *w, uint32_t *h)
+{
+    uint32_t bpp, lines;
+
+    if (!g_av_scanout.set || !g_av_scanout.pitch)
+        return 0;
+    switch (g_av_scanout.format) {
+    case 0x10: case 0x11: case 0x1C: bpp = 2; break;  /* LIN A1R5G5B5, R5G6B5, X1R5G5B5 */
+    case 0x12: case 0x1E:            bpp = 4; break;  /* LIN A8R8G8B8, X8R8G8B8 */
+    default: return 0;
+    }
+    switch ((g_av_scanout.mode >> AV_STANDARD_SHIFT) & 0xFF) {
+    case AV_STANDARD_NTSC_M: case AV_STANDARD_NTSC_J: lines = 480; break;
+    case AV_STANDARD_PAL_I:  lines = 576; break;
+    default: return 0;
+    }
+    if (pitch) *pitch = g_av_scanout.pitch;
+    if (bpp_out) *bpp_out = bpp;
+    if (w) *w = g_av_scanout.pitch / bpp;
+    if (h) *h = lines;
+    return 1;
 }
 
 /* ============================================================================
@@ -1654,27 +1815,15 @@ NTSTATUS __stdcall xbox_HalWriteSMBusValue(
  * of real storage -- pointing these at a function is what produced garbage
  * disk metadata before.
  *
- * The strings are counted (Length/MaximumLength), not NUL-terminated, matching
- * the kernel's STRING type. Values describe the virtual disk we present; no
- * real hardware is queried.
+ * The strings are counted (Length/MaximumLength); no terminator is required,
+ * matching the kernel's STRING type. Values come from the port; zero defaults do not
+ * invent a disk model, serial number or cache-partition topology.
  * ============================================================================ */
 
-ULONG xbox_HalDiskCachePartitionCount = 3;
-
-static char g_disk_model[]  = "XBOXRECOMP VIRTUAL HDD";
-static char g_disk_serial[] = "XR0000000000";
-
-XBOX_ANSI_STRING xbox_HalDiskModelNumber = {
-    sizeof(g_disk_model) - 1,
-    sizeof(g_disk_model) - 1,
-    g_disk_model
-};
-
-XBOX_ANSI_STRING xbox_HalDiskSerialNumber = {
-    sizeof(g_disk_serial) - 1,
-    sizeof(g_disk_serial) - 1,
-    g_disk_serial
-};
+/* Port supplies disk topology and counted identity strings before init. */
+ULONG xbox_HalDiskCachePartitionCount = 0;
+XBOX_ANSI_STRING xbox_HalDiskModelNumber = {0};
+XBOX_ANSI_STRING xbox_HalDiskSerialNumber = {0};
 
 /*
  * Video mode the SMC reported at boot. 0 lets title code fall back to querying
@@ -1682,12 +1831,11 @@ XBOX_ANSI_STRING xbox_HalDiskSerialNumber = {
  */
 ULONG xbox_HalBootSMCVideoMode = 0;
 
-/*
- * IDE channel object. Real kernels export a device object for the ATA channel;
- * drivers only ever pass it back to us, so identity is all that is required.
- */
-static ULONG g_idex_channel_data = 0x49444558; /* 'IDEX' */
-PVOID xbox_IdexChannelObject = &g_idex_channel_data;
+/* Native embeddings may supply an IDE channel object before kernel init.
+ * No native IDE channel implementation exists here; a non-NULL scalar marker
+ * cannot stand in for the structure. Guest exports use separate fixed-width
+ * storage initialized by kernel_data_init, not this host pointer. */
+PVOID xbox_IdexChannelObject = NULL;
 
 /* ============================================================================
  * Shutdown Notification

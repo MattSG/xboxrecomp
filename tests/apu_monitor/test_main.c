@@ -4,8 +4,8 @@
  * mixer into it, so every sample the VP and DSP made was thrown away before
  * the device saw it, and it rendered a 1024-sample device buffer for every
  * 256-sample EP period. Here the device is a fake that records what it is
- * given, and the frame thread's sequence (dsp_frame then monitor_frame, eight
- * times per period) is driven by hand. */
+ * given, and the frame thread's sequence (DSP output, then monitor_frame,
+ * eight times per period) is driven by hand. */
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
@@ -69,24 +69,22 @@ static int failures;
 #define CHECK(name, cond) \
     do { if (!(cond)) { printf("FAIL: %s\n", name); failures++; } } while (0)
 
-/* What dsp_frame writes for bin value v: (int16_t)(v * 32767). Bin 0 is
- * left and bin 1 right in both mixdown modes. */
+/* The DSP stage's output for sub-frame k, sample i: (int16_t)(v * 32767). */
 static float left_of(int k, int i)  { return (float)(k * SUB + i) / 4096.0f; }
 static float right_of(int k, int i) { return -(float)(k * SUB + i) / 8192.0f; }
 
-/* One EP period the way the frame thread runs it. */
+/* One EP period the way the frame thread runs it. The DSP (apu_dsp.c) needs
+ * a loaded program, so its output goes straight into frame_buf, where its
+ * EP publishes a period. */
 static void run_period(MCPXAPUState *d)
 {
-    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     int calls0 = got_calls;
     for (int k = 0; k < 8; k++) {
-        memset(mixbins, 0, sizeof(mixbins));
         for (int i = 0; i < SUB; i++) {
-            mixbins[0][i] = left_of(k, i);
-            mixbins[1][i] = right_of(k, i);
+            d->monitor.frame_buf[k * SUB + i][0] = (int16_t)(left_of(k, i) * 32767.0f);
+            d->monitor.frame_buf[k * SUB + i][1] = (int16_t)(right_of(k, i) * 32767.0f);
         }
         d->ep_frame_div = k;
-        mcpx_apu_dsp_frame(d, mixbins);
         mcpx_apu_monitor_frame(d);
         if (k < 7)
             CHECK("nothing submitted mid-period", got_calls == calls0);

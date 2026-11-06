@@ -37,12 +37,15 @@ target_include_directories(host_time PUBLIC
 )
 
 if(WIN32)
+    # line_server: a named-pipe line protocol for host tools (POSIX: a socket).
+    add_library(line_server STATIC line_server.c)
+    target_include_directories(line_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     add_library(platform INTERFACE)
-    target_link_libraries(platform INTERFACE host_time)
+    target_link_libraries(platform INTERFACE host_time line_server)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
     target_link_libraries(platform INTERFACE recomp_exit_hook)
 else()
-    add_library(platform STATIC win32_compat.c)
+    add_library(platform STATIC win32_compat.c line_server.c)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}

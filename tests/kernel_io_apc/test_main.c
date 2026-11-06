@@ -132,6 +132,7 @@ int main(void)
         return 1;
     }
     g_xbox_mem_offset = (ptrdiff_t)mem;
+    g_xbox_kernel_data_base = 0x00080000u;   /* the layout's kernel data area */
 
     /* A host directory standing in for the disc, holding one file. */
     GetTempPathA(sizeof dir, dir);

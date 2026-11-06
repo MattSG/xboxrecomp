@@ -3,7 +3,24 @@
 #include <float.h>
 #include <stdio.h>
 #define CHECK(x) do { if(!(x)) { fprintf(stderr,"FAIL line %d\n",__LINE__); return 1; } } while(0)
+ptrdiff_t g_xbox_mem_offset;
+static uint8_t guest[16];
+/* fld tbyte at guest address 0: the 80-bit operand's bytes, little-endian. */
+static double fp80(uint64_t significand, uint16_t sign_exponent) {
+    int i;
+    for (i = 0; i < 8; ++i) guest[i] = (uint8_t)(significand >> (8 * i));
+    guest[8] = (uint8_t)sign_exponent; guest[9] = (uint8_t)(sign_exponent >> 8);
+    return MEMFP80(0);
+}
 int main(void) {
+    g_xbox_mem_offset = (ptrdiff_t)(uintptr_t)guest;
+    CHECK(fp80(UINT64_C(0x8000000000000000), 0x3FFF) == 1.0);
+    CHECK(fp80(UINT64_C(0xC000000000000000), 0xC000) == -3.0);
+    CHECK(fp80(UINT64_C(0xC90FDAA22168C235), 0x4000) == 3.14159265358979323846);
+    CHECK(fp80(0, 0) == 0.0);
+    CHECK(isinf(fp80(UINT64_C(0x8000000000000000), 0xFFFF)));
+    CHECK(fp80(UINT64_C(0x8000000000000000), 0xFFFF) < 0);
+    CHECK(isnan(fp80(UINT64_C(0xC000000000000000), 0x7FFF)));
     /* The Burnout 3 case: 96 * (float)(1/255) must equal its float-stored copy. */
     double v = 96.0 * (double)(1.0f / 255.0f);
     CHECK(recomp_fp_round24(v) == (double)(float)v);

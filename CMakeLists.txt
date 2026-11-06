@@ -1,20 +1,34 @@
 cmake_minimum_required(VERSION 3.20)
 project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 
+# Recompiled x86 code relies on what MSVC does anyway: signed arithmetic wraps
+# like the CPU's, and guest memory is read through whatever pointer type an
+# instruction implies. GCC and Clang optimise both away as undefined
+# behaviour unless told not to.
+if(NOT MSVC)
+    add_compile_options(-fwrapv -fno-strict-aliasing)
+endif()
+
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
 # Pattern: extract emulator subsystems (xemu) into reusable static libraries.
 #
-# Libraries:
-#   xbox_kernel    - Xbox kernel replacement layer (147 imports → Win32)
-#   xbox_d3d8      - D3D8 → D3D11 graphics compatibility
-#   xbox_dsound    - DirectSound → software mixer compatibility
-#   xbox_input     - Xbox gamepad → XInput compatibility
-#   xbox_apu       - MCPX APU audio emulation (extracted from xemu)
-#   xbox_nv2a      - NV2A GPU emulation (extracted from xemu)
+# Runtime modules and their transitive host dependencies are declared below.
+# Link the xboxrecomp interface target rather than relying on a snapshot count.
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# All host graphics, input and audio use SDL3.
+set(XBOXRECOMP_RENDERER "SDL3_GPU" CACHE STRING "Host renderer" FORCE)
+set(XBOXRECOMP_SDL3 ON)
+include(Sdl3)
+include(Dxc)
+include(cmake/xbox_sdl3.cmake)
+include(cmake/xbox_ffmpeg.cmake)
+add_compile_definitions(XBOXRECOMP_SDL3=1)
 
 # Common definitions for all targets
 add_compile_definitions(
@@ -63,8 +77,14 @@ add_subdirectory(src/usb)
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
 
+# Network: Ethernet controller, NAT and peer tunnel
+add_subdirectory(src/net)
+
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
+
+# Host bring-up: MMIO routing to the APU/USB/NV2A models, window and device
+add_subdirectory(src/host)
 
 # ── Umbrella target ───────────────────────────────────────────
 
@@ -77,9 +97,11 @@ list(APPEND XBOXRECOMP_LIBS
     xbox_dsound
     xbox_input
     xbox_usb
+    xbox_net
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_host
 )
 add_library(xboxrecomp INTERFACE)
 if(UNIX AND NOT APPLE)

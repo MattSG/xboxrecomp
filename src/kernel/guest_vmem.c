@@ -30,10 +30,12 @@ typedef struct {
     uint32_t reserve_protect; /* protection the reservation was created with */
 } guest_page_t;
 
+static int s_requested;        /* opt-in remains meaningful if reservation fails */
 static guest_page_t *s_pages;   /* one entry per page from s_lo to s_top */
-static uint32_t s_mirror_lo;    /* first address that aliases low memory */
-static uint32_t s_lo;           /* first tracked address: the top of the mirrors */
+static uint32_t s_slots_lo;     /* first address above the mapped range */
+static uint32_t s_lo;           /* first tracked address: the top of the slots */
 static uint32_t s_top;          /* end of what the host let us reserve */
+static int s_placeholder;
 static ptrdiff_t s_offset;      /* host address minus guest address */
 static SRWLOCK s_lock = SRWLOCK_INIT;
 
@@ -48,6 +50,7 @@ int guest_vmem_active(void) { return s_pages != NULL; }
  * fails outright. */
 static size_t host_free_run(uintptr_t host, size_t limit)
 {
+#ifdef _WIN32
     uintptr_t cur = host;
 
     while (cur - host < limit) {
@@ -57,35 +60,66 @@ static size_t host_free_run(uintptr_t host, size_t limit)
         cur = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
     }
     return cur - host < limit ? cur - host : limit;
+#else
+    /* POSIX VirtualQuery only tracks owned mappings. VirtualAlloc's fixed,
+     * non-replacing reservation below is the authoritative availability check. */
+    (void)host;
+    return limit;
+#endif
 }
 
-/* Reserve the host range for [s_lo, s_top). The mirrors are the last thing the
- * layout maps, so right after them is when a fixed host address is most likely
- * to still be free; asked for lazily, deep into boot, the range was taken by
- * something else nearly every run. MEM_RESERVE only: commits happen where a
+/* Reserve the host range for [s_lo, s_top). The slots are the last thing the
+ * layout reserves, so right after them is when a fixed host address is most
+ * likely to still be free; asked for lazily, deep into boot, the range was taken
+ * by something else nearly every run. MEM_RESERVE only: commits happen where a
  * title commits, as on the console. */
-int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top)
+int guest_vmem_init(ptrdiff_t offset, uint64_t slots_lo, uint64_t slots_top,
+                    int placeholder)
 {
     size_t bytes;
     void *host;
 
-    if (s_pages || !getenv("RECOMP_EXT_VMA"))
-        return 0;
-    if (mirror_top >= GUEST_VMEM_TOP) {
-        fprintf(stderr, "  Extended VMA: the mirrors reach 0x%llX, past user space;"
+    if (s_pages) return 0;
+    s_requested = getenv("RECOMP_EXT_VMA") != NULL;
+    if (!s_requested) return 0;
+    s_slots_lo = slots_lo < GUEST_VMEM_TOP ? (uint32_t)slots_lo : GUEST_VMEM_TOP;
+    s_lo = slots_top < GUEST_VMEM_TOP ? (uint32_t)slots_top : GUEST_VMEM_TOP;
+    s_top = s_lo;
+    if (slots_top >= GUEST_VMEM_TOP) {
+        fprintf(stderr, "  Extended VMA: the slots reach 0x%llX, past user space;"
                         " nothing above them to track\n",
-                (unsigned long long)mirror_top);
+                (unsigned long long)slots_top);
         return 0;
     }
 
     s_offset = offset;
-    s_mirror_lo = (uint32_t)mirror_lo;
-    s_lo = (uint32_t)mirror_top;
     host = (void *)((uintptr_t)s_lo + (uintptr_t)offset);
 
-    bytes = host_free_run((uintptr_t)host, GUEST_VMEM_TOP - s_lo) & ~(size_t)0xFFFF;
-    if (bytes && !VirtualAlloc(host, bytes, MEM_RESERVE, PAGE_NOACCESS))
-        bytes = 0;
+    s_placeholder = 0;
+#ifdef _WIN32
+    if (placeholder) {
+        typedef PVOID (WINAPI *Alloc2)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, PVOID, ULONG);
+        Alloc2 alloc2 = (Alloc2)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2");
+        bytes = GUEST_VMEM_TOP - s_lo;
+        /* Split only the part that the tracker owns, then replace it without
+         * releasing the address range for another host allocation to claim. */
+        if (!alloc2 || !VirtualFree(host, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) ||
+            !alloc2(GetCurrentProcess(), host, bytes,
+                    MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0))
+            bytes = 0;
+        else
+            s_placeholder = 1;
+    } else
+#endif
+    {
+        (void)placeholder;
+        bytes = host_free_run((uintptr_t)host, GUEST_VMEM_TOP - s_lo) & ~(size_t)0xFFFF;
+        /* ponytail: startup-only 64 KiB backoff. Use a native free-range
+         * query if heavily fragmented startup cost becomes material. Each
+         * fixed reservation refuses foreign mappings; retain the free prefix. */
+        while (bytes && !VirtualAlloc(host, bytes, MEM_RESERVE, PAGE_NOACCESS))
+            bytes -= 0x10000u;
+    }
     if (!bytes) {
         fprintf(stderr, "  Extended VMA: could not reserve host memory at %p (error %lu);"
                         " the tracker stays off\n", host, GetLastError());
@@ -94,7 +128,12 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top)
     s_top = s_lo + (uint32_t)bytes;
     s_pages = calloc(bytes / VMEM_PAGE, sizeof s_pages[0]);
     if (!s_pages) {
-        VirtualFree(host, 0, MEM_RELEASE);
+        VirtualFree(host, 0, MEM_RELEASE
+#ifdef _WIN32
+                    | (s_placeholder ? MEM_PRESERVE_PLACEHOLDER : 0)
+#endif
+                    );
+        s_top = s_lo;
         fprintf(stderr, "  Extended VMA: out of memory for the page table\n");
         return 0;
     }
@@ -107,9 +146,15 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top)
 void guest_vmem_shutdown(void)
 {
     if (s_pages)
-        VirtualFree((void *)((uintptr_t)s_lo + (uintptr_t)s_offset), 0, MEM_RELEASE);
+        VirtualFree((void *)((uintptr_t)s_lo + (uintptr_t)s_offset), 0, MEM_RELEASE
+#ifdef _WIN32
+                    | (s_placeholder ? MEM_PRESERVE_PLACEHOLDER : 0)
+#endif
+                    );
     free(s_pages);
     s_pages = NULL;
+    s_requested = 0;
+    s_slots_lo = s_lo = s_top = 0;
 }
 
 /* Commits [start, end) of the host reservation. Zeroes the pages, as
@@ -160,11 +205,9 @@ static int allocate_locked(uint32_t *base, uint32_t *size, uint32_t alloc_type,
     int is_commit  = (alloc_type & MEM_COMMIT_FLAG) != 0;
     uint64_t end64;
 
-    /* Between the start of the mirrors and the top of them, every address is
-     * physical RAM seen again: there is no distinct memory to hand out, and a
-     * title that reserved there would zero live data at the wrapped address
-     * (confirmed: it wiped .rdata). Above s_top the host would not give us the
-     * range. Refuse both cleanly, so the caller's own address-mismatch retry
+    /* Below s_lo are the slots themselves: the layout reserves them no-access
+     * and they are not ours to hand out. Above s_top the host would not give us
+     * the range. Refuse both cleanly, so the caller's own address-mismatch retry
      * picks a real address. */
     if (requested_base < s_lo || (requested_base >= s_top && requested_base < GUEST_VMEM_TOP)) {
         *status = STATUS_CONFLICTING_ADDRESSES;
@@ -228,9 +271,10 @@ int guest_vmem_allocate(uint32_t *base, uint32_t *size, uint32_t alloc_type,
 {
     int handled;
 
-    /* base = 0 means "anywhere", and anything below the mirrors is the heap's. */
-    if (!s_pages || *base < s_mirror_lo)
+    /* base = 0 means "anywhere", and anything below the slots is the heap's. */
+    if (!s_requested || *base < s_slots_lo)
         return 0;
+    if (!s_pages) { *status = STATUS_CONFLICTING_ADDRESSES; return 1; }
     AcquireSRWLockExclusive(&s_lock);
     handled = allocate_locked(base, size, alloc_type, protect, status);
     ReleaseSRWLockExclusive(&s_lock);
@@ -297,8 +341,9 @@ int guest_vmem_free(uint32_t *base, uint32_t *size, uint32_t free_type,
 {
     int handled;
 
-    if (!s_pages || *base < s_mirror_lo)
+    if (!s_requested || *base < s_slots_lo)
         return 0;
+    if (!s_pages) { *status = STATUS_INVALID_PARAMETER; return 1; }
     AcquireSRWLockExclusive(&s_lock);
     handled = free_locked(base, size, free_type, status);
     ReleaseSRWLockExclusive(&s_lock);
@@ -322,17 +367,17 @@ int guest_vmem_query(uint32_t address, uint32_t info[7])
     guest_page_t first;
     uint32_t start, end;
 
-    if (!s_pages || address < s_mirror_lo || address >= GUEST_VMEM_TOP)
+    if (!s_requested || address < s_slots_lo || address >= GUEST_VMEM_TOP)
         return 0;
 
-    /* The mirrors are never tracked, so left alone a query reports them as one
+    /* The slots are never tracked, so left alone a query reports them as one
      * free region, and a title's own address-space scanner (which uses this
      * query to find free space) keeps proposing an address inside it, being
      * refused, and proposing it again -- forever, on the title this came from.
      * Report them as reserved and the scanner moves past the top on its very
      * next query. The same goes for anything the host would not give us. */
     if (address < s_lo) {
-        reserved_region(info, s_mirror_lo, s_lo);
+        reserved_region(info, s_slots_lo, s_lo);
         return 1;
     }
     if (address >= s_top) {

@@ -113,7 +113,7 @@ def _build_summary(enriched, rw_results, crt_results, propagated, rw_modules):
     unknown_total = cat_counts.get("unknown", 0)
 
     # Count vtable functions specifically
-    vtable_total = sum(1 for e in enriched if e.get("method") in ("vtable_scan", "vtable_ctor"))
+    vtable_total = sum(1 for e in enriched if e.get("method") in ("vtable_scan", "vtable_thunk", "vtable_ctor"))
 
     # RW modules with function counts
     rw_module_summary = {}

@@ -21,7 +21,7 @@ from .output import write_results
 
 
 def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
-        output_dir=None, verbose=False):
+        output_dir=None, verbose=False, game_keywords=None):
     """
     Run the full function identification pipeline.
 
@@ -32,10 +32,12 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
         xrefs_path: Path to xrefs.json (or default).
         output_dir: Output directory (or default).
         verbose: Print progress info.
+        game_keywords: Optional caller-owned category-to-keyword mapping.
 
     Returns:
         dict: Summary statistics.
     """
+    config.configure_from_xbe(xbe_path)
     functions_path = functions_path or config.DEFAULT_FUNCTIONS_JSON
     strings_path = strings_path or config.DEFAULT_STRINGS_JSON
     xrefs_path = xrefs_path or config.DEFAULT_XREFS_JSON
@@ -119,7 +121,7 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
     t4 = time.time()
     propagated = propagate_labels(
         functions, rw_results, crt_results, imm_refs, strings,
-        verbose=verbose, sections=xbe_sections
+        verbose=verbose, sections=xbe_sections, game_keywords=game_keywords
     )
     if verbose:
         print(f"  Done in {time.time() - t4:.1f}s")

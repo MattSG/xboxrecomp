@@ -8,8 +8,8 @@
  * these instructions in its vertex shader pipeline.
  *
  * This module translates NV2A vertex shader microcode into HLSL source
- * code, compiles it with D3DCompile, and caches the resulting
- * ID3D11VertexShader for use by the D3D8->D3D11 compatibility layer.
+ * code, compiles it with the shader compiler, and caches the resulting
+ * vertex shader for use by the D3D8 compatibility layer.
  *
  * NV2A Vertex Shader Architecture:
  *
@@ -46,7 +46,7 @@
 #ifndef XBOXRECOMP_D3D8_VSH_H
 #define XBOXRECOMP_D3D8_VSH_H
 
-#include <d3d11.h>
+#include "gfx/gpu_shader.h"
 #include <stdint.h>
 #include <windows.h>
 
@@ -308,7 +308,7 @@ typedef struct NV2AVSConstants {
 /**
  * Initialize the vertex shader translator.
  * Allocates the constant buffer and shader cache.
- * Must be called after D3D11 device creation.
+ * Must be called after the GPU device is created.
  */
 HRESULT d3d8_vsh_init(void);
 

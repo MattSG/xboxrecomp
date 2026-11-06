@@ -76,6 +76,18 @@ Derived algorithms — credited, independently implemented
   label.
 
 
+Libraries linked, not included
+------------------------------
+
+  SDL3 and SDL_shadercross (zlib), DirectXShaderCompiler (UIUC / LLVM
+  with exceptions), SPIRV-Cross and SPIRV-Tools (Apache-2.0) provide host
+  graphics, audio, input and runtime shader compilation.
+
+  FFmpeg supplies video and WMA decoding. Windows uses the pinned LGPL
+  shared build from BtbN/FFmpeg-Builds, loaded dynamically so users may
+  replace its DLLs. Other hosts use their system FFmpeg. These dependencies
+  are downloaded or found by CMake; their sources are not copied here.
+
 Reference material (no code taken)
 -----------------------------------
 

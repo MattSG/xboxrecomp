@@ -1,19 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(fb_present_test C)
-if(NOT WIN32)
-    message(FATAL_ERROR "The GDI framebuffer presenter is Windows-only")
-endif()
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
-add_executable(fb_present_test test_main.c)
-target_compile_definitions(fb_present_test PRIVATE
-    WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
-target_include_directories(fb_present_test PRIVATE
-    ../../src
-    ../../src/input
-    ../../src/platform
-    ../../src/video
-)
-target_link_libraries(fb_present_test PRIVATE xboxrecomp)
+add_subdirectory(../../src/platform platform)
+add_executable(fb_present_test test_main.c ../../src/video/fb_present.c)
+target_include_directories(fb_present_test PRIVATE ../../src ../../src/kernel)
+target_link_libraries(fb_present_test PRIVATE platform)
 enable_testing()
-add_test(NAME fb_present COMMAND fb_present_test)
+add_test(NAME fb_present_ram_bounds COMMAND fb_present_test)
+if(NOT WIN32)
+    target_compile_definitions(fb_present_test PRIVATE XBOXRECOMP_SDL3)
+endif()

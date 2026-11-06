@@ -1,5 +1,6 @@
 /* Run with: python tests/audio_mixer/run.py */
 #include <assert.h>
+#include <stdlib.h>
 #include "audio/dsound_xbox.h"
 
 static IDirectSoundBuffer8 *make_buffer(WORD channels, DWORD rate,
@@ -89,6 +90,36 @@ int main(void)
 {
     check_playback(1);
     check_playback(2);
+
+    /* Preallocated storage filled through Lock must feed the same mixer as
+     * SetBufferData. This is the public adapter's other creation path. */
+    for (WORD channels = 1; channels <= 2; channels++) {
+        IDirectSound8 *ds;
+        IDirectSoundBuffer8 *locked;
+        XBOX_WAVEFORMATEX format = {0};
+        format.nChannels = channels;
+        format.nSamplesPerSec = 48000;
+        format.wBitsPerSample = 16;
+        DSBUFFERDESC desc = {0};
+        desc.lpwfxFormat = &format;
+        desc.dwBufferBytes = 2 * channels * sizeof(int16_t);
+        assert(xbox_DirectSoundCreate(NULL, &ds, NULL) == S_OK);
+        assert(ds->lpVtbl->CreateSoundBuffer(ds, &desc, &locked, NULL) == S_OK);
+        void *data = NULL;
+        DWORD bytes = 0;
+        assert(locked->lpVtbl->Lock(locked, 0, 0, &data, &bytes, NULL, NULL, 0) == S_OK);
+        assert(data && bytes == desc.dwBufferBytes);
+        for (unsigned i = 0; i < 2 * channels; i++)
+            ((int16_t *)data)[i] = i / channels ? 200 : 100;
+        assert(locked->lpVtbl->Unlock(locked, data, bytes, NULL, 0) == S_OK);
+        assert(locked->lpVtbl->Play(locked, 0, 0, 0) == S_OK);
+        check_sample(100);
+        check_state(locked, channels * sizeof(int16_t), DSBSTATUS_PLAYING);
+        check_sample(200);
+        check_state(locked, 0, 0);
+        assert(locked->lpVtbl->Release(locked) == 0);
+        assert(g_mixer_active_count == 0);
+    }
 
     /* Fractional source frames survive a loop and a Stop/Play boundary. */
     const int16_t pcm[] = {100, 200, 300, 400};

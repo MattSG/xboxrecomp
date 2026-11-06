@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
+import argparse
 import json, bisect, os
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.recomp import config
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
@@ -8,36 +13,25 @@ UNRESOLVED_PATH = os.path.join(SCRIPT_DIR, 'output', 'unresolved_symbols.txt')
 FUNCTIONS_PATH = os.path.join(REPO_ROOT, 'tools', 'disasm', 'output', 'functions.json')
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, 'output', 'missing_functions.json')
 
-SECTIONS = [
-    {'name': '.text', 'va': 0x00011000, 'size': 2863616},
-    {'name': 'XMV', 'va': 0x002CC200, 'size': 163124},
-    {'name': 'DSOUND', 'va': 0x002F3F40, 'size': 52668},
-    {'name': 'WMADEC', 'va': 0x00300D00, 'size': 105828},
-    {'name': 'XONLINE', 'va': 0x0031AA80, 'size': 124764},
-    {'name': 'XNET', 'va': 0x003391E0, 'size': 78056},
-    {'name': 'D3D', 'va': 0x0034C2E0, 'size': 83828},
-    {'name': 'XGRPH', 'va': 0x00360A60, 'size': 8300},
-    {'name': 'XPP', 'va': 0x00362AE0, 'size': 36052},
-    {'name': '.rdata', 'va': 0x0036B7C0, 'size': 289684},
-    {'name': '.data', 'va': 0x003B2360, 'size': 3904988},
-    {'name': 'DOLBY', 'va': 0x0076B940, 'size': 29056},
-    {'name': 'XON_RD', 'va': 0x00772AC0, 'size': 5416},
-    {'name': '.data1', 'va': 0x00774000, 'size': 224},
-]
-
-TEXT_START = 0x00011000
-TEXT_END = 0x00011000 + 2863616
-
-def find_section(addr):
-    for s in SECTIONS:
+def find_section(addr, sections):
+    for s in sections:
         if s['va'] <= addr < s['va'] + s['size']:
-            return s['name']
+            return s
     return None
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Classify unresolved targets in the supplied XBE")
+    parser.add_argument("xbe", help="XBE matching the symbol/function inputs")
+    parser.add_argument("--functions", default=FUNCTIONS_PATH)
+    parser.add_argument("--unresolved", default=UNRESOLVED_PATH)
+    parser.add_argument("--output", default=OUTPUT_PATH)
+    args = parser.parse_args()
+    config.configure_from_xbe(args.xbe)
+    SECTIONS = [{"name": s.name, "va": s.va, "size": s.va_size, "is_code": s.is_code} for s in config._SECTIONS]
+    TEXT_START, TEXT_END = config.TEXT_VA_START, config.TEXT_VA_END
     print('Loading function database...')
-    with open(FUNCTIONS_PATH) as f:
+    with open(args.functions) as f:
         raw_funcs = json.load(f)
 
     functions = []
@@ -50,10 +44,10 @@ def main():
     functions.sort(key=lambda x: x[0])
     func_starts = [f[0] for f in functions]
     print(f'  Loaded {len(functions)} functions')
-    print(f'  Range: 0x{functions[0][0]:08X} - 0x{functions[-1][1]:08X}')
+    if functions: print(f'  Range: 0x{functions[0][0]:08X} - 0x{functions[-1][1]:08X}')
 
     print('Loading unresolved symbols...')
-    with open(UNRESOLVED_PATH) as f:
+    with open(args.unresolved) as f:
         unresolved = []
         for line in f:
             line = line.strip()
@@ -62,7 +56,7 @@ def main():
             unresolved.append(addr)
     unresolved.sort()
     print(f'  Loaded {len(unresolved)} unresolved symbols')
-    print(f'  Range: 0x{unresolved[0]:08X} - 0x{unresolved[-1]:08X}')
+    if unresolved: print(f'  Range: 0x{unresolved[0]:08X} - 0x{unresolved[-1]:08X}')
 
     results = {
         'mid_function': [],
@@ -75,20 +69,20 @@ def main():
     missing_functions = []
 
     for addr in unresolved:
-        section = find_section(addr)
+        sec_info = find_section(addr, SECTIONS)
+        section = sec_info["name"] if sec_info else None
 
         if section is None:
             results['unknown'].append(addr)
             missing_functions.append({'address': f'0x{addr:08X}', 'type': 'unknown', 'estimated_end': None})
             continue
 
-        if section in ('.rdata', '.data', '.data1'):
+        if not sec_info["is_code"]:
             results['data_section'].append(addr)
             missing_functions.append({'address': f'0x{addr:08X}', 'type': 'data_section', 'section': section, 'estimated_end': None})
             continue
 
         if section != '.text':
-            sec_info = next(s for s in SECTIONS if s['name'] == section)
             sec_end = sec_info['va'] + sec_info['size']
             results['library_section'].append((addr, section))
             missing_functions.append({'address': f'0x{addr:08X}', 'type': 'library_section', 'section': section, 'estimated_end': f'0x{sec_end:08X}'})
@@ -139,11 +133,12 @@ def main():
     print('UNRESOLVED SYMBOL ANALYSIS SUMMARY')
     print('================================================================================')
     total = len(unresolved)
+    denominator = total or 1
     print(f'\nTotal unresolved symbols: {total}')
     print()
 
     mid = results['mid_function']
-    print(f'(a) MID-FUNCTION ENTRIES: {len(mid)} ({100*len(mid)/total:.1f}%)')
+    print(f'(a) MID-FUNCTION ENTRIES: {len(mid)} ({100*len(mid)/denominator:.1f}%)')
     print('    These addresses fall inside a known function body.')
     print('    Likely: tail-call targets, computed jumps, or function pointer offsets.')
     if mid:
@@ -154,7 +149,7 @@ def main():
     print()
 
     cont = results['continuation']
-    print(f'(b) CONTINUATION PAST BOUNDARY: {len(cont)} ({100*len(cont)/total:.1f}%)')
+    print(f'(b) CONTINUATION PAST BOUNDARY: {len(cont)} ({100*len(cont)/denominator:.1f}%)')
     print('    Address falls exactly at a known function end.')
     print('    The function database underestimated the function size.')
     if cont:
@@ -166,7 +161,7 @@ def main():
     print()
 
     gap = results['gap']
-    print(f'(c) GAP FUNCTIONS: {len(gap)} ({100*len(gap)/total:.1f}%)')
+    print(f'(c) GAP FUNCTIONS: {len(gap)} ({100*len(gap)/denominator:.1f}%)')
     print('    Addresses fall in gaps between known functions in .text.')
     print('    These are likely real functions the disassembler missed.')
     if gap and isinstance(gap[0], tuple):
@@ -185,7 +180,7 @@ def main():
     print()
 
     lib = results['library_section']
-    print(f'(d) LIBRARY SECTION FUNCTIONS: {len(lib)} ({100*len(lib)/total:.1f}%)')
+    print(f'(d) LIBRARY SECTION FUNCTIONS: {len(lib)} ({100*len(lib)/denominator:.1f}%)')
     print('    Addresses fall in non-.text code sections (XDK libraries).')
     if lib:
         section_counts = {}
@@ -203,12 +198,12 @@ def main():
     print()
 
     data = results['data_section']
-    print(f'(e) DATA SECTION REFERENCES: {len(data)} ({100*len(data)/total:.1f}%)')
-    print('    Addresses fall in .rdata/.data - not code, likely misidentified.')
+    print(f'(e) DATA SECTION REFERENCES: {len(data)} ({100*len(data)/denominator:.1f}%)')
+    print('    Addresses fall in non-code sections, likely misidentified.')
     if data:
         print('    Examples:')
         for a in data[:10]:
-            sec = find_section(a)
+            sec = find_section(a, SECTIONS)["name"]
             print(f'      0x{a:08X}  ({sec})')
     print()
 
@@ -253,12 +248,12 @@ def main():
         print(f'  Total library section bytes (all used sections): {total_lib_bytes:,} ({total_lib_bytes/1024:.1f} KB)')
     print()
 
-    print(f'\nWriting {len(missing_functions)} entries to {OUTPUT_PATH}...')
-    with open(OUTPUT_PATH, 'w') as f:
+    print(f'\nWriting {len(missing_functions)} entries to {args.output}...')
+    with open(args.output, 'w') as f:
         json.dump(missing_functions, f, indent=2)
     print('Done.')
 
-    quick_add_path = os.path.join(SCRIPT_DIR, 'output', 'addable_functions.json')
+    quick_add_path = str(Path(args.output).with_name('addable_functions.json'))
     addable = []
     for entry in missing_functions:
         if entry['type'] in ('gap', 'continuation', 'library_section'):

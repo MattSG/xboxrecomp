@@ -1,9 +1,9 @@
 /**
  * D3D8 Resource Management - Vertex Buffers, Index Buffers, Textures
  *
- * Implements Xbox D3D8 resource creation and Lock/Unlock using D3D11.
- * Resources use system memory staging with UpdateSubresource on Unlock
- * for maximum compatibility with D3D8 Lock semantics.
+ * Implements Xbox D3D8 resource creation and Lock/Unlock on SDL_GPU.
+ * Resources keep a system-memory copy that Lock hands out; Unlock uploads it
+ * to the GPU (buffers upload lazily, at the next draw that uses them).
  */
 
 #include "d3d8_internal.h"
@@ -23,20 +23,20 @@ static UINT vol_level_depth(const struct D3D8VolumeTexture *vol, UINT level);
 static UINT vol_level_pitch(const struct D3D8VolumeTexture *vol, UINT level);
 static UINT vol_level_rows(const struct D3D8VolumeTexture *vol, UINT level);
 static UINT vol_level_offset(const struct D3D8VolumeTexture *vol, UINT level);
-static void d3d8_upload_mip_level(ID3D11Texture2D *d3d11_texture, D3DFORMAT fmt,
-                                  UINT w, UINT h, UINT subresource,
+static void d3d8_upload_mip_level(SDL_GPUTexture *gpu_texture, D3DFORMAT fmt,
+                                  UINT w, UINT h, UINT mip, UINT layer,
                                   const BYTE *src_data, UINT src_row_pitch,
                                   UINT palette);
 
 /* ================================================================
- * Format conversion: Xbox D3DFORMAT → DXGI_FORMAT
+ * Format conversion: Xbox D3DFORMAT → SDL_GPUTextureFormat
  *
  * Xbox binary format constants follow the packed XDK layout above.
- * Formats that need a different D3D11 storage (YUV, P8, AL8) are
+ * Formats that need a different GPU storage (YUV, P8, AL8) are
  * converted in software during LockRect upload.
  * ================================================================ */
 
-DXGI_FORMAT d3d8_to_dxgi_format(D3DFORMAT fmt)
+SDL_GPUTextureFormat d3d8_to_gpu_format(D3DFORMAT fmt)
 {
     switch (fmt) {
     /* 32-bit ARGB / RGB */
@@ -44,101 +44,101 @@ DXGI_FORMAT d3d8_to_dxgi_format(D3DFORMAT fmt)
     case D3DFMT_LIN_A8R8G8B8:
     case D3DFMT_B8G8R8A8:
     case D3DFMT_LIN_B8G8R8A8:
-        return DXGI_FORMAT_B8G8R8A8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
     case D3DFMT_X8R8G8B8:
     case D3DFMT_LIN_X8R8G8B8:
-        return DXGI_FORMAT_B8G8R8X8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
     case D3DFMT_R8G8B8A8:
     case D3DFMT_LIN_R8G8B8A8:
     case D3DFMT_A8B8G8R8:
     case D3DFMT_LIN_A8B8G8R8:
-        return DXGI_FORMAT_R8G8B8A8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
 
     /* Signed bump-map (SNORM) formats */
     case D3DFMT_Q8W8V8U8:
-        return DXGI_FORMAT_R8G8B8A8_SNORM;
+        return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_SNORM;
     case D3DFMT_X8L8V8U8:
-        return DXGI_FORMAT_R8G8B8A8_SNORM;
+        return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_SNORM;
     case D3DFMT_V8U8:
     case D3DFMT_LIN_V8U8:
-        return DXGI_FORMAT_R8G8_SNORM;
+        return SDL_GPU_TEXTUREFORMAT_R8G8_SNORM;
     case D3DFMT_L6V5U5:
     case D3DFMT_LIN_L6V5U5:
-        return DXGI_FORMAT_R8G8_SNORM;   /* L6V5U5 sign-extended to R8G8_SNORM at upload */
+        return SDL_GPU_TEXTUREFORMAT_R8G8_SNORM;   /* L6V5U5 sign-extended to R8G8_SNORM at upload */
     case D3DFMT_V16U16:
     case D3DFMT_LIN_V16U16:
-        return DXGI_FORMAT_R16G16_SNORM;
+        return SDL_GPU_TEXTUREFORMAT_R16G16_SNORM;
 
     /* 16-bit RGB */
     case D3DFMT_R5G6B5:
     case D3DFMT_LIN_R5G6B5:
     case D3DFMT_R6G5B5:
     case D3DFMT_LIN_R6G5B5:
-        return DXGI_FORMAT_B5G6R5_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_B5G6R5_UNORM;
     case D3DFMT_A1R5G5B5:
     case D3DFMT_X1R5G5B5:
     case D3DFMT_LIN_A1R5G5B5:
     case D3DFMT_LIN_X1R5G5B5:
-        return DXGI_FORMAT_B5G5R5A1_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_B5G5R5A1_UNORM;
     case D3DFMT_A4R4G4B4:
     case D3DFMT_LIN_A4R4G4B4:
-        return DXGI_FORMAT_B4G4R4A4_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_B4G4R4A4_UNORM;
     case D3DFMT_R5G5B5A1:       /* bit-reordered to B5G5R5A1 at upload */
     case D3DFMT_LIN_R5G5B5A1:
-        return DXGI_FORMAT_B5G5R5A1_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_B5G5R5A1_UNORM;
     case D3DFMT_R4G4B4A4:       /* bit-reordered to B4G4R4A4 at upload */
     case D3DFMT_LIN_R4G4B4A4:
-        return DXGI_FORMAT_B4G4R4A4_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_B4G4R4A4_UNORM;
 
     /* Compressed */
     case D3DFMT_DXT1:
-    case D3DFMT_CTX1:           /* no real D3D11 equiv; approximate as BC1 */
+    case D3DFMT_CTX1:           /* no real GPU equiv; approximate as BC1 */
     case D3DFMT_LIN_CTX1:
-        return DXGI_FORMAT_BC1_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM;
     case D3DFMT_DXT3:
     case D3DFMT_DXT3A:          /* explicit-alpha DXT3 variant */
     case D3DFMT_LIN_DXT3A:
-        return DXGI_FORMAT_BC2_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM;
     case D3DFMT_DXT5:
     case D3DFMT_DXT5A:          /* alpha-only DXT5 variant */
     case D3DFMT_LIN_DXT5A:
-        return DXGI_FORMAT_BC3_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM;
     case D3DFMT_DXN:            /* 2-channel normal compression */
     case D3DFMT_LIN_DXN:
-        return DXGI_FORMAT_BC5_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_BC5_RG_UNORM;
 
     /* Alpha / luminance */
     case D3DFMT_A8:
     case D3DFMT_LIN_A8:
-        return DXGI_FORMAT_A8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_A8_UNORM;
     case D3DFMT_L8:
     case D3DFMT_LIN_L8:
-        return DXGI_FORMAT_R8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_R8_UNORM;
     case D3DFMT_L16:
     case D3DFMT_LIN_L16:
-        return DXGI_FORMAT_R16_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_R16_UNORM;
     case D3DFMT_A8L8:
     case D3DFMT_LIN_A8L8:
-        return DXGI_FORMAT_R8G8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_R8G8_UNORM;
     case D3DFMT_AL8:            /* expanded to 16-bit at upload */
     case D3DFMT_LIN_AL8:
-        return DXGI_FORMAT_R8G8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_R8G8_UNORM;
 
     /* 16-bit color channel pairs */
     case D3DFMT_G8B8:
     case D3DFMT_LIN_G8B8:
     case D3DFMT_R8B8:
     case D3DFMT_LIN_R8B8:
-        return DXGI_FORMAT_R8G8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_R8G8_UNORM;
 
     /* Palette */
     case D3DFMT_P8:             /* expanded to BGRA through the palette */
-        return DXGI_FORMAT_B8G8R8A8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
 
     /* YUV (converted to BGRA at upload) */
     case D3DFMT_YUY2:
     case D3DFMT_UYVY:
-        return DXGI_FORMAT_B8G8R8A8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
 
     /* Depth/stencil */
     case D3DFMT_D24S8:
@@ -149,58 +149,58 @@ DXGI_FORMAT d3d8_to_dxgi_format(D3DFORMAT fmt)
     case D3DFMT_LIN_F24S8:
     case D3DFMT_LIN_D24X8:
     case D3DFMT_LIN_D24FS8:
-        return DXGI_FORMAT_D24_UNORM_S8_UINT;
+        return SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT;
     case D3DFMT_D16:
     case D3DFMT_LIN_D16:
-        return DXGI_FORMAT_D16_UNORM;
-    case D3DFMT_F16:            /* no float depth in D3D11; sample as R16 */
+        return SDL_GPU_TEXTUREFORMAT_D16_UNORM;
+    case D3DFMT_F16:            /* no float depth format; sample as R16 */
     case D3DFMT_LIN_F16:
-        return DXGI_FORMAT_R16_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_R16_FLOAT;
     case D3DFMT_D32:
     case D3DFMT_LIN_D32:        /* 32-bit fixed depth; approximated as float D32 */
-        return DXGI_FORMAT_D32_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
 
     /* 16/32-bit uncompressed pairs & luminance */
     case D3DFMT_G16R16:
     case D3DFMT_LIN_G16R16:
     case D3DFMT_A16L16:          /* luma+alpha -> R,G */
     case D3DFMT_LIN_A16L16:
-        return DXGI_FORMAT_R16G16_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_R16G16_UNORM;
     case D3DFMT_A16B16G16R16:   /* BGRA layout -> R16G16B16A16 (swizzled byte order at upload) */
     case D3DFMT_LIN_A16B16G16R16:
-        return DXGI_FORMAT_R16G16B16A16_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM;
     case D3DFMT_A32B32G32R32:
     case D3DFMT_LIN_A32B32G32R32:
-        return DXGI_FORMAT_R32G32B32A32_FLOAT;   /* no 128-bit UNORM in DXGI */
+        return SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT;   /* no 128-bit UNORM in DXGI */
     case D3DFMT_G32R32:
     case D3DFMT_LIN_G32R32:
-        return DXGI_FORMAT_R32G32_FLOAT;   /* no R32G32_UNORM in DXGI */
+        return SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT;   /* no R32G32_UNORM in DXGI */
     case D3DFMT_L32:
     case D3DFMT_LIN_L32:        /* 32-bit luminance */
-        return DXGI_FORMAT_R32_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_R32_FLOAT;
     case D3DFMT_A32L32:
     case D3DFMT_LIN_A32L32:
-        return DXGI_FORMAT_R32G32_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT;
 
     /* Floating-point formats */
     case D3DFMT_R16F:
     case D3DFMT_LIN_R16F:
-        return DXGI_FORMAT_R16_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_R16_FLOAT;
     case D3DFMT_R32F:
     case D3DFMT_LIN_R32F:
-        return DXGI_FORMAT_R32_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_R32_FLOAT;
     case D3DFMT_G16R16F:
     case D3DFMT_LIN_G16R16F:
-        return DXGI_FORMAT_R16G16_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
     case D3DFMT_G32R32F:
     case D3DFMT_LIN_G32R32F:
-        return DXGI_FORMAT_R32G32_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT;
     case D3DFMT_A16B16G16R16F:
     case D3DFMT_LIN_A16B16G16R16F:
-        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
     case D3DFMT_A32B32G32R32F:
     case D3DFMT_LIN_A32B32G32R32F:
-        return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT;
 
     /* 10-bit formats */
     case D3DFMT_A2R10G10B10:
@@ -211,32 +211,32 @@ DXGI_FORMAT d3d8_to_dxgi_format(D3DFORMAT fmt)
     case D3DFMT_LIN_X2R10G10B10:
     case D3DFMT_LIN_A2B10G10R10:
     case D3DFMT_LIN_A2W10V10U10:
-        return DXGI_FORMAT_R10G10B10A2_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_R10G10B10A2_UNORM;
     case D3DFMT_R11G11B10:
     case D3DFMT_LIN_R11G11B10:
-        return DXGI_FORMAT_R11G11B10_FLOAT;
+        return SDL_GPU_TEXTUREFORMAT_R11G11B10_UFLOAT;
     case D3DFMT_R10G11B11:
     case D3DFMT_LIN_R10G11B11:
-        return DXGI_FORMAT_R11G11B10_FLOAT;   /* no exact DXGI; approximate */
+        return SDL_GPU_TEXTUREFORMAT_R11G11B10_UFLOAT;   /* no exact DXGI; approximate */
 
     /* Signed bump (16/32/64-bit) */
     case D3DFMT_V32U32:
     case D3DFMT_LIN_V32U32:
-        return DXGI_FORMAT_R32G32_FLOAT;   /* 32-bit signed ints sampled as float */
+        return SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT;   /* 32-bit signed ints sampled as float */
     case D3DFMT_Q16W16V16U16:
     case D3DFMT_LIN_Q16W16V16U16:
-        return DXGI_FORMAT_R16G16B16A16_SNORM;
+        return SDL_GPU_TEXTUREFORMAT_R16G16B16A16_SNORM;
     case D3DFMT_Q32W32V32U32:
     case D3DFMT_LIN_Q32W32V32U32:
-        return DXGI_FORMAT_R32G32B32A32_SINT;   /* no 128-bit SNORM in DXGI */
+        return SDL_GPU_TEXTUREFORMAT_R32G32B32A32_INT;   /* no 128-bit SNORM in DXGI */
 
     /* Index buffers */
-    case D3DFMT_INDEX16:        return DXGI_FORMAT_R16_UINT;
-    case D3DFMT_INDEX32:        return DXGI_FORMAT_R32_UINT;
+    case D3DFMT_INDEX16:        return SDL_GPU_TEXTUREFORMAT_INVALID;
+    case D3DFMT_INDEX32:        return SDL_GPU_TEXTUREFORMAT_INVALID;
 
     default:
         fprintf(stderr, "D3D8: Unknown format 0x%X, using R8G8B8A8\n", fmt);
-        return DXGI_FORMAT_R8G8B8A8_UNORM;
+        return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
     }
 }
 
@@ -438,7 +438,7 @@ UINT d3d8_row_pitch(D3DFORMAT fmt, UINT width)
     return (width * d3d8_format_bpp(fmt)) / 8;
 }
 
-/* Bits per pixel of the data uploaded to the D3D11 texture
+/* Bits per pixel of the data uploaded to the GPU texture
  * (after any software format conversion). */
 UINT d3d8_upload_bpp(D3DFORMAT fmt)
 {
@@ -458,6 +458,8 @@ UINT d3d8_upload_bpp(D3DFORMAT fmt)
 BOOL d3d8_format_has_conversion(D3DFORMAT fmt)
 {
     switch (fmt) {
+    case D3DFMT_X8R8G8B8:
+    case D3DFMT_LIN_X8R8G8B8:
     case D3DFMT_YUY2:
     case D3DFMT_UYVY:
     case D3DFMT_P8:
@@ -493,7 +495,7 @@ BOOL d3d8_format_is_palettized(D3DFORMAT fmt)
 }
 
 /* Convert width*height texels of a linear (unswizzled) Xbox layout into
- * the layout the D3D11 texture expects. src uses d3d8_format_bpp()/8,
+ * the layout the GPU texture expects. src uses d3d8_format_bpp()/8,
  * dst uses d3d8_upload_bpp()/8 bytes per pixel. `palette` selects the
  * palette P8 indices are expanded through (the texture's stage). */
 void d3d8_convert_linear_pixels(D3DFORMAT fmt, UINT width, UINT height,
@@ -502,6 +504,22 @@ void d3d8_convert_linear_pixels(D3DFORMAT fmt, UINT width, UINT height,
     UINT x, y;
 
     switch (fmt) {
+    case D3DFMT_X8R8G8B8:
+    case D3DFMT_LIN_X8R8G8B8:
+        /* SDL_GPU has no BGRX format; keep BGRA and force opaque alpha so a
+         * shader that reads .a does not see whatever the X byte held. */
+        for (y = 0; y < height; y++) {
+            const BYTE *s = src + (size_t)y * width * 4;
+            BYTE *d = dst + (size_t)y * width * 4;
+            for (x = 0; x < width; x++) {
+                d[x * 4 + 0] = s[x * 4 + 0];
+                d[x * 4 + 1] = s[x * 4 + 1];
+                d[x * 4 + 2] = s[x * 4 + 2];
+                d[x * 4 + 3] = 0xFF;
+            }
+        }
+        break;
+
     case D3DFMT_AL8:
     case D3DFMT_LIN_AL8: {
         /* 8-bit packed: high nibble alpha, low nibble luma.
@@ -730,7 +748,7 @@ static ULONG __stdcall vb_Release(IDirect3DVertexBuffer8 *self)
     D3D8VertexBuffer *vb = vb_from_iface(self);
     LONG ref = InterlockedDecrement(&vb->ref_count);
     if (ref <= 0) {
-        if (vb->d3d11_buffer) ID3D11Buffer_Release(vb->d3d11_buffer);
+        if (vb->gpu_buffer) SDL_ReleaseGPUBuffer(d3d8_GetGpu()->device, vb->gpu_buffer);
         free(vb->sys_mem);
         free(vb);
     }
@@ -786,16 +804,7 @@ static HRESULT __stdcall vb_Unlock(IDirect3DVertexBuffer8 *self)
     if (!vb->locked) return E_FAIL;
 
     vb->locked = FALSE;
-    vb->dirty = TRUE;
-
-    /* Upload to GPU */
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    if (ctx && vb->d3d11_buffer) {
-        ID3D11DeviceContext_UpdateSubresource(ctx,
-            (ID3D11Resource *)vb->d3d11_buffer,
-            0, NULL, vb->sys_mem, vb->size, 0);
-        vb->dirty = FALSE;
-    }
+    vb->dirty = TRUE;     /* uploaded by d3d8_vb_sync at the next draw */
     return S_OK;
 }
 
@@ -822,8 +831,7 @@ static const IDirect3DVertexBuffer8Vtbl g_vb_vtbl = {
 HRESULT d3d8_CreateVertexBufferImpl(UINT Length, DWORD Usage, DWORD FVF, IDirect3DVertexBuffer8 **ppVB)
 {
     D3D8VertexBuffer *vb;
-    D3D11_BUFFER_DESC bd;
-    HRESULT hr;
+    SDL_GPUBufferCreateInfo bi;
 
     if (!ppVB) return E_INVALIDARG;
 
@@ -833,17 +841,15 @@ HRESULT d3d8_CreateVertexBufferImpl(UINT Length, DWORD Usage, DWORD FVF, IDirect
     vb->sys_mem = (BYTE *)calloc(1, Length);
     if (!vb->sys_mem) { free(vb); return E_OUTOFMEMORY; }
 
-    /* Create D3D11 buffer */
-    memset(&bd, 0, sizeof(bd));
-    bd.ByteWidth = Length;
-    bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL, &vb->d3d11_buffer);
-    if (FAILED(hr)) {
+    SDL_zero(bi);
+    bi.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
+    bi.size = Length;
+    vb->gpu_buffer = SDL_CreateGPUBuffer(d3d8_GetGpu()->device, &bi);
+    if (!vb->gpu_buffer) {
+        fprintf(stderr, "D3D8: vertex buffer create failed: %s\n", SDL_GetError());
         free(vb->sys_mem);
         free(vb);
-        return hr;
+        return E_OUTOFMEMORY;
     }
 
     vb->iface.lpVtbl = &g_vb_vtbl;
@@ -881,7 +887,7 @@ static ULONG __stdcall ib_Release(IDirect3DIndexBuffer8 *self)
     D3D8IndexBuffer *ib = ib_from_iface(self);
     LONG ref = InterlockedDecrement(&ib->ref_count);
     if (ref <= 0) {
-        if (ib->d3d11_buffer) ID3D11Buffer_Release(ib->d3d11_buffer);
+        if (ib->gpu_buffer) SDL_ReleaseGPUBuffer(d3d8_GetGpu()->device, ib->gpu_buffer);
         free(ib->sys_mem);
         free(ib);
     }
@@ -916,15 +922,7 @@ static HRESULT __stdcall ib_Unlock(IDirect3DIndexBuffer8 *self)
     D3D8IndexBuffer *ib = ib_from_iface(self);
     if (!ib->locked) return E_FAIL;
     ib->locked = FALSE;
-    ib->dirty = TRUE;
-
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    if (ctx && ib->d3d11_buffer) {
-        ID3D11DeviceContext_UpdateSubresource(ctx,
-            (ID3D11Resource *)ib->d3d11_buffer,
-            0, NULL, ib->sys_mem, ib->size, 0);
-        ib->dirty = FALSE;
-    }
+    ib->dirty = TRUE;     /* uploaded by d3d8_ib_sync at the next draw */
     return S_OK;
 }
 
@@ -943,8 +941,7 @@ static const IDirect3DIndexBuffer8Vtbl g_ib_vtbl = {
 HRESULT d3d8_CreateIndexBufferImpl(UINT Length, DWORD Usage, D3DFORMAT Format, IDirect3DIndexBuffer8 **ppIB)
 {
     D3D8IndexBuffer *ib;
-    D3D11_BUFFER_DESC bd;
-    HRESULT hr;
+    SDL_GPUBufferCreateInfo bi;
 
     if (!ppIB) return E_INVALIDARG;
 
@@ -954,13 +951,16 @@ HRESULT d3d8_CreateIndexBufferImpl(UINT Length, DWORD Usage, D3DFORMAT Format, I
     ib->sys_mem = (BYTE *)calloc(1, Length);
     if (!ib->sys_mem) { free(ib); return E_OUTOFMEMORY; }
 
-    memset(&bd, 0, sizeof(bd));
-    bd.ByteWidth = Length;
-    bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL, &ib->d3d11_buffer);
-    if (FAILED(hr)) { free(ib->sys_mem); free(ib); return hr; }
+    SDL_zero(bi);
+    bi.usage = SDL_GPU_BUFFERUSAGE_INDEX;
+    bi.size = Length;
+    ib->gpu_buffer = SDL_CreateGPUBuffer(d3d8_GetGpu()->device, &bi);
+    if (!ib->gpu_buffer) {
+        fprintf(stderr, "D3D8: index buffer create failed: %s\n", SDL_GetError());
+        free(ib->sys_mem);
+        free(ib);
+        return E_OUTOFMEMORY;
+    }
 
     ib->iface.lpVtbl = &g_ib_vtbl;
     ib->ref_count = 1;
@@ -972,6 +972,24 @@ HRESULT d3d8_CreateIndexBufferImpl(UINT Length, DWORD Usage, D3DFORMAT Format, I
     return S_OK;
 }
 
+/* Uploads the system-memory copy if Unlock marked it dirty. Called by the draw
+ * path before the buffer is bound, so a Lock/Unlock costs nothing until used. */
+void d3d8_vb_sync(IDirect3DVertexBuffer8 *iface)
+{
+    D3D8VertexBuffer *vb = (D3D8VertexBuffer *)iface;
+    if (vb && vb->dirty && vb->gpu_buffer &&
+        xgpu_upload_buffer(d3d8_GetGpu(), vb->gpu_buffer, 0, vb->sys_mem, vb->size))
+        vb->dirty = FALSE;
+}
+
+void d3d8_ib_sync(IDirect3DIndexBuffer8 *iface)
+{
+    D3D8IndexBuffer *ib = (D3D8IndexBuffer *)iface;
+    if (ib && ib->dirty && ib->gpu_buffer &&
+        xgpu_upload_buffer(d3d8_GetGpu(), ib->gpu_buffer, 0, ib->sys_mem, ib->size))
+        ib->dirty = FALSE;
+}
+
 /* ================================================================
  * Surface Implementation
  *
@@ -979,7 +997,7 @@ HRESULT d3d8_CreateIndexBufferImpl(UINT Length, DWORD Usage, D3DFORMAT Format, I
  * "Surface Implementation (offscreen render targets, texture levels)"
  * section. Surface LockRect uses a staging readback round-trip and covers
  * palette/P8, MSAA and sub-rect locks. xbox_d3d8_surface_wrap() is provided
- * for wrapping a raw D3D11 texture (e.g. a back buffer) as a surface and is
+ * for wrapping a raw GPU texture (e.g. a back buffer) as a surface and is
  * implemented on top of d3d8_surface_create() below.
  * ================================================================ */
 
@@ -1046,8 +1064,7 @@ static ULONG __stdcall tex_Release(IDirect3DTexture8 *self)
     D3D8Texture *tex = tex_from_iface(self);
     LONG ref = InterlockedDecrement(&tex->ref_count);
     if (ref <= 0) {
-        if (tex->srv) ID3D11ShaderResourceView_Release(tex->srv);
-        if (tex->d3d11_texture) ID3D11Texture2D_Release(tex->d3d11_texture);
+        xgputex_unref(d3d8_GetGpu(), tex->gpu);
         free(tex->sys_mem);
         free(tex);
     }
@@ -1109,17 +1126,8 @@ static ULONG __stdcall sf_Release(IDirect3DSurface8 *self)
     D3D8Surface *sf = sf_from_iface(self);
     LONG ref = InterlockedDecrement(&sf->ref_count);
     if (ref <= 0) {
-        if (sf->locked) {
-            if (sf->staging && d3d8_GetD3D11Context()) {
-                ID3D11DeviceContext_Unmap(d3d8_GetD3D11Context(),
-                    (ID3D11Resource *)sf->staging, 0);
-            }
-            sf->locked = FALSE;
-        }
-        if (sf->staging) ID3D11Texture2D_Release(sf->staging);
-        if (sf->rtv) ID3D11RenderTargetView_Release(sf->rtv);
-        if (sf->dsv) ID3D11DepthStencilView_Release(sf->dsv);
-        if (sf->d3d11_texture) ID3D11Texture2D_Release(sf->d3d11_texture);
+        free(sf->lock_buf);
+        xgputex_unref(d3d8_GetGpu(), sf->gpu);
         free(sf);
     }
     return (ULONG)ref;
@@ -1149,25 +1157,20 @@ static HRESULT __stdcall sf_GetDesc(IDirect3DSurface8 *self, D3DSURFACE_DESC *pD
     return S_OK;
 }
 
-/* CPU readback of a surface region. Copies the requested sub-rect of the
- * D3D11 texture into a staging texture, maps it, and returns the mapped
- * pointer. UnlockRect unmaps and writes the region back (unless the lock
- * was read-only). Supports MSAA sources via ResolveSubresource. */
+/* CPU access to a surface region: the region is read back into a host buffer
+ * that LockRect hands out, and UnlockRect writes it back unless the lock was
+ * read-only. Depth and block-compressed surfaces cannot be read this way. */
 static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD Flags)
 {
     D3D8Surface *sf = sf_from_iface(self);
-    ID3D11DeviceContext *ctx;
-    D3D11_TEXTURE2D_DESC tdesc, sdesc;
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr;
-    UINT rx, ry, rw, rh;
+    UINT rx, ry, rw, rh, row_bytes;
 
     if (!pLockedRect) return E_INVALIDARG;
     if (sf->locked) return E_FAIL;
 
     /* P8 surfaces: the palette indices live in the parent texture's
-     * sys_mem, not in the D3D11 texture. Expose them directly (
-     * only the full level is addressable this way). */
+     * sys_mem, not in the GPU texture. Expose them directly (only the full
+     * level is addressable this way). */
     if (sf->palettized) {
         if (pRect &&
             (pRect->left != 0 || pRect->top != 0 ||
@@ -1182,7 +1185,8 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pL
         return S_OK;
     }
 
-    if (!sf->d3d11_texture) return E_FAIL;
+    if (!sf->gpu) return E_FAIL;
+    if (sf->is_depth || d3d8_format_is_compressed(sf->format)) return E_NOTIMPL;
 
     /* The lock rectangle defaults to the whole surface. */
     if (pRect) {
@@ -1197,60 +1201,25 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pL
     if (rx + rw > sf->width || ry + rh > sf->height) return E_INVALIDARG;
     if (!rw || !rh) return E_INVALIDARG;
 
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx) return E_FAIL;
-
-    ID3D11Texture2D_GetDesc(sf->d3d11_texture, &tdesc);
-
-    if (tdesc.SampleDesc.Count > 1) {
-        /* MSAA sub-rects cannot be resolved individually; ignore the
-         * sub-rect and expose the whole (resolved) surface. */
-        rx = 0; ry = 0;
-        rw = sf->width; rh = sf->height;
-    }
-
-    memset(&sdesc, 0, sizeof(sdesc));
-    sdesc.Width = rw;
-    sdesc.Height = rh;
-    sdesc.MipLevels = 1;
-    sdesc.ArraySize = 1;
-    sdesc.Format = tdesc.Format;
-    sdesc.SampleDesc.Count = 1;   /* staging is never multisampled */
-    sdesc.Usage = D3D11_USAGE_STAGING;
-    sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
-
-    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &sdesc, NULL, &sf->staging);
-    if (FAILED(hr)) return hr;
-
-    if (tdesc.SampleDesc.Count > 1) {
-        /* MSAA: resolve into the staging copy (full surface). */
-        ID3D11DeviceContext_ResolveSubresource(ctx,
-            (ID3D11Resource *)sf->staging, 0,
-            (ID3D11Resource *)sf->d3d11_texture, sf->subresource, tdesc.Format);
-    } else {
-        D3D11_BOX box;
-        box.left = rx; box.top = ry; box.front = 0;
-        box.right = rx + rw; box.bottom = ry + rh; box.back = 1;
-        ID3D11DeviceContext_CopySubresourceRegion(ctx,
-            (ID3D11Resource *)sf->staging, 0, 0, 0, 0,
-            (ID3D11Resource *)sf->d3d11_texture, sf->subresource, &box);
-    }
-
-    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)sf->staging, 0,
-             (Flags & D3DLOCK_READONLY) ? D3D11_MAP_READ : D3D11_MAP_READ_WRITE,
-             0, &mapped);
-    if (FAILED(hr)) {
-        ID3D11Texture2D_Release(sf->staging);
-        sf->staging = NULL;
-        return hr;
+    row_bytes = rw * (d3d8_upload_bpp(sf->format) / 8);
+    sf->lock_buf = (BYTE *)malloc((size_t)row_bytes * rh);
+    if (!sf->lock_buf) return E_OUTOFMEMORY;
+    memset(sf->lock_buf, 0, (size_t)row_bytes * rh);
+    if (!xgpu_download_texture(d3d8_GetGpu(), sf->gpu->tex, sf->mip, sf->layer,
+                               rx, ry, rw, rh, sf->lock_buf, row_bytes)) {
+        free(sf->lock_buf);
+        sf->lock_buf = NULL;
+        return E_FAIL;
     }
 
     sf->locked = TRUE;
     sf->lock_readonly = (Flags & D3DLOCK_READONLY) != 0;
     sf->lock_x = rx;
     sf->lock_y = ry;
-    sf->locked_pitch = (INT)mapped.RowPitch;
-    sf->locked_bits = (BYTE *)mapped.pData;
+    sf->lock_w = rw;
+    sf->lock_h = rh;
+    sf->locked_pitch = (INT)row_bytes;
+    sf->locked_bits = sf->lock_buf;
 
     pLockedRect->Pitch = sf->locked_pitch;
     pLockedRect->pBits = sf->locked_bits;
@@ -1260,51 +1229,27 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pL
 static HRESULT __stdcall sf_UnlockRect(IDirect3DSurface8 *self)
 {
     D3D8Surface *sf = sf_from_iface(self);
-    ID3D11DeviceContext *ctx;
 
     if (!sf->locked) return E_FAIL;
 
     /* P8 surface: re-upload the raw indices through the surface's palette. */
     if (sf->palettized) {
-        if (!sf->lock_readonly && sf->d3d11_texture && sf->palette_sys) {
-            D3D11_TEXTURE2D_DESC td;
-            ID3D11Texture2D_GetDesc(sf->d3d11_texture, &td);
-            d3d8_upload_mip_level(sf->d3d11_texture, sf->format,
-                sf->width, sf->height, sf->subresource,
+        if (!sf->lock_readonly && sf->gpu && sf->palette_sys) {
+            d3d8_upload_mip_level(sf->gpu->tex, sf->format,
+                sf->width, sf->height, sf->mip, sf->layer,
                 sf->palette_sys, sf->palette_pitch, sf->palette_index);
         }
         sf->locked = FALSE;
         return S_OK;
     }
 
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx) { sf->locked = FALSE; return E_FAIL; }
-
-    if (sf->staging) {
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)sf->staging, 0);
-
-        /* Write the (possibly modified) locked region back to the GPU
-         * texture unless the lock was read-only. */
-        if (!sf->lock_readonly && sf->d3d11_texture) {
-            D3D11_TEXTURE2D_DESC tdesc;
-            ID3D11Texture2D_GetDesc(sf->d3d11_texture, &tdesc);
-            if (tdesc.SampleDesc.Count > 1) {
-                /* MSAA: resolve the staging copy back into the RT. */
-                DXGI_FORMAT fmt = tdesc.Format;
-                ID3D11DeviceContext_ResolveSubresource(ctx,
-                    (ID3D11Resource *)sf->d3d11_texture, sf->subresource,
-                    (ID3D11Resource *)sf->staging, 0, fmt);
-            } else {
-                /* Copy the whole staging texture back at the lock origin
-                 * (a NULL src box means "entire resource"). */
-                ID3D11DeviceContext_CopySubresourceRegion(ctx,
-                    (ID3D11Resource *)sf->d3d11_texture, sf->subresource,
-                    sf->lock_x, sf->lock_y, 0,
-                    (ID3D11Resource *)sf->staging, 0, NULL);
-            }
-        }
-        ID3D11Texture2D_Release(sf->staging);
-        sf->staging = NULL;
+    if (sf->lock_buf) {
+        if (!sf->lock_readonly && sf->gpu)
+            xgpu_upload_texture(d3d8_GetGpu(), sf->gpu->tex, sf->mip, sf->layer,
+                                sf->lock_x, sf->lock_y, 0, sf->lock_w, sf->lock_h, 1,
+                                sf->lock_buf, (UINT)sf->locked_pitch, sf->lock_h);
+        free(sf->lock_buf);
+        sf->lock_buf = NULL;
     }
 
     sf->locked = FALSE;
@@ -1317,10 +1262,9 @@ static const IDirect3DSurface8Vtbl g_sf_vtbl = {
     sf_GetDevice, sf_GetDesc, sf_LockRect, sf_UnlockRect,
 };
 
-/* Create a surface wrapping an existing D3D11 texture (a texture mip level,
- * cube face, or a dedicated offscreen render target). Adds a render target
- * view or depth stencil view when the caller requests it. */
-IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
+/* Create a surface wrapping a GPU texture (a texture mip level, cube face, or
+ * a dedicated offscreen render target). The surface holds a reference. */
+IDirect3DSurface8 *d3d8_surface_create(XGpuTex *texture,
                                        UINT mip_slice,
                                        UINT array_slice,
                                        UINT width, UINT height,
@@ -1331,10 +1275,6 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
                                        UINT palette_index)
 {
     D3D8Surface *sf;
-    DXGI_FORMAT dxgi;
-    D3D11_TEXTURE2D_DESC td;
-    BOOL is_depth;
-    BOOL is_array;
 
     if (!texture) return NULL;
 
@@ -1343,63 +1283,20 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
 
     sf->iface.lpVtbl = &g_sf_vtbl;
     sf->ref_count = 1;
-    sf->d3d11_texture = texture;
-    ID3D11Texture2D_AddRef(texture);
+    sf->gpu = xgputex_ref(texture);
     sf->width = width;
     sf->height = height;
     sf->format = fmt;
     sf->pool = pool;
     sf->usage = usage;
-
-    ID3D11Texture2D_GetDesc(texture, &td);
-    is_array = (td.ArraySize > 1);
-    sf->subresource = array_slice * td.MipLevels + mip_slice;
-    sf->sample_count = td.SampleDesc.Count ? td.SampleDesc.Count : 1;
+    sf->mip = mip_slice;
+    sf->layer = array_slice;
+    sf->sample_count = 1;              /* multisampling is not implemented */
     sf->multsample_type = multsample_type;
-
-    dxgi = d3d8_to_dxgi_format(fmt);
-    is_depth = d3d8_format_is_depth(fmt);
-
-    if (is_depth) {
-        /* F16 has no D3D11 depth equivalent; skip the DSV. */
-        if (dxgi == DXGI_FORMAT_D16_UNORM ||
-            dxgi == DXGI_FORMAT_D24_UNORM_S8_UINT) {
-            D3D11_DEPTH_STENCIL_VIEW_DESC dsvd;
-            memset(&dsvd, 0, sizeof(dsvd));
-            dsvd.Format = dxgi;
-            dsvd.ViewDimension = is_array
-                ? D3D11_DSV_DIMENSION_TEXTURE2DARRAY
-                : D3D11_DSV_DIMENSION_TEXTURE2D;
-            if (is_array) {
-                dsvd.Texture2DArray.MipSlice = mip_slice;
-                dsvd.Texture2DArray.FirstArraySlice = array_slice;
-                dsvd.Texture2DArray.ArraySize = 1;
-            } else {
-                dsvd.Texture2D.MipSlice = mip_slice;
-            }
-            ID3D11Device_CreateDepthStencilView(d3d8_GetD3D11Device(),
-                (ID3D11Resource *)texture, &dsvd, &sf->dsv);
-        }
-    } else if (usage & D3DUSAGE_RENDERTARGET) {
-        D3D11_RENDER_TARGET_VIEW_DESC rtvd;
-        memset(&rtvd, 0, sizeof(rtvd));
-        rtvd.Format = dxgi;
-        rtvd.ViewDimension = is_array
-            ? D3D11_RTV_DIMENSION_TEXTURE2DARRAY
-            : D3D11_RTV_DIMENSION_TEXTURE2D;
-        if (is_array) {
-            rtvd.Texture2DArray.MipSlice = mip_slice;
-            rtvd.Texture2DArray.FirstArraySlice = array_slice;
-            rtvd.Texture2DArray.ArraySize = 1;
-        } else {
-            rtvd.Texture2D.MipSlice = mip_slice;
-        }
-        ID3D11Device_CreateRenderTargetView(d3d8_GetD3D11Device(),
-            (ID3D11Resource *)texture, &rtvd, &sf->rtv);
-    }
+    sf->is_depth = d3d8_format_is_depth(fmt);
 
     /* P8 surfaces expose the raw palette indices through LockRect. The
-     * index data is not in the D3D11 texture (it was palette-expanded to
+     * index data is not in the GPU texture (it was palette-expanded to
      * BGRA at upload), so attach a pointer to the parent's raw sys_mem
      * region. Only the texture/cube/volume creators pass raw_level_data. */
     if (d3d8_format_is_palettized(fmt) && raw_level_data) {
@@ -1412,10 +1309,9 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
     return &sf->iface;
 }
 
-/* Wrap a raw D3D11 texture (e.g. a back buffer) as a surface. Borrowed from
- * upstream's "ponytail" fix so a surface can alias a GPU texture that is not
- * owned by a D3D8Texture. The surface adds a reference to the D3D11 texture. */
-IDirect3DSurface8 *xbox_d3d8_surface_wrap(ID3D11Texture2D *tex, UINT w, UINT h,
+/* Wrap a GPU texture that is not owned by a D3D8Texture (a back buffer, say)
+ * as a surface. */
+IDirect3DSurface8 *xbox_d3d8_surface_wrap(XGpuTex *tex, UINT w, UINT h,
                                           D3DFORMAT fmt)
 {
     return d3d8_surface_create(tex, 0, 0, w, h, fmt,
@@ -1428,7 +1324,7 @@ static HRESULT __stdcall tex_GetSurfaceLevel(IDirect3DTexture8 *self, UINT Level
     D3D8Texture *tex = tex_from_iface(self);
     if (!ppSurface || Level >= tex->levels) return E_INVALIDARG;
 
-    *ppSurface = d3d8_surface_create(tex->d3d11_texture, Level, 0,
+    *ppSurface = d3d8_surface_create(tex->gpu, Level, 0,
                                      tex_level_width(tex, Level),
                                      tex_level_height(tex, Level),
                                      tex->d3d8_format,
@@ -1456,23 +1352,23 @@ static HRESULT __stdcall tex_LockRect(IDirect3DTexture8 *self, UINT Level, D3DLO
 }
 
 /* Upload one 2D mip level (or a single cube face level) into the given
- * D3D11 texture subresource: unswizzle (swizzled formats), convert to the
- * D3D11 layout (YUV/P8/AL8/reordered 16-bit), then UpdateSubresource.
- * Shared by 2D textures, cube faces and volume slices. */
-static void d3d8_upload_mip_level(ID3D11Texture2D *d3d11_texture, D3DFORMAT fmt,
-                                  UINT w, UINT h, UINT subresource,
+ * texture: unswizzle (swizzled formats), convert to the layout the GPU format
+ * expects (YUV/P8/AL8/reordered 16-bit), then copy it up. Shared by 2D
+ * textures, cube faces and volume slices. */
+static void d3d8_upload_mip_level(SDL_GPUTexture *gpu_texture, D3DFORMAT fmt,
+                                  UINT w, UINT h, UINT mip, UINT layer,
                                   const BYTE *src_data, UINT src_row_pitch,
                                   UINT palette)
 {
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     UINT bpp = d3d8_format_bpp(fmt) / 8;
     UINT rows = d3d8_format_is_compressed(fmt) ? (h + 3) / 4 : h;
     BYTE *linear = NULL;
     BYTE *converted = NULL;
     const BYTE *upload_data = src_data;
     UINT upload_pitch = src_row_pitch;
+    UINT uw = w, uh = h;
 
-    if (!ctx || !d3d11_texture) return;
+    if (!gpu_texture) return;
 
     /* Step 1: unswizzle swizzled formats into linear storage. */
     if (!d3d8_format_is_compressed(fmt) && d3d8_format_is_swizzled(fmt)) {
@@ -1484,7 +1380,7 @@ static void d3d8_upload_mip_level(ID3D11Texture2D *d3d11_texture, D3DFORMAT fmt,
         }
     }
 
-    /* Step 2: convert formats whose D3D11 layout differs. */
+    /* Step 2: convert formats whose GPU layout differs. */
     if (d3d8_format_has_conversion(fmt)) {
         UINT ubpp = d3d8_upload_bpp(fmt) / 8;
         converted = (BYTE *)malloc((size_t)w * h * ubpp);
@@ -1497,8 +1393,14 @@ static void d3d8_upload_mip_level(ID3D11Texture2D *d3d11_texture, D3DFORMAT fmt,
         }
     }
 
-    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)d3d11_texture,
-        subresource, NULL, upload_data, upload_pitch, upload_pitch * rows);
+    /* Block-compressed copies must cover whole 4x4 blocks, which matters for
+     * the 2x2 and 1x1 tail of a mip chain. */
+    if (d3d8_format_is_compressed(fmt)) {
+        uw = (w + 3) & ~3u;
+        uh = (h + 3) & ~3u;
+    }
+    xgpu_upload_texture(d3d8_GetGpu(), gpu_texture, mip, layer, 0, 0, 0,
+                        uw, uh, 1, upload_data, upload_pitch, rows);
 
     if (linear) free(linear);
     if (converted) free(converted);
@@ -1512,9 +1414,9 @@ static HRESULT __stdcall tex_UnlockRect(IDirect3DTexture8 *self, UINT Level)
     tex->locked = FALSE;
     tex->dirty = FALSE;
 
-    d3d8_upload_mip_level(tex->d3d11_texture, tex->d3d8_format,
+    d3d8_upload_mip_level(tex->gpu ? tex->gpu->tex : NULL, tex->d3d8_format,
                           tex_level_width(tex, Level),
-                          tex_level_height(tex, Level), Level,
+                          tex_level_height(tex, Level), Level, 0,
                           tex->sys_mem + tex_level_offset(tex, Level),
                           tex_level_pitch(tex, Level), tex->palette);
     return S_OK;
@@ -1530,11 +1432,8 @@ static const IDirect3DTexture8Vtbl g_tex_vtbl = {
 HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DTexture8 **ppTex)
 {
     D3D8Texture *tex;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
-    HRESULT hr;
+    SDL_GPUTextureUsageFlags uflags = SDL_GPU_TEXTUREUSAGE_SAMPLER;
     UINT max_dim;
-    BOOL want_srv;
 
     if (!ppTex || !Width || !Height) return E_INVALIDARG;
 
@@ -1542,7 +1441,7 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
     if (!tex) return E_OUTOFMEMORY;
 
     tex->d3d8_format = Format;
-    tex->dxgi_format = d3d8_to_dxgi_format(Format);
+    tex->gpu_format = d3d8_to_gpu_format(Format);
     tex->width = Width;
     tex->height = Height;
     tex->usage = Usage;
@@ -1561,45 +1460,22 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
     tex->sys_mem = (BYTE *)calloc(1, tex_total_size(tex));
     if (!tex->sys_mem) { free(tex); return E_OUTOFMEMORY; }
 
-    /* Create D3D11 texture */
-    memset(&td, 0, sizeof(td));
-    td.Width = Width;
-    td.Height = Height;
-    td.MipLevels = tex->levels;
-    td.ArraySize = 1;
-    td.Format = tex->dxgi_format;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    if (Usage & D3DUSAGE_RENDERTARGET)     td.BindFlags |= D3D11_BIND_RENDER_TARGET;
-    if (Usage & D3DUSAGE_DEPTHSTENCIL)     td.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
-
-    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex->d3d11_texture);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateTexture2D failed: 0x%08lX (fmt=%d %ux%u)\n", hr, Format, Width, Height);
+    if (tex->gpu_format == SDL_GPU_TEXTUREFORMAT_INVALID) {
         free(tex->sys_mem);
         free(tex);
-        return hr;
+        return E_INVALIDARG;
     }
-
-    /* Depth textures are not sampled directly in D3D11. */
-    want_srv = !d3d8_format_is_depth(Format);
-
-    /* Create shader resource view */
-    if (want_srv) {
-        memset(&srvd, 0, sizeof(srvd));
-        srvd.Format = tex->dxgi_format;
-        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvd.Texture2D.MipLevels = tex->levels;
-
-        hr = ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
-            (ID3D11Resource *)tex->d3d11_texture, &srvd, &tex->srv);
-        if (FAILED(hr)) {
-            ID3D11Texture2D_Release(tex->d3d11_texture);
-            free(tex->sys_mem);
-            free(tex);
-            return hr;
-        }
+    if (Usage & D3DUSAGE_RENDERTARGET)
+        uflags |= SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+    if ((Usage & D3DUSAGE_DEPTHSTENCIL) || d3d8_format_is_depth(Format))
+        uflags |= SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+    tex->gpu = xgputex_create(d3d8_GetGpu(), SDL_GPU_TEXTURETYPE_2D, tex->gpu_format,
+                              Width, Height, 1, tex->levels, uflags);
+    if (!tex->gpu) {
+        fprintf(stderr, "D3D8: CreateTexture failed (fmt=%d %ux%u)\n", Format, Width, Height);
+        free(tex->sys_mem);
+        free(tex);
+        return E_OUTOFMEMORY;
     }
 
     tex->iface.lpVtbl = &g_tex_vtbl;
@@ -1623,19 +1499,20 @@ static void d3d8_check_overlay(void)
     static BOOL checked = FALSE;
     if (checked) return;
     checked = TRUE;
-    if (offsetof(D3D8CubeTexture, srv)   != offsetof(D3D8Texture, srv)   ||
-        offsetof(D3D8VolumeTexture, srv) != offsetof(D3D8Texture, srv)   ||
+    if (offsetof(D3D8CubeTexture, gpu)   != offsetof(D3D8Texture, gpu)   ||
+        offsetof(D3D8VolumeTexture, gpu) != offsetof(D3D8Texture, gpu)   ||
         offsetof(D3D8CubeTexture, width) != offsetof(D3D8Texture, width) ||
         offsetof(D3D8VolumeTexture, levels) != offsetof(D3D8Texture, levels))
         fprintf(stderr, "D3D8: internal base-texture layout mismatch\n");
 }
 
-ID3D11ShaderResourceView *d3d8_base_srv(IDirect3DBaseTexture8 *texture)
+SDL_GPUTexture *d3d8_base_gpu_texture(IDirect3DBaseTexture8 *texture)
 {
+    XGpuTex *t;
     if (!texture) return NULL;
     d3d8_check_overlay();
-    return *(ID3D11ShaderResourceView **)((BYTE *)texture +
-        offsetof(D3D8Texture, srv));
+    t = *(XGpuTex **)((BYTE *)texture + offsetof(D3D8Texture, gpu));
+    return t ? t->tex : NULL;
 }
 
 /* Look up the palette index a base texture bakes. All wrapper types keep
@@ -1662,13 +1539,14 @@ void d3d8_base_set_palette(IDirect3DBaseTexture8 *texture, UINT palette)
     *(UINT *)((BYTE *)texture + offsetof(D3D8Texture, palette)) = palette;
 }
 
+static void upload_volume_level(D3D8VolumeTexture *vol, UINT Level);
+
 /* Re-upload every level of a P8 (palettized) texture through the current
  * stage palette. Used to re-bake after dev_SetPalette. Non-P8 textures
  * are untouched. */
 void d3d8_refresh_palette(IDirect3DBaseTexture8 *texture)
 {
     D3DRESOURCETYPE type;
-    UINT palette;
 
     if (!texture) return;
     type = IDirect3DBaseTexture8_GetType(texture);
@@ -1676,14 +1554,13 @@ void d3d8_refresh_palette(IDirect3DBaseTexture8 *texture)
     if (type == D3DRTYPE_CUBETEXTURE) {
         D3D8CubeTexture *cube = (D3D8CubeTexture *)texture;
         if (!d3d8_format_is_palettized(cube->d3d8_format)) return;
-        palette = cube->palette;
         for (UINT face = 0; face < 6; face++) {
             for (UINT lvl = 0; lvl < cube->levels; lvl++) {
                 UINT w = cube_level_width(cube, lvl);
-                d3d8_upload_mip_level(cube->d3d11_texture, cube->d3d8_format,
-                    w, w, face * cube->levels + lvl,
+                d3d8_upload_mip_level(cube->gpu ? cube->gpu->tex : NULL, cube->d3d8_format,
+                    w, w, lvl, face,
                     cube_level_ptr(cube, face, lvl),
-                    d3d8_row_pitch(cube->d3d8_format, w), palette);
+                    d3d8_row_pitch(cube->d3d8_format, w), cube->palette);
             }
         }
         return;
@@ -1691,56 +1568,9 @@ void d3d8_refresh_palette(IDirect3DBaseTexture8 *texture)
 
     if (type == D3DRTYPE_VOLUMETEXTURE) {
         D3D8VolumeTexture *vol = (D3D8VolumeTexture *)texture;
-        ID3D11DeviceContext *ctx;
         if (!d3d8_format_is_palettized(vol->d3d8_format)) return;
-        ctx = d3d8_GetD3D11Context();
-        if (!ctx) return;
-        palette = vol->palette;
-        for (UINT lvl = 0; lvl < vol->levels; lvl++) {
-            UINT w = vol_level_width(vol, lvl);
-            UINT h = vol_level_height(vol, lvl);
-            UINT d = vol_level_depth(vol, lvl);
-            UINT bpp = d3d8_format_bpp(vol->d3d8_format) / 8;
-            UINT rows = vol_level_rows(vol, lvl);
-            BYTE *src = vol->sys_mem + vol_level_offset(vol, lvl);
-            BYTE *linear = NULL, *converted = NULL;
-            const BYTE *upload_data = src;
-            UINT up = vol_level_pitch(vol, lvl);
-            UINT ud = up * rows;
-
-            if (d3d8_format_is_swizzled(vol->d3d8_format)) {
-                linear = (BYTE *)malloc((size_t)w * h * d * bpp);
-                if (linear) {
-                    xbox_unswizzle_box(linear, src, w, h, d, bpp);
-                    upload_data = linear;
-                    up = w * bpp;
-                    ud = up * h;
-                }
-            }
-            {
-                UINT ubpp = d3d8_upload_bpp(vol->d3d8_format) / 8;
-                UINT z;
-                converted = (BYTE *)malloc((size_t)w * h * d * ubpp);
-                if (converted) {
-                    UINT slice_bytes = (size_t)w * h * bpp;
-                    UINT usize = (size_t)w * h * ubpp;
-                    for (z = 0; z < d; z++) {
-                        d3d8_convert_linear_pixels(vol->d3d8_format, w, h,
-                            upload_data + (size_t)z * slice_bytes,
-                            converted + (size_t)z * usize, palette);
-                    }
-                    if (linear) { free(linear); linear = NULL; }
-                    upload_data = converted;
-                    up = w * ubpp;
-                    ud = up * h;
-                }
-            }
-            ID3D11DeviceContext_UpdateSubresource(ctx,
-                (ID3D11Resource *)vol->d3d11_texture, lvl, NULL,
-                upload_data, up, ud);
-            if (linear) free(linear);
-            if (converted) free(converted);
-        }
+        for (UINT lvl = 0; lvl < vol->levels; lvl++)
+            upload_volume_level(vol, lvl);
         return;
     }
 
@@ -1748,12 +1578,11 @@ void d3d8_refresh_palette(IDirect3DBaseTexture8 *texture)
     {
         D3D8Texture *tex = (D3D8Texture *)texture;
         if (!d3d8_format_is_palettized(tex->d3d8_format)) return;
-        palette = tex->palette;
         for (UINT lvl = 0; lvl < tex->levels; lvl++) {
-            d3d8_upload_mip_level(tex->d3d11_texture, tex->d3d8_format,
-                tex_level_width(tex, lvl), tex_level_height(tex, lvl), lvl,
+            d3d8_upload_mip_level(tex->gpu ? tex->gpu->tex : NULL, tex->d3d8_format,
+                tex_level_width(tex, lvl), tex_level_height(tex, lvl), lvl, 0,
                 tex->sys_mem + tex_level_offset(tex, lvl),
-                tex_level_pitch(tex, lvl), palette);
+                tex_level_pitch(tex, lvl), tex->palette);
         }
     }
 }
@@ -1805,8 +1634,7 @@ static ULONG __stdcall cube_Release(IDirect3DCubeTexture8 *self)
     D3D8CubeTexture *cube = cube_from_iface(self);
     LONG ref = InterlockedDecrement(&cube->ref_count);
     if (ref <= 0) {
-        if (cube->srv) ID3D11ShaderResourceView_Release(cube->srv);
-        if (cube->d3d11_texture) ID3D11Texture2D_Release(cube->d3d11_texture);
+        xgputex_unref(d3d8_GetGpu(), cube->gpu);
         free(cube->sys_mem);
         free(cube);
     }
@@ -1855,7 +1683,7 @@ static HRESULT __stdcall cube_GetCubeMapSurface(IDirect3DCubeTexture8 *self, D3D
     if (!ppSurface || face >= 6 || Level >= cube->levels) return E_INVALIDARG;
 
     w = h = cube_level_width(cube, Level);
-    *ppSurface = d3d8_surface_create(cube->d3d11_texture, Level, face, w, h,
+    *ppSurface = d3d8_surface_create(cube->gpu, Level, face, w, h,
                                      cube->d3d8_format, D3DPOOL_DEFAULT,
                                      cube->usage,                                      D3DMULTISAMPLE_NONE,
                                      d3d8_format_is_palettized(cube->d3d8_format)
@@ -1892,8 +1720,8 @@ static HRESULT __stdcall cube_UnlockRect(IDirect3DCubeTexture8 *self, D3DCUBEMAP
     if (face >= 6 || Level >= cube->levels || !cube->locked) return E_FAIL;
 
     w = cube_level_width(cube, Level);
-    d3d8_upload_mip_level(cube->d3d11_texture, cube->d3d8_format, w, w,
-        face * cube->levels + Level, cube_level_ptr(cube, face, Level),
+    d3d8_upload_mip_level(cube->gpu ? cube->gpu->tex : NULL, cube->d3d8_format, w, w,
+        Level, face, cube_level_ptr(cube, face, Level),
         d3d8_row_pitch(cube->d3d8_format, w), cube->palette);
 
     cube->locked = FALSE;
@@ -1911,9 +1739,7 @@ static const IDirect3DCubeTexture8Vtbl g_cube_vtbl = {
 HRESULT d3d8_CreateCubeTextureImpl(UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DCubeTexture8 **ppTex)
 {
     D3D8CubeTexture *cube;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
-    HRESULT hr;
+    SDL_GPUTextureUsageFlags uflags = SDL_GPU_TEXTUREUSAGE_SAMPLER;
     UINT max_dim;
     UINT face_size;
 
@@ -1923,7 +1749,7 @@ HRESULT d3d8_CreateCubeTextureImpl(UINT EdgeLength, UINT Levels, DWORD Usage, D3
     if (!cube) return E_OUTOFMEMORY;
 
     cube->d3d8_format = Format;
-    cube->dxgi_format = d3d8_to_dxgi_format(Format);
+    cube->gpu_format = d3d8_to_gpu_format(Format);
     cube->width = EdgeLength;
     cube->height = EdgeLength;
     cube->usage = Usage;
@@ -1941,39 +1767,20 @@ HRESULT d3d8_CreateCubeTextureImpl(UINT EdgeLength, UINT Levels, DWORD Usage, D3
     cube->sys_mem = (BYTE *)calloc(1, (size_t)6 * face_size);
     if (!cube->sys_mem) { free(cube); return E_OUTOFMEMORY; }
 
-    memset(&td, 0, sizeof(td));
-    td.Width = EdgeLength;
-    td.Height = EdgeLength;
-    td.MipLevels = cube->levels;
-    td.ArraySize = 6;
-    td.Format = cube->dxgi_format;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    if (Usage & D3DUSAGE_RENDERTARGET) td.BindFlags |= D3D11_BIND_RENDER_TARGET;
-    td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
-
-    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &cube->d3d11_texture);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateCubeTexture2D failed: 0x%08lX (fmt=%d edge=%u)\n", hr, Format, EdgeLength);
+    if (cube->gpu_format == SDL_GPU_TEXTUREFORMAT_INVALID) {
         free(cube->sys_mem);
         free(cube);
-        return hr;
+        return E_INVALIDARG;
     }
-
-    if (!d3d8_format_is_depth(Format) && cube->dxgi_format != DXGI_FORMAT_UNKNOWN) {
-        memset(&srvd, 0, sizeof(srvd));
-        srvd.Format = cube->dxgi_format;
-        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
-        srvd.TextureCube.MipLevels = cube->levels;
-        hr = ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
-            (ID3D11Resource *)cube->d3d11_texture, &srvd, &cube->srv);
-        if (FAILED(hr)) {
-            ID3D11Texture2D_Release(cube->d3d11_texture);
-            free(cube->sys_mem);
-            free(cube);
-            return hr;
-        }
+    if (Usage & D3DUSAGE_RENDERTARGET)
+        uflags |= SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+    cube->gpu = xgputex_create(d3d8_GetGpu(), SDL_GPU_TEXTURETYPE_CUBE, cube->gpu_format,
+                               EdgeLength, EdgeLength, 6, cube->levels, uflags);
+    if (!cube->gpu) {
+        fprintf(stderr, "D3D8: CreateCubeTexture failed (fmt=%d edge=%u)\n", Format, EdgeLength);
+        free(cube->sys_mem);
+        free(cube);
+        return E_OUTOFMEMORY;
     }
 
     d3d8_check_overlay();
@@ -2067,8 +1874,7 @@ static ULONG __stdcall voltex_Release(IDirect3DVolumeTexture8 *self)
     D3D8VolumeTexture *vol = (D3D8VolumeTexture *)self;
     LONG ref = InterlockedDecrement(&vol->ref_count);
     if (ref <= 0) {
-        if (vol->srv) ID3D11ShaderResourceView_Release(vol->srv);
-        if (vol->d3d11_texture) ID3D11Texture3D_Release(vol->d3d11_texture);
+        xgputex_unref(d3d8_GetGpu(), vol->gpu);
         free(vol->sys_mem);
         free(vol);
     }
@@ -2120,20 +1926,16 @@ static HRESULT __stdcall voltex_LockBox(IDirect3DVolumeTexture8 *self, UINT Leve
     return S_OK;
 }
 
-static HRESULT __stdcall voltex_UnlockBox(IDirect3DVolumeTexture8 *self, UINT Level)
+/* Uploads one level: unswizzle the whole slab into z-slice-major order, convert
+ * per slice for formats whose GPU layout differs, then copy it up. */
+static void upload_volume_level(D3D8VolumeTexture *vol, UINT Level)
 {
-    D3D8VolumeTexture *vol = (D3D8VolumeTexture *)self;
-    ID3D11DeviceContext *ctx;
     UINT w, h, d, bpp, rows;
     BYTE *src, *linear = NULL, *converted = NULL;
     const BYTE *upload_data;
-    UINT upload_pitch, upload_depth;
-    UINT slice_bytes, usize;
+    UINT upload_pitch, upload_rows;
 
-    if (Level >= vol->levels || !vol->locked) return E_FAIL;
-
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx || !vol->d3d11_texture) { vol->locked = FALSE; return E_FAIL; }
+    if (!vol->gpu) return;
 
     w = vol_level_width(vol, Level);
     h = vol_level_height(vol, Level);
@@ -2143,9 +1945,8 @@ static HRESULT __stdcall voltex_UnlockBox(IDirect3DVolumeTexture8 *self, UINT Le
     src = vol->sys_mem + vol_level_offset(vol, Level);
     upload_data = src;
     upload_pitch = vol_level_pitch(vol, Level);
-    upload_depth = upload_pitch * rows;
+    upload_rows = rows;
 
-    /* Step 1: unswizzle the whole slab into z-slice-major order. */
     if (!d3d8_format_is_compressed(vol->d3d8_format) &&
         d3d8_format_is_swizzled(vol->d3d8_format)) {
         linear = (BYTE *)malloc((size_t)w * h * d * bpp);
@@ -2153,18 +1954,17 @@ static HRESULT __stdcall voltex_UnlockBox(IDirect3DVolumeTexture8 *self, UINT Le
             xbox_unswizzle_box(linear, src, w, h, d, bpp);
             upload_data = linear;
             upload_pitch = w * bpp;
-            upload_depth = upload_pitch * h;
+            upload_rows = h;
         }
     }
 
-    /* Step 2: convert per slice for formats whose D3D11 layout differs. */
     if (d3d8_format_has_conversion(vol->d3d8_format)) {
         UINT ubpp = d3d8_upload_bpp(vol->d3d8_format) / 8;
         UINT z;
+        size_t slice_bytes = (size_t)w * h * bpp;
+        size_t usize = (size_t)w * h * ubpp;
         converted = (BYTE *)malloc((size_t)w * h * d * ubpp);
         if (converted) {
-            slice_bytes = (size_t)w * h * bpp;
-            usize = (size_t)w * h * ubpp;
             for (z = 0; z < d; z++) {
                 d3d8_convert_linear_pixels(vol->d3d8_format, w, h,
                     upload_data + (size_t)z * slice_bytes,
@@ -2173,15 +1973,32 @@ static HRESULT __stdcall voltex_UnlockBox(IDirect3DVolumeTexture8 *self, UINT Le
             if (linear) { free(linear); linear = NULL; }
             upload_data = converted;
             upload_pitch = w * ubpp;
-            upload_depth = upload_pitch * h;
+            upload_rows = h;
         }
     }
 
-    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)vol->d3d11_texture,
-        Level, NULL, upload_data, upload_pitch, upload_depth);
+    {
+        UINT uw = w, uh = h;
+        if (d3d8_format_is_compressed(vol->d3d8_format)) {
+            uw = (w + 3) & ~3u;
+            uh = (h + 3) & ~3u;
+        }
+        xgpu_upload_texture(d3d8_GetGpu(), vol->gpu->tex, Level, 0, 0, 0, 0,
+                            uw, uh, d, upload_data, upload_pitch, upload_rows);
+    }
 
     if (linear) free(linear);
     if (converted) free(converted);
+}
+
+static HRESULT __stdcall voltex_UnlockBox(IDirect3DVolumeTexture8 *self, UINT Level)
+{
+    D3D8VolumeTexture *vol = (D3D8VolumeTexture *)self;
+
+    if (Level >= vol->levels || !vol->locked) return E_FAIL;
+    if (!vol->gpu) { vol->locked = FALSE; return E_FAIL; }
+
+    upload_volume_level(vol, Level);
 
     vol->locked = FALSE;
     vol->dirty = FALSE;
@@ -2219,9 +2036,6 @@ static const IDirect3DVolumeTexture8Vtbl g_voltex_vtbl = {
 HRESULT d3d8_CreateVolumeTextureImpl(UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DVolumeTexture8 **ppTex)
 {
     D3D8VolumeTexture *vol;
-    D3D11_TEXTURE3D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
-    HRESULT hr;
     UINT max_dim;
 
     if (!ppTex || !Width || !Height || !Depth) return E_INVALIDARG;
@@ -2230,7 +2044,7 @@ HRESULT d3d8_CreateVolumeTextureImpl(UINT Width, UINT Height, UINT Depth, UINT L
     if (!vol) return E_OUTOFMEMORY;
 
     vol->d3d8_format = Format;
-    vol->dxgi_format = d3d8_to_dxgi_format(Format);
+    vol->gpu_format = d3d8_to_gpu_format(Format);
     vol->width = Width;
     vol->height = Height;
     vol->depth = Depth;
@@ -2250,37 +2064,19 @@ HRESULT d3d8_CreateVolumeTextureImpl(UINT Width, UINT Height, UINT Depth, UINT L
     vol->sys_mem = (BYTE *)calloc(1, vol_total_size(vol));
     if (!vol->sys_mem) { free(vol); return E_OUTOFMEMORY; }
 
-    memset(&td, 0, sizeof(td));
-    td.Width = Width;
-    td.Height = Height;
-    td.Depth = Depth;
-    td.MipLevels = vol->levels;
-    td.Format = vol->dxgi_format;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-    hr = ID3D11Device_CreateTexture3D(d3d8_GetD3D11Device(), &td, NULL, &vol->d3d11_texture);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateVolumeTexture3D failed: 0x%08lX (fmt=%d %ux%ux%u)\n",
-                hr, Format, Width, Height, Depth);
+    if (vol->gpu_format == SDL_GPU_TEXTUREFORMAT_INVALID) {
         free(vol->sys_mem);
         free(vol);
-        return hr;
+        return E_INVALIDARG;
     }
-
-    if (!d3d8_format_is_depth(Format) && vol->dxgi_format != DXGI_FORMAT_UNKNOWN) {
-        memset(&srvd, 0, sizeof(srvd));
-        srvd.Format = vol->dxgi_format;
-        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
-        srvd.Texture3D.MipLevels = vol->levels;
-        hr = ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
-            (ID3D11Resource *)vol->d3d11_texture, &srvd, &vol->srv);
-        if (FAILED(hr)) {
-            ID3D11Texture3D_Release(vol->d3d11_texture);
-            free(vol->sys_mem);
-            free(vol);
-            return hr;
-        }
+    vol->gpu = xgputex_create(d3d8_GetGpu(), SDL_GPU_TEXTURETYPE_3D, vol->gpu_format,
+                              Width, Height, Depth, vol->levels, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+    if (!vol->gpu) {
+        fprintf(stderr, "D3D8: CreateVolumeTexture failed (fmt=%d %ux%ux%u)\n",
+                Format, Width, Height, Depth);
+        free(vol->sys_mem);
+        free(vol);
+        return E_OUTOFMEMORY;
     }
 
     d3d8_check_overlay();
@@ -2371,36 +2167,24 @@ const IDirect3DVolume8Vtbl g_vol_vtbl = {
 
 HRESULT d3d8_CreateImageSurfaceImpl(UINT Width, UINT Height, D3DFORMAT Format, IDirect3DSurface8 **ppSurface)
 {
-    D3D11_TEXTURE2D_DESC td;
-    ID3D11Texture2D *tex = NULL;
-    HRESULT hr;
+    SDL_GPUTextureFormat gf;
+    XGpuTex *tex;
 
     if (!ppSurface || !Width || !Height) return E_INVALIDARG;
-    if (d3d8_to_dxgi_format(Format) == DXGI_FORMAT_UNKNOWN) {
+    gf = d3d8_to_gpu_format(Format);
+    if (gf == SDL_GPU_TEXTUREFORMAT_INVALID) {
         fprintf(stderr, "D3D8: CreateImageSurface: unsupported format 0x%X\n", Format);
         return E_INVALIDARG;
     }
 
-    memset(&td, 0, sizeof(td));
-    td.Width = Width;
-    td.Height = Height;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = d3d8_to_dxgi_format(Format);
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateImageSurface failed: 0x%08lX (fmt=0x%X %ux%u)\n",
-                hr, Format, Width, Height);
-        return hr;
-    }
+    tex = xgputex_create(d3d8_GetGpu(), SDL_GPU_TEXTURETYPE_2D, gf, Width, Height, 1, 1,
+                         SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+    if (!tex)
+        return E_OUTOFMEMORY;
 
     *ppSurface = d3d8_surface_create(tex, 0, 0, Width, Height, Format,
                                      D3DPOOL_DEFAULT, D3DUSAGE_RENDERTARGET,
                                      D3DMULTISAMPLE_NONE, NULL, 0);
-    ID3D11Texture2D_Release(tex);
+    xgputex_unref(d3d8_GetGpu(), tex);
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }

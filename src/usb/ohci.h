@@ -1,23 +1,7 @@
-/*
- * ohci.h -- the Xbox USB host controllers, enough of them to be found.
- *
- * A title reaches its gamepad through XAPI, which is statically linked into
- * the image and drives the OHCI controller registers directly rather than
- * going through anything this runtime can shim. Half-Life 2 registers a 4 KB
- * block at 0xFED00000 and takes an interrupt vector for it, then reads
- * HcRevision out of an aperture backed by zeroed RAM, concludes there is a
- * host controller with no root hub ports, and enumerates nothing.
- *
- * This is the register half of the answer: a controller that reports a real
- * revision, a root hub with ports, and the handful of registers that have
- * behaviour rather than storage. It does not yet walk the endpoint and
- * transfer descriptor lists, which is what actually moves a report, so a
- * driver that gets this far will find a port and then have nothing to talk to.
- * That is deliberate -- the register trace is what says whether the driver
- * polls HcInterruptStatus or waits on the IRQ, and that answers how much of
- * the rest is needed before any of it is written.
- *
- * Written from the OHCI 1.0a specification and this title's own code.
+/* OHCI host controller model for the two MCPX USB apertures.
+ * Implements operational/root-hub registers, endpoint/transfer descriptor
+ * walking and interrupt delivery, connected to the runtime's USB gamepads.
+ * This is a partial device model; see ohci.c for supported transfer paths.
  */
 #ifndef XBOX_OHCI_H
 #define XBOX_OHCI_H
@@ -51,5 +35,9 @@ int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 
 /* Report counts at exit, so a run says whether the driver ever looked. */
 void xbox_OhciReport(void);
+
+/* Resolve one physical descriptor/buffer address to the guest VA used by the
+ * OHCI model. Exposed so memory mapping regressions exercise the same path. */
+uint32_t xbox_OhciResolvePhysical(uint32_t physical, uint32_t bytes);
 
 #endif /* XBOX_OHCI_H */
