@@ -1,17 +1,16 @@
 """EBP used as data must survive direct, indirect, and sibling calls."""
-import shutil
 import subprocess
 
 import pytest
 
-from tools.recomp import config
+from tools.recomp import config, c_fixture
 from tools.recomp.translator import FunctionTranslator
 
 
 def test_general_ebp_across_calls(tmp_path, monkeypatch):
-    cc = shutil.which('gcc') or shutil.which('clang')
+    cc = c_fixture.compiler()
     if not cc:
-        pytest.skip('gcc or clang required for generated-code execution')
+        pytest.skip('C compiler required for generated-code execution')
     # Synthetic caller: save EBP, set a loop pointer, call a frame owner,
     # then call an EBP reader directly and indirectly, restore EBP, return.
     base = 0x10000
@@ -45,6 +44,9 @@ static uint32_t ram[1024];
 void sub_00010000(void); void sub_00010030(void); void sub_00010040(void);
 ''' + bodies + r'''
 int main(void) {
+    esp=4000; g_ebp=0x12345678; g_seh_ebp=0xbad;
+    sub_00010040();
+    assert(eax==0x12345678); assert(esp==4004);
     esp=4000; g_ebp=g_seh_ebp=0xabcdef;
     sub_00010000();
     assert(eax==0x12345678); assert(esp==4004);
@@ -54,6 +56,6 @@ int main(void) {
 '''
     src = tmp_path / 'check.c'; exe = tmp_path / 'check.exe'
     src.write_text(source)
-    subprocess.run([cc, '-std=c11', '-O2', str(src), '-o', str(exe)], check=True,
+    subprocess.run(c_fixture.command(cc, [src], exe), cwd=tmp_path, check=True,
                    capture_output=True, text=True)
     subprocess.run([str(exe)], check=True)
