@@ -1206,11 +1206,11 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
         # Conditional tail call: same frame bridge as the unconditional tail
         # jmp in _lift_jmp, applied only on the taken path.
         if target in lifter.manual_functions:
-            return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; "
+            return (f"if ({cond_expr}) {{ g_ebp = ebp; g_seh_ebp = ebp; "
                     f"RECOMP_ITAIL(0x{target:08X}u); return; }}"
                     f" /* {jcc}: {desc}, manual tail */")
         name = lifter._call_target_name(target)
-        return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
+        return (f"if ({cond_expr}) {{ g_ebp = ebp; g_seh_ebp = ebp; {name}(); return; }}"
                 f" /* {jcc}: {desc} */")
     return f"if ({cond_expr}) goto loc_{target:08X}; /* {jcc}: {desc} */"
 
@@ -1511,6 +1511,10 @@ class Lifter:
         # Addresses loaded as immediates into a register inside the current
         # function, used to resolve `jmp <reg>`. See _lift_jmp.
         self.imm_code_refs = set()
+        # Addresses inside a function that a caller may enter directly, as well as
+        # by falling through or branching. Each becomes a label, and the function
+        # dispatches to it when g_recomp_resume names it on entry.
+        self.resume_entries = set()
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -2026,7 +2030,7 @@ class Lifter:
     # ── MOV family ──
 
     def _lift_mov(self, insn, ops):
-        if nops := len(ops) < 2:
+        if len(ops) < 2:
             return [f"/* mov: bad operands */"]
         src = _fmt_operand_read(ops[1])
         out = [_fmt_operand_write(ops[0], src)]
@@ -2039,14 +2043,7 @@ class Lifter:
         if (ops[0].type == "reg" and ops[0].reg == "ebp" and
                 ops[1].type == "reg" and ops[1].reg == "esp"):
             out.append("g_ebp = ebp; /* publish frame for frameless callees */")
-            # g_seh_ebp too. A callee with no prologue inherits through
-            # g_seh_ebp, not g_ebp, but only tail jumps and the SEH helpers
-            # ever wrote it -- so one reached by an ordinary call read whatever
-            # frame the last tail jump had left behind. Wreckless hit this in
-            # setjmp: it saved that stale ebp into the jmp_buf, and the longjmp
-            # that should have resumed the catch restored a frame two calls
-            # dead, so the exception unwound past every handler and off the top
-            # of the stack.
+            # Keep the SEH/setjmp frame exchange in step with architectural EBP.
             out.append("g_seh_ebp = ebp;")
         return out
 
@@ -2373,6 +2370,9 @@ class Lifter:
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
+        # x86 masks the shift operand to five bits for byte, word and dword
+        # shifts.  Leaving the register's low byte intact emits undefined C
+        # shifts for counts >= 32 (common in bitstream decoders).
         cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
         out = []
         if self.needs_cf:
@@ -2735,7 +2735,7 @@ class Lifter:
         if self.publishes_ebp:
             prefix = "g_ebp = ebp; g_seh_ebp = ebp; "
         elif self.func_start in self.SEH_HELPERS:
-            prefix = "g_seh_ebp = ebp; "
+            prefix = "g_ebp = ebp; g_seh_ebp = ebp; "
         # Exit trace, for functions that return with a register the caller
         # relied on holding something else. Entry tracing alone cannot show
         # that: it tells you what went in, never what came back. Emitted at the
@@ -2906,7 +2906,7 @@ class Lifter:
                 # Bridge ebp so the target function can inherit our frame pointer.
                 if insn.jump_target in self.manual_functions:
                     tail = (
-                        f"g_seh_ebp = ebp; "
+                        f"g_ebp = ebp; g_seh_ebp = ebp; "
                         f"RECOMP_ITAIL(0x{insn.jump_target:08X}u); return; "
                         f"/* manual tail jmp 0x{insn.jump_target:08X} */"
                     )
@@ -2918,7 +2918,7 @@ class Lifter:
                         ]
                     return [self._forced_tail(tail)]
                 name = self._call_target_name(insn.jump_target)
-                tail = (f"g_seh_ebp = ebp; {name}(); return; "
+                tail = (f"g_ebp = ebp; g_seh_ebp = ebp; {name}(); return; "
                         f"/* tail jmp 0x{insn.jump_target:08X} */")
                 if self.trace_exit_name:
                     # Tag the exit so a trace says which one was taken. A
@@ -2938,7 +2938,7 @@ class Lifter:
                 lines = [f"{{ uint32_t _jt = {target_expr}; /* switch: {len(switch_targets)} entries, {len(unique_targets)} targets */"]
                 for t in unique_targets:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
-                lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
+                lines.append(f"g_ebp = ebp; g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
                 return lines
             # `jmp <reg>` where the register was loaded with an address
             # inside this same function: a hand-written continuation chain,
@@ -2963,11 +2963,11 @@ class Lifter:
                              f" {len(inside)} targets */"]
                     for t in inside:
                         lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
-                    lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
+                    lines.append("g_ebp = ebp; g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
                     return lines
             target = _fmt_operand_read(ops[0])
             return [self._forced_tail(
-                f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return;"
+                f"g_ebp = ebp; g_seh_ebp = ebp; RECOMP_ITAIL({target}); return;"
                 f" /* indirect tail jmp */")]
         return ["/* jmp: no target */"]
 
@@ -2982,7 +2982,7 @@ class Lifter:
             if target:
                 if self._is_external_target(target):
                     name = self._call_target_name(target)
-                    return [f"if ({cond}) {{ g_seh_ebp = ebp; {name}(); return; }} /* {jcc} */"]
+                    return [f"if ({cond}) {{ g_ebp = ebp; g_seh_ebp = ebp; {name}(); return; }} /* {jcc} */"]
                 return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
             return [f"/* {jcc} - no target */"]
 
@@ -3008,7 +3008,7 @@ class Lifter:
         if target:
             if self._is_external_target(target):
                 name = self._call_target_name(target)
-                return [f"if ({cond} /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
+                return [f"if ({cond} /* {jcc}: {desc} */) {{ g_ebp = ebp; g_seh_ebp = ebp; {name}(); return; }}"]
             return [f"if ({cond} /* {jcc}: {desc} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 
@@ -3415,7 +3415,7 @@ class Lifter:
         """Translate SSE instructions to C float operations."""
         nops = len(ops)
         if nops < 1:
-            return [f"/* {m}: no operands */"]
+            return self._unimplemented(insn, m)
 
         def _is_xmm(op):
             return op.type == "reg" and op.reg and op.reg.startswith("xmm")
@@ -3493,7 +3493,22 @@ class Lifter:
                     written = _packed_write(ops[0], src)
                     if written is not None:
                         return [written + f" /* {m} */"]
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
+
+        # movq on xmm moves the low qword. A register destination zeroes the
+        # high qword; a load from memory does too.
+        if m == "movq" and nops >= 2 and (_is_xmm(ops[0]) or _is_xmm(ops[1])):
+            if _is_xmm(ops[0]) and ops[1].type == "mem":
+                d = ops[0].reg
+                return [f"XMM_LOAD_LOW({d}, {_fmt_mem(ops[1])}); "
+                        f"{d}.u[2] = {d}.u[3] = 0; /* movq */"]
+            if ops[0].type == "mem" and _is_xmm(ops[1]):
+                return [f"XMM_STORE_LOW({_fmt_mem(ops[0])}, {ops[1].reg}); /* movq */"]
+            if _is_xmm(ops[0]) and _is_xmm(ops[1]):
+                d, s = ops[0].reg, ops[1].reg
+                return [f"{d}.u[0] = {s}.u[0]; {d}.u[1] = {s}.u[1]; "
+                        f"{d}.u[2] = {d}.u[3] = 0; /* movq */"]
+            return self._unimplemented(insn, m)
 
         # movlps/movhps transfer 8 bytes into or out of one half.
         if m in ("movlps", "movhps"):
@@ -3505,7 +3520,7 @@ class Lifter:
                 if ops[0].type == "mem" and _is_xmm(ops[1]):
                     return [f"XMM_STORE_{half}({_fmt_mem(ops[0])}, "
                             f"{ops[1].reg}); /* {m} */"]
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         if m in ("movlhps", "movhlps"):
             helper = ("XMM_MOVE_LOW_TO_HIGH" if m == "movlhps"
@@ -3513,7 +3528,7 @@ class Lifter:
             lifted = _packed_binary(helper)
             if lifted is not None:
                 return lifted
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         # movss/movsd are scalar. Loading from memory zeroes the upper lanes;
         # a register-to-register move leaves them untouched.
@@ -3526,7 +3541,7 @@ class Lifter:
                             f"{scalar}({_sse_read(ops[1])}); /* {m} */"]
                 src = _sse_read(ops[1])
                 return [_sse_write(ops[0], src) + f" /* {m} */"]
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         # movd moves 32 bits without converting. Into an XMM register it also
         # zeroes the upper lanes. The generated code redefines memcpy as a
@@ -3548,7 +3563,7 @@ class Lifter:
                             " /* movd */"]
                 src = _fmt_operand_read(ops[1])
                 return [f"{_fmt_operand_write(ops[0], src)} /* movd */"]
-            return [f"/* movd {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         # ── Arithmetic ──
         if m in ("addss", "addsd"):
@@ -3585,7 +3600,7 @@ class Lifter:
             lifted = _packed_binary(helper)
             if lifted is not None:
                 return lifted
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         # ── Conversions ──
         if m == "cvtsi2ss":
@@ -3647,14 +3662,14 @@ class Lifter:
             lifted = _packed_binary("XMM_XOR")
             if lifted is not None:
                 return lifted
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
         if m in ("andps", "orps", "andnps"):
             helper = {"andps": "XMM_AND", "orps": "XMM_OR",
                       "andnps": "XMM_ANDN"}[m]
             lifted = _packed_binary(helper)
             if lifted is not None:
                 return lifted
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         # ── Packed min/max ──
         if m in ("minps", "maxps"):
@@ -3662,7 +3677,7 @@ class Lifter:
             lifted = _packed_binary(helper)
             if lifted is not None:
                 return lifted
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         # ── Reciprocal / rsqrt ──
         if m == "rsqrtss":
@@ -3685,17 +3700,17 @@ class Lifter:
             lifted = _packed_binary("XMM_SQRT")
             if lifted is not None:
                 return lifted
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
         if m == "rsqrtps":
             lifted = _packed_binary("XMM_RSQRT")
             if lifted is not None:
                 return lifted
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
         if m == "rcpps":
             lifted = _packed_binary("XMM_RCP")
             if lifted is not None:
                 return lifted
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         # ── Comparison ──
         # Every predicate, packed and scalar, named or by immediate. Only
@@ -3710,14 +3725,14 @@ class Lifter:
                 pred, width = _SSE_CMP_NAMED[m]
             else:
                 if nops < 3 or ops[2].type != "imm":
-                    return [f"/* {m} {insn.op_str} - no predicate */"]
+                    return self._unimplemented(insn, m)
                 pred, width = ops[2].imm & 7, m[-2:]
             if nops < 2 or not _is_xmm(ops[0]):
-                return [f"/* {m} {insn.op_str} */"]
+                return self._unimplemented(insn, m)
             if width == "ps":
                 b = _packed_read(ops[1])
                 if b is None:
-                    return [f"/* {m} {insn.op_str} */"]
+                    return self._unimplemented(insn, m)
                 return [_packed_write(ops[0], f"XMM_CMP_PRED({ops[0].reg}, {b}, {pred})")
                         + f" /* {m} */"]
             return [f"{ops[0].reg}.u[0] = recomp_cmp_pred({ops[0].reg}.f[0], "
@@ -3731,12 +3746,26 @@ class Lifter:
                 if src is not None:
                     return [_fmt_operand_write(ops[0], f"XMM_MOVEMASK({src})")
                             + f" /* {m} */"]
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
-        # ── MMX / integer SIMD ──
-        if m in ("pand", "pandn", "por", "pxor", "pcmpgtd"):
-            if nops >= 2:
-                return [f"/* {m} {insn.op_str} (MMX/SIMD integer) */"]
+        # ── Integer SIMD on xmm ──
+        # The bitwise forms are the same bit operation as the float XMM
+        # helpers. pcmpgtd has no packed-integer compare helper yet, so it is
+        # recorded as unimplemented rather than dropped.
+        if m in ("pand", "pandn", "por", "pxor"):
+            helper = {"pand": "XMM_AND", "pandn": "XMM_ANDN",
+                      "por": "XMM_OR", "pxor": "XMM_XOR"}[m]
+            if nops >= 2 and _is_xmm(ops[0]):
+                lifted = _packed_binary(helper)
+                if lifted is not None:
+                    return lifted
+            return self._unimplemented(insn, m)
+        if m == "pcmpgtd":
+            if nops >= 2 and _is_xmm(ops[0]):
+                lifted = _packed_binary("XMM_PCMPGTD")
+                if lifted is not None:
+                    return lifted
+            return self._unimplemented(insn, m)
 
         # ── Shuffle/unpack ──
         # shufps is the broadcast in every matrix concatenation.
@@ -3750,16 +3779,16 @@ class Lifter:
                         f"XMM_SHUFFLE({a}, {b}, {_fmt_imm(ops[2].imm)})")
                     if written is not None:
                         return [written + f" /* {m} */"]
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
         if m in ("unpcklps", "unpckhps"):
             helper = ("XMM_UNPACK_LOW" if m == "unpcklps"
                       else "XMM_UNPACK_HIGH")
             lifted = _packed_binary(helper)
             if lifted is not None:
                 return lifted
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
-        return [f"/* SSE: {m} {insn.op_str} */"]
+        return self._unimplemented(insn, m)
 
     # ── FPU (x87) ──
 
@@ -3799,6 +3828,19 @@ class Lifter:
 
     def _lift_fpu(self, insn, m, ops):
         """Basic FPU instruction translation using double locals."""
+        # x87 exception flags are not modelled, so clearing them and the
+        # no-op form change nothing here. Everything else falls through.
+        if m in ("fnclex", "fclex", "fnop", "fwait"):
+            return [f"/* {m}: x87 exception flags are not modelled */"]
+        # The tag word is not modelled, and freeing a register changes no
+        # value or TOP here, so ffree is a no-op in this model.
+        if m == "ffree":
+            return [f"/* ffree {insn.op_str}: x87 tag word is not modelled */"]
+        # TOP rotates without moving any value, as the hardware does.
+        if m == "fincstp":
+            return ["g_fp_top = (g_fp_top + 1) & 7; /* fincstp */"]
+        if m == "fdecstp":
+            return ["g_fp_top = (g_fp_top - 1) & 7; /* fdecstp */"]
         # FPU is complex. We translate common patterns to double operations.
         # Full accuracy would require an x87 stack emulator.
 
@@ -3832,7 +3874,7 @@ class Lifter:
                     src = self._st_expr(self._st_index(ops[0].reg))
                     return [f"{{ double _t = {src}; fp_push(_t); }}"
                             f" /* fld {insn.op_str} */"]
-            return [f"/* fld {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         if m in ("fst", "fstp"):
             # Only fstp pops. fst stores st0 and leaves the stack alone. The old
@@ -3872,13 +3914,13 @@ class Lifter:
                     parts.append("fp_pop();")
                 body = " ".join(parts) if parts else "(void)0;"
                 return [f"{body} /* {m} st({idx}) */"]
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         if m == "fild":
             if len(ops) >= 1 and ops[0].type == "mem":
                 smem = _smem_accessor(ops[0].mem_size)
                 return [f"fp_push((double){smem}({_fmt_mem(ops[0])})); /* fild */"]
-            return [f"/* fild {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         if m in ("fist", "fistp", "fisttp"):
             if len(ops) >= 1 and ops[0].type == "mem":
@@ -3890,7 +3932,7 @@ class Lifter:
                 control = "0x0C00u" if m == "fisttp" else "g_fp_control_word"
                 return [f"{mem_acc}({_fmt_mem(ops[0])}) = "
                         f"({int_type})recomp_fist(fp_top(), {control}, {size * 8});{pop} /* {m} */"]
-            return [f"/* {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp",
                  "fmul", "fmulp", "fdiv", "fdivp", "fdivr", "fdivrp",
@@ -4114,7 +4156,7 @@ class Lifter:
             if ops and ops[0].type == "reg":
                 return [_fmt_set_reg(ops[0].reg, status)
                         + f" /* fnstsw {insn.op_str} */"]
-            return [f"/* fnstsw {insn.op_str} - no destination operand */"]
+            return self._unimplemented(insn, m)
         if m == "fnstcw":
             # The CRT reads the control word back to decide whether an
             # exception is masked, so it must be stored, not dropped.
@@ -4124,7 +4166,7 @@ class Lifter:
             if ops and ops[0].type == "reg":
                 return [_fmt_set_reg(ops[0].reg, "g_fp_control_word")
                         + f" /* fnstcw {insn.op_str} */"]
-            return [f"/* fnstcw {insn.op_str} - no destination operand */"]
+            return self._unimplemented(insn, m)
         if m == "fldcw":
             if ops and ops[0].type == "mem":
                 return [f"g_fp_control_word = MEM16({_fmt_mem(ops[0])});"
@@ -4133,7 +4175,7 @@ class Lifter:
                 return [f"g_fp_control_word = (uint16_t)"
                         f"{_fmt_operand_read(ops[0])};"
                         f" /* fldcw {insn.op_str} */"]
-            return [f"/* fldcw {insn.op_str} - no source operand */"]
+            return self._unimplemented(insn, m)
         if m == "fldz":
             return [f"fp_push(0.0); /* fldz */"]
         if m == "fld1":
@@ -4145,7 +4187,7 @@ class Lifter:
             # untracked flag reader falls back to (see _lift_cmovcc).
             return [_fcmov_statement(insn, f"_flags /* {m} */")]
 
-        return [f"/* FPU: {m} {insn.op_str} */"]
+        return self._unimplemented(insn, m)
 
 
 # FCMOVcc moves st(i) into st(0) when an EFLAGS condition holds; each one
