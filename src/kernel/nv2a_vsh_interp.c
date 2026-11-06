@@ -143,6 +143,7 @@ void nv2a_vsh_state_restore(const void *in)
     memcpy(s_const, v->c, sizeof s_const);
     s_load_slot = v->load_slot; s_load_word = v->load_word; s_start_slot = v->start_slot;
     s_const_load = v->const_load; s_const_word = v->const_word; s_cxt_write = v->cxt_write;
+    s_program_revision++;
     s_program_version++;
     s_const_version++;
 }
@@ -540,7 +541,7 @@ static void dec_program(void)
         it = d->mac ? 1u : tdst;
         d->mac_dst = (uint8_t)(tdst <= 12 ? tdst : DEC_NO_DST);
         d->ilu_dst = (uint8_t)(it <= 12 ? it : DEC_NO_DST);
-        if (!d->mac || d->mac == 13)              /* ARL writes only a0 */
+        if (!d->mac || d->mac == 13 || (d->ilu && tdst == 1))              /* ARL writes only a0 */
             d->mac_mask = 0;
         if (!d->ilu)
             d->ilu_mask = 0;
@@ -548,6 +549,7 @@ static void dec_program(void)
         d->oaddr = (uint8_t)field(ins, 3, 3, 8);
         d->to_o = (uint8_t)field(ins, 3, 11, 1);
         d->from_ilu = (uint8_t)field(ins, 3, 2, 1);
+        if (!(d->from_ilu ? d->ilu : d->mac)) d->omask = 0;
         d->final = (uint8_t)field(ins, 3, 0, 1);
         d->reads = dec_reads(d->mac, d->ilu);
         for (k = 0; k < 3; k++)
@@ -623,8 +625,10 @@ static int vsh_run_decoded(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *ou
         if (d->omask) {
             const vec4 *src = d->from_ilu ? &ires : &mres;
             if (!d->to_o) {                               /* to c[] */
-                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
+                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS) {
                     write_masked(s_const[d->oaddr], src, d->omask);
+                    s_const_version++;
+                }
             } else if (d->oaddr == 0) {
                 write_masked(regs[12].v, src, d->omask);
             } else if (d->oaddr < 13) {
