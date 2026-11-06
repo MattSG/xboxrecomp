@@ -1,16 +1,11 @@
 /* The APU brought up and torn down several times in one process.
  *
- * Two kinds of state outlived an instance. The DSP doorbell ack keeps its
- * configuration and the GPRST gate in file statics: a GP held in reset by
- * one instance left the ack paused in the next, and the RECOMP_APU_DSP_ACK
- * setting read by the first instance was never read again. And shutdown
- * never released the GP/EP state that init allocates.
+ * Shutdown must release the GP/EP state that init allocates.
  *
- * A small zeroed buffer stands in for RAM, as in apu_dsp_ack: with no heap,
+ * A small zeroed buffer stands in for RAM: with no heap,
  * no image and no contiguous allocation above page 0, mcpx_apu_phys resolves
  * a low physical address to the buffer + address. The frame thread idles
- * after init (pause_requested) until something resumes it, so the test polls
- * the doorbell itself. */
+ * after init (pause_requested) until something resumes it. */
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
@@ -46,7 +41,6 @@ int  xa2_submit_samples(const int16_t *s, int n) { (void)s; (void)n; return 1; }
 #define FAKE_RAM   (256u << 10)
 #define SGE_TABLE  0x00010000u
 #define GP_PAGE    0x00020000u
-#define DOORBELL   (GP_PAGE + 0x810u)
 
 static int failures;
 
@@ -54,15 +48,6 @@ static void check(int ok, const char *what)
 {
     printf("  %-62s %s\n", what, ok ? "PASS" : "FAIL");
     if (!ok) failures++;
-}
-
-static void set_ack_env(const char *v)
-{
-#ifdef _WIN32
-    _putenv_s("RECOMP_APU_DSP_ACK", v);
-#else
-    setenv("RECOMP_APU_DSP_ACK", v, 1);
-#endif
 }
 
 static uint32_t *dword(uint8_t *ram, uint32_t phys)
@@ -108,50 +93,6 @@ static long long heap_in_use(void)
 #endif
 }
 
-/* A GP held in reset when the instance went away: the next init must start
- * with the GP running, as a fresh process does. */
-static void gate_case(uint8_t *ram)
-{
-    MCPXAPUState *d;
-
-    set_ack_env("auto");
-    d = bring_up(ram);
-    if (!d) { failures++; return; }
-    mcpx_apu_dsp_gprst_write(0);                       /* hold the GP */
-    *dword(ram, DOORBELL) = 0x11;
-    mcpx_apu_dsp_ack_poll(d);
-    check(*dword(ram, DOORBELL) == 0x11, "held in reset: poll leaves the doorbell");
-    mcpx_apu_shutdown(d);
-
-    d = bring_up(ram);
-    if (!d) { failures++; return; }
-    *dword(ram, DOORBELL) = 0x22;
-    mcpx_apu_dsp_ack_poll(d);
-    check(*dword(ram, DOORBELL) == 0, "reinit: GP counts as running, poll clears it");
-    mcpx_apu_shutdown(d);
-}
-
-/* The ack setting is read again by each instance. */
-static void config_case(uint8_t *ram)
-{
-    MCPXAPUState *d;
-
-    set_ack_env("off");
-    d = bring_up(ram);
-    if (!d) { failures++; return; }
-    *dword(ram, DOORBELL) = 0x33;
-    mcpx_apu_dsp_ack_poll(d);
-    check(*dword(ram, DOORBELL) == 0x33, "RECOMP_APU_DSP_ACK=off: poll leaves it");
-    mcpx_apu_shutdown(d);
-
-    set_ack_env("auto");
-    d = bring_up(ram);
-    if (!d) { failures++; return; }
-    mcpx_apu_dsp_ack_poll(d);
-    check(*dword(ram, DOORBELL) == 0, "reinit with =auto: poll clears it");
-    mcpx_apu_shutdown(d);
-}
-
 /* Several init/shutdown cycles: the device is opened and closed once each,
  * and the heap does not grow by the GP/EP state per cycle. A double free
  * aborts in the allocator. The first cycle is the baseline: lazy one-time
@@ -189,8 +130,6 @@ int main(void)
 
     if (!ram) { fprintf(stderr, "out of memory\n"); return 2; }
     setvbuf(stdout, NULL, _IONBF, 0);
-    gate_case(ram);
-    config_case(ram);
     cycle_case(ram);
     printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     free(ram);

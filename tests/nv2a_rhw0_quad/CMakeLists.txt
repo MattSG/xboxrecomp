@@ -5,7 +5,8 @@ add_executable(nv2a-rhw0-quad-test nv2a_rhw0_quad_test.c
     ../../src/kernel/nv2a_pb_exec.c
     ../../src/kernel/nv2a_vsh_interp.c
     ../../src/kernel/nv2a_combiner.c
-    ../../src/kernel/nv2a_flip_hold.c)
+    ../../src/kernel/nv2a_flip_hold.c
+    ../nv2a_exec_stubs.c)       # what the executor reaches outside the backend interface
 target_include_directories(nv2a-rhw0-quad-test PRIVATE ../../src/kernel ../../src)
 if(MSVC)
     target_compile_definitions(nv2a-rhw0-quad-test PRIVATE _CRT_SECURE_NO_WARNINGS)

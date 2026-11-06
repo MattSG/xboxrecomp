@@ -4,57 +4,18 @@ Configuration constants for the disassembly tool.
 Defines instruction classification, function-detection limits, and other
 constants used throughout the disassembler.
 
-The XBE memory layout below is a reference fallback. Call
-configure_from_xbe() with the XBE being analyzed to derive the real section
-table; the disassembler itself reads sections from the loader's analysis
-JSON, so these numbers are only for anything that consults this module
-directly.
+Call configure_from_xbe() with the analyzed XBE. Before configuration there
+is no image layout; direct callers never inherit a reference title's addresses.
 """
 
 # ============================================================
-# XBE Memory Layout (reference fallback - see configure_from_xbe())
+# XBE Memory Layout (empty until configured)
 # ============================================================
-
 XBE_BASE_ADDRESS = 0x00010000
-XBE_IMAGE_SIZE = 7766528  # 0x768800
-
-# Entry point (retail, XOR-decoded)
-ENTRY_POINT = 0x001D2807
-
-# Kernel thunk table start (in .rdata)
-KERNEL_THUNK_ADDR = 0x0036B7C0
-
-# ============================================================
-# Section Definitions (reference fallback)
-# ============================================================
-
-# Executable code sections (name, va_start, va_size)
-EXECUTABLE_SECTIONS = [
-    (".text",   0x00011000, 2863616),
-    ("XMV",     0x002CC200, 163124),
-    ("DSOUND",  0x002F3F40, 52668),
-    ("WMADEC",  0x00300D00, 105828),
-    ("XONLINE", 0x0031AA80, 124764),
-    ("XNET",    0x003391E0, 78056),
-    ("D3D",     0x0034C2E0, 83828),
-    ("XGRPH",   0x00360A60, 8300),
-    ("XPP",     0x00362AE0, 36052),
-    ("DOLBY",   0x0076B940, 29056),
-]
-
-# Data sections
-DATA_SECTIONS = [
-    (".rdata",  0x0036B7C0, 289684),
-    (".data",   0x003B2360, 3904988),
-    ("XON_RD",  0x00772AC0, 5416),
-    (".data1",  0x00774000, 224),
-]
-
-# All sections by name for quick lookup
-ALL_SECTIONS = {
-    s[0]: {"va": s[1], "size": s[2]}
-    for s in EXECUTABLE_SECTIONS + DATA_SECTIONS
-}
+XBE_IMAGE_SIZE = ENTRY_POINT = KERNEL_THUNK_ADDR = 0
+EXECUTABLE_SECTIONS = []
+DATA_SECTIONS = []
+ALL_SECTIONS = {}
 
 # Conventional PE data-section names; matched by name regardless of the XBE's
 # executable flag (matches tools/disasm/loader.py's DATA_SECTION_NAMES).
@@ -66,7 +27,7 @@ _configured_from = None
 
 
 def configured_from():
-    """Path of the XBE this layout came from, or None if still the fallback."""
+    """Path of the XBE this layout came from, or None if unconfigured."""
     return _configured_from
 
 
@@ -75,6 +36,8 @@ def _install(sections, entry_point, kernel_thunk_addr, image_size, origin):
     global EXECUTABLE_SECTIONS, DATA_SECTIONS, ALL_SECTIONS
     global ENTRY_POINT, KERNEL_THUNK_ADDR, XBE_IMAGE_SIZE, _configured_from
 
+    if not sections:
+        raise ValueError("cannot install an empty XBE section layout")
     EXECUTABLE_SECTIONS = [s for s in sections if s[0] not in _DATA_SECTION_NAMES]
     DATA_SECTIONS = [s for s in sections if s[0] in _DATA_SECTION_NAMES]
     if not EXECUTABLE_SECTIONS:
@@ -82,12 +45,9 @@ def _install(sections, entry_point, kernel_thunk_addr, image_size, origin):
     ALL_SECTIONS = {s[0]: {"va": s[1], "size": s[2]} for s in sections}
     _configured_from = origin
 
-    if entry_point:
-        ENTRY_POINT = entry_point
-    if kernel_thunk_addr:
-        KERNEL_THUNK_ADDR = kernel_thunk_addr
-    if image_size:
-        XBE_IMAGE_SIZE = image_size
+    ENTRY_POINT = entry_point
+    KERNEL_THUNK_ADDR = kernel_thunk_addr
+    XBE_IMAGE_SIZE = image_size or 0
 
 
 def configure_from_xbe(xbe_path):

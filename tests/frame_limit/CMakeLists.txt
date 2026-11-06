@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(recomp_frame_limit C)
+set(CMAKE_C_STANDARD 11)
+add_executable(recomp_frame_limit test_frame_limit.c)
+target_include_directories(recomp_frame_limit PRIVATE ../../src)
+enable_testing()
+add_test(NAME recomp_frame_limit COMMAND recomp_frame_limit)

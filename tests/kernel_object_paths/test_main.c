@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "../kernel_test_host.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,12 +13,23 @@ void *recomp_lookup(ULONG a) { (void)a; abort(); }
 void *recomp_lookup_manual(ULONG a) { (void)a; abort(); }
 static uint8_t *mem;
 int main(void) {
-    char root[MAX_PATH], path[MAX_PATH];
-    GetTempPathA(MAX_PATH,root); sprintf(path,"%sxml1-dir-test-%lu",root,GetCurrentProcessId());
-    if(!CreateDirectoryA(path,NULL)) return 10;
-    char child[MAX_PATH]; sprintf(child,"%s\\SaveSlot",path); CreateDirectoryA(child,NULL);
+    /* This fixture owns fixed raw scratch addresses below the export page. */
+    if (!xbox_ConfigureKernelData(0x00740000u)) return 90;
+
+    char path[MAX_PATH], child[MAX_PATH];
+    if(!xt_make_temp_dir(path,sizeof path)) return 10;
+    xt_join(child,sizeof child,path,"SaveSlot"); xt_make_dir(child);
+#if !defined(_WIN32)
+    /* The default save root goes in a sibling directory, outside the search. */
+    char save_root[MAX_PATH];
+    if(!xt_make_temp_dir(save_root,sizeof save_root)) return 10;
+    setenv("XDG_DATA_HOME", save_root, 1);
+#endif
     HANDLE h=CreateFileA(path,FILE_LIST_DIRECTORY,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,NULL);
-    if(h==INVALID_HANDLE_VALUE||(uintptr_t)h>UINT32_MAX) return 11;
+    if(h==INVALID_HANDLE_VALUE) return 11;
+#if defined(_WIN32)   /* Windows kernel handles fit a guest word; compat objects need not */
+    if((uintptr_t)h>UINT32_MAX) return 11;
+#endif
     mem=VirtualAlloc(NULL,16*1024*1024,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE); if(!mem) return 12;
     g_xbox_mem_offset=(ptrdiff_t)mem;
     *(uint32_t *)(mem+0x10000)=0x800000CF;
@@ -46,9 +58,8 @@ int main(void) {
     }
     if(!g_eax) {
         uint32_t token=*(uint32_t *)(mem+0x40500);
-        char saved[MAX_PATH]; sprintf(saved,"%s\\save.dat",child);
-        HANDLE file=CreateFileA(saved,GENERIC_WRITE,7,NULL,CREATE_ALWAYS,0,NULL);
-        DWORD written; WriteFile(file,"roundtrip",9,&written,NULL); CloseHandle(file);
+        char saved[MAX_PATH]; xt_join(saved,sizeof saved,child,"save.dat");
+        if(!xt_write_file(saved,"roundtrip",9)) return 13;
         *(uint32_t *)(mem+0x40000)=token;
         memcpy(mem+0x40200,"save.dat",9);
         *(uint16_t *)(mem+0x40100)=8; *(uint16_t *)(mem+0x40102)=9;
@@ -66,16 +77,23 @@ int main(void) {
             if(g_eax || g_esp!=0x20018) ok=0;
             sp[0]=0xBEEF0001;sp[1]=file_token;g_esp=0x20000;
             recomp_lookup_kernel(*(uint32_t *)(mem+0x10008))();
-            if(g_eax || GetFileAttributesA(saved)!=INVALID_FILE_ATTRIBUTES) {
+            if(g_eax || xt_path_exists(saved)) {
                 puts("FAIL relative save delete-on-close");ok=0;
             }
         }
-        DeleteFileA(saved);
+        xt_delete_file(saved);
         sp[0]=0xBEEF0001;sp[1]=token;g_esp=0x20000;
         recomp_lookup_kernel(*(uint32_t *)(mem+0x10008))();
         if(g_eax || g_esp!=0x20008) ok=0;
     }
-    CloseHandle(h); RemoveDirectoryA(child); RemoveDirectoryA(path); VirtualFree(mem,0,MEM_RELEASE);
+    CloseHandle(h);
+#if defined(_WIN32)
+    xt_remove_dir(child); xt_remove_dir(path);
+#else
+    xt_remove_tree(path);
+    xt_remove_tree(save_root);
+#endif
+    VirtualFree(mem,0,MEM_RELEASE);
     if(!ok) return 1;
     puts("PASS: counted object names, relative save opens, deletion, and Xbox stack cleanup"); return 0;
 }

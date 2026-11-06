@@ -4,7 +4,8 @@ project(kernel_memory_posix_test C)
 # because these need no mapped guest window: they are the Mm* and Nt* calls a
 # title makes, sitting on the Win32 shim rather than on the Xbox layout.
 if(WIN32)
-    message(FATAL_ERROR "This regression covers the POSIX memory-API path")
+    message(STATUS "kernel_memory_posix: covers the POSIX memory-API path; skipped on Windows")
+    return()
 endif()
 set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)

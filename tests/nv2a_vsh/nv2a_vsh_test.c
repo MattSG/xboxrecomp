@@ -92,6 +92,38 @@ int main(void)
             return 1;
         }
     }
+
+    /* Context writes must invalidate consumers of the constant snapshot. */
+    {
+        uint32_t write[4] = {0}, before, after;
+        const float initial[4] = {1, 2, 3, 4};
+        write[1] = 1u << 21; /* mov c[17].x, v0; FINAL */
+        src(write, 0, V, 0, XYZW);
+        write[3] = (8u << 12) | (17u << 3) | 1u;
+        nv2a_vsh_set_instruction(0, write);
+        nv2a_vsh_set_constant(17, initial);
+        nv2a_vsh_constants(&before);
+        nv2a_vsh_set_cxt_write(0);
+        if (!nv2a_vsh_run((const float (*)[4])in, &o)) return 1;
+        nv2a_vsh_constants(&after);
+        if (before != after || nv2a_vsh_constant(17)[0] != 1) return 1;
+        nv2a_vsh_set_cxt_write(1);
+        in[0][0] = 9;
+        if (!nv2a_vsh_run((const float (*)[4])in, &o)) return 1;
+        nv2a_vsh_constants(&after);
+        if (before == after || nv2a_vsh_constant(17)[0] != 9 ||
+            nv2a_vsh_constant(17)[1] != 2 || nv2a_vsh_constant(17)[2] != 3 ||
+            nv2a_vsh_constant(17)[3] != 4) {
+            puts("FAIL: context write did not publish masked constant update");
+            return 1;
+        }
+        before = after;
+        write[3] = (8u << 12) | (200u << 3) | 1u;
+        nv2a_vsh_set_instruction(0, write);
+        if (!nv2a_vsh_run((const float (*)[4])in, &o)) return 1;
+        nv2a_vsh_constants(&after);
+        if (before != after) return 1;
+    }
     puts("ok");
     return 0;
 }

@@ -412,6 +412,9 @@ static void requeue(void)
 int main(void)
 {
     int slot;
+    /* The memory layout places the worker stacks; with no layout, give
+     * them a fixed base. */
+    xbox_worker_stack_reset(0x00100000u);
 
     g_fs_base = 0;
     /* Guest memory where the worker stacks are, plus a page for the KDPC. */

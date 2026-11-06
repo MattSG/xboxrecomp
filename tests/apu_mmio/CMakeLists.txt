@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(apu_mmio_test C)
+add_executable(apu_mmio_test test_main.c)
+target_include_directories(apu_mmio_test PRIVATE ../../src)
+enable_testing()
+add_test(NAME apu_mmio_plain COMMAND ${CMAKE_COMMAND} -E env --unset=RECOMP_APU_TRACE $<TARGET_FILE:apu_mmio_test>)
+add_test(NAME apu_mmio_trace COMMAND ${CMAKE_COMMAND} -E env RECOMP_APU_TRACE=1 $<TARGET_FILE:apu_mmio_test>)

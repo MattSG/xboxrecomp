@@ -1,5 +1,7 @@
 # cmake -DOBJDUMP=<objdump> -DEXE=<exe> -P check_imports.cmake
-# Passes when EXE imports XINPUT1_4.dll and no other XInput DLL.
+# Passes when EXE imports no XInput DLL: controllers go through SDL3, which loads
+# XInput at run time, so XINPUT1_3.dll (the DirectX redistributable, absent on
+# stock Windows) cannot stop the exe at start-up.
 execute_process(COMMAND ${OBJDUMP} -p ${EXE}
                 OUTPUT_VARIABLE dump RESULT_VARIABLE rc)
 if(NOT rc EQUAL 0)
@@ -15,7 +17,6 @@ foreach(n IN LISTS names)
     endif()
 endforeach()
 message(STATUS "XInput imports: ${xinput}")
-if(NOT xinput STREQUAL "XINPUT1_4.DLL")
-    message(FATAL_ERROR "expected only XINPUT1_4.DLL, got '${xinput}': "
-        "XINPUT1_3.dll is the DirectX redistributable, absent on stock Windows")
+if(NOT xinput STREQUAL "")
+    message(FATAL_ERROR "expected no XInput import, got '${xinput}': the exe would need that DLL to start")
 endif()

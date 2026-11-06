@@ -3,8 +3,8 @@
 Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted from [xemu](https://github.com/xemu-project/xemu). The APU is a custom chip with three processors:
 
 - **VP (Voice Processor)** — 256 hardware voices, ADPCM/PCM decode, pitch shifting, envelopes, HRTF 3D audio
-- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass.
-- **EP (Encode Processor)** — DSP for AC3/DTS encoding. Currently **stubbed** — passthrough.
+- **GP (Global Processor)** — DSP for global effects (reverb, chorus), run by the DSP56300 interpreter in `dsp/` (see `dsp/PROVENANCE.md`).
+- **EP (Encode Processor)** — DSP for AC3/DTS encoding, also on the interpreter (adapted from xemu's `gp_ep.c`).
 
 Audio output uses Windows `waveOut` at 48kHz stereo 16-bit.
 
@@ -17,7 +17,7 @@ Audio output uses Windows `waveOut` at 48kHz stereo 16-bit.
 | `apu_regs.h` | 366 | MCPX APU register definitions and field masks |
 | `apu_core.c` | 762 | MMIO handlers, frame thread, waveOut output, test tone |
 | `apu_vp.c` | 1,247 | Voice Processor — decode, resample, mix, envelopes, HRTF |
-| `apu_dsp.c` | 90 | GP/EP stubs (mixbin 0/1 passthrough) |
+| `apu_dsp.c` | | GP/EP glue around the DSP interpreter in `dsp/` |
 | `apu_mmio_hook.c` | 253 | VEH x86-64 instruction decoder for 0xFE800000+ MMIO |
 | `apu_shim.h` | 431 | QEMU compatibility (threads, atomics, clocks → Win32) |
 | `apu_debug.h` | 104 | Debug logging macros |
@@ -77,9 +77,9 @@ mcpx_apu_shutdown(apu);
          ▼           ▼           ▼
    ┌──────────┐ ┌─────────┐ ┌─────────┐
    │    VP    │ │   GP    │ │   EP    │
-   │256 voices│ │  (stub) │ │  (stub) │
-   │ ADPCM/  │ │  effects│ │  encode │
-   │  PCM    │ │  bypass │ │  bypass │
+   │256 voices│ │ DSP     │ │ DSP     │
+   │ ADPCM/  │ │ effects │ │ encode  │
+   │  PCM    │ │ program │ │ program │
    └────┬─────┘ └────┬────┘ └────┬────┘
         │             │           │
         └──────┬──────┘───────────┘

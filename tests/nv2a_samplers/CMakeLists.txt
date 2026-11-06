@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_samplers C)
+enable_testing()
+if(WIN32)
+    include(../../cmake/Nv2aHlsl.cmake)   # the renderer's embedded HLSL
+    add_executable(nv2a_samplers test_samplers.c)
+    target_include_directories(nv2a_samplers PRIVATE ../../src ../../src/video)
+    target_link_libraries(nv2a_samplers PRIVATE d3d11 dxgi dxguid d3dcompiler)
+    foreach(case pixels eviction failure levels)
+        add_test(NAME nv2a_samplers_${case} COMMAND nv2a_samplers ${case})
+    endforeach()
+    xbr_embed_nv2a_hlsl(nv2a_samplers)
+endif()
+
+# The SDL3 GPU renderer's samplers, on every platform its backend builds on.
+include(../../cmake/Nv2aSdlgpu.cmake)
+add_subdirectory(../../src/platform ${CMAKE_CURRENT_BINARY_DIR}/platform)
+add_executable(nv2a_samplers_sdlgpu test_samplers_sdlgpu.c ../../src/video/fb_window_sdl.c ../../src/input/keyboard.c
+    ../../src/input/keymap_spec.c ../../src/input/input_map.c)
+xbr_nv2a_sdlgpu_target(nv2a_samplers_sdlgpu)
+target_link_libraries(nv2a_samplers_sdlgpu PRIVATE platform)
+if(NOT MSVC)
+    target_compile_options(nv2a_samplers_sdlgpu PRIVATE -fwrapv -fno-strict-aliasing)
+endif()
+foreach(case pixels eviction failure levels common)
+    add_test(NAME nv2a_samplers_sdlgpu_${case} COMMAND nv2a_samplers_sdlgpu ${case})
+endforeach()

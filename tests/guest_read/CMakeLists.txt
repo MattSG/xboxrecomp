@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(recomp_guest_read C)
+set(CMAKE_C_STANDARD 11)
+add_executable(recomp_guest_read test_main.c ../../src/kernel/guest_read.c)
+target_include_directories(recomp_guest_read PRIVATE ../../src ../../src/kernel)
+enable_testing()
+add_test(NAME recomp_guest_read COMMAND recomp_guest_read)

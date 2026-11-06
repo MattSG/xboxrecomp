@@ -463,6 +463,9 @@ static void above_dispatch(void)
 
 int main(void)
 {
+    /* The memory layout places the worker stacks; with no layout, give
+     * them a fixed base. */
+    xbox_worker_stack_reset(0x00100000u);
     uint8_t *mem;
     XboxGuestCpuStats gs;
     HANDLE timer;
@@ -476,6 +479,7 @@ int main(void)
         return 1;
     }
     g_xbox_mem_offset = (ptrdiff_t)mem;
+    g_xbox_kernel_data_base = 0x00080000u;   /* the layout's kernel data area */
     MEM32(KDPC_VA + 12) = DPC_ROUTINE_VA;      /* DeferredRoutine */
     MEM32(KDPC_VA + 16) = 0xC0FFEEu;           /* DeferredContext */
     for (i = 0; i < K_COUNT; i++)

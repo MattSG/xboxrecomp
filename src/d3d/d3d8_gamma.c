@@ -1,32 +1,55 @@
 /* Gamma is a display transform, not a modification to guest render targets.
- * Snapshot before presentation, then restore even when the swap chain fails. */
+ *
+ * It is applied while the backbuffer is copied to the window: a fullscreen
+ * pass reads the backbuffer through the ramp and writes the swapchain image.
+ * The backbuffer itself is never touched, so there is nothing to restore if
+ * presentation fails. An identity ramp costs nothing (the plain blit runs). */
 #include "d3d8_internal.h"
-#include <d3dcompiler.h>
+#include <stdio.h>
 #include <string.h>
 
 static D3DGAMMARAMP g_ramp;
-static BOOL g_initialized, g_enabled, g_active;
-static ID3D11DeviceContext *g_deferred;
-static ID3D11VertexShader *g_vs;
-static ID3D11PixelShader *g_ps;
-static ID3D11Buffer *g_constants;
-static ID3D11Texture2D *g_snapshot;
-static ID3D11ShaderResourceView *g_source;
+static BOOL g_initialized, g_enabled;
+
+static XGpuShader              g_vs, g_ps;
+static SDL_GPUGraphicsPipeline *g_pipe;
+static SDL_GPUSampler          *g_sampler;
+static SDL_GPUTextureFormat     g_pipe_format = SDL_GPU_TEXTUREFORMAT_INVALID;
+
+static const char k_gamma_vs[] =
+    "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+    "    return float4(id == 2 ? 3 : -1, id == 1 ? 3 : -1, 0, 1); }\n";
+
+/* ramp[v] holds the corrected value for channel value v (0..255) in .rgb. */
+static const char k_gamma_ps[] =
+    "Texture2D pixels : register(t0, space2);\n"
+    "SamplerState samp : register(s0, space2);\n"
+    "cbuffer Gamma : register(b0, space3) { float4 ramp[256]; float4 inv_size; };\n"
+    "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    "    float4 c = pixels.Sample(samp, p.xy * inv_size.xy);\n"
+    "    uint3 i = (uint3)(saturate(c.rgb) * 255.0 + 0.5);\n"
+    "    return float4(ramp[i.r].r, ramp[i.g].g, ramp[i.b].b, c.a); }\n";
 
 static void gamma_release_resources(void)
 {
-    if (g_source) { ID3D11ShaderResourceView_Release(g_source); g_source = NULL; }
-    if (g_snapshot) { ID3D11Texture2D_Release(g_snapshot); g_snapshot = NULL; }
-    if (g_constants) { ID3D11Buffer_Release(g_constants); g_constants = NULL; }
-    if (g_vs) { ID3D11VertexShader_Release(g_vs); g_vs = NULL; }
-    if (g_ps) { ID3D11PixelShader_Release(g_ps); g_ps = NULL; }
-    if (g_deferred) { ID3D11DeviceContext_Release(g_deferred); g_deferred = NULL; }
+    XGpu *g = d3d8_GetGpu();
+    if (g && g->device) {
+        if (g_pipe) SDL_ReleaseGPUGraphicsPipeline(g->device, g_pipe);
+        if (g_sampler) SDL_ReleaseGPUSampler(g->device, g_sampler);
+        xgpu_release_shader(g->device, &g_vs);
+        xgpu_release_shader(g->device, &g_ps);
+    }
+    g_pipe = NULL;
+    g_sampler = NULL;
+    memset(&g_vs, 0, sizeof(g_vs));
+    memset(&g_ps, 0, sizeof(g_ps));
+    g_pipe_format = SDL_GPU_TEXTUREFORMAT_INVALID;
 }
 
 void d3d8_gamma_shutdown(void)
 {
     gamma_release_resources();
-    g_initialized = g_enabled = g_active = FALSE;
+    g_initialized = g_enabled = FALSE;
 }
 
 void d3d8_gamma_get(D3DGAMMARAMP *ramp)
@@ -53,117 +76,85 @@ void d3d8_gamma_set(const D3DGAMMARAMP *ramp)
     }
 }
 
-static HRESULT gamma_create_shaders(void)
+static int gamma_create(XGpu *g, SDL_GPUTextureFormat swap_format)
 {
-    static const char shader[] =
-        "Texture2D pixels : register(t0);\n"
-        "cbuffer Gamma : register(b0) { float4 ramp[256]; };\n"
-        "float4 vs(uint id : SV_VertexID) : SV_Position {\n"
-        " return float4(id==2?3:-1,id==1?3:-1,0,1); }\n"
-        "float4 ps(float4 p : SV_Position) : SV_Target {\n"
-        " float4 c = pixels.Load(int3(p.xy,0));\n"
-        " uint3 i = (uint3)(saturate(c.rgb)*255+0.5);\n"
-        " return float4(ramp[i.r].r,ramp[i.g].g,ramp[i.b].b,c.a); }\n";
-    ID3D11Device *device = d3d8_GetD3D11Device();
-    ID3DBlob *vs = NULL, *ps = NULL;
-    D3D11_BUFFER_DESC bd = {0};
-    HRESULT hr;
-    if (g_deferred) return S_OK;
-    hr = D3DCompile(shader, sizeof(shader) - 1, NULL, NULL, NULL, "vs", "vs_4_0", 0, 0, &vs, NULL);
-    if (SUCCEEDED(hr)) hr = D3DCompile(shader, sizeof(shader) - 1, NULL, NULL, NULL, "ps", "ps_4_0", 0, 0, &ps, NULL);
-    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateVertexShader(device,
-        ID3D10Blob_GetBufferPointer(vs), ID3D10Blob_GetBufferSize(vs), NULL, &g_vs);
-    if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(device,
-        ID3D10Blob_GetBufferPointer(ps), ID3D10Blob_GetBufferSize(ps), NULL, &g_ps);
-    bd.ByteWidth = 256 * 4 * sizeof(float);
-    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateBuffer(device, &bd, NULL, &g_constants);
-    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateDeferredContext(device, 0, &g_deferred);
-    if (vs) ID3D10Blob_Release(vs);
-    if (ps) ID3D10Blob_Release(ps);
-    if (FAILED(hr)) gamma_release_resources();
-    return hr;
-}
+    SDL_GPUGraphicsPipelineCreateInfo pi;
+    SDL_GPUColorTargetDescription ct;
+    SDL_GPUSamplerCreateInfo si;
 
-HRESULT d3d8_gamma_begin(ID3D11RenderTargetView *target)
-{
-    ID3D11Device *device = d3d8_GetD3D11Device();
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    ID3D11Resource *backbuffer;
-    ID3D11CommandList *commands = NULL;
-    D3D11_TEXTURE2D_DESC desc, saved;
-    D3D11_VIEWPORT viewport = {0};
-    float values[256][4];
-    HRESULT hr;
-    UINT i;
-    if (g_active) return E_UNEXPECTED;
-    if (!g_enabled) return S_FALSE; /* Identity needs no GPU work or resources. */
-    if (!device || !ctx || !target) return E_INVALIDARG;
-    hr = gamma_create_shaders();
-    if (FAILED(hr)) return hr;
-    ID3D11RenderTargetView_GetResource(target, &backbuffer);
-    /* The device's default render target is always a single-sample Texture2D. */
-    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)backbuffer, &desc);
-    if (desc.SampleDesc.Count != 1) {
-        ID3D11Resource_Release(backbuffer);
-        return E_NOTIMPL;
-    }
-    if (g_snapshot) {
-        ID3D11Texture2D_GetDesc(g_snapshot, &saved);
-        if (saved.Width != desc.Width || saved.Height != desc.Height || saved.Format != desc.Format) {
-            ID3D11ShaderResourceView_Release(g_source); g_source = NULL;
-            ID3D11Texture2D_Release(g_snapshot); g_snapshot = NULL;
-        }
-    }
-    if (!g_snapshot) {
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        desc.CPUAccessFlags = desc.MiscFlags = 0;
-        hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &g_snapshot);
-        if (SUCCEEDED(hr)) hr = ID3D11Device_CreateShaderResourceView(device,
-            (ID3D11Resource *)g_snapshot, NULL, &g_source);
-        if (FAILED(hr)) {
-            ID3D11Resource_Release(backbuffer);
-            gamma_release_resources();
-            return hr;
-        }
-    }
-    for (i = 0; i < 256; i++) {
-        values[i][0] = g_ramp.red[i] / 65535.0f;
-        values[i][1] = g_ramp.green[i] / 65535.0f;
-        values[i][2] = g_ramp.blue[i] / 65535.0f;
-        values[i][3] = 0;
-    }
-    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)g_constants, 0, NULL, values, 0, 0);
-    viewport.Width = (float)desc.Width; viewport.Height = (float)desc.Height; viewport.MaxDepth = 1;
-    ID3D11DeviceContext_CopyResource(g_deferred, (ID3D11Resource *)g_snapshot, backbuffer);
-    ID3D11DeviceContext_RSSetViewports(g_deferred, 1, &viewport);
-    ID3D11DeviceContext_OMSetRenderTargets(g_deferred, 1, &target, NULL);
-    ID3D11DeviceContext_IASetPrimitiveTopology(g_deferred, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_VSSetShader(g_deferred, g_vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(g_deferred, g_ps, NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(g_deferred, 0, 1, &g_constants);
-    ID3D11DeviceContext_PSSetShaderResources(g_deferred, 0, 1, &g_source);
-    ID3D11DeviceContext_Draw(g_deferred, 3, 0);
-    hr = ID3D11DeviceContext_FinishCommandList(g_deferred, FALSE, &commands);
-    ID3D11Resource_Release(backbuffer);
-    if (FAILED(hr)) {
+    if (g_pipe && g_pipe_format == swap_format)
+        return 1;
+    gamma_release_resources();
+
+    if (!xgpu_compile_hlsl_ex(g->device, k_gamma_vs, "main", 0, "gamma_vs", &g_vs) ||
+        !xgpu_compile_hlsl_ex(g->device, k_gamma_ps, "main", 1, "gamma_ps", &g_ps)) {
         gamma_release_resources();
-        return hr;
+        return 0;
     }
-    /* The runtime preserves the entire game pipeline, including cached states. */
-    ID3D11DeviceContext_ExecuteCommandList(ctx, commands, TRUE);
-    ID3D11CommandList_Release(commands);
-    g_active = TRUE;
-    return S_OK;
+    SDL_zero(si);                      /* nearest, clamp: the pass is 1:1 */
+    si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    g_sampler = SDL_CreateGPUSampler(g->device, &si);
+
+    SDL_zero(pi); SDL_zero(ct);
+    ct.format = swap_format;
+    pi.vertex_shader = g_vs.shader;
+    pi.fragment_shader = g_ps.shader;
+    pi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pi.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+    pi.target_info.color_target_descriptions = &ct;
+    pi.target_info.num_color_targets = 1;
+    g_pipe = SDL_CreateGPUGraphicsPipeline(g->device, &pi);
+    if (!g_pipe || !g_sampler) {
+        fprintf(stderr, "D3D8: gamma pipeline failed: %s\n", SDL_GetError());
+        gamma_release_resources();
+        return 0;
+    }
+    g_pipe_format = swap_format;
+    return 1;
 }
 
-void d3d8_gamma_end(ID3D11RenderTargetView *target)
+/* Present hook (see XGpu.present_hook): draws the backbuffer into `swap`
+ * through the gamma ramp. Returns 0 when gamma is off so the plain blit runs. */
+int d3d8_gamma_present(XGpu *g, SDL_GPUTexture *swap, Uint32 swap_w, Uint32 swap_h)
 {
-    ID3D11Resource *backbuffer;
-    if (!g_active) return;
-    ID3D11RenderTargetView_GetResource(target, &backbuffer);
-    ID3D11DeviceContext_CopyResource(d3d8_GetD3D11Context(), backbuffer, (ID3D11Resource *)g_snapshot);
-    ID3D11Resource_Release(backbuffer);
-    g_active = FALSE;
+    SDL_GPUColorTargetInfo c;
+    SDL_GPURenderPass *rp;
+    SDL_GPUTextureSamplerBinding tsb;
+    struct { float ramp[256][4]; float inv_size[4]; } u;
+    SDL_GPUViewport vp;
+    UINT i;
+
+    if (!g_enabled)
+        return 0;
+    if (!gamma_create(g, g->present_format))
+        return 0;
+
+    for (i = 0; i < 256; i++) {
+        u.ramp[i][0] = g_ramp.red[i] / 65535.0f;
+        u.ramp[i][1] = g_ramp.green[i] / 65535.0f;
+        u.ramp[i][2] = g_ramp.blue[i] / 65535.0f;
+        u.ramp[i][3] = 0;
+    }
+    /* The pass is scaled to the window: sample by position within it. */
+    u.inv_size[0] = 1.0f / (float)swap_w;
+    u.inv_size[1] = 1.0f / (float)swap_h;
+    u.inv_size[2] = u.inv_size[3] = 0;
+
+    SDL_zero(c);
+    c.texture = swap;
+    c.load_op = SDL_GPU_LOADOP_DONT_CARE;
+    c.store_op = SDL_GPU_STOREOP_STORE;
+    rp = SDL_BeginGPURenderPass(g->cmd, &c, 1, NULL);
+    if (!rp)
+        return 0;
+    SDL_BindGPUGraphicsPipeline(rp, g_pipe);
+    vp.x = 0; vp.y = 0; vp.w = (float)swap_w; vp.h = (float)swap_h; vp.min_depth = 0; vp.max_depth = 1;
+    SDL_SetGPUViewport(rp, &vp);
+    SDL_PushGPUFragmentUniformData(g->cmd, 0, &u, sizeof(u));
+    tsb.texture = g->backbuffer;
+    tsb.sampler = g_sampler;
+    SDL_BindGPUFragmentSamplers(rp, 0, &tsb, 1);
+    SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
+    SDL_EndGPURenderPass(rp);
+    return 1;
 }

@@ -13,9 +13,9 @@
  *                        try_bases[] is unmappable, and the "let the OS
  *                        choose" sentinel is never reached because the loop
  *                        condition terminates on it
- *   3. mirrors           28 views at 64MB intervals must alias the same
- *                        physical pages: the 26-bit address bus means
- *                        0x04070000 reads what 0x00070000 holds
+ *   3. above the map     the 28 slots above the mapped range are reserved,
+ *                        never mapped: a read there must fault, not alias
+ *                        low RAM (0x04070000 is not 0x00070000)
  *   4. teardown          shutdown must release every view, or a second init
  *                        in one process fails on addresses it already owns
  *
@@ -31,6 +31,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+#include <signal.h>
 #include <sys/wait.h>
 
 
@@ -53,11 +58,11 @@ static void check(int ok, const char *what, const char *detail)
 /* Read one byte in a forked child.
  *
  * The obvious approaches both failed here. Catching SIGSEGV and recovering
- * with siglongjmp works until two unmapped mirrors fall next to each other,
+ * with siglongjmp works until two unmapped slots fall next to each other,
  * at which point the recovery itself dies. Asking mach_vm_region first reports
  * some of these addresses as mapped when reading them still faults. A child
  * process cannot be wrong about it: if the read faults, the child dies and the
- * parent sees the signal, and the 27 other mirrors still get checked.
+ * parent sees the signal, and the other slots still get checked.
  *
  * Returns 1 and sets *out when the read succeeds, 0 when it faults.
  */
@@ -71,6 +76,20 @@ static int read_byte_in_child(const unsigned char *addr, unsigned char *out)
 
     if (pid == 0) {
         close(fd[0]);
+#ifdef __linux__
+        /* Piped core handlers (including WSL) ignore RLIMIT_CORE. */
+        prctl(PR_SET_DUMPABLE, 0);
+#endif
+        /* Do not run the inherited emulator fault handler in this probe: it
+         * initializes SDL/GPU state after fork. Expected faults should simply
+         * terminate this child, without writing a potentially huge core. */
+        struct sigaction sa = {0};
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+        struct rlimit no_core = {0, 0};
+        setrlimit(RLIMIT_CORE, &no_core);
         unsigned char v = *addr;          /* faults here, or does not */
         ssize_t n = write(fd[1], &v, 1);
         _exit(n == 1 ? 0 : 1);
@@ -142,7 +161,7 @@ int main(int argc, char **argv)
     printf("XBE %s: %zu bytes\n", path, n);
 
     long host_page = sysconf(_SC_PAGESIZE);
-    printf("host page size %ld, %d mirrors expected\n\n",
+    printf("host page size %ld, %d slots above the map expected\n\n",
            host_page, XBOX_NUM_MIRRORS);
 
     /* 1. The model must come up at all. */
@@ -154,6 +173,18 @@ int main(int argc, char **argv)
         free(xbe);
         return 1;
     }
+
+    /* The guest-window helpers that the fork's diagnostics and the teleport
+     * endpoint rely on, checked against the real mapping on this host. */
+    check(xbox_GuestMapped(XBOX_STACK_BASE, 16),
+          "xbox_GuestMapped: the committed stack is readable",
+          "the stack range is not reported as mapped");
+    check(!xbox_GuestMapped(0x0FFFFu, 4),
+          "xbox_GuestMapped: below the guest window floor is refused", NULL);
+    check(!xbox_GuestMapped(XBOX_DEVKIT_RAM, 4),
+          "xbox_GuestMapped: beyond the devkit window is refused", NULL);
+    check(xbox_GuestRangeInWindow(0x10000u, 4) && !xbox_GuestRangeInWindow(0x0FFFFu, 4),
+          "xbox_GuestRangeInWindow: floor is exact", NULL);
 
     void  *base = xbox_GetMemoryBase();
     size_t size = xbox_GetMappedSize();
@@ -167,42 +198,31 @@ int main(int argc, char **argv)
     check((size % (size_t)host_page) == 0,
           "mapped size is a whole number of host pages", NULL);
 
-    /* 3. The wrap. Write through the base, read through each mirror: the
-     *    26-bit bus means every mirror is the same physical memory. */
+    /* 3. Nothing above the mapped range aliases RAM. Write through the base,
+     *    then read through each slot above it: the slots are reserved and never
+     *    mapped, so every read must fault. Under the old mirror views each one
+     *    read the base page back. */
     unsigned char *p = (unsigned char *)base;
     const size_t probe = 0x70000;
-    fprintf(stderr, "[base=%p size=0x%zx probe=0x%zx addr=%p]\n",
-            base, size, probe, (void *)(p + probe));          /* the address the comment cites */
     if (probe < size) {
         p[probe] = 0x5A;
-        int aliased = 0, checked = 0, unmapped = 0;
+        int faulted = 0, readable = 0;
         for (int m = 1; m <= XBOX_NUM_MIRRORS; m++) {
-            unsigned char *mp = p + (size_t)m * size + probe;
-            checked++;
-            /* Ask before touching. A mirror the layout could not place is not
-             * mapped at all, and dereferencing it would abort this test with a
-             * signal instead of reporting which mirrors are missing. */
             unsigned char got = 0;
-            if (!read_byte_in_child(mp, &got)) { unmapped++; continue; }
-            if (got == 0x5A) aliased++;
+            if (read_byte_in_child(p + (size_t)m * size + probe, &got)) readable++;
+            else faulted++;
         }
         char detail[128];
         snprintf(detail, sizeof detail,
-                 "%d of %d aliased, %d never mapped", aliased, checked, unmapped);
-        check(aliased == checked, "every mirror aliases the base page", detail);
+                 "%d of %d slots faulted, %d readable", faulted,
+                 XBOX_NUM_MIRRORS, readable);
+        check(faulted == XBOX_NUM_MIRRORS && readable == 0,
+              "every slot above the map faults, none aliases RAM", detail);
 
-        /* And the other direction: a write through a mirror is visible at the
-         * base, which is what a title's out-of-range write actually does. */
-        unsigned char *m1 = p + size + probe;
-        unsigned char ignored = 0;
-        if (read_byte_in_child(m1, &ignored)) {
-            *m1 = 0xA5;
-            check(p[probe] == 0xA5, "a write through mirror 1 reaches the base",
-                  "mirror is a separate copy, not an alias");
-        } else {
-            check(0, "a write through mirror 1 reaches the base",
-                  "mirror 1 is not accessible");
-        }
+        /* The mapped range itself is real, distinct memory at its top edge. */
+        p[size - 1] = 0xA5;
+        check(p[size - 1] == 0xA5, "the top byte of the mapped range is backed",
+              NULL);
     } else {
         check(0, "mapped region covers the 0x70000 probe", "region too small");
     }

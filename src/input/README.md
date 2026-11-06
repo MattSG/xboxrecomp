@@ -1,6 +1,6 @@
 # xbox_input — Xbox Gamepad to XInput
 
-Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGetState` with a slightly different structure layout than the XInput API on Windows. This layer translates between them.
+Maps the Xbox controller API to the host's gamepads through SDL3, on every platform (Xbox, PlayStation and Switch pads, hot plugging, rumble). The original Xbox used `XInputGetState` with a slightly different structure layout than the XInput API on Windows; this layer reads each pad into an XInput-shaped state and translates that. There is no XInput backend: on Windows SDL reaches Xbox pads through XInput itself. `xbox_InputHostPad` returns the raw pad (no keyboard or mouse merged) for launchers and overlays.
 
 ## Files
 

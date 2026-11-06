@@ -1,15 +1,8 @@
 /**
  * Xbox DirectSound → XAudio2 Compatibility Layer
  *
- * Implements the Xbox DirectSound interfaces. Currently provides
- * stub sound buffer objects that accept all method calls silently.
- * This allows the game to initialize audio and create buffers without
- * crashing, while actual audio playback is deferred to a later phase.
- *
- * Architecture:
- * - XAudio2 mastering voice for output (future)
- * - Each DirectSound buffer maps to an XAudio2 source voice (future)
- * - 3D audio emulated using X3DAudio (future)
+ * PCM buffer operations delegate to the shared APU mixer. Several stream,
+ * listener and spatial methods remain compatibility stubs.
  */
 
 #include "dsound_xbox.h"
@@ -20,10 +13,7 @@
 #include <math.h>
 
 /* ================================================================
- * Sound buffer stub implementation
- *
- * Returns a valid buffer object for every CreateSoundBuffer call.
- * All audio methods are no-ops that return S_OK.
+ * Sound buffer compatibility implementation
  * ================================================================ */
 
 typedef struct DSoundBuffer {
@@ -274,6 +264,12 @@ static HRESULT __stdcall ds_CreateSoundBuffer(IDirectSound8 *self, const DSBUFFE
         buf->bits_per_sample = wfx->wBitsPerSample;
     }
 
+    /* Allocate storage before binding the voice, including the Lock path. */
+    if (desc && desc->dwBufferBytes > 0) {
+        buf->buffer_data = calloc(1, desc->dwBufferBytes);
+        buf->buffer_size = desc->dwBufferBytes;
+    }
+
     /* Allocate a mixer voice slot */
     buf->mixer_slot = apu_mixer_alloc_voice();
     if (buf->mixer_slot >= 0) {
@@ -281,13 +277,9 @@ static HRESULT __stdcall ds_CreateSoundBuffer(IDirectSound8 *self, const DSBUFFE
         if (v) {
             v->num_channels = buf->channels;
             v->sample_rate = buf->frequency;
+            v->pcm_data = buf->bits_per_sample == 16 ? buf->buffer_data : NULL;
+            v->pcm_bytes = v->pcm_data ? buf->buffer_size : 0;
         }
-    }
-
-    /* Pre-allocate buffer if size specified */
-    if (desc && desc->dwBufferBytes > 0) {
-        buf->buffer_data = calloc(1, desc->dwBufferBytes);
-        buf->buffer_size = desc->dwBufferBytes;
     }
 
     static int create_log_count = 0;
@@ -381,6 +373,6 @@ HRESULT xbox_DirectSoundCreate(void *pGuid, IDirectSound8 **ppDS, void *pUnkOute
     (void)pGuid; (void)pUnkOuter;
     if (!ppDS) return E_INVALIDARG;
     *ppDS = &g_dsound;
-    fprintf(stderr, "Audio: DirectSound created (stub - no audio output)\n");
+    fprintf(stderr, "Audio: DirectSound compatibility interface created\n");
     return S_OK;
 }

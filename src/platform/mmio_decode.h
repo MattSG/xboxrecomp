@@ -30,8 +30,15 @@
 
 #include <stdint.h>
 
+/* Win32 hands a VEH the CONTEXT; on x86-64 POSIX win32_compat's SIGSEGV
+ * dispatch fills the same CONTEXT from the ucontext. */
+#if defined(_WIN32) || defined(__x86_64__)
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include "xbox_winnt.h"
+#include "win32_compat.h"
+#endif
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
@@ -290,5 +297,5 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || __x86_64__ */
 #endif /* MMIO_DECODE_H */

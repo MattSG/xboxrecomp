@@ -1511,6 +1511,10 @@ class Lifter:
         # Addresses loaded as immediates into a register inside the current
         # function, used to resolve `jmp <reg>`. See _lift_jmp.
         self.imm_code_refs = set()
+        # Addresses inside a function that a caller may enter directly, as well as
+        # by falling through or branching. Each becomes a label, and the function
+        # dispatches to it when g_recomp_resume names it on entry.
+        self.resume_entries = set()
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -2026,7 +2030,7 @@ class Lifter:
     # ── MOV family ──
 
     def _lift_mov(self, insn, ops):
-        if nops := len(ops) < 2:
+        if len(ops) < 2:
             return [f"/* mov: bad operands */"]
         src = _fmt_operand_read(ops[1])
         out = [_fmt_operand_write(ops[0], src)]
@@ -2373,6 +2377,9 @@ class Lifter:
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
+        # x86 masks the shift operand to five bits for byte, word and dword
+        # shifts.  Leaving the register's low byte intact emits undefined C
+        # shifts for counts >= 32 (common in bitstream decoders).
         cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
         out = []
         if self.needs_cf:
