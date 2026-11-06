@@ -126,19 +126,38 @@ void xbox_InputSetMenuProbe(int (*in_menu)(void));
  * title can dispatch it on its guest thread instead of receiving pad A. */
 void xbox_InputSetMenuClickHandler(int (*click)(float x, float y));
 
-/* The host's pads, supplied by the embedding project instead of the bundled
- * XInput / SDL2 backend (an SDL3 gamepad layer, say). Register before
- * xbox_InputInit; NULL restores the bundled backend. The provider is borrowed
- * and must stay valid. get_state fills `state` (zeroed on entry) and returns
- * ERROR_SUCCESS, or ERROR_DEVICE_NOT_CONNECTED (1167) for an empty port; the
- * keyboard still merges on top of port 0. set_state (rumble) and init are
- * optional. */
+/* The raw host pad, supplied by the embedding project instead of XInput (an
+ * SDL3 gamepad layer, say). XInput's layout: `buttons` are the
+ * XINPUT_GAMEPAD_* bits, triggers 0-255, sticks up-positive. `packet` must
+ * change whenever the state does. The toolkit maps it to the Xbox pad
+ * (RECOMP_PADMAP) and adds the keyboard and mouse, UI-capture neutralisation
+ * and packet sequencing, so every backend behaves the same. */
+typedef struct {
+    uint16_t buttons;
+    uint8_t  left_trigger, right_trigger;
+    int16_t  lx, ly, rx, ry;
+    uint32_t packet;
+} XBOX_HOST_PAD;
+
+/* Register before xbox_InputInit; NULL restores XInput. The provider is
+ * borrowed and must stay valid. `get` fills the pad and returns ERROR_SUCCESS,
+ * or ERROR_DEVICE_NOT_CONNECTED (1167) for an empty port; `rumble` and `init`
+ * are optional. May be called from any thread the title polls on. */
 typedef struct {
     void  (*init)(void);
-    DWORD (*get_state)(DWORD port, XBOX_INPUT_STATE *state);
-    DWORD (*set_state)(DWORD port, const XBOX_VIBRATION *vibration);
+    DWORD (*get)(DWORD port, XBOX_HOST_PAD *pad);
+    void  (*rumble)(DWORD port, WORD left, WORD right);
 } XBOX_HOST_PAD_PROVIDER;
 void xbox_InputSetHostPadProvider(const XBOX_HOST_PAD_PROVIDER *provider);
+
+/* The host pad on a port in XInput's layout (wButtons are the XINPUT_GAMEPAD_*
+ * bits, triggers 0-255, sticks up-positive), without the keyboard and mouse the
+ * title's state merges in. For launchers and overlays that need the raw pad.
+ * Returns 0 when read, ERROR_DEVICE_NOT_CONNECTED (1167) otherwise. */
+uint32_t xbox_InputHostPad(uint32_t port, uint16_t *buttons,
+                           uint8_t *left_trigger, uint8_t *right_trigger,
+                           int16_t *lx, int16_t *ly, int16_t *rx, int16_t *ry);
+
 
 #if !defined(_WIN32)
 /* The POSIX SDL presenter owns event pumping while its main-thread window is

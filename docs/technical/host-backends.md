@@ -14,7 +14,7 @@ stack, for example) without carrying a fork of the toolkit.
 | Framebuffer window (`fbw_*`, `xbox_FramebufferWindowStart`) | `src/video/fb_window_win32.c` | `-DXBOXRECOMP_RENDERER=EXTERNAL` | `src/video/fb_window.h`, `fb_present.h` |
 | APU audio device (`xa2_*`) | XAudio2 on Windows, SDL2 elsewhere | `-DXBOXRECOMP_APU_OUTPUT=EXTERNAL` | `src/apu/apu_xaudio2.h` |
 | D3D8 layer (`xbox_d3d8`) | `src/d3d` | `-DXBOXRECOMP_BUILD_D3D8=OFF` | — |
-| Host pads | XInput on Windows, SDL2 elsewhere | `xbox_InputSetHostPadProvider()` at run time | `src/input/xinput_xbox.h` |
+| Host pads | XInput on Windows, none elsewhere | `xbox_InputSetHostPadProvider()` at run time | `src/input/xinput_xbox.h` |
 
 The window and the renderer are one choice because the window's input and
 overlay state is shared with the renderer's present path; a renderer that
@@ -68,7 +68,11 @@ above. The window module writes key and pointer state through
 and PVIDEO overlay are showing. Pads go through `XBOX_HOST_PAD_PROVIDER`:
 
 ```c
-static DWORD my_get_state(DWORD port, XBOX_INPUT_STATE *s) { /* fill s */ return ERROR_SUCCESS; }
-static const XBOX_HOST_PAD_PROVIDER pads = { NULL, my_get_state, NULL };
+static DWORD my_get(DWORD port, XBOX_HOST_PAD *pad) { /* fill pad */ return ERROR_SUCCESS; }
+static const XBOX_HOST_PAD_PROVIDER pads = { NULL, my_get, NULL };
 xbox_InputSetHostPadProvider(&pads);   /* before xbox_InputInit() */
 ```
+
+The provider supplies only the raw pad (XInput layout). The toolkit maps it to
+the Xbox pad (`RECOMP_PADMAP`) and adds the keyboard and mouse, UI-capture
+neutralisation and packet sequencing, so every backend behaves the same.
