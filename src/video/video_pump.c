@@ -19,6 +19,12 @@
 #include "d3d/d3d8_xbox.h"
 #include "d3d/d3d8_internal.h"
 
+static void (*s_present_handler)(unsigned frame);
+void xbox_VideoSetPresentHandler(void (*handler)(unsigned frame))
+{
+    s_present_handler = handler;
+}
+
 #define VP_WINDOW_W 640
 #define VP_WINDOW_H 480
 
@@ -133,6 +139,7 @@ static DWORD WINAPI vp_thread(LPVOID unused)
         dev->lpVtbl->EndScene(dev);
         dev->lpVtbl->Present(dev, NULL, NULL, NULL, NULL);
         frames++;
+        if (s_present_handler) s_present_handler(frames);
 
         /* A couple of frames to disc as evidence that real pixels were
          * drawn -- two of them, far enough apart to show the picture moving
@@ -186,6 +193,7 @@ int xbox_VideoIsPlaying(void)
 }
 
 #else  /* !_WIN32 */
+void xbox_VideoSetPresentHandler(void (*handler)(unsigned frame)) { (void)handler; }
 int xbox_VideoPlayFile(const char *p) { (void)p; return -1; }
 int xbox_VideoIsPlaying(void) { return 0; }
 #endif
