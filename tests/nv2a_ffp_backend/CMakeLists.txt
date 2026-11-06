@@ -5,7 +5,8 @@ set(NV2A_BACKEND_TEST_SOURCES
     ../../src/kernel/nv2a_pb_exec.c
     ../../src/kernel/nv2a_vsh_interp.c
     ../../src/kernel/nv2a_combiner.c
-    ../../src/kernel/nv2a_flip_hold.c)
+    ../../src/kernel/nv2a_flip_hold.c
+    ../nv2a_exec_stubs.c)
 add_executable(nv2a-ffp-backend-test nv2a_ffp_backend_test.c ${NV2A_BACKEND_TEST_SOURCES})
 add_executable(nv2a-present-sync-test nv2a_present_sync_test.c ${NV2A_BACKEND_TEST_SOURCES})
 foreach(target nv2a-ffp-backend-test nv2a-present-sync-test)
