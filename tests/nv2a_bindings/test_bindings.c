@@ -608,6 +608,8 @@ static void test_host_draw(void)
     puts("PASS: native target callback ordering, metadata, rejection and guest binding restoration");
 }
 
+#include "depth_texture_cases.h"
+
 int main(int argc,char **argv)
 {
     CHECK(argc==2);
@@ -632,6 +634,7 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[1],"ps_reset")) test_ps_reset();
     else if(!strcmp(argv[1],"overlay_upload")) test_overlay_upload();
     else if(!strcmp(argv[1],"benchmark")) benchmark();
+    else if (!strcmp(argv[1], "depth_texture")) test_depth_texture();
     else CHECK(0);
     return 0;
 }
