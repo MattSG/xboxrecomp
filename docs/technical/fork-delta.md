@@ -77,7 +77,7 @@ build on Windows passed the sweep; the rest of that sweep was fixed or dropped:
   `apu_vp` (mono HRTF routing check), `apu_monitor`, `nv2a_raster_batch`
   (the software rasteriser path is gone from the fork's executor),
   `nv2a_pb_constants`, `nv2a_tex_filter`, the `nv2a-pb-hitch` / `nv2a-pb-capture`
-  targets of `kernel_dispatch`, `fb_present`, `d3d8_smoke`.
+  targets of `kernel_dispatch`, `fb_present`. (`d3d8_smoke` stays: upstream's `src/d3d` builds it.)
 - Dropped because they exercise the SDL3 pad path that stays with the embedder:
   `input_capture`, `input_usb_report`, `input_keyboard`, `input_keyboard_map`,
   `input_keyboard_sdl`, `input_sdl_hotplug`, `input_xinput_imports`.
