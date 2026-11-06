@@ -16,6 +16,57 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ---- hooks a title or host registers (xinput_xbox.h) ------------------- */
+
+static BOOL menu_click(void);
+static XBOX_KEYBOARD_HOOK s_keyboard_hook;
+void xbox_InputSetKeyboardHook(XBOX_KEYBOARD_HOOK hook) { s_keyboard_hook = hook; }
+
+/* Optional title click dispatch, with mouse-to-A fallback. Declared rather
+ * than included so src/input does not depend on the video module's include
+ * path. */
+extern int xbox_FramebufferHostInputCaptured(void);
+extern int xbox_FramebufferMouse(float *x, float *y);
+extern void xbox_FramebufferSetMousePressHandler(int (*handler)(float, float));
+static int (*s_menu_click)(float x, float y);
+
+static BOOL keyboard_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_KEYBOARD");
+        on = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return on ? TRUE : FALSE;
+}
+
+static int menu_press(float x, float y)
+{
+    return keyboard_enabled() && xbox_InputKeyboardMenu() &&
+        !xbox_FramebufferHostInputCaptured() && s_menu_click && s_menu_click(x, y);
+}
+
+void xbox_InputSetMenuClickHandler(int (*click)(float, float))
+{
+    s_menu_click = click;
+    xbox_FramebufferSetMousePressHandler(click ? menu_press : NULL);
+}
+
+/* A left click the title did not take is a short press of A. */
+static BOOL menu_click(void)
+{
+    static int was_down;
+    static ULONGLONG a_until;
+    ULONGLONG now = GetTickCount64();
+    float x, y;
+    int down = xbox_FramebufferKeyDown(XBOX_VK_LBUTTON);
+    xbox_FramebufferMouse(&x, &y);
+    if (down && !was_down && !(s_menu_click && s_menu_click(x, y)))
+        a_until = now + 80;
+    was_down = down;
+    return now < a_until;
+}
+
 /* Merge the keyboard on top of a pad on port 0 rather than only standing in
  * for a missing one.
  *
@@ -35,6 +86,10 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
 
     if (!xbox_InputKeyboardPoll(&kb))
         return;
+    if (xbox_InputKeyboardMenu() && menu_click())
+        kb.Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+    if (s_keyboard_hook)
+        s_keyboard_hook(&kb, xbox_InputKeyboardMenu() ? TRUE : FALSE);
     pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
     for (i = 0; i < 8; i++)
         if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
@@ -47,6 +102,15 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
      * read as the same state and the press never happens. */
     pState->dwPacketNumber = kb.dwPacketNumber;
 }
+
+/* The bundled backends below define backend_Input*; the public xbox_Input*
+ * entry points at the end of the file route to a registered host pad
+ * provider first, then to them. */
+#define xbox_InputInit            backend_InputInit
+#define xbox_InputGetState        backend_InputGetState
+#define xbox_InputSetState        backend_InputSetState
+#define xbox_InputIsConnected     backend_InputIsConnected
+#define xbox_InputGetCapabilities backend_InputGetCapabilities
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -409,3 +473,72 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 }
 
 #endif /* _WIN32 */
+
+#undef xbox_InputInit
+#undef xbox_InputGetState
+#undef xbox_InputSetState
+#undef xbox_InputIsConnected
+#undef xbox_InputGetCapabilities
+
+/* ---- host pad provider -------------------------------------------------- */
+
+static const XBOX_HOST_PAD_PROVIDER *s_pad_provider;
+
+void xbox_InputSetHostPadProvider(const XBOX_HOST_PAD_PROVIDER *provider)
+{
+    s_pad_provider = provider;
+}
+
+void xbox_InputInit(void)
+{
+    if (s_pad_provider) {
+        if (s_pad_provider->init) s_pad_provider->init();
+        return;
+    }
+    backend_InputInit();
+}
+
+DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    DWORD r;
+    if (!s_pad_provider)
+        return backend_InputGetState(dwPort, pState);
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    memset(pState, 0, sizeof(*pState));
+    r = s_pad_provider->get_state(dwPort, pState);
+    if (r == ERROR_SUCCESS && dwPort == 0)
+        keyboard_merge(pState);
+    return r;
+}
+
+DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+{
+    if (!s_pad_provider)
+        return backend_InputSetState(dwPort, pVibration);
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    return s_pad_provider->set_state ? s_pad_provider->set_state(dwPort, pVibration)
+                                     : ERROR_SUCCESS;
+}
+
+BOOL xbox_InputIsConnected(DWORD dwPort)
+{
+    XBOX_INPUT_STATE st;
+    if (!s_pad_provider)
+        return backend_InputIsConnected(dwPort);
+    return dwPort < XBOX_MAX_CONTROLLERS &&
+           s_pad_provider->get_state(dwPort, &st) == ERROR_SUCCESS;
+}
+
+DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
+{
+    if (!s_pad_provider)
+        return backend_InputGetCapabilities(dwPort, dwFlags, pCaps);
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps || !xbox_InputIsConnected(dwPort))
+        return ERROR_DEVICE_NOT_CONNECTED;
+    memset(pCaps, 0, sizeof(*pCaps));
+    pCaps->Type = 1;     /* XINPUT_DEVTYPE_GAMEPAD */
+    pCaps->SubType = 1;  /* XINPUT_DEVSUBTYPE_GAMEPAD */
+    return ERROR_SUCCESS;
+}
