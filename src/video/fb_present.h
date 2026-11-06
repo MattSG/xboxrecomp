@@ -59,6 +59,10 @@ void xbox_FramebufferRenderHostOverlay(void *device, void *context, void *target
 int xbox_FramebufferHostInputCaptured(void);
 #endif
 
+/* The title set a display mode: open the window (once) if one is wanted.
+ * Implemented by the window module (fb_window.h). */
+void xbox_FramebufferWindowStart(void);
+
 /* A buffer the display reads straight from guest memory because the title is
  * not flipping into it (loading screens drawn by the CPU, the first frames
  * before any flip). Returns 0 while flips are in charge. */

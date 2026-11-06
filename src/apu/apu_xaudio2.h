@@ -7,8 +7,16 @@
 #include <stdint.h>
 
 /* The device backend behind these functions: XAudio2 on Windows
- * (apu_xaudio2.c), SDL3 on POSIX hosts (apu_sdl.c). Same contract. */
-#define XA2_BACKEND_NAME "SDL"
+ * (apu_xaudio2.c), SDL2 on POSIX hosts (apu_sdl2.c). Same contract. */
+/* A backend supplied by the embedding project
+ * (XBOXRECOMP_APU_OUTPUT=EXTERNAL) defines its own name before this header. */
+#ifndef XA2_BACKEND_NAME
+#if defined(_WIN32)
+#define XA2_BACKEND_NAME "XAudio2"
+#else
+#define XA2_BACKEND_NAME "SDL2"
+#endif
+#endif
 
 /* Initialize the device backend. Returns 1 on success, 0 on failure. */
 int xa2_init(void);
@@ -57,7 +65,7 @@ static inline void xa2_pacing_marks(int buf_samples, int count, int period,
 unsigned xa2_underruns(void);
 
 /* Samples the device has consumed since init: XAudio2's SamplesPlayed, or
- * on SDL everything queued minus what is still queued. Read against the
+ * on SDL2 everything queued minus what is still queued. Read against the
  * wall clock this is the host-side starvation measure: while the device
  * plays, it advances 48000 a second; whatever it falls behind is silence
  * the device inserted (an underrun the WAV tap, which records submissions,

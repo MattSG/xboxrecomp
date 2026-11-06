@@ -1,24 +1,24 @@
 /**
- * D3D8 Compatibility Device Implementation (SDL_GPU)
+ * D3D8→D3D11 Compatibility Device Implementation
  *
- * Implements the Xbox D3D8 IDirect3DDevice8 interface on SDL3's GPU API.
+ * Implements the Xbox D3D8 IDirect3DDevice8 interface using D3D11.
  * The game's translated RenderWare code calls D3D8 methods through
- * COM vtables; this layer translates those calls to SDL_GPU.
+ * COM vtables; this layer translates those calls to D3D11 equivalents.
  *
  * Architecture:
- * - One SDL window and SDL_GPU device (gfx/gpu_device.c). The D3D8 backbuffer
- *   is an offscreen texture blitted to the window at Present.
- * - Render state tracking: D3D8 states are kept here and turned into a
- *   pipeline description at draw time (d3d8_pipeline.c, d3d8_states.c)
- * - Texture/buffer management: D3D8 resource handles wrap SDL_GPU resources
- * - Fixed-function pipeline: emulated via generated shaders (the Xbox D3D8
+ * - D3D11 device and swap chain created during initialization
+ * - Render state tracking: D3D8 states mapped to D3D11 state objects
+ * - Texture/buffer management: D3D8 resource handles wrap D3D11 resources
+ * - Fixed-function pipeline: emulated via D3D11 shaders (the Xbox D3D8
  *   pipeline is configurable but not fully programmable)
+ *
+ * Build: Requires Windows SDK with d3d11.h and dxgi.h
  */
 
 #include "d3d8_internal.h"
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include "recomp_exit_hook.h"
 
 /* ================================================================
  * Internal device state
@@ -32,11 +32,18 @@
 #define MAX_LIGHTS           8
 
 typedef struct D3D8DeviceState {
-    /* SDL_GPU device, window and backbuffer */
-    XGpu                    gpu;
-    XGpuTex                *backbuffer;     /* borrowed view of gpu.backbuffer */
-    XGpuTex                *default_depth;
+    /* D3D11 objects */
+    ID3D11Device            *d3d11_device;
+    ID3D11DeviceContext     *d3d11_context;
+    IDXGISwapChain          *swap_chain;
 
+    /* Default render targets */
+    ID3D11RenderTargetView  *default_rtv;
+    ID3D11DepthStencilView  *default_dsv;
+    ID3D11Texture2D         *default_depth;
+
+    /* Window */
+    HWND                    hwnd;
     UINT                    width;
     UINT                    height;
     D3DFORMAT               backbuffer_format;
@@ -114,19 +121,16 @@ const DWORD *d3d8_GetPalette(DWORD stage)
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
 
-/* Window events: the game's internal loop drives rendering, so nothing else
- * pumps the window. Called from every present. The pump (src/video/sdl_events.c)
- * is shared with the framebuffer window so the two never steal each other's
- * events, and it keeps the held-key state for the RECOMP_KEYBOARD pad stand-in. */
-void xbox_PumpEvents(void);
-
 static HRESULT d3d8_present(void)
 {
-    xbox_PumpEvents();
-    xgpu_present(&g_device_state.gpu);
-    xgpu_begin_frame(&g_device_state.gpu);
-    d3d8_pipe_begin_frame();
-    return S_OK;
+    HRESULT hr = d3d8_gamma_begin(g_device_state.default_rtv);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: Gamma presentation failed: 0x%08lX\n", hr);
+        return hr;
+    }
+    hr = IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    d3d8_gamma_end(g_device_state.default_rtv);
+    return hr;
 }
 
 /* ================================================================
@@ -134,7 +138,20 @@ static HRESULT d3d8_present(void)
  * ================================================================ */
 void d3d8_PresentFrame(void)
 {
-    if (g_device_state.gpu.device)
+    /* Pump Windows messages */
+    MSG msg;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            /* ExitProcess skips atexit, where the summary would print. */
+            recomp_exit_hook_run("window");
+            ExitProcess(0);
+        }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    /* Present the backbuffer (VSync = 1) */
+    if (g_device_state.swap_chain)
         d3d8_present();
 }
 
@@ -143,8 +160,11 @@ void d3d8_PresentFrame(void)
  * ================================================================ */
 
 IDirect3DDevice8    *d3d8_GetDevice(void) { return &g_device; }
-XGpu                *d3d8_GetGpu(void) { return &g_device_state.gpu; }
-void                 d3d8_GetViewport(D3DVIEWPORT8 *vp) { *vp = g_device_state.viewport; }
+ID3D11Device        *d3d8_GetD3D11Device(void) { return g_device_state.d3d11_device; }
+ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_context; }
+IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
+ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
+HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
 UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.width; }
 UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.height; }
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
@@ -174,71 +194,108 @@ UINT                 d3d8_GetNumLights(void) {
     return MAX_LIGHTS;
 }
 
-/* What the next draw renders into. An offscreen target without a depth surface
- * of its own gets none (the default depth buffer is window-sized). */
-void d3d8_GetCurrentTargets(XGpuTargets *t, SDL_GPUTextureFormat *color_fmt,
-                            SDL_GPUTextureFormat *depth_fmt, Uint32 *w, Uint32 *h)
-{
-    XGpuTex *depth = NULL;
-
-    memset(t, 0, sizeof(*t));
-    if (g_cur_rt && g_cur_rt->gpu) {
-        t->color = g_cur_rt->gpu->tex;
-        t->color_mip = g_cur_rt->mip;
-        t->color_layer = g_cur_rt->layer;
-        *color_fmt = g_cur_rt->gpu->format;
-        *w = g_cur_rt->width;
-        *h = g_cur_rt->height;
-    } else {
-        t->color = NULL;
-        *color_fmt = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
-        *w = g_device_state.width;
-        *h = g_device_state.height;
-    }
-    if (g_cur_ds && g_cur_ds->gpu)
-        depth = g_cur_ds->gpu;
-    else if (!g_cur_rt)
-        depth = g_device_state.default_depth;
-    t->depth = depth ? depth->tex : NULL;
-    *depth_fmt = depth ? depth->format : SDL_GPU_TEXTUREFORMAT_INVALID;
-}
-
 /* ================================================================
- * Device initialization helpers
+ * D3D11 initialization helpers
  * ================================================================ */
 
-static HRESULT gpu_create_device(D3D8DeviceState *state, D3DPRESENT_PARAMETERS *pp)
+static HRESULT d3d11_create_device_and_swap_chain(
+    D3D8DeviceState *state,
+    D3DPRESENT_PARAMETERS *pp)
 {
-    UINT w = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
-    UINT h = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
-    const char *hide;
+    DXGI_SWAP_CHAIN_DESC scd;
+    D3D_FEATURE_LEVEL feature_level;
+    UINT create_flags = 0;
+    HRESULT hr;
 
-    /* RECOMP_HIDE_WINDOW=1 renders without showing a window (tests, CI). */
-    hide = getenv("RECOMP_HIDE_WINDOW");
-    if (!xgpu_init(&state->gpu, "xboxrecomp", (int)w, (int)h, hide && *hide && *hide != '0')) {
-        fprintf(stderr, "D3D8: Failed to create SDL_GPU device\n");
-        return E_FAIL;
+#ifdef _DEBUG
+    create_flags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+
+    memset(&scd, 0, sizeof(scd));
+    scd.BufferCount = pp->BackBufferCount ? pp->BackBufferCount : 1;
+    scd.BufferDesc.Width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
+    scd.BufferDesc.Height = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
+    scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.BufferDesc.RefreshRate.Numerator = 60;
+    scd.BufferDesc.RefreshRate.Denominator = 1;
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.OutputWindow = pp->hDeviceWindow;
+    scd.SampleDesc.Count = 1;
+    scd.SampleDesc.Quality = 0;
+    scd.Windowed = pp->Windowed;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    hr = D3D11CreateDeviceAndSwapChain(
+        NULL,
+        D3D_DRIVER_TYPE_HARDWARE,
+        NULL,
+        create_flags,
+        NULL, 0,
+        D3D11_SDK_VERSION,
+        &scd,
+        &state->swap_chain,
+        &state->d3d11_device,
+        &feature_level,
+        &state->d3d11_context
+    );
+
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);
+        return hr;
     }
-    if (!pp->Windowed)
-        SDL_SetWindowFullscreen(state->gpu.window, true);
 
-    state->width = w;
-    state->height = h;
-    state->gpu.present_hook = d3d8_gamma_present;
+    state->hwnd = pp->hDeviceWindow;
+    state->width = scd.BufferDesc.Width;
+    state->height = scd.BufferDesc.Height;
+
     return S_OK;
 }
 
-static HRESULT gpu_create_render_targets(D3D8DeviceState *state)
+static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
 {
-    XGpuTex *depth;
+    ID3D11Texture2D *back_buffer = NULL;
+    D3D11_TEXTURE2D_DESC depth_desc;
+    HRESULT hr;
 
-    state->backbuffer = xgputex_wrap(state->gpu.backbuffer, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
-                                     state->gpu.width, state->gpu.height);
-    depth = xgputex_create(&state->gpu, SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT,
-                           state->width, state->height, 1, 1,
-                           SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
-    state->default_depth = depth;
-    return (state->backbuffer && depth) ? S_OK : E_FAIL;
+    /* Create render target view from swap chain back buffer */
+    hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
+                                   &IID_ID3D11Texture2D,
+                                   (void **)&back_buffer);
+    if (FAILED(hr)) return hr;
+
+    hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
+                                              (ID3D11Resource *)back_buffer,
+                                              NULL, &state->default_rtv);
+    ID3D11Texture2D_Release(back_buffer);
+    if (FAILED(hr)) return hr;
+
+    /* Create depth stencil */
+    memset(&depth_desc, 0, sizeof(depth_desc));
+    depth_desc.Width = state->width;
+    depth_desc.Height = state->height;
+    depth_desc.MipLevels = 1;
+    depth_desc.ArraySize = 1;
+    depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depth_desc.SampleDesc.Count = 1;
+    depth_desc.SampleDesc.Quality = 0;
+    depth_desc.Usage = D3D11_USAGE_DEFAULT;
+    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+
+    hr = ID3D11Device_CreateTexture2D(state->d3d11_device, &depth_desc,
+                                       NULL, &state->default_depth);
+    if (FAILED(hr)) return hr;
+
+    hr = ID3D11Device_CreateDepthStencilView(state->d3d11_device,
+                                              (ID3D11Resource *)state->default_depth,
+                                              NULL, &state->default_dsv);
+    if (FAILED(hr)) return hr;
+
+    /* Bind default render targets */
+    ID3D11DeviceContext_OMSetRenderTargets(state->d3d11_context, 1,
+                                            &state->default_rtv,
+                                            state->default_dsv);
+
+    return S_OK;
 }
 
 static void d3d8_init_default_states(D3D8DeviceState *state)
@@ -311,19 +368,21 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     LONG ref = InterlockedDecrement(&g_device_state.ref_count);
     if (ref <= 0) {
         /* Cleanup subsystems first */
-        d3d8_clear_shutdown();
-        d3d8_pipe_shutdown();
+        up_ring_shutdown();
         d3d8_gamma_shutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
         d3d8_states_shutdown();
         d3d8_shaders_shutdown();
 
-        /* Cleanup GPU resources */
+        /* Cleanup D3D11 resources */
         D3D8DeviceState *s = &g_device_state;
-        if (s->default_depth) { xgputex_unref(&s->gpu, s->default_depth); s->default_depth = NULL; }
-        if (s->backbuffer) { xgputex_unref(&s->gpu, s->backbuffer); s->backbuffer = NULL; }
-        xgpu_shutdown(&s->gpu);
+        if (s->default_dsv) { ID3D11DepthStencilView_Release(s->default_dsv); s->default_dsv = NULL; }
+        if (s->default_depth) { ID3D11Texture2D_Release(s->default_depth); s->default_depth = NULL; }
+        if (s->default_rtv) { ID3D11RenderTargetView_Release(s->default_rtv); s->default_rtv = NULL; }
+        if (s->swap_chain) { IDXGISwapChain_Release(s->swap_chain); s->swap_chain = NULL; }
+        if (s->d3d11_context) { ID3D11DeviceContext_Release(s->d3d11_context); s->d3d11_context = NULL; }
+        if (s->d3d11_device) { ID3D11Device_Release(s->d3d11_device); s->d3d11_device = NULL; }
         g_device_initialized = FALSE;
     }
     return (ULONG)ref;
@@ -397,21 +456,42 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
         last_tick = now;
     }
 
+    /* Pump Windows messages: the game's internal main loop drives rendering,
+     * so our external message pump never runs. Process messages here to keep
+     * the window responsive and handle input. */
+    MSG msg;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            recomp_exit_hook_run("window");     /* ExitProcess skips atexit */
+            ExitProcess(0);
+        }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
     return d3d8_present();
 }
 
 static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuffer, DWORD Type, IDirect3DSurface8 **ppSurface)
 {
     (void)self; (void)iBackBuffer; (void)Type;
-    if (!ppSurface) return E_INVALIDARG;
-    if (!g_device_state.backbuffer) return E_FAIL;
+    ID3D11Texture2D *back_buffer = NULL;
+    HRESULT hr;
 
-    *ppSurface = d3d8_surface_create(g_device_state.backbuffer, 0, 0,
+    if (!ppSurface) return E_INVALIDARG;
+
+    hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
+                                   &IID_ID3D11Texture2D,
+                                   (void **)&back_buffer);
+    if (FAILED(hr)) return hr;
+
+    *ppSurface = d3d8_surface_create(back_buffer, 0, 0,
                                      g_device_state.width,
                                      g_device_state.height,
                                      D3DFMT_X8R8G8B8,
-                                     D3DPOOL_DEFAULT, D3DUSAGE_RENDERTARGET,
+                                     D3DPOOL_DEFAULT, 0,
                                      D3DMULTISAMPLE_NONE, NULL, 0);
+    ID3D11Texture2D_Release(back_buffer);
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
@@ -433,75 +513,33 @@ static HRESULT __stdcall dev_EndScene(IDirect3DDevice8 *self)
 
 static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
 {
-    (void)self;
+    (void)self; (void)Count; (void)pRects; (void)Stencil;
     g_d3d_clear_count++;
 
-    /* Clear the currently bound targets (default if none set). D3D8 clears the
-     * viewport, or the rectangles given inside it. A clear that covers the whole
-     * target is a render-pass clear; anything smaller is a scissored draw
-     * (d3d8_clear.c), because a pass can only clear a whole attachment. */
-    {
-        XGpuTargets t;
-        XGpuClear cl;
-        SDL_GPUTextureFormat cf, df;
-        Uint32 tw, th, i;
-        SDL_Rect clip, rects[64];
-        int nrects = 0;
-        int do_color = (Flags & D3DCLEAR_TARGET) != 0;
-        int do_depth, do_stencil;
-        float rgba[4];
+    /* Clear the currently bound targets (default if none set) */
+    ID3D11RenderTargetView *rtv = g_cur_rt ? g_cur_rt->rtv : g_device_state.default_rtv;
+    ID3D11DepthStencilView *dsv = g_cur_ds ? g_cur_ds->dsv : g_device_state.default_dsv;
 
-        d3d8_GetCurrentTargets(&t, &cf, &df, &tw, &th);
-        do_depth = (Flags & D3DCLEAR_ZBUFFER) && t.depth;
-        do_stencil = (Flags & D3DCLEAR_STENCIL) && t.depth;
-        if (!do_color && !do_depth && !do_stencil)
-            return S_OK;
-        rgba[0] = ((Color >> 16) & 0xFF) / 255.0f;   /* R */
-        rgba[1] = ((Color >>  8) & 0xFF) / 255.0f;   /* G */
-        rgba[2] = ((Color >>  0) & 0xFF) / 255.0f;   /* B */
-        rgba[3] = ((Color >> 24) & 0xFF) / 255.0f;   /* A */
+    if ((Flags & D3DCLEAR_TARGET) && rtv) {
+        float clear_color[4] = {
+            ((Color >> 16) & 0xFF) / 255.0f,  /* R */
+            ((Color >>  8) & 0xFF) / 255.0f,  /* G */
+            ((Color >>  0) & 0xFF) / 255.0f,  /* B */
+            ((Color >> 24) & 0xFF) / 255.0f,  /* A */
+        };
+        ID3D11DeviceContext_ClearRenderTargetView(g_device_state.d3d11_context,
+                                                   rtv,
+                                                   clear_color);
+    }
 
-        /* The area D3D8 clears: the viewport, clipped to the target. */
-        clip.x = (int)g_device_state.viewport.X;
-        clip.y = (int)g_device_state.viewport.Y;
-        clip.w = (int)(g_device_state.viewport.Width ? g_device_state.viewport.Width : tw);
-        clip.h = (int)(g_device_state.viewport.Height ? g_device_state.viewport.Height : th);
-        if (clip.x < 0) { clip.w += clip.x; clip.x = 0; }
-        if (clip.y < 0) { clip.h += clip.y; clip.y = 0; }
-        if (clip.x + clip.w > (int)tw) clip.w = (int)tw - clip.x;
-        if (clip.y + clip.h > (int)th) clip.h = (int)th - clip.y;
+    if ((Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) && dsv) {
+        UINT clear_flags = 0;
+        if (Flags & D3DCLEAR_ZBUFFER) clear_flags |= D3D11_CLEAR_DEPTH;
+        if (Flags & D3DCLEAR_STENCIL) clear_flags |= D3D11_CLEAR_STENCIL;
 
-        if (Count == 0 || !pRects) {
-            rects[nrects++] = clip;
-        } else {
-            for (i = 0; i < Count && nrects < 64; i++) {
-                SDL_Rect r;
-                int x1 = (int)pRects[i].x1, y1 = (int)pRects[i].y1;
-                int x2 = (int)pRects[i].x2, y2 = (int)pRects[i].y2;
-                if (x1 < clip.x) x1 = clip.x;
-                if (y1 < clip.y) y1 = clip.y;
-                if (x2 > clip.x + clip.w) x2 = clip.x + clip.w;
-                if (y2 > clip.y + clip.h) y2 = clip.y + clip.h;
-                if (x2 <= x1 || y2 <= y1) continue;
-                r.x = x1; r.y = y1; r.w = x2 - x1; r.h = y2 - y1;
-                rects[nrects++] = r;
-            }
-        }
-        if (nrects == 0 || clip.w <= 0 || clip.h <= 0)
-            return S_OK;
-
-        if (nrects == 1 && rects[0].x == 0 && rects[0].y == 0 &&
-            rects[0].w == (int)tw && rects[0].h == (int)th) {
-            memset(&cl, 0, sizeof(cl));
-            if (do_color) { cl.color = 1; memcpy(cl.rgba, rgba, sizeof(rgba)); }
-            if (do_depth) { cl.depth = 1; cl.z = Z; }
-            if (do_stencil) { cl.stencil = 1; cl.stencil_value = (Uint8)Stencil; }
-            xgpu_render_pass(&g_device_state.gpu, t, &cl);
-        } else {
-            for (i = 0; i < (Uint32)nrects; i++)
-                d3d8_clear_rect(t, cf, df, tw, th, &rects[i], do_color, rgba,
-                                do_depth != 0, Z, do_stencil != 0, (Uint8)Stencil);
-        }
+        ID3D11DeviceContext_ClearDepthStencilView(g_device_state.d3d11_context,
+                                                    dsv,
+                                                    clear_flags, Z, (UINT8)Stencil);
     }
 
     return S_OK;
@@ -574,16 +612,24 @@ static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDi
     if (Stage >= 4) return E_INVALIDARG;
     g_cur_textures[Stage] = pTexture;
 
-    /* The texture is bound at draw time (d3d8_pipe_draw). */
+    /* Bind SRV to pixel shader */
     if (pTexture) {
+        ID3D11ShaderResourceView *srv = d3d8_base_srv(pTexture);
         /* P8 textures bake a palette; record which stage palette they use
          * so SetPalette can re-bake them later. */
         if (d3d8_format_is_palettized(d3d8_base_format(pTexture)))
             d3d8_base_set_palette(pTexture, Stage);
+        if (srv) {
+            ID3D11DeviceContext_PSSetShaderResources(g_device_state.d3d11_context,
+                Stage, 1, &srv);
+        }
         /* Mark texture stage as active */
         if (g_device_state.tss[Stage][D3DTSS_COLOROP] == D3DTOP_DISABLE)
             g_device_state.tss[Stage][D3DTSS_COLOROP] = D3DTOP_MODULATE;
     } else {
+        ID3D11ShaderResourceView *null_srv = NULL;
+        ID3D11DeviceContext_PSSetShaderResources(g_device_state.d3d11_context,
+            Stage, 1, &null_srv);
         g_device_state.tss[Stage][D3DTSS_COLOROP] = D3DTOP_DISABLE;
     }
     return S_OK;
@@ -604,6 +650,13 @@ static HRESULT __stdcall dev_SetStreamSource(IDirect3DDevice8 *self, UINT Stream
     if (StreamNumber != 0) return S_OK; /* Only stream 0 supported */
     g_cur_vb = pStreamData;
     g_cur_vb_stride = Stride;
+
+    if (pStreamData) {
+        D3D8VertexBuffer *vb = (D3D8VertexBuffer *)pStreamData;
+        UINT offset = 0;
+        ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
+            0, 1, &vb->d3d11_buffer, &Stride, &offset);
+    }
     return S_OK;
 }
 
@@ -622,6 +675,14 @@ static HRESULT __stdcall dev_SetIndices(IDirect3DDevice8 *self, IDirect3DIndexBu
     (void)self;
     g_cur_ib = pIndexData;
     g_cur_ib_base_vertex = BaseVertexIndex;
+
+    if (pIndexData) {
+        D3D8IndexBuffer *ib = (D3D8IndexBuffer *)pIndexData;
+        DXGI_FORMAT fmt = (ib->format == D3DFMT_INDEX32)
+            ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+        ID3D11DeviceContext_IASetIndexBuffer(g_device_state.d3d11_context,
+            ib->d3d11_buffer, fmt, 0);
+    }
     return S_OK;
 }
 
@@ -635,25 +696,24 @@ static HRESULT __stdcall dev_GetIndices(IDirect3DDevice8 *self, IDirect3DIndexBu
     return S_OK;
 }
 
-static int map_primitive_type(D3DPRIMITIVETYPE pt, UINT count, UINT *out_count,
-                              SDL_GPUPrimitiveType *prim)
+static D3D11_PRIMITIVE_TOPOLOGY map_primitive_type(D3DPRIMITIVETYPE pt, UINT count, UINT *out_count)
 {
     switch (pt) {
-    case D3DPT_TRIANGLELIST:  *out_count = count * 3; *prim = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST; return 1;
-    case D3DPT_TRIANGLESTRIP: *out_count = count + 2; *prim = SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP; return 1;
-    case D3DPT_TRIANGLEFAN:   *out_count = count * 3; *prim = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST; return 1;
-    case D3DPT_LINELIST:      *out_count = count * 2; *prim = SDL_GPU_PRIMITIVETYPE_LINELIST; return 1;
-    case D3DPT_LINESTRIP:     *out_count = count + 1; *prim = SDL_GPU_PRIMITIVETYPE_LINESTRIP; return 1;
-    case D3DPT_POINTLIST:     *out_count = count;     *prim = SDL_GPU_PRIMITIVETYPE_POINTLIST; return 1;
-    case D3DPT_QUADLIST:      *out_count = count * 6; *prim = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST; return 1;
-    default:                  *out_count = 0; return 0;
+    case D3DPT_TRIANGLELIST:  *out_count = count * 3; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    case D3DPT_TRIANGLESTRIP: *out_count = count + 2; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+    case D3DPT_TRIANGLEFAN:   *out_count = count * 3; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    case D3DPT_LINELIST:      *out_count = count * 2; return D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
+    case D3DPT_LINESTRIP:     *out_count = count + 1; return D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
+    case D3DPT_POINTLIST:     *out_count = count;     return D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
+    case D3DPT_QUADLIST:      *out_count = count * 6; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    default:                  *out_count = 0;          return D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
     }
 }
 
 /* ================================================================
  * Triangle fan / quad list → triangle list conversion
  *
- * SDL_GPU doesn't support triangle fans or quad lists.
+ * D3D11 doesn't support triangle fans or quad lists.
  * Convert vertex data in-place to triangle list.
  * Returns malloc'd buffer (caller must free) or NULL if no conversion needed.
  * ================================================================ */
@@ -704,75 +764,126 @@ static void *convert_fan_or_quad(D3DPRIMITIVETYPE pt, const void *src,
 }
 
 /* ================================================================
- * Draw entry points
+ * DrawPrimitiveUP ring buffer
  *
- * Each draw asks the shader modules to describe what is bound (shaders, vertex
- * layout, uniforms), then hands the buffers and range to d3d8_pipe_draw.
+ * Instead of creating and destroying a D3D11 buffer on every
+ * DrawPrimitiveUP call, use a persistent ring buffer.
  * ================================================================ */
 
-static void prepare_draw_state(void)
+#define UP_RING_BUFFER_SIZE (4 * 1024 * 1024)  /* 4MB ring buffer */
+
+static ID3D11Buffer *g_up_ring_buffer = NULL;
+static UINT          g_up_ring_offset = 0;
+
+static HRESULT up_ring_init(void)
 {
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
-    d3d8_combiners_prepare_draw();   /* overrides the pixel shader if a combiner program is active */
+    D3D11_BUFFER_DESC bd;
+    memset(&bd, 0, sizeof(bd));
+    bd.ByteWidth = UP_RING_BUFFER_SIZE;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    return ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &g_up_ring_buffer);
+}
+
+static void up_ring_shutdown(void)
+{
+    if (g_up_ring_buffer) {
+        ID3D11Buffer_Release(g_up_ring_buffer);
+        g_up_ring_buffer = NULL;
+    }
+    g_up_ring_offset = 0;
+}
+
+/* Upload vertex data to ring buffer, returns offset. Returns (UINT)-1 on failure. */
+static UINT up_ring_upload(const void *data, UINT size)
+{
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    D3D11_MAP map_type;
+    HRESULT hr;
+    UINT offset;
+
+    if (!g_up_ring_buffer) {
+        if (FAILED(up_ring_init())) return (UINT)-1;
+    }
+
+    if (size > UP_RING_BUFFER_SIZE) return (UINT)-1;
+
+    /* Wrap around if not enough space */
+    if (g_up_ring_offset + size > UP_RING_BUFFER_SIZE) {
+        g_up_ring_offset = 0;
+        map_type = D3D11_MAP_WRITE_DISCARD;
+    } else {
+        map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
+    }
+
+    hr = ID3D11DeviceContext_Map(g_device_state.d3d11_context,
+        (ID3D11Resource *)g_up_ring_buffer, 0, map_type, 0, &mapped);
+    if (FAILED(hr)) return (UINT)-1;
+
+    offset = g_up_ring_offset;
+    memcpy((BYTE *)mapped.pData + offset, data, size);
+
+    ID3D11DeviceContext_Unmap(g_device_state.d3d11_context,
+        (ID3D11Resource *)g_up_ring_buffer, 0);
+
+    g_up_ring_offset = (offset + size + 15) & ~15;  /* 16-byte align */
+    return offset;
 }
 
 static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
 {
-    D3D8Draw d;
-    UINT vertex_count;
-    D3D8VertexBuffer *vb = (D3D8VertexBuffer *)g_cur_vb;
     (void)self;
     g_d3d_draw_count++;
+    D3D11_PRIMITIVE_TOPOLOGY topology;
+    UINT vertex_count;
 
-    if (!vb || !map_primitive_type(PrimitiveType, PrimitiveCount, &vertex_count, &d.prim) || !vertex_count)
-        return E_INVALIDARG;
+    topology = map_primitive_type(PrimitiveType, PrimitiveCount, &vertex_count);
+    if (vertex_count == 0) return E_INVALIDARG;
 
-    d3d8_vb_sync(g_cur_vb);
-    prepare_draw_state();
+    /* Prepare pipeline: shaders, input layout, constant buffers, render states */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_states_apply();
 
-    d.vb = vb->gpu_buffer; d.vb_offset = 0; d.vb_stride = g_cur_vb_stride;
-    d.ib = NULL; d.ib_offset = 0; d.ib32 = 0;
-    d.count = vertex_count; d.first = StartVertex; d.base_vertex = 0;
-    d3d8_pipe_draw(&d);
+    ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
+    ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, StartVertex);
     return S_OK;
 }
 
 static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount)
 {
-    D3D8Draw d;
-    UINT index_count;
-    D3D8VertexBuffer *vb = (D3D8VertexBuffer *)g_cur_vb;
-    D3D8IndexBuffer *ib = (D3D8IndexBuffer *)g_cur_ib;
     (void)self; (void)MinVertexIndex; (void)NumVertices;
     g_d3d_draw_count++;
+    D3D11_PRIMITIVE_TOPOLOGY topology;
+    UINT index_count;
 
-    if (!vb || !ib || !map_primitive_type(PrimitiveType, PrimitiveCount, &index_count, &d.prim) || !index_count)
-        return E_INVALIDARG;
+    topology = map_primitive_type(PrimitiveType, PrimitiveCount, &index_count);
+    if (index_count == 0) return E_INVALIDARG;
 
-    d3d8_vb_sync(g_cur_vb);
-    d3d8_ib_sync(g_cur_ib);
-    prepare_draw_state();
+    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_states_apply();
 
-    d.vb = vb->gpu_buffer; d.vb_offset = 0; d.vb_stride = g_cur_vb_stride;
-    d.ib = ib->gpu_buffer; d.ib_offset = 0; d.ib32 = (ib->format == D3DFMT_INDEX32);
-    d.count = index_count; d.first = StartIndex; d.base_vertex = (Sint32)g_cur_ib_base_vertex;
-    d3d8_pipe_draw(&d);
+    ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
+    ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, StartIndex, (INT)g_cur_ib_base_vertex);
     return S_OK;
 }
 
 static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void *pVertexData, UINT VertexStreamZeroStride)
 {
-    D3D8Draw d;
-    UINT vertex_count;
-    const void *draw_data = pVertexData;
-    void *converted = NULL;
-    int ok;
     (void)self;
     g_d3d_draw_count++;
+    D3D11_PRIMITIVE_TOPOLOGY topology;
+    UINT vertex_count, vb_size, ring_offset;
+    const void *draw_data = pVertexData;
+    void *converted = NULL;
 
     if (!pVertexData || !VertexStreamZeroStride) return E_INVALIDARG;
-    if (!map_primitive_type(PrimitiveType, PrimitiveCount, &vertex_count, &d.prim) || !vertex_count)
-        return E_INVALIDARG;
+
+    topology = map_primitive_type(PrimitiveType, PrimitiveCount, &vertex_count);
+    if (vertex_count == 0) return E_INVALIDARG;
 
     /* Convert triangle fans and quad lists to triangle lists */
     if (PrimitiveType == D3DPT_TRIANGLEFAN || PrimitiveType == D3DPT_QUADLIST) {
@@ -782,40 +893,107 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
         if (converted) draw_data = converted;
     }
 
-    ok = d3d8_pipe_stream(draw_data, vertex_count * VertexStreamZeroStride, &d.vb, &d.vb_offset);
-    if (converted) free(converted);
-    if (!ok) return E_OUTOFMEMORY;
+    vb_size = vertex_count * VertexStreamZeroStride;
 
-    prepare_draw_state();
-    d.vb_stride = VertexStreamZeroStride;
-    d.ib = NULL; d.ib_offset = 0; d.ib32 = 0;
-    d.count = vertex_count; d.first = 0; d.base_vertex = 0;
-    d3d8_pipe_draw(&d);
+    /* Upload to ring buffer */
+    ring_offset = up_ring_upload(draw_data, vb_size);
+    if (converted) free(converted);
+
+    if (ring_offset == (UINT)-1) return E_OUTOFMEMORY;
+
+    /* Bind ring buffer at the right offset */
+    ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
+        0, 1, &g_up_ring_buffer, &VertexStreamZeroStride, &ring_offset);
+
+    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_states_apply();
+
+    ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
+    ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, 0);
+
+    /* Restore previous VB binding if any */
+    if (g_cur_vb) {
+        D3D8VertexBuffer *vb = (D3D8VertexBuffer *)g_cur_vb;
+        UINT restore_offset = 0;
+        ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
+            0, 1, &vb->d3d11_buffer, &g_cur_vb_stride, &restore_offset);
+    }
     return S_OK;
 }
 
 static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void *pIndexData, D3DFORMAT IndexDataFormat, const void *pVertexData, UINT VertexStreamZeroStride)
 {
-    D3D8Draw d;
-    UINT index_count, idx_bytes;
     (void)self; (void)MinVertexIndex;
     g_d3d_draw_count++;
+    D3D11_PRIMITIVE_TOPOLOGY topology;
+    D3D11_BUFFER_DESC bd;
+    D3D11_SUBRESOURCE_DATA sd;
+    ID3D11Buffer *tmp_vb = NULL, *tmp_ib = NULL;
+    UINT index_count, vb_size, ib_size, offset = 0;
+    UINT idx_bytes;
+    DXGI_FORMAT ib_fmt;
+    HRESULT hr;
 
     if (!pVertexData || !pIndexData || !VertexStreamZeroStride) return E_INVALIDARG;
-    if (!map_primitive_type(PrimitiveType, PrimitiveCount, &index_count, &d.prim) || !index_count)
-        return E_INVALIDARG;
+
+    topology = map_primitive_type(PrimitiveType, PrimitiveCount, &index_count);
+    if (index_count == 0) return E_INVALIDARG;
 
     idx_bytes = (IndexDataFormat == D3DFMT_INDEX32) ? 4 : 2;
-    if (!d3d8_pipe_stream(pVertexData, NumVertices * VertexStreamZeroStride, &d.vb, &d.vb_offset))
-        return E_OUTOFMEMORY;
-    if (!d3d8_pipe_stream(pIndexData, index_count * idx_bytes, &d.ib, &d.ib_offset))
-        return E_OUTOFMEMORY;
+    ib_fmt = (IndexDataFormat == D3DFMT_INDEX32) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+    vb_size = NumVertices * VertexStreamZeroStride;
+    ib_size = index_count * idx_bytes;
 
-    prepare_draw_state();
-    d.vb_stride = VertexStreamZeroStride;
-    d.ib32 = (IndexDataFormat == D3DFMT_INDEX32);
-    d.count = index_count; d.first = 0; d.base_vertex = 0;
-    d3d8_pipe_draw(&d);
+    /* Create temp vertex buffer */
+    memset(&bd, 0, sizeof(bd));
+    bd.ByteWidth = vb_size;
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    memset(&sd, 0, sizeof(sd));
+    sd.pSysMem = pVertexData;
+    hr = ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, &sd, &tmp_vb);
+    if (FAILED(hr)) return hr;
+
+    /* Create temp index buffer */
+    bd.ByteWidth = ib_size;
+    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    sd.pSysMem = pIndexData;
+    hr = ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, &sd, &tmp_ib);
+    if (FAILED(hr)) { ID3D11Buffer_Release(tmp_vb); return hr; }
+
+    /* Bind, prepare, draw */
+    ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
+        0, 1, &tmp_vb, &VertexStreamZeroStride, &offset);
+    ID3D11DeviceContext_IASetIndexBuffer(g_device_state.d3d11_context,
+        tmp_ib, ib_fmt, 0);
+
+    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_states_apply();
+
+    ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
+    ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, 0, 0);
+
+    /* Cleanup temp buffers */
+    ID3D11Buffer_Release(tmp_ib);
+    ID3D11Buffer_Release(tmp_vb);
+
+    /* Restore previous bindings */
+    if (g_cur_vb) {
+        D3D8VertexBuffer *vb = (D3D8VertexBuffer *)g_cur_vb;
+        offset = 0;
+        ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
+            0, 1, &vb->d3d11_buffer, &g_cur_vb_stride, &offset);
+    }
+    if (g_cur_ib) {
+        D3D8IndexBuffer *ib = (D3D8IndexBuffer *)g_cur_ib;
+        DXGI_FORMAT fmt = (ib->format == D3DFMT_INDEX32) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+        ID3D11DeviceContext_IASetIndexBuffer(g_device_state.d3d11_context,
+            ib->d3d11_buffer, fmt, 0);
+    }
     return S_OK;
 }
 
@@ -857,93 +1035,172 @@ static HRESULT __stdcall dev_CreateIndexBuffer(IDirect3DDevice8 *self, UINT Leng
 
 static HRESULT __stdcall dev_CreateRenderTarget(IDirect3DDevice8 *self, UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, BOOL Lockable, IDirect3DSurface8 **ppSurface)
 {
-    SDL_GPUTextureFormat gf;
-    XGpuTex *tex;
     (void)self; (void)Lockable;
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D *tex = NULL;
+    HRESULT hr;
+    UINT sample_count;
 
     if (!ppSurface || !Width || !Height) return E_INVALIDARG;
 
-    if (d3d8_msaa_sample_count(MultiSample) > 1)
-        fprintf(stderr, "D3D8: MSAA render target requested; rendering single-sampled\n");
+    sample_count = d3d8_msaa_sample_count(MultiSample);
+    if (sample_count > 1) {
+        UINT levels = 0;
+        UINT maxq = 0;
+        DXGI_FORMAT fmt = d3d8_to_dxgi_format(Format);
+        /* Validate against D3D11 hardware limits; fall back gracefully. */
+        hr = ID3D11Device_CheckMultisampleQualityLevels(d3d8_GetD3D11Device(),
+                fmt, sample_count, &maxq);
+        if (FAILED(hr) || maxq == 0) {
+            UINT counts[] = { 9, 8, 4, 2, 1 };
+            UINT i;
+            for (i = 0; i < 5; i++) {
+                if (counts[i] >= sample_count) continue;
+                if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(
+                        d3d8_GetD3D11Device(), fmt, counts[i], &levels)) && levels > 0) {
+                    sample_count = counts[i];
+                    break;
+                }
+            }
+            if (sample_count > 1) {
+                fprintf(stderr, "D3D8: MSAA %lu unsupported, falling back to %lu samples\n",
+                        d3d8_msaa_sample_count(MultiSample) > 1 ? (unsigned long)d3d8_msaa_sample_count(MultiSample) : 0,
+                        (unsigned long)sample_count);
+            } else {
+                sample_count = 1;
+            }
+        }
+    }
 
-    gf = d3d8_to_gpu_format(Format);
-    if (gf == SDL_GPU_TEXTUREFORMAT_INVALID) return E_INVALIDARG;
-    tex = xgputex_create(d3d8_GetGpu(), SDL_GPU_TEXTURETYPE_2D, gf, Width, Height, 1, 1,
-                         SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
-    if (!tex) {
-        fprintf(stderr, "D3D8: CreateRenderTarget failed (fmt=0x%X %ux%u)\n", Format, Width, Height);
-        return E_OUTOFMEMORY;
+    memset(&td, 0, sizeof(td));
+    td.Width = Width;
+    td.Height = Height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = d3d8_to_dxgi_format(Format);
+    td.SampleDesc.Count = sample_count;
+    td.SampleDesc.Quality = 0;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: CreateRenderTarget failed: 0x%08lX (fmt=0x%X %ux%u)\n", hr, Format, Width, Height);
+        return hr;
     }
 
     *ppSurface = d3d8_surface_create(tex, 0, 0, Width, Height, Format,
                                      D3DPOOL_DEFAULT, D3DUSAGE_RENDERTARGET,
                                      MultiSample, NULL, 0);
-    xgputex_unref(d3d8_GetGpu(), tex);
+    ID3D11Texture2D_Release(tex);
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
 static HRESULT __stdcall dev_CreateDepthStencilSurface(IDirect3DDevice8 *self, UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, IDirect3DSurface8 **ppSurface)
 {
-    SDL_GPUTextureFormat gf;
-    D3DFORMAT surface_format = Format;
-    XGpuTex *tex;
     (void)self;
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D *tex = NULL;
+    DXGI_FORMAT dxgi;
+    D3DFORMAT surface_format = Format;
+    HRESULT hr;
+    UINT sample_count;
 
     if (!ppSurface || !Width || !Height) return E_INVALIDARG;
 
-    gf = d3d8_to_gpu_format(Format);
-    if (gf == SDL_GPU_TEXTUREFORMAT_R16_FLOAT) {
-        /* F16 has no depth equivalent; fall back to D16. */
+    dxgi = d3d8_to_dxgi_format(Format);
+    if (dxgi == DXGI_FORMAT_R16_FLOAT) {
+        /* F16 has no D3D11 depth equivalent; fall back to D16. */
         fprintf(stderr, "D3D8: F16 depth surface falling back to D16\n");
-        gf = SDL_GPU_TEXTUREFORMAT_D16_UNORM;
+        dxgi = DXGI_FORMAT_D16_UNORM;
         surface_format = D3DFMT_D16;
     }
-    if (d3d8_msaa_sample_count(MultiSample) > 1)
-        fprintf(stderr, "D3D8: MSAA depth surface requested; rendering single-sampled\n");
 
-    tex = xgputex_create(d3d8_GetGpu(), SDL_GPU_TEXTURETYPE_2D, gf, Width, Height, 1, 1,
-                         SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
-    if (!tex) {
-        fprintf(stderr, "D3D8: CreateDepthStencilSurface failed (fmt=0x%X)\n", Format);
-        return E_OUTOFMEMORY;
+    sample_count = d3d8_msaa_sample_count(MultiSample);
+    if (sample_count > 1) {
+        UINT levels = 0;
+        hr = ID3D11Device_CheckMultisampleQualityLevels(d3d8_GetD3D11Device(),
+                dxgi, sample_count, &levels);
+        if (FAILED(hr) || levels == 0) {
+            UINT counts[] = { 9, 8, 4, 2, 1 };
+            UINT i;
+            for (i = 0; i < 5; i++) {
+                if (counts[i] >= sample_count) continue;
+                if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(
+                        d3d8_GetD3D11Device(), dxgi, counts[i], &levels)) && levels > 0) {
+                    sample_count = counts[i];
+                    break;
+                }
+            }
+            if (sample_count > 1)
+                fprintf(stderr, "D3D8: depth MSAA %lu unsupported, fallback %lu samples\n",
+                        (unsigned long)d3d8_msaa_sample_count(MultiSample),
+                        (unsigned long)sample_count);
+            else
+                sample_count = 1;
+        }
+    }
+
+    memset(&td, 0, sizeof(td));
+    td.Width = Width;
+    td.Height = Height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = dxgi;
+    td.SampleDesc.Count = sample_count;
+    td.SampleDesc.Quality = 0;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+
+    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: CreateDepthStencilSurface failed: 0x%08lX (fmt=0x%X)\n", hr, Format);
+        return hr;
     }
 
     *ppSurface = d3d8_surface_create(tex, 0, 0, Width, Height, surface_format,
                                      D3DPOOL_DEFAULT, D3DUSAGE_DEPTHSTENCIL,
                                      MultiSample, NULL, 0);
-    xgputex_unref(d3d8_GetGpu(), tex);
+    ID3D11Texture2D_Release(tex);
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
 static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSurface8 *pRenderTarget, IDirect3DSurface8 *pZStencilSurface)
 {
     (void)self;
+    ID3D11RenderTargetView *rtv;
+    ID3D11DepthStencilView *dsv = NULL;
 
     if (g_cur_rt) { IDirect3DSurface8_Release(&g_cur_rt->iface); g_cur_rt = NULL; }
     if (g_cur_ds) { IDirect3DSurface8_Release(&g_cur_ds->iface); g_cur_ds = NULL; }
 
     if (pRenderTarget) {
-        D3D8Surface *rt = (D3D8Surface *)pRenderTarget;
-        if (!rt->gpu || rt->is_depth) {
+        g_cur_rt = (D3D8Surface *)pRenderTarget;
+        if (!g_cur_rt->rtv) {
+            g_cur_rt = NULL;
             fprintf(stderr, "D3D8: SetRenderTarget on non-renderable surface\n");
             return E_INVALIDARG;
         }
-        /* The backbuffer surface means "the default target". */
-        if (rt->gpu != g_device_state.backbuffer) {
-            g_cur_rt = rt;
-            IDirect3DSurface8_AddRef(pRenderTarget);
-        }
+        rtv = g_cur_rt->rtv;
+        IDirect3DSurface8_AddRef(pRenderTarget);
+    } else {
+        rtv = g_device_state.default_rtv;
     }
 
     if (pZStencilSurface) {
-        D3D8Surface *ds = (D3D8Surface *)pZStencilSurface;
-        if (!ds->gpu || !ds->is_depth) {
+        g_cur_ds = (D3D8Surface *)pZStencilSurface;
+        if (!g_cur_ds->dsv) {
+            g_cur_ds = NULL;
             fprintf(stderr, "D3D8: SetRenderTarget with non-depth stencil surface\n");
         } else {
-            g_cur_ds = ds;
+            dsv = g_cur_ds->dsv;
             IDirect3DSurface8_AddRef(pZStencilSurface);
         }
     }
+
+    if (!dsv) dsv = g_device_state.default_dsv;
+    ID3D11DeviceContext_OMSetRenderTargets(g_device_state.d3d11_context, 1,
+                                            &rtv, dsv);
     return S_OK;
 }
 
@@ -977,7 +1234,16 @@ static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPO
 {
     (void)self;
     if (pViewport) {
-        g_device_state.viewport = *pViewport;   /* applied at draw time */
+        g_device_state.viewport = *pViewport;
+
+        D3D11_VIEWPORT d3d11_vp;
+        d3d11_vp.TopLeftX = (FLOAT)pViewport->X;
+        d3d11_vp.TopLeftY = (FLOAT)pViewport->Y;
+        d3d11_vp.Width    = (FLOAT)pViewport->Width;
+        d3d11_vp.Height   = (FLOAT)pViewport->Height;
+        d3d11_vp.MinDepth = pViewport->MinZ;
+        d3d11_vp.MaxDepth = pViewport->MaxZ;
+        ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &d3d11_vp);
     }
     return S_OK;
 }
@@ -1126,6 +1392,17 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
 {
     (void)self; (void)Flags;
 
+    /* Pump Windows messages (same as dev_Present) */
+    MSG msg;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            recomp_exit_hook_run("window");     /* ExitProcess skips atexit */
+            ExitProcess(0);
+        }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
     return d3d8_present();
 }
 
@@ -1240,22 +1517,27 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     memset(&g_device_state, 0, sizeof(g_device_state));
     g_device_state.ref_count = 1;
 
-    (void)hFocusWindow;    /* the window is SDL's, not the title's */
+    if (!pPP->hDeviceWindow) pPP->hDeviceWindow = hFocusWindow;
 
-    hr = gpu_create_device(&g_device_state, pPP);
+    hr = d3d11_create_device_and_swap_chain(&g_device_state, pPP);
     if (FAILED(hr)) return hr;
 
-    hr = gpu_create_render_targets(&g_device_state);
+    hr = d3d11_create_render_targets(&g_device_state);
     if (FAILED(hr)) return hr;
 
     d3d8_init_default_states(&g_device_state);
 
-    hr = d3d8_pipe_init();
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: Pipeline init failed: 0x%08lX\n", hr);
-        return hr;
+    /* Set initial viewport (D3D11 requires explicit viewport) */
+    {
+        D3D11_VIEWPORT vp;
+        vp.TopLeftX = 0.0f;
+        vp.TopLeftY = 0.0f;
+        vp.Width    = (FLOAT)g_device_state.width;
+        vp.Height   = (FLOAT)g_device_state.height;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &vp);
     }
-    xgpu_begin_frame(&g_device_state.gpu);
 
     /* Initialize shader and state subsystems */
     hr = d3d8_shaders_init();

@@ -1,7 +1,7 @@
 /**
  * The pump behind xbox_VideoPlayFile().
  *
- * Owns a D3D8 device (and with it an SDL window) and a decoder, all on one
+ * Owns a window, a D3D8 device and a Media Foundation session, all on one
  * thread of its own. Nothing here reads or writes guest memory and nothing
  * runs on the guest's thread, so a title that is still booting keeps booting
  * while its video plays.
@@ -9,9 +9,10 @@
  * The guest decides when. A title opens its movie file at the point its own
  * logic reaches the intro; the runtime notices that open and plays that file.
  */
-#include <SDL3/SDL.h>
+#if defined(_WIN32)
+#define COBJMACROS
+#include <windows.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "video_player.h"
@@ -27,19 +28,56 @@ void xbox_VideoSetPresentHandler(void (*handler)(unsigned frame))
 #define VP_WINDOW_W 640
 #define VP_WINDOW_H 480
 
-static SDL_AtomicInt s_playing;
-static char          s_path[1024];
+static volatile LONG s_playing;
+static char          s_path[MAX_PATH];
 
-static int SDLCALL vp_thread(void *unused)
+static LRESULT CALLBACK vp_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m == WM_CLOSE || m == WM_DESTROY) {
+        InterlockedExchange(&s_playing, 0);
+        return 0;
+    }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static HWND vp_create_window(void)
+{
+    WNDCLASSA wc;
+    RECT r;
+
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc   = vp_wndproc;
+    wc.hInstance     = GetModuleHandleA(NULL);
+    wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+    wc.lpszClassName = "XboxRecompVideo";
+    RegisterClassA(&wc);
+
+    r.left = 0; r.top = 0; r.right = VP_WINDOW_W; r.bottom = VP_WINDOW_H;
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    return CreateWindowExA(0, "XboxRecompVideo", "Xbox Recomp - Video",
+                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                           CW_USEDEFAULT, CW_USEDEFAULT,
+                           r.right - r.left, r.bottom - r.top,
+                           NULL, NULL, GetModuleHandleA(NULL), NULL);
+}
+
+static DWORD WINAPI vp_thread(LPVOID unused)
 {
     IDirect3D8 *d3d;
     IDirect3DDevice8 *dev = NULL;
     D3DPRESENT_PARAMETERS pp;
+    HWND hwnd;
     HRESULT hr;
-    Uint64 last;
+    DWORD last;
     unsigned frames = 0;
 
     (void)unused;
+
+    hwnd = vp_create_window();
+    if (!hwnd) {
+        fprintf(stderr, "  [VIDEO] window creation failed\n");
+        goto done;
+    }
 
     d3d = xbox_Direct3DCreate8(0);
     if (!d3d) {
@@ -53,12 +91,12 @@ static int SDLCALL vp_thread(void *unused)
     pp.BackBufferFormat       = D3DFMT_X8R8G8B8;
     pp.BackBufferCount        = 1;
     pp.SwapEffect             = D3DSWAPEFFECT_DISCARD;
+    pp.hDeviceWindow          = hwnd;
     pp.Windowed               = TRUE;
     pp.EnableAutoDepthStencil = TRUE;
     pp.AutoDepthStencilFormat = D3DFMT_D24S8;
 
-    /* The device creates its own SDL window; no window handle is passed. */
-    hr = d3d->lpVtbl->CreateDevice(d3d, 0, 0, NULL, 0, &pp, &dev);
+    hr = d3d->lpVtbl->CreateDevice(d3d, 0, 0, hwnd, 0, &pp, &dev);
     if (FAILED(hr) || !dev) {
         fprintf(stderr, "  [VIDEO] CreateDevice failed: 0x%08lX\n", (unsigned long)hr);
         goto done;
@@ -72,12 +110,18 @@ static int SDLCALL vp_thread(void *unused)
     }
 
     fprintf(stderr, "  [VIDEO] playing %s\n", s_path);
-    last = SDL_GetTicks();
+    last = GetTickCount();
 
-    while (SDL_GetAtomicInt(&s_playing)) {
-        Uint64 now = SDL_GetTicks();
+    while (InterlockedCompareExchange(&s_playing, 1, 1)) {
+        MSG msg;
+        DWORD now = GetTickCount();
         float dt = (float)(now - last) / 1000.0f;
         last = now;
+
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
 
         /* video_update returns 1 when it uploaded a new frame, 0 when the
          * next one is not due yet, and negative at end of stream or on error.
@@ -87,8 +131,7 @@ static int SDLCALL vp_thread(void *unused)
         if (video_update(dt) < 0 || video_is_finished())
             break;
 
-        /* Clear, then the frame as a fullscreen quad, then present (which
-         * also pumps the window's events). */
+        /* Clear, then the frame as a fullscreen quad, then present. */
         dev->lpVtbl->Clear(dev, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
                            0xFF000000u, 1.0f, 0);
         dev->lpVtbl->BeginScene(dev);
@@ -96,10 +139,19 @@ static int SDLCALL vp_thread(void *unused)
         dev->lpVtbl->EndScene(dev);
         dev->lpVtbl->Present(dev, NULL, NULL, NULL, NULL);
         frames++;
-
         if (s_present_handler) s_present_handler(frames);
 
-        SDL_Delay(1);
+        /* A couple of frames to disc as evidence that real pixels were
+         * drawn -- two of them, far enough apart to show the picture moving
+         * rather than one still held for the duration. */
+        if ((frames == 60 || frames == 80) && getenv("RECOMP_FMV_DUMP")) {
+            char out[MAX_PATH];
+            _snprintf_s(out, sizeof(out), _TRUNCATE, "%s.%u.bmp",
+                        getenv("RECOMP_FMV_DUMP"), frames);
+            video_dump_frame_bmp(out);
+        }
+
+        Sleep(1);
     }
 
     fprintf(stderr, "  [VIDEO] finished %s after %u presented frames\n",
@@ -108,33 +160,40 @@ static int SDLCALL vp_thread(void *unused)
     video_shutdown();
 
 done:
-    SDL_SetAtomicInt(&s_playing, 0);
+    InterlockedExchange(&s_playing, 0);
     return 0;
 }
 
 int xbox_VideoPlayFile(const char *host_path)
 {
-    SDL_Thread *th;
+    HANDLE th;
 
     if (!host_path || !*host_path)
         return -1;
-    /* One at a time: the pump owns a device and a window, and a second one
+    /* One at a time: the pump owns a window and a device, and a second one
      * would fight the first for both. */
-    if (!SDL_CompareAndSwapAtomicInt(&s_playing, 0, 1))
+    if (InterlockedCompareExchange(&s_playing, 1, 0) != 0)
         return -1;
 
-    SDL_strlcpy(s_path, host_path, sizeof(s_path));
+    strncpy(s_path, host_path, sizeof(s_path) - 1);
+    s_path[sizeof(s_path) - 1] = '\0';
 
-    th = SDL_CreateThread(vp_thread, "video pump", NULL);
+    th = CreateThread(NULL, 0, vp_thread, NULL, 0, NULL);
     if (!th) {
-        SDL_SetAtomicInt(&s_playing, 0);
+        InterlockedExchange(&s_playing, 0);
         return -1;
     }
-    SDL_DetachThread(th);
+    CloseHandle(th);
     return 0;
 }
 
 int xbox_VideoIsPlaying(void)
 {
-    return SDL_GetAtomicInt(&s_playing) != 0;
+    return InterlockedCompareExchange(&s_playing, 0, 0) != 0;
 }
+
+#else  /* !_WIN32 */
+void xbox_VideoSetPresentHandler(void (*handler)(unsigned frame)) { (void)handler; }
+int xbox_VideoPlayFile(const char *p) { (void)p; return -1; }
+int xbox_VideoIsPlaying(void) { return 0; }
+#endif

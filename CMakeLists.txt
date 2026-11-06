@@ -1,6 +1,21 @@
 cmake_minimum_required(VERSION 3.20)
 project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 
+# Xbox Static Recompilation Runtime Library
+# Provides link-time libraries for statically recompiled Xbox games.
+# Pattern: extract emulator subsystems (xemu) into reusable static libraries.
+#
+# Libraries:
+#   xbox_kernel    - Xbox kernel replacement layer (147 imports → Win32)
+#   xbox_d3d8      - D3D8 → D3D11 graphics compatibility
+#   xbox_dsound    - DirectSound → software mixer compatibility
+#   xbox_input     - Xbox gamepad → XInput compatibility
+#   xbox_apu       - MCPX APU audio emulation (extracted from xemu)
+#   xbox_nv2a      - NV2A GPU emulation (extracted from xemu)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
 # Recompiled x86 code relies on what MSVC does anyway: signed arithmetic wraps
 # like the CPU's, and guest memory is read through whatever pointer type an
 # instruction implies. GCC and Clang optimise both away as undefined
@@ -9,26 +24,24 @@ if(NOT MSVC)
     add_compile_options(-fwrapv -fno-strict-aliasing)
 endif()
 
-# Xbox Static Recompilation Runtime Library
-# Provides link-time libraries for statically recompiled Xbox games.
-# Pattern: extract emulator subsystems (xemu) into reusable static libraries.
-#
-# Runtime modules and their transitive host dependencies are declared below.
-# Link the xboxrecomp interface target rather than relying on a snapshot count.
-
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
-
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-# All host graphics, input and audio use SDL3.
-set(XBOXRECOMP_RENDERER "SDL3_GPU" CACHE STRING "Host renderer" FORCE)
-set(XBOXRECOMP_SDL3 ON)
-include(Sdl3)
-include(Dxc)
-include(cmake/xbox_sdl3.cmake)
-include(cmake/xbox_ffmpeg.cmake)
-add_compile_definitions(XBOXRECOMP_SDL3=1)
+# Host backends. Each host-facing module has a function-level contract, so an
+# embedding project can bring its own implementation (an SDL3 window, GPU
+# renderer, pad and audio stack, say) and leave the bundled one out:
+#   XBOXRECOMP_RENDERER=EXTERNAL     renderer + window: nv2a_d3d11.h, fb_window.h
+#   XBOXRECOMP_APU_OUTPUT=EXTERNAL   audio device: apu_xaudio2.h (xa2_*)
+#   XBOXRECOMP_BUILD_D3D8=OFF        D3D8 layer: an xbox_d3d8 target of its own
+# D3D11 is the bundled renderer and window, available on Windows; elsewhere the
+# embedding project provides them.
+if(WIN32)
+    set(_xbr_renderer_default D3D11)
+else()
+    set(_xbr_renderer_default EXTERNAL)
+endif()
+set(XBOXRECOMP_RENDERER "${_xbr_renderer_default}" CACHE STRING "Host renderer: D3D11 or EXTERNAL")
+set_property(CACHE XBOXRECOMP_RENDERER PROPERTY STRINGS D3D11 EXTERNAL)
+include(xbox_ffmpeg)
 
 # Common definitions for all targets
 add_compile_definitions(

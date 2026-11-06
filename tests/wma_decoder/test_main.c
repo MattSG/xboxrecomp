@@ -1,9 +1,43 @@
-/* WMA-to-PCM decoding through FFmpeg: the public failure contract (failures
- * leave a cleared result), and the checked-in CC0 sine fixture decoding to
- * 44.1 kHz stereo 16-bit PCM that is not silent. */
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
 #include "wma_decoder.h"
+
+#if defined(_WIN32)
+#define COBJMACROS
+#include <windows.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+
+static int inject_read_error;
+static int read_count;
+static DWORD first_sample_bytes;
+
+static HRESULT read_sample(IMFSourceReader *reader, DWORD stream, DWORD control,
+                           DWORD *actual, DWORD *flags, LONGLONG *timestamp,
+                           IMFSample **sample)
+{
+    HRESULT hr;
+    if (inject_read_error && ++read_count > 2)
+        return E_UNEXPECTED;
+    hr = IMFSourceReader_ReadSample(reader, stream, control, actual, flags,
+                                   timestamp, sample);
+    if (inject_read_error && SUCCEEDED(hr)) {
+        if (read_count == 1 && *sample)
+            IMFSample_GetTotalLength(*sample, &first_sample_bytes);
+        if (read_count == 2)
+            *flags |= MF_SOURCE_READERF_ERROR;
+    }
+    return hr;
+}
+
+/* Keep the real decoder and Media Foundation; inject only a read status flag. */
+#undef IMFSourceReader_ReadSample
+#define IMFSourceReader_ReadSample read_sample
+#endif
+#include "../../src/audio/wma_decoder.c"
 
 static int is_cleared(const XboxWmaPcm *pcm)
 {
@@ -14,7 +48,6 @@ static int is_cleared(const XboxWmaPcm *pcm)
 int main(int argc, char **argv)
 {
     XboxWmaPcm pcm;
-    size_t i;
 
     /* Even argument-validation failures must honor the public failure contract
      * and clear a caller-provided result structure. */
@@ -33,6 +66,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "missing input unexpectedly decoded\n");
         return 1;
     }
+
     if (!is_cleared(&pcm)) {
         fprintf(stderr, "failed decode did not leave a cleared result\n");
         return 1;
@@ -46,6 +80,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
+#if defined(_WIN32)
     if (argc != 2 || xbox_wma_decode_file(argv[1], &pcm) != 0) {
         fprintf(stderr, "fixture did not decode\n");
         return 1;
@@ -56,15 +91,28 @@ int main(int argc, char **argv)
         xbox_wma_pcm_free(&pcm);
         return 1;
     }
-    for (i = 0; i < pcm.size && pcm.data[i] == 0; ++i) {}
-    if (i == pcm.size) {
-        fprintf(stderr, "decoded sine fixture is silent\n");
-        xbox_wma_pcm_free(&pcm);
-        return 1;
+    {
+        size_t i;
+        for (i = 0; i < pcm.size && pcm.data[i] == 0; ++i) {}
+        if (i == pcm.size) {
+            fprintf(stderr, "decoded sine fixture is silent\n");
+            xbox_wma_pcm_free(&pcm);
+            return 1;
+        }
     }
     xbox_wma_pcm_free(&pcm);
     xbox_wma_pcm_free(&pcm);
 
-    puts("PASS: wma decoder contract and fixture");
+    inject_read_error = 1;
+    if (xbox_wma_decode_file(argv[1], &pcm) != -1 || !is_cleared(&pcm) ||
+        read_count != 2 || first_sample_bytes == 0) {
+        fprintf(stderr, "read error did not stop decoding and clear partial PCM\n");
+        xbox_wma_pcm_free(&pcm);
+        return 1;
+    }
+#else
+    (void)argc;
+    (void)argv;
+#endif
     return 0;
 }

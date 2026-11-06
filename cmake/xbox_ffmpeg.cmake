@@ -20,6 +20,9 @@ if(NOT TARGET xbox::ffmpeg)
         add_library(xbox::ffmpeg ALIAS xbox_ffmpeg)
     elseif(WIN32)
         include(FetchContent)
+        if(POLICY CMP0135)
+            cmake_policy(SET CMP0135 NEW)
+        endif()
         FetchContent_Declare(ffmpeg_win
             URL https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-30-13-01/ffmpeg-n8.1.3-27-g8dca1586f4-win64-lgpl-shared-8.1.zip
             URL_HASH SHA256=21b96a5b382b031e89c1c91d7af8efc3db989c4c11bff27422a4c4ea24cf45ed)
@@ -48,10 +51,8 @@ function(xbox_copy_ffmpeg target)
 endfunction()
 
 # Every executable that links the runtime libraries needs the DLLs beside it
-# on Windows: SDL_shadercross's DXC (dxcompiler.dll, dxil.dll) and FFmpeg are
-# imported by the static libraries whether or not a particular program uses
-# them. Call this once per executable.
+# on Windows. Call this once per executable; embedding projects that ship more
+# runtime DLLs (a shader compiler, say) wrap it.
 function(xbox_copy_runtime_dlls target)
-    xbox_copy_dxc(${target})
     xbox_copy_ffmpeg(${target})
 endfunction()

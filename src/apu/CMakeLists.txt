@@ -12,9 +12,18 @@ add_library(xbox_apu STATIC
     dsp/dsp_dma.c
     dsp/interp/dsp_cpu.c
     apu_mmio_hook.c
-    apu_sdl.c
     apu_wav.c
 )
+
+# The audio device behind the xa2_* contract (apu_xaudio2.h): XAudio2 on
+# Windows, SDL2 elsewhere. An embedding project that brings its own (an SDL3
+# stream, say) sets XBOXRECOMP_APU_OUTPUT=EXTERNAL and defines the xa2_*
+# functions in a target it links alongside this one.
+set(XBOXRECOMP_APU_OUTPUT "DEFAULT" CACHE STRING "APU audio output: DEFAULT or EXTERNAL")
+set_property(CACHE XBOXRECOMP_APU_OUTPUT PROPERTY STRINGS DEFAULT EXTERNAL)
+if(NOT XBOXRECOMP_APU_OUTPUT STREQUAL "EXTERNAL")
+    target_sources(xbox_apu PRIVATE apu_xaudio2.c apu_sdl2.c)
+endif()
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -60,4 +69,13 @@ if(XBOXRECOMP_DSP_PROGRAM_DIR)
     set_source_files_properties(dsp/interp/dsp_cpu.c PROPERTIES OBJECT_DEPENDS ${dsp_recomp_inc})
 endif()
 
-target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 $<$<NOT:$<PLATFORM_ID:Windows>>:m>)
+if(XBOXRECOMP_APU_OUTPUT STREQUAL "EXTERNAL")
+    target_link_libraries(xbox_apu PRIVATE platform $<$<NOT:$<PLATFORM_ID:Windows>>:m>)
+elseif(WIN32)
+    # xaudio2_8 for XAudio2Create, which apu_xaudio2.c calls directly.
+    target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
+else()
+    # POSIX: SDL2 for the audio device (apu_sdl2.c) and libm
+    find_package(SDL2 REQUIRED)
+    target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
+endif()
