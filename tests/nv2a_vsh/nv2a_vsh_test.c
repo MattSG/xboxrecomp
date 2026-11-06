@@ -10,6 +10,7 @@
 #include "nv2a_vsh_interp.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 enum { T = 1, V = 2, C = 3 };             /* source mux */
 #define XYZW 0x1B                         /* swizzle x,y,z,w */
@@ -123,6 +124,29 @@ int main(void)
         if (!nv2a_vsh_run((const float (*)[4])in, &o)) return 1;
         nv2a_vsh_constants(&after);
         if (before != after) return 1;
+    }
+    /* Restoring a recorded frame must also invalidate the decoded program. */
+    {
+        uint32_t word[4] = {0};
+        void *snapshot = malloc(nv2a_vsh_state_size());
+        if (!snapshot) return 1;
+        word[1] = 1u << 21;
+        src(word, 0, V, 0, XYZW);
+        word[3] = (15u << 12) | (1u << 11) | 1u;
+        nv2a_vsh_set_cxt_write(0);
+        nv2a_vsh_set_instruction(0, word);
+        nv2a_vsh_set_start_slot(0);
+        nv2a_vsh_state_save(snapshot);
+        if (!nv2a_vsh_run((const float (*)[4])in, &o) || o.pos[0] != 9) return 1;
+        word[1] |= 1u << 8;
+        nv2a_vsh_set_instruction(0, word);
+        if (!nv2a_vsh_run((const float (*)[4])in, &o) || o.pos[0] != -9) return 1;
+        nv2a_vsh_state_restore(snapshot);
+        free(snapshot);
+        if (!nv2a_vsh_run((const float (*)[4])in, &o) || o.pos[0] != 9) {
+            puts("FAIL: restored frame reused another program's decoded instructions");
+            return 1;
+        }
     }
     puts("ok");
     return 0;
