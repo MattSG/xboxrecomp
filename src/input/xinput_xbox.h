@@ -128,6 +128,37 @@ uint32_t xbox_InputHostPad(uint32_t port, uint16_t *buttons,
  */
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
 
+/* ---- Hooks ------------------------------------------------------------- */
+
+/* A port's contextual keys (RECOMP_KEYBOARD=1): the hook may change the
+ * keyboard pad after the default keys are read. `menu` is TRUE while
+ * RECOMP_MENU_KEYS navigation applies; xbox_FramebufferKeyDown reads a key.
+ * Configure before input polling starts. It runs on the input thread, so it
+ * must be fast and safe to call from that thread. */
+typedef void (*XBOX_KEYBOARD_HOOK)(XBOX_INPUT_STATE *state, BOOL menu);
+void xbox_InputSetKeyboardHook(XBOX_KEYBOARD_HOOK hook);
+
+/* RECOMP_MENU_KEYS applies only while in_menu() returns nonzero. */
+void xbox_InputSetMenuProbe(int (*in_menu)(void));
+
+/* Register before polling. A nonzero result consumes a menu click so the
+ * title can dispatch it on its guest thread instead of receiving pad A. */
+void xbox_InputSetMenuClickHandler(int (*click)(float x, float y));
+
+/* The host's pads, supplied by the embedding project instead of the bundled
+ * XInput / SDL2 backend (an SDL3 gamepad layer, say). Register before
+ * xbox_InputInit; NULL restores the bundled backend. The provider is borrowed
+ * and must stay valid. get_state fills `state` (zeroed on entry) and returns
+ * ERROR_SUCCESS, or ERROR_DEVICE_NOT_CONNECTED (1167) for an empty port; the
+ * keyboard still merges on top of port 0. set_state (rumble) and init are
+ * optional. */
+typedef struct {
+    void  (*init)(void);
+    DWORD (*get_state)(DWORD port, XBOX_INPUT_STATE *state);
+    DWORD (*set_state)(DWORD port, const XBOX_VIBRATION *vibration);
+} XBOX_HOST_PAD_PROVIDER;
+void xbox_InputSetHostPadProvider(const XBOX_HOST_PAD_PROVIDER *provider);
+
 #if !defined(_WIN32)
 /* The POSIX SDL presenter owns event pumping while its main-thread window is
  * active, and keeps SDL alive at shutdown while controller handles are open. */
