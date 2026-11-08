@@ -48,6 +48,8 @@ void nv2a_d3d_kick(void) {}
 void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
+int nv2a_d3d_surface_read(uint32_t phys, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t *out)
+{ (void)phys; (void)x; (void)y; (void)w; (void)h; (void)out; return 0; }
 int nv2a_d3d_prof_enabled(void) { return 0; }
 void nv2a_d3d_prof_add(int slot, int64_t ticks, uint32_t verts) { (void)slot; (void)ticks; (void)verts; }
 int nv2a_d3d_writeback_busy(void) { return 0; }

@@ -3533,6 +3533,11 @@ void nv2a_d3d_zpass_clear(void)
     if (was) nv2a_d3d_zpass_enable(1);
 }
 
+/* The D3D11 back end does not read a render target back for the 2D engine; the
+ * executor falls back to guest memory. */
+int nv2a_d3d_surface_read(uint32_t phys, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t *out)
+{ (void)phys; (void)x; (void)y; (void)w; (void)h; (void)out; return 0; }
+
 uint32_t nv2a_d3d_zpass_read(void)
 {
     int was = s_query_active;
@@ -4389,6 +4394,8 @@ void nv2a_d3d_set_overlay_hooks(const NvOverlayHooks *hooks) { (void)hooks; }
 void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
+int nv2a_d3d_surface_read(uint32_t phys, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t *out)
+{ (void)phys; (void)x; (void)y; (void)w; (void)h; (void)out; return 0; }
 float nv2a_d3d_display_aspect(void) { return 4.0f / 3.0f; }
 int nv2a_d3d_host_draw(const NvD3DState *st, int (*draw)(const NvHostTarget *, void *), void *user) { (void)st; (void)draw; (void)user; return 0; }
 #endif

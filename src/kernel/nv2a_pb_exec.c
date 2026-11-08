@@ -5197,6 +5197,53 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
     return 1;
 }
 
+/* ---- 2D engine (surfaces-2D + image blit) -------------------------------- */
+static struct { uint32_t format, pitch, src, dst, point_in, point_out; } s_blit;
+
+static void blit_2d(uint32_t size)
+{
+    const uint32_t w = size & 0xFFFFu, h = size >> 16;
+    const uint32_t fmt = s_blit.format & 0xFFu;
+    /* NV062 colour formats: 1 = Y8; 2..5 are 16-bit (R5G6B5 is 4); the rest 32-bit. */
+    const uint32_t bpp = fmt == 1u ? 1u : (fmt >= 2u && fmt <= 5u) ? 2u : 4u;
+    const uint32_t sp = s_blit.pitch & 0xFFFFu, dp = s_blit.pitch >> 16;
+    const uint32_t sx = s_blit.point_in & 0xFFFFu, sy = s_blit.point_in >> 16;
+    const uint32_t dx = s_blit.point_out & 0xFFFFu, dy = s_blit.point_out >> 16;
+    const uint32_t limit = 0x04000000u;     /* 64 MB of guest RAM */
+    uint8_t *mem, *s0, *d0;
+    uint32_t *px = NULL, row;
+    int from_target = 0;
+
+    if (!w || !h || w > 4096u || h > 4096u || w * bpp > sp || w * bpp > dp)
+        return;
+    if (s_blit.src >= limit || s_blit.dst >= limit ||
+        s_blit.src + (uint64_t)(sy + h) * sp > limit || s_blit.dst + (uint64_t)(dy + h) * dp > limit)
+        return;
+    mem = (uint8_t *)xbox_GetMemoryOffset();
+    s0 = mem + dma_resolve(s_blit.src);
+    d0 = mem + dma_resolve(s_blit.dst);
+    if (bpp == 4 && use_d3d() && w * h <= 65536u)
+        px = (uint32_t *)malloc((size_t)w * h * 4);
+    if (px && nv2a_d3d_surface_read(s_blit.src, sx, sy, w, h, px)) {
+        from_target = 1;
+        for (row = 0; row < h; ++row)
+            memcpy(d0 + (size_t)(dy + row) * dp + (size_t)dx * bpp, px + (size_t)row * w, (size_t)w * 4);
+    } else {
+        for (row = 0; row < h; ++row)
+            memmove(d0 + (size_t)(dy + row) * dp + (size_t)dx * bpp,
+                    s0 + (size_t)(sy + row) * sp + (size_t)sx * bpp, (size_t)w * bpp);
+    }
+    free(px);
+    {
+        static unsigned noted;
+        if (noted < 4) {
+            ++noted;
+            fprintf(stderr, "[GPU] 2D blit %ux%u fmt %X %08X -> %08X%s\n", w, h, fmt,
+                    s_blit.src, s_blit.dst, from_target ? " (render target)" : "");
+        }
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static uint32_t semaphore_dma, semaphore_offset;
@@ -5334,6 +5381,33 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         *r = param;
+        return;
+    }
+    /* The 2D engine: a surfaces-2D object (XDK D3D binds it to subchannel 3;
+     * NV062: colour format 0x300, pitches 0x304, source and destination
+     * offsets 0x308/0x30C) and an image-blit object (subchannel 2; NV09F:
+     * source point 0x300, destination point 0x304, size 0x308, which starts
+     * the copy). Titles use them to copy small pictures between surfaces; one
+     * known use builds a sun-visibility mask this way. A source the GPU drew
+     * into holds its pixels only in the back end's render target, so it is
+     * read from there when the back end can (nv2a_d3d_surface_read). */
+    if (subch == 3 && method >= 0x0300 && method <= 0x030C) {
+        switch (method) {
+        case 0x0300: s_blit.format = param; break;
+        case 0x0304:        s_blit.pitch = param; break;
+        case 0x0308: s_blit.src = param; break;
+        default:                     s_blit.dst = param; break;
+        }
+        return;
+    }
+    if (subch == 2 && method >= 0x0300 && method <= 0x0308) {
+        if (method == 0x0300) {
+            s_blit.point_in = param;
+        } else if (method == 0x0304) {
+            s_blit.point_out = param;
+        } else {
+            blit_2d(param);
+        }
         return;
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */

@@ -272,6 +272,36 @@ int main(void)
 
     /* Method 0x0310 on subchannel 5 is latched into PGRAPH 0x400B10; on the
      * 3D subchannel it is SET_DITHER_ENABLE and is not. */
+    /* The 2D engine: surfaces-2D on subchannel 3 (format, pitches, offsets), image blit
+     * on subchannel 2 (source point, destination point, size starts the copy). A 4x3 block
+     * of 32-bit pixels moves from (1,1) of one surface to (2,1) of another, nothing else
+     * changes, and a blit that would leave RAM is refused. */
+    {
+        uint32_t x, y;
+        for (y = 0; y < 8; y++)
+            for (x = 0; x < 8; x++)
+                put32(0x6000 + y * 32 + x * 4, 0xA0000000u | (y << 8) | x);
+        memset(s_mem + 0x7000, 0, 8 * 32);
+        nv2a_pb_exec_method(3, 0x0300, 0x0A);                  /* A8R8G8B8 */
+        nv2a_pb_exec_method(3, 0x0304, (32u << 16) | 32u);     /* destination pitch, source pitch */
+        nv2a_pb_exec_method(3, 0x0308, 0x6000);                /* source offset */
+        nv2a_pb_exec_method(3, 0x030C, 0x7000);                /* destination offset */
+        nv2a_pb_exec_method(2, 0x0300, (1u << 16) | 1u);       /* source point (1,1) */
+        nv2a_pb_exec_method(2, 0x0304, (1u << 16) | 2u);       /* destination point (2,1) */
+        nv2a_pb_exec_method(2, 0x0308, (3u << 16) | 4u);       /* 4 wide, 3 high */
+        for (y = 0; y < 8; y++)
+            for (x = 0; x < 8; x++) {
+                uint32_t got, want = 0;
+                memcpy(&got, s_mem + 0x7000 + y * 32 + x * 4, 4);
+                if (x >= 2 && x < 6 && y >= 1 && y < 4)
+                    want = 0xA0000000u | ((y - 1 + 1) << 8) | (x - 2 + 1);
+                CHECK(got == want);
+            }
+        nv2a_pb_exec_method(3, 0x0308, 0x03FFFFF0u);           /* a source that runs past RAM */
+        nv2a_pb_exec_method(2, 0x0308, (3u << 16) | 4u);
+        CHECK(*(uint32_t *)(s_mem + 0x7000 + 32 + 8) == (0xA0000000u | (1u << 8) | 1u));
+    }
+
     nv2a_pb_exec_method(5, 0x0310, 0xABCD1234u);
     CHECK(s_pgraph_400b10 == 0xABCD1234u);
     nv2a_pb_exec_method(0, 0x0310, 7);
