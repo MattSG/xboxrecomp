@@ -185,6 +185,12 @@ void     nv2a_d3d_zpass_enable(int on);
 void     nv2a_d3d_zpass_clear(void);
 uint32_t nv2a_d3d_zpass_read(void);
 
+/* A block of a render target in guest pixels (B8G8R8A8, alpha kept raw), for the
+ * 2D engine's blits from a surface the GPU drew into. phys is the surface's
+ * offset as the title bound it. Returns 1 on success, 0 when the back end has
+ * no such surface or cannot read it back (the executor then copies guest memory). */
+int nv2a_d3d_surface_read(uint32_t phys, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t *out);
+
 /* RECOMP_D3D_PROFILE stage accounting (slot 0 = vertex processing). */
 int  nv2a_d3d_prof_enabled(void);
 /* A flip's surfaces are still being read back into guest memory: DMA_GET and

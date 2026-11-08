@@ -74,6 +74,8 @@ void nv2a_d3d_flip_present(uint32_t surface_addr, uint32_t pitch, int show)
 void nv2a_d3d_zpass_enable(int on) { (void)on; STUB_HIT("nv2a_d3d_zpass_enable"); }
 void nv2a_d3d_zpass_clear(void) { STUB_HIT("nv2a_d3d_zpass_clear"); }
 uint32_t nv2a_d3d_zpass_read(void) { STUB_HIT("nv2a_d3d_zpass_read"); return 0; }
+int nv2a_d3d_surface_read(uint32_t phys, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t *out)
+{ (void)phys; (void)x; (void)y; (void)w; (void)h; (void)out; STUB_HIT("nv2a_d3d_surface_read"); return 0; }
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 { (void)fb_va; (void)pitch; STUB_HIT("xbox_FramebufferWindowSet"); }
 void xbox_FramebufferWindowStart(void) { STUB_HIT("xbox_FramebufferWindowStart"); }

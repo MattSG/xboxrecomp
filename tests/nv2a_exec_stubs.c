@@ -17,6 +17,8 @@ void nv2a_d3d_flip_present(uint32_t va, uint32_t pitch, int now) { (void)va; (vo
 void nv2a_d3d_zpass_enable(int on) { (void)on; }
 void nv2a_d3d_zpass_clear(void) {}
 uint32_t nv2a_d3d_zpass_read(void) { return 0; }
+int nv2a_d3d_surface_read(uint32_t phys, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t *out)
+{ (void)phys; (void)x; (void)y; (void)w; (void)h; (void)out; return 0; }
 
 int xbox_ContiguousRangeAllocated(uint32_t physical_offset, uint32_t size)
 { (void)physical_offset; (void)size; return 1; }
