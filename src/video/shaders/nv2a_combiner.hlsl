@@ -187,6 +187,15 @@ float4 shade(PSIn i, out uint cov) {
     float4 c = tc[n]; float4 t = float4(0, 0, 0, 1);
     float q = c.w != 0.0 ? c.w : 1.0;
     if ((mode == 1 || mode == 2) && (tex_info[n].y & 256u)) t = sampv(n, c.xyz / q);
+    else if (n == 0 && (ps_flags & 0x1000u) && (mode == 1 || mode == 2)) {
+      /* ps_flags 0x1000: stage 0 is a Y16 view of a depth buffer the host renders at the same scale as the target
+       * (zp0.z host pixels per guest pixel), read for the pixel being shaded. The title's own tap is the high word of
+       * a guest pixel (u = 2x + 1.5), which upscaled lands up to a guest pixel's width right of the shaded pixel:
+       * a light volume then lights the background beside a silhouette and not the edge of the object. The view's
+       * texel j holds depth pixel floor((j + 0.5) / 2 - zp0.z / 4) (see y16d_ps), so take the j that holds this pixel. */
+      int j = 2 * (int)i.pos.x + max(1, (int)floor(0.5 * zp0.z + 0.5));
+      t = T2D0.Load(int3(j, (int)i.pos.y, 0));
+    }
     else if (mode == 1 || mode == 2) {
       float2 g = c.xy / q, d = abs(ddx(g)) + abs(ddy(g));
       if (tex_info[n].z != 0u && max(d.x, d.y) < 1e-4)
