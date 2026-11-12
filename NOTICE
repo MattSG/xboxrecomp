@@ -54,6 +54,37 @@ LGPL-2.1-or-later — extracted from xemu
   satisfies that.
 
 
+GPL-2.0-or-later — DSP56300 interpreter, extracted from xemu (this fork only)
+-----------------------------------------------------------------------------
+
+  https://github.com/xemu-project/xemu  (hw/xbox/mcpx/apu/dsp/)
+
+  src/apu/dsp/interp/*, src/apu/dsp/dsp.c and src/apu/dsp/debug.h are
+  GPL-2.0-or-later; src/apu/dsp/dsp_dma.* is LGPL. The per-file list, the
+  pinned xemu commit, the copyright holders and the local changes are in
+  src/apu/dsp/PROVENANCE.md; the licence texts are src/apu/dsp/COPYING.GPL-2
+  and src/apu/dsp/COPYING.LGPL-2.1.
+
+  Unlike the LGPL files above, this code is not covered by the linking
+  permission: a binary that links the interpreter is a combined work under
+  the GPL and has to be distributed on GPL terms, with source. Upstream
+  xboxrecomp does not carry this directory.
+
+
+LGPL — FFmpeg, loaded dynamically (this fork only)
+--------------------------------------------------
+
+  https://ffmpeg.org/
+
+  src/video/video_player.c and src/audio/wma_decoder.c decode FMV and WMA
+  through FFmpeg's shared libraries (libavformat, libavcodec, libavutil,
+  libswscale, libswresample). cmake/xbox_ffmpeg.cmake uses the system FFmpeg
+  on Linux and macOS, and on Windows downloads a pinned LGPL shared build
+  from https://github.com/BtbN/FFmpeg-Builds. No FFmpeg source is in this
+  repository. A distribution that ships those DLLs has to carry FFmpeg's
+  licence and say where its source is.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 
