@@ -1,11 +1,33 @@
 # What the MattSG fork carries on top of upstream
 
-Measured against upstream `343b6d89` (v0.17.0): the fork's `main` is 97
-commits and 496 files ahead (about +79k / -19k lines). Its history is one
-consolidated delta, so the inventory is by path, not by commit. This branch
-(`hooks/host-extension-points`) takes the part that is not tied to a specific
-host API and turns the rest into replaceable backends, so a game repository can
-keep its SDL3 stack itself and depend on upstream.
+Measured against upstream `343b6d89` (v0.17.0) on 2026-11-12: the fork's `main`
+is 111 commits and 395 files ahead (about +59k / -15k lines), and 0 behind.
+Its history is one consolidated delta, so the inventory is by path, not by
+commit. `main` is the former `hooks/host-extension-points` tree ("this branch"
+below): it keeps the part that is not tied to a specific host API and turns
+the rest into replaceable backends, so a game repository keeps its SDL3 stack
+itself. Before that change the fork was 97 commits and 496 files ahead, with
+the SDL3 stack inside it.
+
+Third-party licences for the DSP interpreter (GPL) and FFmpeg are in `NOTICE`.
+
+## Upstream v0.17.0 changes this tree does not have
+
+Files taken whole from the fork lost these; none is used by the SDL3 host in
+mm3-recomp, and each is still to be ported or confirmed not to apply:
+
+- `e17123ca` (#285) the lock around the presented-frame copy in `fb_present.c`.
+- `6b8a7b41` a named heap page is RAM only for the named block's bytes
+  (`xbox_memory_layout.c`; the fork has a different physical-address model).
+- `1c9630f2` (#241) POSIX handles as table indices, and `08e727f6` (#252)
+  trapped-MMIO decode on Linux: the fork carries its own POSIX layer and MMIO
+  hook instead.
+
+## Sent upstream
+
+Opened 2026-11-12 from this delta: sp00nznet/xboxrecomp #322 to #329 (xiso
+unpack paths, abi_analysis output path, four func_id fixes, RTTI bounded reads,
+lifter silent drops).
 
 ## Taken onto this branch unchanged from the fork
 
