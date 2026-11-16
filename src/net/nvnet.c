@@ -361,6 +361,19 @@ static void nic_write(void *dev, uint32_t off, uint64_t val, int size)
         else if (v == 0)
             put(R_SETUP5, 0x80000000u);   /* forcedeth waits for bit 31 */
         break;
+    case R_TX_RING:
+    case R_RX_RING:
+        /* The NIC walks a ring from its base: programming the base (the driver
+         * does so after the reset above) moves its current and next pointers
+         * there. Without this they kept the old base, 0, and the ring stopped. */
+        if (size == 4) {
+            put(off, v);
+            put(off == R_TX_RING ? R_TX_CUR_DESC : R_RX_CUR_DESC, v);
+            put(off == R_TX_RING ? R_TX_NEXT_DESC : R_RX_NEXT_DESC, v);
+            break;
+        }
+        memcpy(s.regs + off, &v, (size_t)size);
+        break;
     case R_IRQ_STATUS:
     case R_MII_STATUS: { /* write one to clear */
         uint32_t cur = 0;
