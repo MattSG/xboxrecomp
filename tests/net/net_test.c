@@ -66,7 +66,22 @@ int main(void)
     n = next_frame(r, 500);
     if (n < 14 + 28 + 240 || r[14 + 28] != 2 || r[14 + 28 + 4] != 0x12) { puts("FAIL: no DHCP offer"); return 2; }
     uint32_t yiaddr = rd32(r + 14 + 28 + 16);
-    if ((yiaddr & 0xFFFFFF00u) != NET_PREFIX || (yiaddr & 0xFF) < 16) { puts("FAIL: offered address"); return 3; }
+    if ((yiaddr & LAN_MASK) != LAN_PREFIX || (yiaddr & 0xFFFFFF00u) == NET_PREFIX ||
+        !(yiaddr & 0xFF) || (yiaddr & 0xFF) == 0xFF) { puts("FAIL: offered address"); return 3; }
+    {   /* the subnet spans every peer's guest */
+        const uint8_t *opt = r + 14 + 28 + 240;
+        while (*opt != 255 && *opt != 1) opt += 2 + opt[1];
+        if (*opt != 1 || rd32(opt + 2) != LAN_MASK) { puts("FAIL: subnet mask"); return 3; }
+    }
+    {   /* addresses come from the whole MAC: 64 consoles differing only in byte 3 */
+        uint32_t seen[64];
+        for (int i = 0; i < 64; i++) {
+            uint8_t mac[6] = {0x00, 0x50, 0xF2, (uint8_t)i, 0x02, 0x03};
+            seen[i] = guest_address(mac);
+            for (int j = 0; j < i; j++)
+                if (seen[j] == seen[i]) { puts("FAIL: address collision"); return 3; }
+        }
+    }
     if (fold(sum16(r + 14, 20, 0)) != 0) { puts("FAIL: IP checksum"); return 4; }
     {
         uint32_t ulen = rd16(r + 14 + 20 + 4);
@@ -88,13 +103,19 @@ int main(void)
     }
     if (rd16(r + 20) != 2 || memcmp(r + 22, k_router_mac, 6)) { puts("FAIL: ARP reply"); return 7; }
 
-    /* The peer got both broadcasts, tagged. */
+    /* The peer got both broadcasts, tagged, and a keepalive at once. */
     {
         uint8_t got[4 + FRAME_MAX];
+        int frames = 0, keepalives = 0, k;
         net_sock_set_nonblocking(peer, 0);
         net_sock_set_recv_timeout(peer, 500);
-        int k = recv(peer, (char *)got, sizeof got, 0);
-        if (k < 4 + 14 || rd32(got) != TUNNEL_MAGIC) { puts("FAIL: peer did not get the broadcast"); return 8; }
+        while ((k = recv(peer, (char *)got, sizeof got, 0)) >= 4 && rd32(got) == TUNNEL_MAGIC) {
+            if (k == 4) keepalives++;
+            else if (k >= 4 + 14) frames++;
+            if (frames >= 2 && keepalives) break;
+        }
+        if (frames < 2) { puts("FAIL: peer did not get the broadcasts"); return 8; }
+        if (!keepalives) { puts("FAIL: no keepalive to the listed peer"); return 8; }
     }
 
     /* UDP out through the NAT to an echo server, and the reply back in. */
@@ -132,6 +153,31 @@ int main(void)
         sendto(peer, (const char *)t, sizeof t, 0, (struct sockaddr *)&me, sizeof me);
         n = next_frame(r, 500);
         if (n != 60 || rd16(r + 12) != 0x88B5) { puts("FAIL: tunnel frame not delivered"); return 11; }
+    }
+
+    /* A bare keepalive from an unlisted peer teaches its address (hole punching),
+     * delivers nothing, and that peer is forgotten once quiet; listed ones stay. */
+    {
+        uint8_t ka[4];
+        struct sockaddr_in me;
+        net_socklen_t ml = sizeof me;
+        SOCKET other = udp_socket(0);
+        int before = st.npeers;
+        wr32(ka, TUNNEL_MAGIC);
+        getsockname(st.tunnel, (struct sockaddr *)&me, &ml);
+        me.sin_addr.s_addr = htonl(0x7F000001u);
+        sendto(other, (const char *)ka, sizeof ka, 0, (struct sockaddr *)&me, sizeof me);
+        for (int t = 0; t < 100 && st.npeers == before; t++) Sleep(5);
+        if (st.npeers != before + 1) { puts("FAIL: keepalive did not add the peer"); return 16; }
+        if (next_frame(r, 100)) { puts("FAIL: keepalive delivered a frame"); return 16; }
+        AcquireSRWLockExclusive(&st.lock);
+        for (int i = 0; i < st.npeers; i++)
+            st.peer_seen[i] = GetTickCount() - PEER_EXPIRE_MS - 1;
+        st.keepalive_at = 0;
+        ReleaseSRWLockExclusive(&st.lock);
+        keep_peers_alive();
+        if (st.npeers != 1 || !st.peer_listed[0]) { puts("FAIL: quiet learned peers not dropped"); return 17; }
+        net_sock_close(other);
     }
 
     /* Opt-in DNS alias through the actual guest packet path, with a numeric
