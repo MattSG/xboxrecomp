@@ -1866,6 +1866,8 @@ static void bridge_ExQueryNonVolatileSetting(void)
  *
  * It never returns on hardware. Returning here would let the game run on past
  * a decision to quit, which reads as a hang rather than an exit. */
+void (*xbox_firmware_return_hook)(uint32_t routine, uint32_t launch_page);
+
 static void bridge_HalReturnToFirmware(void)
 {
     uint32_t routine = STACK_ARG(0);
@@ -1959,6 +1961,9 @@ static void bridge_HalReturnToFirmware(void)
                     waited);
     }
 
+    if (xbox_firmware_return_hook)
+        xbox_firmware_return_hook(routine,
+                                  BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE));
     xbox_HalReturnToFirmware(routine);
 }
 

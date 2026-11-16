@@ -1062,6 +1062,14 @@ extern UCHAR                   xbox_HDKey[16];
 extern UCHAR                   xbox_SignatureKey[16];
 extern UCHAR                   xbox_LANKey[16];
 extern UCHAR                   xbox_AlternateSignatureKeys[16][16];
+/* A console's 256-byte EEPROM image (e.g. an xemu eeprom.bin). Only its
+ * plaintext factory section (serial, MAC, online key, AV region) is served;
+ * all zero means none, and only the MAC has a synthesized fallback. */
+extern UCHAR                   xbox_EEPROM[256];
+/* Called when the title quits or hands off to another image (XLaunchNewImage,
+ * a dashboard request), before the process exits: routine and the guest
+ * launch data page (0 if none). The port may explain the exit to the player. */
+extern void (*xbox_firmware_return_hook)(uint32_t routine, uint32_t launch_page);
 /* Counted host string: caller backs Length bytes and retains Buffer while
  * native consumers use it. Bridge init copies bytes and MaximumLength capacity
  * into guest storage; it does not assume a terminator. Invalid counts/pointers
@@ -1288,6 +1296,11 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_MISC                   0x11
 #define XC_DVD_REGION             0x12
 #define XC_MAX_OS                 0xFF
+/* Factory settings: read-only, from the port-supplied xbox_EEPROM image. */
+#define XC_FACTORY_SERIAL_NUMBER  0x100
+#define XC_FACTORY_ETHERNET_ADDR  0x101
+#define XC_FACTORY_ONLINE_KEY     0x102
+#define XC_FACTORY_AV_REGION      0x103
 
 /* Older spellings kept so existing call sites still build. */
 #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
