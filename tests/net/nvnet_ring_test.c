@@ -155,7 +155,21 @@ int main(void)
     CHECK(!memcmp(sent_frame, guest + 0x2200, sizeof(sent_frame)));
     CHECK(!(desc_flags(0x1100) & NV_TX_VALID));
     CHECK(bus_ptr(RAM_ID_BASE + sizeof(guest) - 4, 8) == NULL);
-    printf("NIC rings: pointer bounds, wrap and runtime physical DMA IDs passed\n");
+
+    /* The driver's order: reset, then program the ring bases through MMIO and
+     * never write the next pointers. The rings start at the new bases. */
+    InitializeCriticalSection(&s.lock);
+    nic_write(NULL, R_TX_RX_CTL, TXRX_RESET, 4);
+    nic_write(NULL, R_TX_RX_CTL, 0, 4);
+    nic_write(NULL, R_TX_RING, 0x1200, 4);
+    nic_write(NULL, R_RX_RING, 0x1300, 4);
+    CHECK(get(R_TX_NEXT_DESC) == 0x1200 && get(R_TX_CUR_DESC) == 0x1200);
+    CHECK(get(R_RX_NEXT_DESC) == 0x1300 && get(R_RX_CUR_DESC) == 0x1300);
+    desc_put(0x1200, 0x2400, 59, NV_TX_VALID | NV_TX_LASTPACKET);
+    memset(guest + 0x2400, 0x5A, sizeof(frame));
+    transmit();
+    CHECK(sends == 3 && sent_frame[0] == 0x5A);
+    printf("NIC rings: pointer bounds, wrap, runtime physical DMA IDs and ring programming passed\n");
     return 0;
 }
 
