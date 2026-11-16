@@ -52,6 +52,7 @@ UCHAR xbox_HDKey[16]                  = {0};
 UCHAR xbox_SignatureKey[16]           = {0};
 UCHAR xbox_LANKey[16]                 = {0};
 UCHAR xbox_AlternateSignatureKeys[16][16] = {{0}};
+UCHAR xbox_EEPROM[256]                = {0};
 
 /* Public-key bytes; zero until supplied by the port. */
 UCHAR xbox_XePublicKeyData[284] = {0};
@@ -129,10 +130,12 @@ static int settings_field(ULONG index, ULONG *offset, ULONG *length, ULONG *type
         *offset = 0;
         *length = SETTINGS_SIZE;
         *type = 3;
-    } else if (index == 0x101) {
-        *offset = 0;
-        *length = 6;
-        *type = 3;
+    } else if (index >= XC_FACTORY_SERIAL_NUMBER && index <= XC_FACTORY_AV_REGION) {
+        /* Offsets into the EEPROM image's factory section. */
+        static const unsigned char factory[][2] = { {0x34, 12}, {0x40, 6}, {0x48, 16}, {0x58, 4} };
+        *offset = factory[index - XC_FACTORY_SERIAL_NUMBER][0];
+        *length = factory[index - XC_FACTORY_SERIAL_NUMBER][1];
+        *type = index == XC_FACTORY_AV_REGION ? 4 : 3;
     } else {
         return 0;
     }
@@ -358,7 +361,7 @@ static SettingsLock settings_lock_file(const xbox_host_char *path, int write)
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
-    unsigned char data[SETTINGS_SIZE];
+    unsigned char data[sizeof xbox_EEPROM];
     xbox_host_char path[MAX_PATH], lockpath[MAX_PATH];
     SettingsLock lock;
     ULONG offset, length, type;
@@ -368,8 +371,14 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     if (ResultLength) *ResultLength = length;
     if (ValueLength < length) return SETTINGS_BUFFER_TOO_SMALL;
     if (!Value) return STATUS_INVALID_PARAMETER;
-    if (ValueIndex == 0x101) {
-        settings_mac(data);
+    if (ValueIndex >= XC_FACTORY_SERIAL_NUMBER) {
+        static const unsigned char none[12];
+        int imported = memcmp(xbox_EEPROM + 0x34, none, sizeof none) != 0;
+        memcpy(data, xbox_EEPROM, sizeof data);
+        if (ValueIndex == XC_FACTORY_ETHERNET_ADDR && (!imported || getenv("RECOMP_NET_MAC")))
+            settings_mac(data + 0x40);
+        else if (!imported)
+            return STATUS_OBJECT_NAME_NOT_FOUND;
     } else {
         if (!settings_path(path, "") || !settings_path(lockpath, ".lock"))
             return STATUS_UNSUCCESSFUL;

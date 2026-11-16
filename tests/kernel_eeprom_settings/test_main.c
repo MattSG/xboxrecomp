@@ -84,7 +84,44 @@ int main(void)
             fprintf(stderr, "FAIL: byte 0x%02X past the block is 0x%02X\n", (unsigned)i, blk[i]);
             return 1;
         }
-    printf("PASS: time zone bias %ld (host), XC_MAX_OS block matches the single queries.\n",
-           (long)bias);
+    {
+        /* Factory settings: none until the port supplies an EEPROM image, except
+         * a synthesized MAC; then served from its plaintext factory section. */
+        static const uint8_t serial[12] = "123456789012", mac[6] = {0, 0x50, 0xF2, 1, 2, 3};
+        uint8_t out[16], key[16];
+        for (i = 0; i < 16; i++) key[i] = (uint8_t)(0xA0 + i);
+        if (xbox_ExQueryNonVolatileSetting(XC_FACTORY_SERIAL_NUMBER, &type, out, 12, &len)
+                != (NTSTATUS)0xC0000034L ||
+            xbox_ExQueryNonVolatileSetting(XC_FACTORY_ETHERNET_ADDR, &type, out, 6, &len) || len != 6) {
+            fprintf(stderr, "FAIL: factory settings without an EEPROM image\n");
+            return 1;
+        }
+        memcpy(xbox_EEPROM + 0x34, serial, 12);
+        memcpy(xbox_EEPROM + 0x40, mac, 6);
+        memcpy(xbox_EEPROM + 0x48, key, 16);
+        v = 0x00400100; memcpy(xbox_EEPROM + 0x58, &v, 4);
+        if (xbox_ExQueryNonVolatileSetting(XC_FACTORY_SERIAL_NUMBER, &type, out, 12, &len) ||
+                type != 3 || len != 12 || memcmp(out, serial, 12) ||
+            xbox_ExQueryNonVolatileSetting(XC_FACTORY_ETHERNET_ADDR, &type, out, 6, &len) ||
+                memcmp(out, mac, 6) ||
+            xbox_ExQueryNonVolatileSetting(XC_FACTORY_ONLINE_KEY, &type, out, 16, &len) ||
+                len != 16 || memcmp(out, key, 16) ||
+            query(XC_FACTORY_AV_REGION) != 0x00400100) {
+            fprintf(stderr, "FAIL: factory settings from the EEPROM image\n");
+            return 1;
+        }
+#ifdef _WIN32
+        _putenv("RECOMP_NET_MAC=00:50:F2:AA:BB:CC");
+#else
+        setenv("RECOMP_NET_MAC", "00:50:F2:AA:BB:CC", 1);
+#endif
+        if (xbox_ExQueryNonVolatileSetting(XC_FACTORY_ETHERNET_ADDR, &type, out, 6, &len) ||
+            out[3] != 0xAA || out[5] != 0xCC) {
+            fprintf(stderr, "FAIL: RECOMP_NET_MAC must override the image's MAC\n");
+            return 1;
+        }
+    }
+    printf("PASS: time zone bias %ld (host), XC_MAX_OS block matches the single queries, "
+           "factory settings come from the EEPROM image.\n", (long)bias);
     return 0;
 }
