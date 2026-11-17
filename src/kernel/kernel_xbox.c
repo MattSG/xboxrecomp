@@ -470,16 +470,20 @@ unlock_thread:
 /* ============================================================================
  * Network / PHY
  *
- * PhyGetLinkState reports Ethernet link status. Xbox had a built-in 100Mbit
- * NIC. For PC, we report link-up since we'll handle networking differently.
+ * PhyGetLinkState reports Ethernet link status. The NIC model sets
+ * xbox_PhyLinkUp: 0 when the network is off, a console with no cable.
+ * Reporting a link there sent XNet into DHCP retries until its timeout
+ * (MM3: ~19 s of its boot load spent waiting for an address).
  * ============================================================================ */
+
+volatile LONG xbox_PhyLinkUp = 1;
 
 ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
 {
     (void)Verify;
     /* Link up, 100 Mbps, full duplex: XNET_ETHERNET_LINK_ACTIVE |
      * _100MBPS | _FULL_DUPLEX, the bits the kernel reads off the PHY. */
-    return 0x01 | 0x02 | 0x08;
+    return xbox_PhyLinkUp ? 0x01 | 0x02 | 0x08 : 0;
 }
 
 NTSTATUS __stdcall xbox_PhyInitialize(BOOLEAN ForceReset, PVOID Param2)

@@ -62,6 +62,7 @@ void xbox_IrqlLeaveInterrupt(int saved) { (void)saved; unexpected_call("xbox_Irq
 int xbox_worker_stack_alloc(void) { unexpected_call("xbox_worker_stack_alloc"); return -1; }
 void xbox_worker_stack_free(int slot) { (void)slot; unexpected_call("xbox_worker_stack_free"); }
 RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_fs_base;
+volatile LONG xbox_PhyLinkUp = 1;
 
 static void desc_put(uint32_t at, uint32_t buf, uint16_t len, uint16_t flags)
 {

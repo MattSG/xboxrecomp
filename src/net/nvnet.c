@@ -469,6 +469,10 @@ void xbox_NicInit(void)
     const char *mode = getenv("RECOMP_NET");
     ptrdiff_t off = xbox_GetMemoryOffset();
     DWORD old;
+    /* Until the adapter is up, PhyGetLinkState reports no cable. Reporting a
+     * link with the network off sent XNet into DHCP retries until its timeout
+     * (MM3: ~19 s of its boot load spent waiting for an address). */
+    xbox_PhyLinkUp = 0;
     if (!mode || !*mode || !strcmp(mode, "0"))
         return;
 #if !defined(_WIN32) && !defined(__x86_64__)
@@ -490,6 +494,7 @@ void xbox_NicInit(void)
         return;
     }
     s.enabled = 1;
+    xbox_PhyLinkUp = 1;
     HANDLE th = CreateThread(NULL, 0, nic_thread, NULL, 0, NULL);
     if (th)
         CloseHandle(th);
