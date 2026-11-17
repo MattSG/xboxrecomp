@@ -1086,6 +1086,7 @@ NTSTATUS __stdcall xbox_XeLoadSection(PXBE_SECTION_HEADER Section);
 NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section);
 
 ULONG   __stdcall xbox_PhyGetLinkState(BOOLEAN Verify);
+extern volatile LONG xbox_PhyLinkUp;   /* set by the NIC model: 0 = no cable */
 NTSTATUS __stdcall xbox_PhyInitialize(BOOLEAN ForceReset, PVOID Param2);
 
 /* ============================================================================
