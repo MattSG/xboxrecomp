@@ -3751,6 +3751,11 @@ int strcpy_s(char *dst, size_t size, const char *src)
 #endif /* !_WIN32 */
 
 #if !defined(_WIN32)
+/* Ceiling for the open-file soft limit; far above any title cache, and
+ * keeps an unlimited hard limit from being requested verbatim. */
+#ifndef W32_FD_LIMIT_CAP
+#define W32_FD_LIMIT_CAP ((rlim_t)65536)
+#endif
 int w32_raise_fd_limit(unsigned long long *before, unsigned long long *after)
 {
     struct rlimit rl;
