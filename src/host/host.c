@@ -29,7 +29,13 @@ extern bool apu_hook_handle_mmio(PCONTEXT context, uintptr_t fault_address,
                                  uint32_t guest_address, int is_write);
 
 static PVOID s_mmio_veh;
-#if !defined(XBOXRECOMP_SDL3)
+/* The runtime's own D3D8 window exists only on Windows without an SDL3 host;
+ * elsewhere the embedding host's renderer opens the window and device. */
+#if defined(_WIN32) && !defined(XBOXRECOMP_SDL3)
+#define XBOX_HOST_D3D8_WINDOW 1
+#endif
+
+#if defined(XBOX_HOST_D3D8_WINDOW)
 static IDirect3D8 *s_d3d;
 static IDirect3DDevice8 *s_device;
 #endif
@@ -120,9 +126,9 @@ void xbox_HostHardwareShutdown(void)
     }
 }
 
-#if defined(XBOXRECOMP_SDL3)
-/* The SDL3 GPU renderer opens its own window and device with the pushbuffer
- * executor; there is no D3D8 device to make. */
+#if !defined(XBOX_HOST_D3D8_WINDOW)
+/* The SDL3 GPU renderer (or a POSIX host's) opens its own window and device
+ * with the pushbuffer executor; there is no D3D8 device to make. */
 int xbox_HostGraphicsInit(const char *window_title)
 {
     DWORD old_protect;
