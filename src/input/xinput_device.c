@@ -17,7 +17,7 @@
 #if !defined(_WIN32)
 /* The mouse layer reads Win32 raw input (mkb_input.c); elsewhere it is off. */
 #define mkb_enabled() 0
-#define mkb_merge(port, state) 0
+#define mkb_merge(port, state) ((void)(port), (void)(state), 0)
 #endif
 #include <stdlib.h>
 #include <stdio.h>
