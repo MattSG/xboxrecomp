@@ -1432,7 +1432,7 @@ static int64_t nv2a_ack_hitch_checkpoint(int64_t frequency, int64_t begin,
         fprintf(stderr, "[HITCH] phase=%s qpc_ms=%.3f start_qpc_ms=%.3f "
                         "duration_ms=%.3f thread=%lu\n", phase,
                 now.QuadPart * ms, begin * ms, (now.QuadPart - begin) * ms,
-                GetCurrentThreadId());
+                (unsigned long)GetCurrentThreadId());
         /* Diagnostic I/O is not part of the following phase. */
         QueryPerformanceCounter(&now);
     }
@@ -2694,7 +2694,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     );
     if (!g_mapping_handle) {
         fprintf(stderr, "xbox_MemoryLayoutInit: CreateFileMapping failed (error %lu)\n",
-                GetLastError());
+                (unsigned long)GetLastError());
         return FALSE;
     }
 
@@ -3260,7 +3260,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: contiguous window at 0x%08X failed "
                     "(error %lu); pinned physical allocations will fault\n",
-                    XBOX_CONTIG_BASE, GetLastError());
+                    XBOX_CONTIG_BASE, (unsigned long)GetLastError());
         }
     }
 
@@ -3293,7 +3293,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 fprintf(stderr, "  NV2A PVIDEO registers routed through MMIO\n");
             } else {
                 fprintf(stderr, "  WARNING: PVIDEO MMIO trap failed "
-                                "(error %lu)\n", GetLastError());
+                                "(error %lu)\n", (unsigned long)GetLastError());
             }
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
@@ -3301,7 +3301,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: NV2A aperture at 0x%08X failed "
                     "(error %lu); D3D register access will fault\n",
-                    XBOX_NV2A_BASE, GetLastError());
+                    XBOX_NV2A_BASE, (unsigned long)GetLastError());
         }
     }
 
@@ -3356,7 +3356,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
                     "(error %lu); USB/audio register access will fault\n",
-                    XBOX_MCPX_BASE, GetLastError());
+                    XBOX_MCPX_BASE, (unsigned long)GetLastError());
         }
     }
 
@@ -3371,7 +3371,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: flash aperture at 0x%08X failed "
                     "(error %lu); a title reading flash will fault\n",
-                    XBOX_FLASH_BASE, GetLastError());
+                    XBOX_FLASH_BASE, (unsigned long)GetLastError());
         }
     }
 
@@ -3448,7 +3448,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             } else {
                 fprintf(stderr, "  Slot %d: not reserved (error %lu); a stray access"
                                 " there would read host memory\n",
-                        m + 1, GetLastError());
+                        m + 1, (unsigned long)GetLastError());
             }
         }
         fprintf(stderr, "  Above-RAM slots: %d/%d reserved, none mapped\n",
@@ -3560,7 +3560,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"
                     " (error %lu); rendering writes will fault\n",
-                    XBOX_TILED_BASE, GetLastError());
+                    XBOX_TILED_BASE, (unsigned long)GetLastError());
         }
     }
 
