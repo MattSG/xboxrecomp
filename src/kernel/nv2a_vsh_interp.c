@@ -664,7 +664,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         /* A program that writes c[] would write it twice; those run once. */
         static unsigned long long checked;
         static unsigned told;
-        Nv2aVshOutput ref;
+        Nv2aVshOutput ref = {0};
         int r1 = vsh_run_fields(in, &ref);
         int r2 = vsh_run_decoded(in, out);
 
