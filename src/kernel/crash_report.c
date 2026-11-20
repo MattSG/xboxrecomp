@@ -66,15 +66,15 @@ LONG xbox_CrashReport(EXCEPTION_POINTERS *info)
     uintptr_t module_base = (uintptr_t)GetModuleHandleW(NULL);
     uint32_t mapped = (uint32_t)xbox_GetMappedSize();
     fprintf(stderr, "[CRASH] code=0x%08lX address=%p guest_esp=0x%08X eax=0x%08X\n",
-            record ? record->ExceptionCode : 0,
+            (unsigned long)(record ? record->ExceptionCode : 0),
             record ? record->ExceptionAddress : NULL,
             g_esp, g_eax);
     fprintf(stderr, "[CRASH] fault=%p rip=%p rsp=%p rax=%llX rdx=%llX\n",
             (void *)fault,
             context ? (void *)context->Rip : NULL,
             context ? (void *)context->Rsp : NULL,
-            context ? context->Rax : 0,
-            context ? context->Rdx : 0);
+            (unsigned long long)(context ? context->Rax : 0),
+            (unsigned long long)(context ? context->Rdx : 0));
     {
         void *frames[16];
         USHORT count = CaptureStackBackTrace(0, 16, frames, NULL);
