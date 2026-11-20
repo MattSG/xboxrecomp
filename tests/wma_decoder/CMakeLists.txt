@@ -6,6 +6,11 @@ add_executable(wma_decoder_test test_main.c)
 target_include_directories(wma_decoder_test PRIVATE ../../src/audio)
 if(WIN32)
     target_link_libraries(wma_decoder_test PRIVATE mfplat mfreadwrite mfuuid mf ole32)
+else()
+    # wma_decoder.c decodes through FFmpeg off Windows.
+    list(APPEND CMAKE_MODULE_PATH ../../cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/xbox_ffmpeg.cmake)
+    target_link_libraries(wma_decoder_test PRIVATE xbox::ffmpeg)
 endif()
 
 enable_testing()

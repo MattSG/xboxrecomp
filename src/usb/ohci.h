@@ -28,9 +28,9 @@ int  xbox_OhciOwnsAddress(uint32_t xbox_va);
 /* Service a trapped access. Returns 1 if the faulting instruction was decoded
  * and stepped over. `ctx` is the fault's thread state: the PCONTEXT from a
  * Win32 VEH, or the ucontext_t * a POSIX SA_SIGINFO handler receives (its
- * third argument). void * keeps windows.h out of here. A title's fault
- * handler calls this (or xbox_VehMmioFault / xbox_PosixMmioFault, which
- * route to it) before it treats the fault as a crash. */
+ * third argument). void * keeps windows.h out of here. The host's vectored
+ * handler (xbox_HostHardwareInit, src/host) calls this before it treats the
+ * fault as a crash. */
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 
 /* Report counts at exit, so a run says whether the driver ever looked. */

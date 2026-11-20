@@ -146,7 +146,7 @@ typedef int64_t            INT64,  *PINT64;
 typedef uint64_t           UINT64, *PUINT64;
 typedef int                BOOL,  *PBOOL;
 typedef int64_t            LONGLONG,  LONG64,  *PLONGLONG;
-typedef uint64_t           ULONGLONG, ULONG64, *PULONGLONG, DWORDLONG;
+typedef uint64_t           ULONGLONG, ULONG64, *PULONGLONG, DWORDLONG, DWORD64, *PDWORD64;
 typedef float              FLOAT;
 typedef double             DOUBLE;
 

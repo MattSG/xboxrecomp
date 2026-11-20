@@ -15,7 +15,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include "mmio_decode.h"
 

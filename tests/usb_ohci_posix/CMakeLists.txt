@@ -21,7 +21,7 @@ add_custom_target(usb_ohci_posix_xbe ALL DEPENDS ${TEST_XBE})
 add_executable(usb_ohci_posix_test test_main.c)
 add_dependencies(usb_ohci_posix_test usb_ohci_posix_xbe)
 target_include_directories(usb_ohci_posix_test PRIVATE
-    ../../src/kernel ../../src/usb)
+    ../../src/kernel ../../src/usb ../../src/host)
 target_link_libraries(usb_ohci_posix_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME usb_ohci_posix_test COMMAND usb_ohci_posix_test ${TEST_XBE})
