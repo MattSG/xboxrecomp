@@ -10,13 +10,14 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+/* kernel_io.c (linked for the object-handle helpers) asks for the guest window; this fixture has none. */
+ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
+
 /* Logging is orthogonal to file/search behavior; no title or runtime init. */
 void xbox_log(int level, const char *subsystem, const char *fmt, ...)
 { (void)level; (void)subsystem; (void)fmt; }
 
 /* This fixture creates no symbolic links; normal device-path translation is real. */
-const char *xbox_LookupSymbolicLink(const char *link)
-{ (void)link; return NULL; }
 
 static int failures;
 static void check(int ok, const char *name)

@@ -1,8 +1,9 @@
 /*
  * The USB OHCI register model on a POSIX host, reached the way a title
- * reaches it: a load or store to the controller's aperture faults, the
- * process's SIGBUS/SIGSEGV handler hands the fault to xbox_OhciHandleMmio,
- * and the instruction completes with the model's value.
+ * reaches it: a load or store to the controller's aperture faults, the host's
+ * vectored handler (xbox_HostHardwareInit; the platform layer emulates VEH over
+ * SIGSEGV/SIGBUS) hands the fault to xbox_OhciHandleMmio, and the instruction
+ * completes with the model's value.
  *
  * Before this was ported the trap existed on Windows only: on POSIX the
  * aperture stayed plain zeroed memory and xbox_OhciHandleMmio returned 0, so
@@ -14,8 +15,8 @@
  */
 #include "xbox_memory_layout.h"
 #include "ohci.h"
+#include "xbox_host.h"
 
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,23 +29,12 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 
 static int failures;
 static uintptr_t s_base;
-static volatile sig_atomic_t s_unhandled;
 
 static void check(int ok, const char *what, const char *detail)
 {
     printf("  %-52s %s%s%s\n", what, ok ? "PASS" : "FAIL",
            detail && !ok ? " -- " : "", detail && !ok ? detail : "");
     if (!ok) failures++;
-}
-
-/* What a title's own fault handler does: hand the fault to the toolkit's
- * trapped-MMIO dispatch, which routes it to the OHCI model. */
-static void on_fault(int sig, siginfo_t *si, void *ucv)
-{
-    if (xbox_PosixMmioFault(ucv, (uintptr_t)si->si_addr))
-        return;
-    s_unhandled = 1;
-    signal(sig, SIG_DFL);           /* re-faults and dies: a FAIL by crash */
 }
 
 static unsigned char *load_file(const char *path, size_t *len)
@@ -71,7 +61,6 @@ int main(int argc, char **argv)
 {
     size_t xbe_len = 0;
     unsigned char *xbe;
-    struct sigaction sa;
     char detail[96];
 
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -83,20 +72,18 @@ int main(int argc, char **argv)
     }
     /* The model is opt-in. */
     setenv("RECOMP_USB", "1", 1);
+    /* The emulated APU unmaps its registers so they trap; xbox_HostHardwareInit brings it up. */
+    setenv("RECOMP_AC97_READY", "1", 1);
     if (!xbox_MemoryLayoutInit(xbe, xbe_len)) {
         fprintf(stderr, "xbox_MemoryLayoutInit failed\n");
         return 2;
     }
     s_base = (uintptr_t)xbox_GetMemoryOffset();
 
-    memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = on_fault;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGBUS, &sa, NULL);
-    sigaction(SIGSEGV, &sa, NULL);
-
-    xbox_OhciInit();
+    if (!xbox_HostHardwareInit()) {
+        fprintf(stderr, "xbox_HostHardwareInit failed\n");
+        return 2;
+    }
 
 #if !defined(__aarch64__) && !(defined(__x86_64__) && defined(__linux__))
     check(!xbox_OhciOwnsAddress(XBOX_OHCI0_BASE),
@@ -151,7 +138,27 @@ int main(int argc, char **argv)
         check((uint32_t)q == 0x10u,
               "an 8-byte read is two register reads", detail);
     }
-    check(!s_unhandled, "no access fell through to the crash path", NULL);
+    {
+        /* APU registers (0xFE800000..): a read must be answered by the model, not crash. */
+        volatile uint32_t *apu = (volatile uint32_t *)(s_base + 0xFE800000u);
+        uint32_t v = apu[0];
+        snprintf(detail, sizeof detail, "read 0x%08X", v);
+        check(1, "an APU register read completes through the trap (a crash aborts the test)", NULL);
+        (void)detail;
+    }
+    {
+        /* The same dispatcher also owns the NV2A PVIDEO page, trapped by
+         * xbox_HostGraphicsInit (the SDL3 host variant: no window or device). */
+        volatile uint32_t *pv = (volatile uint32_t *)(s_base + 0xFD008000u);
+        uint32_t v;
+
+        check(xbox_HostGraphicsInit("trap test") != 0,
+              "PVIDEO page is trapped by xbox_HostGraphicsInit", NULL);
+        pv[0x900 / 4] = 0xA5A5A5A5u;
+        v = pv[0x900 / 4];
+        snprintf(detail, sizeof detail, "read 0x%08X", v);
+        check(v != 0xDEADBEEFu, "a PVIDEO read and write complete (no crash)", detail);
+    }
     xbox_OhciReport();
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;

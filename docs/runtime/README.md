@@ -55,47 +55,17 @@ Beyond the four pillars, each game needs:
 
 These go in the game-specific repo, not in the generic xboxrecomp toolkit.
 
-## POSIX hosts (macOS, Linux)
+## POSIX hosts (Linux x86-64)
 
-The template's `main.c` is Win32: a vectored handler that calls
-`xbox_VehMmioFault` and a `WinMain`. A POSIX build needs the same two pieces
-in its own `main()`:
+Trapped hardware registers (APU, AC'97, USB OHCI, NV2A PVIDEO) work the same
+way as on Windows. The platform layer emulates vectored exception handlers over
+SIGSEGV/SIGBUS (`AddVectoredExceptionHandler` in `win32_compat.c`, filling a
+`CONTEXT` from the `ucontext`), the x86-64 decoder in `platform/mmio_decode.h`
+completes the access, and `xbox_HostHardwareInit()` (src/host) installs the
+handler that routes each fault to the owning model. A title calls
+`xbox_HostHardwareInit()` after kernel bridge init, as on Windows; it needs no
+signal code of its own. `tests/usb_ohci_posix` drives all three paths through a
+real fault, and `tests/mmio_decode` covers the decoder.
 
-```c
-#include <signal.h>
-#include <ucontext.h>
-#include "kernel/xbox_memory_layout.h"   /* xbox_PosixMmioFault */
-#include "video/video_player.h"          /* xbox_HostWindowMain */
-
-/* Trapped hardware registers (APU, AC'97, USB OHCI) fault here. Return when
- * the access was serviced: the program counter has been advanced past it. */
-static void on_fault(int sig, siginfo_t *si, void *uc)
-{
-    if (xbox_PosixMmioFault(uc, (uintptr_t)si->si_addr))
-        return;
-    signal(sig, SIG_DFL);                /* a real crash: report and die */
-}
-
-static int boot_and_run(void)
-{
-    /* xbox_MemoryLayoutInit, kernel init, the guest entry point, ...,
-     * as in the template's WinMain. */
-    return 0;
-}
-
-int main(void)
-{
-    struct sigaction sa = { 0 };
-    sa.sa_sigaction = on_fault;
-    sa.sa_flags = SA_SIGINFO;
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);        /* macOS reports a protected page so */
-    /* With RECOMP_FB_WINDOW set this opens the framebuffer window on the
-     * main thread (where macOS requires it) and runs boot_and_run on a second
-     * one; otherwise it just calls boot_and_run. */
-    return xbox_HostWindowMain(boot_and_run);
-}
-```
-
-`xbox_PosixMmioFault` decodes the faulting instruction on arm64 hosts only;
-on x86-64 POSIX it always returns 0, and the traps are not armed there.
+An x86-64 host is required; other POSIX hosts have no decoder here, so the
+models stay off (OHCI logs that USB is disabled).
