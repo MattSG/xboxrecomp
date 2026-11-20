@@ -32,6 +32,9 @@ void nv2a_d3d_prof_add(int slot, long long ticks, unsigned verts);
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
 #endif
+#if defined(__linux__)
+#include <sys/uio.h>  /* process_vm_readv: xbox_GuestRead */
+#endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
@@ -293,8 +296,23 @@ int xbox_GuestRead(uint32_t va, void *out, size_t size)
     return ReadProcessMemory(GetCurrentProcess(), (const void *)host, out, size, &copied)
            && copied == size;
 #else
-    (void)va; (void)out; (void)size;
-    return 0;
+    uintptr_t host;
+    if (va < 0x10000u || size > UINT32_MAX || va > UINT32_MAX - size)
+        return 0;
+    host = (uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset();
+#if defined(__linux__)
+    {
+        /* The kernel copies and reports an unmapped or protected page as an
+         * error, as ReadProcessMemory does: no fault reaches the MMIO handler. */
+        struct iovec local = { out, size }, remote = { (void *)host, size };
+        return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)size;
+    }
+#else
+    if (!xbox_GuestMapped(va, (uint32_t)size))
+        return 0;
+    memcpy(out, (const void *)host, size);
+    return 1;
+#endif
 #endif
 }
 
@@ -303,15 +321,14 @@ int xbox_GuestRangeInWindow(uint32_t va, uint32_t bytes)
     return va >= 0x10000u && va < XBOX_DEVKIT_RAM && bytes <= XBOX_DEVKIT_RAM - va;
 }
 
-#ifdef _WIN32
 /* Per-frame hooks ask about the same committed region many times a frame, and each VirtualQuery is a
- * system call. The last region a thread found committed is remembered for a few milliseconds; a
- * region that is not committed (MMIO windows, guard pages) is never remembered. The guest's RAM is one
- * allocation that lives for the whole run, and a query followed by a read was never atomic anyway. */
+ * system call (on POSIX, a parse of /proc/self/maps). The last region a thread found committed is
+ * remembered for a few milliseconds; a region that is not committed (MMIO windows, guard pages) is
+ * never remembered. The guest's RAM is one allocation that lives for the whole run, and a query
+ * followed by a read was never atomic anyway. */
 static RECOMP_TLS uintptr_t s_mapped_lo, s_mapped_hi;
 static RECOMP_TLS ULONGLONG s_mapped_stamp;
 enum { MAPPED_CACHE_MS = 8 };
-#endif
 
 int xbox_GuestMapped(uint32_t va, uint32_t bytes)
 {
@@ -336,17 +353,25 @@ int xbox_GuestMapped(uint32_t va, uint32_t bytes)
     }
 #else
     {
-        FILE *maps = fopen("/proc/self/maps", "r");
+        FILE *maps;
         char line[256], access[5];
         unsigned long long lo, hi;
         int mapped = 0;
-        if (!maps)
+        ULONGLONG now = GetTickCount64();
+        if (host >= s_mapped_lo && host < s_mapped_hi && bytes <= s_mapped_hi - host &&
+            now - s_mapped_stamp < MAPPED_CACHE_MS)
+            return 1;
+        if (!(maps = fopen("/proc/self/maps", "r")))
             return 0;
         while (!mapped && fgets(line, sizeof line, maps))
             if (sscanf(line, "%llx-%llx %4s", &lo, &hi, access) == 3 &&
                 access[0] == 'r' && access[1] == 'w' &&
-                host >= lo && host + bytes <= hi)
+                host >= lo && host + bytes <= hi) {
                 mapped = 1;
+                s_mapped_lo = (uintptr_t)lo;
+                s_mapped_hi = (uintptr_t)hi;
+                s_mapped_stamp = now;
+            }
         fclose(maps);
         return mapped;
     }
