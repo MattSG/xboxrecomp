@@ -432,6 +432,7 @@ typedef struct {
 struct w32_object {
     w32_kind        kind;
     LONG            refcount;
+    uint32_t        handle_id;   /* its slot in the handle table, (slot+1)*4 */
     pthread_mutex_t lock;
     pthread_cond_t  cond;
     pthread_cond_t  waitable_cond;
@@ -498,6 +499,102 @@ struct w32_object {
 /* pseudo handles for "current thread"/"current process" */
 #define PSEUDO_CURRENT_PROCESS ((HANDLE)(LONG_PTR)-1)
 #define PSEUDO_CURRENT_THREAD  ((HANDLE)(LONG_PTR)-2)
+
+/*
+ * A HANDLE is an index into this table, not the object's address.
+ *
+ * The guest is 32-bit code: every handle it receives is stored in a 32-bit
+ * slot and handed back later, which the kernel bridge does literally --
+ * `sp[1] = (uint32_t)(uintptr_t)h`. Returning the w32_object pointer means
+ * handing out values like 0x1038dffd0, because macOS heap allocations sit
+ * above 4 GB. The guest keeps the low half, gives it back, and the shim
+ * dereferences an address that was never an object: a SIGSEGV with nothing
+ * to say it came from a truncated handle.
+ *
+ * Windows has no such problem -- a Win32 HANDLE is an index into the process
+ * handle table, small even in a 64-bit process, which is why handles are
+ * documented as 32-bit-significant for interop. This is the same trick.
+ *
+ * Values are HTAB_TAG | (slot + 1) * 4, so no live handle is NULL, -1, -2 or
+ * INVALID_HANDLE_VALUE, and all of them fit in 32 bits.
+ *
+ * The tag is not decoration. A bare (slot + 1) * 4 makes the first handles 4,
+ * 8, 12 -- and the kernel bridge turns any guest word it does not recognise
+ * into a HANDLE by cast (bridge_resolve_handle's "untagged: synthetic/dummy
+ * handle" path). A title passing a small bogus value would then land on a live
+ * object and quietly operate on someone else's event, where the old pointer
+ * handles made it a fault at address 4. The tag keeps the two apart, and is
+ * distinct from the bridge's own 0x48000000 token tag so neither is mistaken
+ * for the other. */
+#define HTAB_TAG    0x5A000000u
+#define HTAB_MASK   0x00FFFFFFu
+#define HTAB_STRIDE 4u
+
+static w32_object    **s_htab;
+static uint32_t        s_htab_len;
+static pthread_mutex_t s_htab_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Register o and return its handle. Idempotent: an object keeps one id for
+ * its lifetime, so DuplicateHandle and repeated GetCurrentThread() agree. */
+static HANDLE obj_handle(w32_object *o)
+{
+    uint32_t slot;
+    HANDLE h;
+
+    if (!o) return NULL;
+    pthread_mutex_lock(&s_htab_lock);
+    if (o->handle_id) {
+        HANDLE existing = (HANDLE)(uintptr_t)o->handle_id;
+        pthread_mutex_unlock(&s_htab_lock);
+        return existing;
+    }
+    for (slot = 0; slot < s_htab_len; slot++)
+        if (!s_htab[slot]) break;
+    if (slot == s_htab_len) {
+        uint32_t grown = s_htab_len ? s_htab_len * 2 : 256;
+        w32_object **t = (w32_object **)realloc(s_htab, grown * sizeof *t);
+        if (!t) { pthread_mutex_unlock(&s_htab_lock); return NULL; }
+        memset(t + s_htab_len, 0, (grown - s_htab_len) * sizeof *t);
+        s_htab = t;
+        s_htab_len = grown;
+    }
+    s_htab[slot] = o;
+    o->handle_id = HTAB_TAG | ((slot + 1) * HTAB_STRIDE);
+    h = (HANDLE)(uintptr_t)o->handle_id;
+    pthread_mutex_unlock(&s_htab_lock);
+    return h;
+}
+
+/* The inverse. NULL for anything that is not a live handle, which is what
+ * callers already expect from a bad one. */
+static w32_object *obj_from_handle(HANDLE h)
+{
+    uintptr_t v = (uintptr_t)h;
+    uint32_t slot;
+    w32_object *o;
+
+    if ((v & ~(uintptr_t)0xFFFFFFFFu) != 0) return NULL;   /* not a handle id */
+    if (((uint32_t)v & ~HTAB_MASK) != HTAB_TAG) return NULL;
+    v &= HTAB_MASK;
+    if (!v || v % HTAB_STRIDE) return NULL;
+    slot = (uint32_t)(v / HTAB_STRIDE) - 1;
+    pthread_mutex_lock(&s_htab_lock);
+    o = (slot < s_htab_len) ? s_htab[slot] : NULL;
+    pthread_mutex_unlock(&s_htab_lock);
+    return o;
+}
+
+static void obj_unregister(w32_object *o)
+{
+    uint32_t slot;
+
+    if (!o || !o->handle_id) return;
+    pthread_mutex_lock(&s_htab_lock);
+    slot = (o->handle_id & HTAB_MASK) / HTAB_STRIDE - 1;
+    if (slot < s_htab_len && s_htab[slot] == o) s_htab[slot] = NULL;
+    o->handle_id = 0;
+    pthread_mutex_unlock(&s_htab_lock);
+}
 #define STILL_ACTIVE 259u
 
 static __thread w32_object *t_self_obj = NULL;
@@ -520,14 +617,104 @@ DWORD GetCurrentThreadId(void)
 }
 
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
-HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
+
+/* errno -> the Win32 code a caller would test for. Only the handful that
+ * callers actually branch on; everything else is a generic failure. */
+static DWORD w32_error_from_errno(int e)
+{
+    switch (e) {
+    case ENOENT:  return ERROR_FILE_NOT_FOUND;
+    case EEXIST:  return ERROR_ALREADY_EXISTS;
+    case EACCES:
+    case EPERM:   return ERROR_ACCESS_DENIED;
+    case ENOTDIR: return ERROR_PATH_NOT_FOUND;
+    case ENOTEMPTY: return ERROR_DIR_NOT_EMPTY;
+    default:      return ERROR_GEN_FAILURE;
+    }
+}
+
+/* ── Directories and the temp path ──────────────────────────────────────
+ *
+ * Thin enough to be obviously right. A test or a title that wants a
+ * scratch directory should not have to bracket itself in #ifdef to get one.
+ */
+/* Win32 accepts either separator, and callers mix them freely -- the kernel
+ * tests build paths as "<posix dir>\\Child". Without this the backslash is
+ * just another filename character on POSIX, so the call quietly operates on a
+ * sibling with a backslash in its name instead of the child it named. */
+static const char *norm_path(const char *in, char *buf, size_t n)
+{
+    snprintf(buf, n, "%s", in);
+    xbox_path_normalize(buf);
+    return buf;
+}
+
+BOOL CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa)
+{
+    (void)sa;
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    char norm[1024];
+    if (mkdir(norm_path(path, norm, sizeof norm), 0777) == 0)
+        return TRUE;
+    /* Win32 reports an existing directory as a failure with this code, and
+     * callers test for it rather than treating every failure as fatal. */
+    SetLastError(errno == EEXIST ? ERROR_ALREADY_EXISTS
+                                 : w32_error_from_errno(errno));
+    return FALSE;
+}
+
+BOOL RemoveDirectoryA(LPCSTR path)
+{
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    char norm[1024];
+    if (rmdir(norm_path(path, norm, sizeof norm)) == 0) return TRUE;
+    SetLastError(w32_error_from_errno(errno));
+    return FALSE;
+}
+
+/* Win32 returns the length written and guarantees a trailing separator. */
+DWORD GetTempPathA(DWORD buflen, LPSTR buf)
+{
+    const char *tmp = getenv("TMPDIR");
+    size_t n;
+
+    if (!tmp || !*tmp) tmp = "/tmp";
+    n = strlen(tmp);
+    if (!buf || buflen < n + 2)
+        return (DWORD)(n + 2);          /* needed size, including the '/' */
+    memcpy(buf, tmp, n);
+    if (n && buf[n - 1] != '/') buf[n++] = '/';
+    buf[n] = 0;
+    return (DWORD)n;
+}
+
+DWORD GetFileAttributesA(LPCSTR path)
+{
+    struct stat st;
+    char norm[1024];
+
+    if (!path || stat(norm_path(path, norm, sizeof norm), &st) != 0) {
+        SetLastError(w32_error_from_errno(path ? errno : EINVAL));
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    return S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY
+                               : FILE_ATTRIBUTE_NORMAL;
+}
+
+BOOL DeleteFileA(LPCSTR path)
+{
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    char norm[1024];
+    if (unlink(norm_path(path, norm, sizeof norm)) == 0) return TRUE;
+    SetLastError(w32_error_from_errno(errno));
+    return FALSE;
+}
+HANDLE GetCurrentThread(void)   { return t_self_obj ? obj_handle(t_self_obj) : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 
-/* Live objects. A HANDLE here is the object's address, so a value that is
- * not one -- a guest pointer, a stale or made-up handle -- would otherwise be
- * dereferenced. Windows answers those with ERROR_INVALID_HANDLE, and callers
- * (the kernel HLE falls back to raw guest values) rely on that.
- * Open addressing over the pointer; deleted slots keep a tombstone. */
+/* Live objects, by address, for the code that holds an object pointer rather
+ * than a HANDLE. Open addressing over the pointer; deleted slots keep a
+ * tombstone. HANDLEs themselves are table indices (obj_handle). */
 #define W32_TOMB ((w32_object *)1)
 static w32_object s_process_heap;
 static w32_object **s_live;
@@ -574,20 +761,25 @@ static size_t live_find_locked(const void *h)
     return (size_t)-1;
 }
 
-/* The object behind h, or NULL (ERROR_INVALID_HANDLE) when h is not one. */
+/* The object behind h, or NULL (ERROR_INVALID_HANDLE) when h is not one. A
+ * handle is a tagged table index (see obj_handle), so a guest pointer, a stale
+ * value or a made-up one fails here instead of being dereferenced. */
 static w32_object *obj_lookup(HANDLE h)
 {
-    size_t i;
+    w32_object *o;
     if (!h || h == INVALID_HANDLE_VALUE) return NULL;
-    if ((w32_object *)h == &s_process_heap) return &s_process_heap;
-    pthread_rwlock_rdlock(&s_live_lock);
-    i = live_find_locked(h);
-    pthread_rwlock_unlock(&s_live_lock);
-    if (i == (size_t)-1) {
-        SetLastError(ERROR_INVALID_HANDLE);
-        return NULL;
-    }
-    return (w32_object *)h;
+    o = obj_from_handle(h);
+    if (!o) SetLastError(ERROR_INVALID_HANDLE);
+    return o;
+}
+
+/* A wait-array element: the object, or the pseudo-handle itself, which the
+ * wait loops compare against and skip. NULL for anything else. */
+static w32_object *wait_obj(HANDLE h)
+{
+    if (h == PSEUDO_CURRENT_PROCESS || h == PSEUDO_CURRENT_THREAD)
+        return (w32_object *)h;
+    return obj_from_handle(h);
 }
 
 static w32_object *obj_alloc(w32_kind kind)
@@ -618,6 +810,9 @@ static void share_forget(w32_object *o);
 
 static void obj_release(w32_object *o)
 {
+    /* obj_from_handle() returns NULL for a handle the table never issued --
+     * a stale or invented guest value. Closing one is a no-op, not a fault. */
+    if (!o) return;
     if (InterlockedDecrement(&o->refcount) > 0)
         return;
     if (o->kind == K_FILE) share_forget(o);
@@ -636,6 +831,9 @@ static void obj_release(w32_object *o)
     } else if (o->kind == K_WAITABLE_TIMER) {
         /* Waitable timers: no special cleanup needed */
     }
+    /* Before the memory goes: a stale slot would hand a later caller a
+     * dangling pointer under a handle that looks live. */
+    obj_unregister(o);
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
     pthread_cond_destroy(&o->waitable_cond);
@@ -846,7 +1044,7 @@ HANDLE w32_open_handle(int fd, const char *host_path)
     w32_object *o = obj_alloc(K_FILE);
     o->fd        = fd;
     o->file_path = host_path ? strdup(host_path) : NULL;
-    return (HANDLE)o;
+    return obj_handle(o);
 }
 
 int w32_handle_fd(HANDLE h)
@@ -911,7 +1109,7 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
     if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
     /* Win32 returns a real process handle here, never the -1 pseudo-handle:
      * -1 is INVALID_HANDLE_VALUE to callers that store the result. */
-    if (src == PSEUDO_CURRENT_PROCESS) { *dst = (HANDLE)obj_alloc(K_PROCESS); return TRUE; }
+    if (src == PSEUDO_CURRENT_PROCESS) { *dst = obj_handle(obj_alloc(K_PROCESS)); return TRUE; }
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
     w32_object *o = obj_lookup(src);
     if (!o) return FALSE;
@@ -1157,6 +1355,18 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, D
     return WaitForMultipleObjectsEx(count, handles, waitAll, ms, FALSE);
 }
 
+/* A handle the table knows, or one of the pseudo-handles. NULL is not one:
+ * the single-object wait answers it as signalled, a convenience for callers
+ * that pass an optional event, but Win32 rejects the whole multiple wait for
+ * it -- and the kernel's own regression pins that, because a NULL slot means
+ * the title named an object the runtime did not resolve. */
+static int wait_handle_ok(HANDLE h)
+{
+    if (h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+        return 1;
+    return obj_from_handle(h) != NULL;
+}
+
 DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                                DWORD ms, BOOL alertable)
 {
@@ -1181,12 +1391,26 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
 
     struct timespec ts = {0, 0};
     int timed = (ms != INFINITE);
+    DWORD k;
+
+    /* Win32 rejects the whole call when any handle is not one, before waiting
+     * on any of them. Polling each with a zero timeout instead -- which is how
+     * the loop below asks -- never reports a bad handle as anything but "not
+     * signalled", so the call used to sit out its timeout and answer
+     * STATUS_TIMEOUT where a title expects STATUS_UNSUCCESSFUL. A title that
+     * reads a timeout as "not yet" retries forever. */
+    if (!handles && count)
+        { SetLastError(ERROR_INVALID_HANDLE); return WAIT_FAILED; }
+    for (k = 0; k < count; k++)
+        if (!wait_handle_ok(handles[k]))
+            { SetLastError(ERROR_INVALID_HANDLE); return WAIT_FAILED; }
+
     if (timed) deadline_from_ms(ms, &ts);
 
     w32_object *ordered[MAXIMUM_WAIT_OBJECTS];
     if (waitAll) {
         for (DWORD i = 0; i < count; i++) {
-            ordered[i] = (w32_object *)handles[i];
+            ordered[i] = wait_obj(handles[i]);
         }
         /* Insertion sort is bounded by MAXIMUM_WAIT_OBJECTS and gives every
          * wait-all call the same lock order, including reversed arrays. */
@@ -1216,7 +1440,7 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
             int ready = 1;
             for (DWORD i = 0; i < count; i++) {
                 if (handles[i] == PSEUDO_CURRENT_PROCESS || handles[i] == PSEUDO_CURRENT_THREAD) continue;
-                if (!object_ready_locked((w32_object *)handles[i])) { ready = 0; break; }
+                if (!object_ready_locked(wait_obj(handles[i]))) { ready = 0; break; }
             }
             if (ready && alertable) {
                 for (DWORD i = count; i > 0; i--) {
@@ -1233,13 +1457,13 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                 }
                 for (DWORD i = 0; i < count; i++) {
                     if (handles[i] == PSEUDO_CURRENT_PROCESS || handles[i] == PSEUDO_CURRENT_THREAD) continue;
-                    if (!object_ready_locked((w32_object *)handles[i])) { ready = 0; break; }
+                    if (!object_ready_locked(wait_obj(handles[i]))) { ready = 0; break; }
                 }
             }
             if (ready) {
                 for (DWORD i = 0; i < count; i++) {
                     if (handles[i] == PSEUDO_CURRENT_PROCESS || handles[i] == PSEUDO_CURRENT_THREAD) continue;
-                    object_consume_locked((w32_object *)handles[i]);
+                    object_consume_locked(wait_obj(handles[i]));
                 }
             }
             for (DWORD i = count; i > 0; i--) {
@@ -1252,12 +1476,12 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
             for (DWORD i = 0; i < count; i++) {
                 HANDLE h = handles[i];
                 int ready = h == PSEUDO_CURRENT_PROCESS || h == PSEUDO_CURRENT_THREAD;
-                if (!ready) ready = wait_single_impl((w32_object *)h, 0, 0) == WAIT_OBJECT_0;
+                if (!ready) ready = wait_single_impl(wait_obj(h), 0, 0) == WAIT_OBJECT_0;
                 if (ready) {
                     service_waitable_timers();
                     if (alertable && drain_apcs() > 0) return WAIT_IO_COMPLETION;
                     if (h != PSEUDO_CURRENT_PROCESS && h != PSEUDO_CURRENT_THREAD &&
-                        wait_single_impl((w32_object *)h, 0, 1) != WAIT_OBJECT_0)
+                        wait_single_impl(wait_obj(h), 0, 1) != WAIT_OBJECT_0)
                         continue;
                     return WAIT_OBJECT_0 + i;
                 }
@@ -1285,7 +1509,7 @@ HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
     w32_object *o = obj_alloc(K_EVENT);
     o->manual_reset = manualReset ? 1 : 0;
     o->signaled     = initialState ? 1 : 0;
-    return (HANDLE)o;
+    return obj_handle(o);
 }
 HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCWSTR name)
 {
@@ -1336,7 +1560,7 @@ HANDLE CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
     w32_object *o = obj_alloc(K_SEM);
     o->sem_count = initial;
     o->sem_max   = maximum;
-    return (HANDLE)o;
+    return obj_handle(o);
 }
 HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCWSTR name)
 {
@@ -1366,7 +1590,7 @@ HANDLE CreateMutexA(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCSTR name)
     (void)sa; (void)name;
     w32_object *o = obj_alloc(K_MUTEX);
     if (initialOwner) { o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion = 1; }
-    return (HANDLE)o;
+    return obj_handle(o);
 }
 HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 {
@@ -1529,7 +1753,7 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
     pthread_attr_destroy(&attr);
 
     if (threadId) *threadId = o->tid;
-    return (HANDLE)o;
+    return obj_handle(o);
 }
 
 VOID ExitThread(DWORD exitCode)
@@ -1751,7 +1975,7 @@ static void *timer_thread(void *arg)
 HANDLE CreateTimerQueue(void)
 {
     /* A timer queue is just a grouping token here. */
-    return (HANDLE)obj_alloc(K_TIMER);
+    return obj_handle(obj_alloc(K_TIMER));
 }
 
 BOOL DeleteTimerQueue(HANDLE timerQueue)
@@ -1778,14 +2002,14 @@ BOOL CreateTimerQueueTimer(PHANDLE newTimer, HANDLE timerQueue,
         return FALSE;
     }
     pthread_detach(o->thread);
-    if (newTimer) *newTimer = (HANDLE)o;
+    if (newTimer) *newTimer = obj_handle(o);
     return TRUE;
 }
 
 BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG period)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
+    w32_object *o = obj_from_handle(timer);
     if (!o || o->kind != K_TIMER) return FALSE;
     o->timer_due    = dueTime;
     o->timer_period = period;
@@ -1795,7 +2019,7 @@ BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG
 BOOL DeleteTimerQueueTimer(HANDLE timerQueue, HANDLE timer, HANDLE completionEvent)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
+    w32_object *o = obj_from_handle(timer);
     if (!o || o->kind != K_TIMER) return FALSE;
     o->timer_cancel = 1;
     if (completionEvent) SetEvent(completionEvent);
@@ -1837,7 +2061,7 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
     w32_object *o = obj_alloc(K_WAITABLE_TIMER);
     o->waitable_manual_reset = manualReset;
     o->waitable_handle_count = 1;
-    return (HANDLE)o;
+    return obj_handle(o);
 }
 
 BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
@@ -1933,8 +2157,8 @@ BOOL CancelWaitableTimer(HANDLE h)
 
 static w32_object s_process_heap = { .kind = K_HEAP };   /* never released */
 
-HANDLE GetProcessHeap(void)                       { return (HANDLE)&s_process_heap; }
-HANDLE HeapCreate(DWORD o, SIZE_T i, SIZE_T m)    { (void)o;(void)i;(void)m; return (HANDLE)&s_process_heap; }
+HANDLE GetProcessHeap(void)                       { return obj_handle(&s_process_heap); }
+HANDLE HeapCreate(DWORD o, SIZE_T i, SIZE_T m)    { (void)o;(void)i;(void)m; return obj_handle(&s_process_heap); }
 BOOL   HeapDestroy(HANDLE h)                      { (void)h; return TRUE; }
 
 LPVOID HeapAlloc(HANDLE heap, DWORD flags, SIZE_T bytes)
@@ -2461,7 +2685,7 @@ HANDLE w32_open_handle_shared(int fd, const char *host_path, DWORD access,
         return INVALID_HANDLE_VALUE;
     }
     h = w32_open_handle(fd, host_path);
-    entry->owner   = (w32_object *)h;
+    entry->owner   = obj_from_handle(h);
     entry->dev     = st.st_dev;
     entry->ino     = st.st_ino;
     entry->granted = granted;
@@ -3108,7 +3332,7 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     o->fd       = fd;
     o->map_size = size;
     o->map_protect = protect;
-    return (HANDLE)o;
+    return obj_handle(o);
 }
 
 HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,

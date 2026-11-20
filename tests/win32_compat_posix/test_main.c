@@ -35,12 +35,17 @@ static void check(int ok, const char *what)
 }
 
 /* An address range nothing currently occupies. */
+/* An unmapped range aligned to the 64 KB allocation granularity, which
+ * MapViewOfFileEx requires of a base address (as Win32 does). */
 static void *free_range(size_t len)
 {
-    void *p = mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    const size_t gran = 64 * 1024;
+    unsigned char *p = mmap(NULL, len + gran, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned char *aligned;
     if (p == MAP_FAILED) return NULL;
-    munmap(p, len);
-    return p;
+    aligned = (unsigned char *)(((uintptr_t)p + gran - 1) & ~(uintptr_t)(gran - 1));
+    munmap(p, len + gran);
+    return aligned;
 }
 
 int main(void)
