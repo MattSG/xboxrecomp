@@ -13,6 +13,10 @@ target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_subdirectory(mapping)
 target_link_libraries(xbox_input PUBLIC xbox_input_map)
 
+# POSIX only: the bundled SDL2 window feeds the key table through keyboard_sdl.c.
+# An embedding project with its own window (an SDL3 host) turns this OFF so SDL2
+# is not linked beside its SDL3.
+option(XBOXRECOMP_INPUT_SDL2 "Link SDL2 and feed keys from keyboard_sdl.c (POSIX)" ON)
 if(WIN32)
     # Mouse+keyboard pad (RECOMP_MKB) reads Win32 raw input.
     target_sources(xbox_input PRIVATE mkb_input.c)
@@ -24,6 +28,11 @@ if(WIN32)
     # MSVC keeps the plain name. tests/input_xinput_imports checks the result.
     target_link_libraries(xbox_input PUBLIC platform
         $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>)
+elseif(NOT XBOXRECOMP_INPUT_SDL2)
+    # XBOXRECOMP_INPUT_SDL2=OFF: the embedding project owns the window and feeds this table from its own
+    # events (an SDL3 host maps SDL3 keycodes itself), so nothing here may pull
+    # in SDL2: its symbols clash with SDL3's in one process.
+    target_link_libraries(xbox_input PUBLIC platform)
 else()
     find_package(SDL2 REQUIRED)
     # The SDL window's key and focus events into that table.

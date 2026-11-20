@@ -41,6 +41,13 @@ else()
 endif()
 set(XBOXRECOMP_RENDERER "${_xbr_renderer_default}" CACHE STRING "Host renderer: D3D11 or EXTERNAL")
 set_property(CACHE XBOXRECOMP_RENDERER PROPERTY STRINGS D3D11 EXTERNAL)
+# An SDL3 host (XBOXRECOMP_RENDERER=EXTERNAL with its own SDL3 window) turns
+# this ON so the headers that name the window (fb_present.h, host.c) see
+# XBOXRECOMP_SDL3 in every toolkit target, not only in the host's.
+option(XBOXRECOMP_SDL3 "The embedding project's window and renderer are SDL3" OFF)
+if(XBOXRECOMP_SDL3)
+    add_compile_definitions(XBOXRECOMP_SDL3=1)
+endif()
 include(xbox_ffmpeg)
 
 # Common definitions for all targets
