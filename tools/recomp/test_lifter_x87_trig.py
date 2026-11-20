@@ -64,7 +64,7 @@ _SOURCE = r"""
 #define RECOMP_GENERATED_CODE 1
 #include "recomp_types.h"
 #include <stdio.h>
-RECOMP_TLS uint32_t g_seh_ebp, g_eflags;
+RECOMP_TLS uint32_t g_ebp, g_seh_ebp, g_eflags;
 RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
 RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS int g_fp_cmp;
 RECOMP_TLS uint16_t g_fp_cc;

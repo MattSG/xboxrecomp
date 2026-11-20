@@ -1621,6 +1621,7 @@ static DWORD errno_to_win32(int e)
         case ENOENT:  return ERROR_FILE_NOT_FOUND;
         case ENOTDIR: return ERROR_PATH_NOT_FOUND;
         case EACCES:
+        case EISDIR:
         case EPERM:   return ERROR_ACCESS_DENIED;
         case EEXIST:  return ERROR_ALREADY_EXISTS;
         default:      return ERROR_GEN_FAILURE;
@@ -1765,6 +1766,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
                  && st.st_size > 0;
         truncate = (flags & O_TRUNC) != 0 && !defer;
         fd = open(host_path, flags & ~O_TRUNC, 0644);
+        /* open(2) reads a directory happily. FILE_NON_DIRECTORY_FILE must
+         * still refuse one, as the Win32 backend does (access denied). */
+        if (fd >= 0 && (CreateOptions & XBOX_FILE_NON_DIRECTORY_FILE) &&
+            fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+            close(fd);
+            fd = -1;
+            errno = EISDIR;
+        }
         if (fd >= 0 && fd < FATX_PENDING_MAX)
             s_overwrite_pending[fd] = (unsigned char)defer;
         else if (fd >= 0 && defer)
