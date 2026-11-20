@@ -26,9 +26,14 @@ void xbox_FramebufferSdlHints(void);
 typedef HCURSOR XboxCursor;
 /* The window to present into, or NULL until it exists. */
 HWND xbox_FramebufferWindowHandle(void);
+#else
+/* POSIX without an SDL3 host: no window of the runtime's own. The handlers
+ * below keep their shape (Win32 types from xbox_winnt.h) for whatever host
+ * embeds it. */
+#include "platform/xbox_winnt.h"
+typedef void *XboxCursor;
 #endif
 
-#if defined(XBOXRECOMP_SDL3) || defined(_WIN32)
 /* Register before window startup. Called on the window thread for client
  * cursor selection; NULL result hides it. Cursor ownership stays with caller. */
 void xbox_FramebufferSetCursorHandler(XboxCursor (*handler)(void));
@@ -57,7 +62,6 @@ typedef struct {
 void xbox_FramebufferSetHostOverlay(const XboxHostOverlay *overlay);
 void xbox_FramebufferRenderHostOverlay(void *device, void *context, void *target);
 int xbox_FramebufferHostInputCaptured(void);
-#endif
 
 /* The title set a display mode: open the window (once) if one is wanted.
  * Implemented by the window module (fb_window.h). */
