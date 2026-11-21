@@ -846,7 +846,7 @@ static void pace_watch_stall(MCPXAPUState *d, int q, int high, int64_t now_us)
     }
 }
 
-/* Pacing one frame at a time (pace_frames, RECOMP_APU_PACE_FRAMES, on by
+/* Pacing one frame at a time (pace_frames, RECOMP_APU_PACE_FRAMES=1; off by
  * default). Paced a period at a time, the eight frames ran back to back and
  * the thread slept out the rest, where the hardware runs one every 0.67 ms:
  * a title that stops a voice and spins until the voice walk retires it
@@ -1492,8 +1492,12 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
 
     {
+        /* Off unless asked for: with this runtime's DSP thread, frames paced
+         * one at a time came out with the voices' 32-sample frames jumping
+         * against each other (about 6 a second in a race, 25 a second in
+         * the menus: heard as crackle). */
         const char *pf = getenv("RECOMP_APU_PACE_FRAMES");
-        d->pace_frames = !pf || !*pf || *pf != '0';
+        d->pace_frames = pf && *pf && *pf != '0';
     }
 
     /* Start background frame and DSP threads */

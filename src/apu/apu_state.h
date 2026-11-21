@@ -407,7 +407,7 @@ struct MCPXAPUState {
     bool pace_stalled;          /* device stopped consuming: host-clock pacing,
                                  * periods dropped (mcpx_apu_pace_step) */
     bool pace_frames;           /* pace each frame, not each period
-                                 * (RECOMP_APU_PACE_FRAMES, default on) */
+                                 * (RECOMP_APU_PACE_FRAMES=1, default off) */
     int pace_span_us;           /* eight frames take this long (pace_frames) */
     unsigned pace_full_asks;    /* pacing asks refused at a full queue */
     bool seq_ran;               /* the VP has rendered since the sequencer last
