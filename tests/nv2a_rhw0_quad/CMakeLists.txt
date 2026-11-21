@@ -11,6 +11,8 @@ target_include_directories(nv2a-rhw0-quad-test PRIVATE ../../src/kernel ../../sr
 if(MSVC)
     target_compile_definitions(nv2a-rhw0-quad-test PRIVATE _CRT_SECURE_NO_WARNINGS)
 elseif(NOT WIN32)
+    # Interlocked*, GetTickCount and the rest of the Win32 surface the executor uses.
+    target_sources(nv2a-rhw0-quad-test PRIVATE ../../src/platform/win32_compat.c)
     target_link_libraries(nv2a-rhw0-quad-test PRIVATE m pthread)
 endif()
 add_test(NAME nv2a-rhw0-quad COMMAND nv2a-rhw0-quad-test)

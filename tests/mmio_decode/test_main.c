@@ -1,7 +1,8 @@
-/* Windows only: the trapped-MMIO decoder it covers is the x86-64 one under a Win32 VEH;
- * this host uses mmio_decode_a64.h, which tests/mmio_decode_a64 covers.
+/* x86-64 hosts (Windows, and POSIX through the platform layer's CONTEXT): the decoder
+ * the MMIO traps use there. An arm64 host uses mmio_decode_a64.h, which
+ * tests/mmio_decode_a64 covers.
  */
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__x86_64__)
 /*
  * mmio_decode - does the trapped-MMIO instruction decoder service what the
  * XDK's device code emits, and refuse what it does not understand.
@@ -369,5 +370,5 @@ int main(void)
 
 #else
 #include <stdio.h>
-int main(void) { printf("mmio_decode: Windows-only, skipped\n"); return 77; }
+int main(void) { printf("mmio_decode: x86-64 only, skipped\n"); return 77; }
 #endif

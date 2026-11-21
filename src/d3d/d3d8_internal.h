@@ -14,6 +14,10 @@
 /* Portable: D3D8 device accessor used by recompiled code on both backends
  * (d3d8_device.c on Windows, d3d8_gl.c on POSIX). */
 IDirect3DDevice8 *d3d8_GetDevice(void);
+/* Also portable: the video player (src/video) uses them on every backend. */
+UINT    d3d8_GetBackbufferWidth(void);
+UINT    d3d8_GetBackbufferHeight(void);
+HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DTexture8 **ppTex);
 
 #if defined(_WIN32)
 /* === Everything below is the D3D11 backend. The POSIX d3d8_compat
@@ -33,8 +37,6 @@ ID3D11DeviceContext *d3d8_GetD3D11Context(void);
 IDXGISwapChain      *d3d8_GetSwapChain(void);
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
 HWND                 d3d8_GetHWND(void);
-UINT                 d3d8_GetBackbufferWidth(void);
-UINT                 d3d8_GetBackbufferHeight(void);
 
 /* Presentation-only gamma. End restores the saved backbuffer even if Present fails. */
 void d3d8_gamma_set(const D3DGAMMARAMP *ramp);
@@ -279,7 +281,6 @@ const DWORD    *d3d8_GetPalette(DWORD stage);
 /* Resource creation (d3d8_resources.c) */
 HRESULT d3d8_CreateVertexBufferImpl(UINT Length, DWORD Usage, DWORD FVF, IDirect3DVertexBuffer8 **ppVB);
 HRESULT d3d8_CreateIndexBufferImpl(UINT Length, DWORD Usage, D3DFORMAT Format, IDirect3DIndexBuffer8 **ppIB);
-HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DTexture8 **ppTex);
 
 /* ================================================================
  * Shader management (d3d8_shaders.c)

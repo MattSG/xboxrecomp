@@ -5,6 +5,9 @@ add_executable(nv2a-pb-walk-test nv2a_pb_walk_test.c ../../src/kernel/nv2a_pb_sc
 target_include_directories(nv2a-pb-walk-test PRIVATE ../../src ../../src/kernel)
 if(MSVC)
     target_compile_definitions(nv2a-pb-walk-test PRIVATE _CRT_SECURE_NO_WARNINGS)
+elseif(NOT WIN32)
+    target_sources(nv2a-pb-walk-test PRIVATE ../../src/platform/win32_compat.c)
+    target_link_libraries(nv2a-pb-walk-test PRIVATE m pthread)
 endif()
 add_test(NAME nv2a-pushbuffer-walk COMMAND nv2a-pb-walk-test)
 # The DMA walk is opt-in; the segment walk is the default.

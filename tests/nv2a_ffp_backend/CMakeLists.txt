@@ -21,6 +21,8 @@ foreach(target nv2a-ffp-backend-test nv2a-present-sync-test
     if(MSVC)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
     elseif(NOT WIN32)
+        # Interlocked*, GetTickCount and the rest of the Win32 surface the executor uses.
+        target_sources(${target} PRIVATE ../../src/platform/win32_compat.c)
         target_link_libraries(${target} PRIVATE m pthread)
     endif()
 endforeach()
