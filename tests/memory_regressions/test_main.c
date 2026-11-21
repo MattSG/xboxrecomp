@@ -194,6 +194,32 @@ static unsigned char *load_file(const char *path, size_t *len)
     return buf;
 }
 
+/* The cluster size the utility drive (Partition3) reports, as XMountUtilityDrive
+ * reads it; 0 if the open or the query fails. */
+static unsigned utility_cluster_bytes(void)
+{
+    static const char device[] = "\\Device\\Harddisk0\\Partition3\\";
+    XBOX_ANSI_STRING name;
+    XBOX_OBJECT_ATTRIBUTES oa;
+    XBOX_IO_STATUS_BLOCK ios;
+    XBOX_FILE_FS_SIZE_INFORMATION info;
+    HANDLE h = NULL;
+    NTSTATUS st;
+
+    name.Length = (USHORT)(sizeof device - 1);
+    name.MaximumLength = (USHORT)sizeof device;
+    name.Buffer = (PCHAR)device;
+    oa.RootDirectory = NULL;
+    oa.ObjectName = &name;
+    oa.Attributes = 0x40;
+    if (xbox_NtCreateFile(&h, 0x80100000u, &oa, &ios, NULL, 0, 3, XBOX_FILE_OPEN, 0x00800021u) != 0 || !h)
+        return 0;
+    memset(&info, 0, sizeof info);
+    st = xbox_NtQueryVolumeInformationFile(h, &ios, &info, sizeof info, XboxFileFsSizeInformation);
+    xbox_NtClose(h);
+    return st == 0 ? (unsigned)(info.BytesPerSector * info.SectorsPerAllocationUnit) : 0;
+}
+
 static void set_env(const char *name, const char *value)
 {
 #ifdef _WIN32
@@ -235,13 +261,14 @@ int main(int argc, char **argv)
     int tls_size_overflow = !strcmp(mode, "tls-size-overflow");
     int tls_invalid = tls_bad_directory || tls_bad_range || tls_size_overflow;
     int tls_layout = !strcmp(mode, "tls-layout") || tls_invalid;
+    int init_flags = !strcmp(mode, "init-flags");
     size_t xbe_len = 0;
     unsigned char *xbe;
     char d[160];
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !reserve_heap && !model_churn && !scene_churn && !tls_layout && !high_image && !bad_image && !stack_layout && !stack_config && !stack_invalid && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !reserve_heap && !model_churn && !scene_churn && !tls_layout && !high_image && !bad_image && !stack_layout && !stack_config && !stack_invalid && !init_flags && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -298,6 +325,7 @@ int main(int argc, char **argv)
         if (short_header) xbe_len = 16;
     }
     if (stack_layout) *(uint32_t *)(xbe + 0x130) = 0x3100;
+    if (init_flags) *(uint32_t *)(xbe + 0x124) = 0x80000007u;   /* Turok: Evolution's: 64 KB clusters */
     if (stack_bad_size) *(uint32_t *)(xbe + 0x130) = UINT32_MAX;
     if (stack_bad_base) check(xbox_ConfigureMainStack(0x780000, 0x4000), "overlap is checked against the loaded image", NULL);
     if (stack_unbacked) check(xbox_ConfigureMainStack(0x3FFF000, 0x2000), "backing is checked at initialization", NULL);
@@ -321,6 +349,28 @@ int main(int argc, char **argv)
     if (!layout_ok) {
         puts("xbox_MemoryLayoutInit failed");
         return 2;
+    }
+    if (init_flags) {
+        /* The loader hands the header's init flags to the file layer: XMountUtilityDrive
+         * insists the cache partition reports the cluster size they ask for. */
+        char root[512];
+#ifdef _WIN32
+        char tmp[MAX_PATH];
+        GetTempPathA(MAX_PATH, tmp);
+        snprintf(root, sizeof root, "%smemreg-initflags-%lu", tmp, (unsigned long)GetCurrentProcessId());
+        CreateDirectoryA(root, NULL);
+#else
+        char tmpl[] = "/tmp/memregXXXXXX";
+        if (!mkdtemp(tmpl)) return 2;
+        snprintf(root, sizeof root, "%s", tmpl);
+#endif
+        xbox_path_init(root, root);
+        unsigned got = utility_cluster_bytes();
+        snprintf(d, sizeof d, "got %u bytes", got);
+        check(got == 0x10000, "init flags 0x80000007: the utility drive reports 64 KB clusters", d);
+        xbox_MemoryLayoutShutdown();
+        free(xbe);
+        return failures ? 1 : 0;
     }
 
     check(*G(XBOX_FS_BASE + 0x28) == 0,
